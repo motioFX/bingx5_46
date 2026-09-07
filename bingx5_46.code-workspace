@@ -1,0 +1,10 @@
+﻿{
+	"folders": [
+		{
+			"path": "."
+		}
+	],
+	"settings": {
+		"python.defaultInterpreterPath": "C:\\Users\\user\\AppData\\Local\\Programs\\Python\\Python310\\python.exe"
+	}
+}

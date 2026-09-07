@@ -1,0 +1,90 @@
+{
+  "description": "Hyperliquid Active Whale Addresses",
+  "updated_at": "2026-08-09",
+  "whales": [
+    {
+      "name": "Whale_1",
+      "address": "0xf5d81a135f756ca16544e53c20fc20643ec3ad53"
+    },
+    {
+      "name": "Whale_2",
+      "address": "0xa70ac79d24b8ea7dc8899d6c2df26488130b4be9"
+    },
+    {
+      "name": "Whale_3",
+      "address": "0xde8d9e530b0528ffa7b1190f862536c055dd9524"
+    },
+    {
+      "name": "Whale_4",
+      "address": "0x4537e1a5b7bcadd39f6d6211cb757ce431798732"
+    },
+    {
+      "name": "Whale_5",
+      "address": "0x888d57a574240407c3d2f9b6ad9374040c9c486e"
+    },
+    {
+      "name": "Whale_6",
+      "address": "0xccd5754de3c150ad12d246b57b5899742f9c3fdd"
+    },
+    {
+      "name": "Whale_7",
+      "address": "0xea6ac6a82fd81f8e3124ab0b309622363b426aa6"
+    },
+    {
+      "name": "Whale_8",
+      "address": "0xe9d199fd55a2560e3193f330e017192316ecd2d3"
+    },
+    {
+      "name": "Whale_9",
+      "address": "0xa62b923a112d50d03e1e096bbd53422490dac104"
+    },
+    {
+      "name": "Whale_10",
+      "address": "0xce7164b7ba9bc64b5a8624c90def60accfdfb1b6"
+    },
+    {
+      "name": "Whale_11",
+      "address": "0x79eafe49f96293e2cd1ec2a7c8b910d431669090"
+    },
+    {
+      "name": "Whale_12",
+      "address": "0x6ba889db7f923622d3548f621ecc2054b80c1817"
+    },
+    {
+      "name": "Whale_13",
+      "address": "0xbc15bdc9dd14922351221326ef57a0a7c1b16adf"
+    },
+    {
+      "name": "Whale_14",
+      "address": "0x3cc873523becfbb6d2303233f1096398a1e09b23"
+    },
+    {
+      "name": "Whale_15",
+      "address": "0xecb63caa47c7c4e77f60f1ce858cf28dc2b82b00"
+    },
+    {
+      "name": "Whale_16",
+      "address": "0xf3ee94871a2b21307d076db89b4cc35d820b603b"
+    },
+    {
+      "name": "Whale_17",
+      "address": "0xf9109ada2f73c62e9889b45453065f0d99260a2d"
+    },
+    {
+      "name": "Whale_18",
+      "address": "0x9c6a5b4662c722d2c47f43d6c9813cb080ffa4ed"
+    },
+    {
+      "name": "Whale_19",
+      "address": "0xbeccae9ffcb69e9d42a1d4e744abf8056149562d"
+    },
+    {
+      "name": "Whale_20",
+      "address": "0x9a31f7aff78fd464bbceb398e11b82ba633c6525"
+    },
+    {
+      "name": "Whale_21",
+      "address": "0xea0e878d5da1f786c035355cd7a8d381a6276766"
+    }
+  ]
+}

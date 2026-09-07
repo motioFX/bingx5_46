@@ -1,0 +1,27 @@
+# Credentials and Secrets (Security)
+bingx_credentials.json
+bingx_credentials_*.json
+hyperliquid_credentials.json
+bitget_credentials.json
+bitget_credentials_*.json
+*.json.bak
+technocore_agent/.technocore/
+technocore_agent/*.log
+
+# Python Caches
+__pycache__/
+*.pyc
+*.pyo
+.webcache/
+
+# Runtime Data and Outputs
+Data/
+backtest_data/
+scratch/
+*.png
+*.jpg
+*.csv
+*.zip
+
+# Dynamic State Files
+traded_symbols.json
