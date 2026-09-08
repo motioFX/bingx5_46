@@ -72,11 +72,15 @@ class send_discord:
         self.bingx_webhook = self.real3_webhook
         self.win32_webhook = self.test4_webhook
         self.default_webhook = self.real3_webhook
-        self.webhook_url = self.real3_webhook or self.test4_webhook
+        self.webhook_url = self.test4_webhook if sys.platform == "win32" else self.real3_webhook
 
     def _get_target_webhooks(self, text: str = "") -> list[str]:
-        # すべての通知を real3_bngx に集約
-        target = self.real3_webhook or self.test4_webhook
+        if sys.platform == "win32":
+            # Windows環境: テスト用 (#test4_backtest)
+            target = self.test4_webhook or self.real3_webhook
+        else:
+            # Linux VPS環境: BingXチャンネル (#real3_bngx)
+            target = self.real3_webhook or self.test4_webhook
         return [target] if target else []
 
     def send_message(self, content: str) -> None:
