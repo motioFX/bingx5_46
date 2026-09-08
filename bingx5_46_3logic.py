@@ -318,7 +318,7 @@ class send_discord:
         self.bingx_webhook = self.real3_webhook
         self.win32_webhook = self.test4_webhook
         self.default_webhook = self.real3_webhook
-        self.webhook_url = self.test4_webhook if sys.platform == 'win32' else self.real3_webhook
+        self.webhook_url = self.real3_webhook or self.test4_webhook
 
         if not self.real3_webhook and not self.test4_webhook:
             print("[WARN] Discord webhook for BingX (real3_bngx / test4_backtest) is not configured.")
@@ -330,21 +330,10 @@ class send_discord:
         self.buffers = send_discord._shared_buffers
         self.timers = send_discord._shared_timers
 
-    def _get_target_webhooks(self, text: str) -> list[str]:
-        # バックテストや最適化、検証結果のメッセージは test4_backtest チャンネルへ出力
-        is_backtest = any(k in text for k in ("backtest", "バックテスト", "最適化", "RANGEの最適化", "BREAKOUTの最適化", "戦略比較結果"))
-        if is_backtest:
-            target = self.test4_webhook or self.real3_webhook
-            return [target] if target else []
-
-        if sys.platform == 'win32':
-            # Windowsローカル環境: test4_backtest（テストチャンネル）へ出力
-            target = self.test4_webhook or self.real3_webhook
-            return [target] if target else []
-        else:
-            # Linux VPS本番環境: real3_bngx（BingX本番チャンネル）へ出力
-            target = self.real3_webhook or self.test4_webhook
-            return [target] if target else []
+    def _get_target_webhooks(self, text: str = "") -> list[str]:
+        # すべての通知（実取引、バックテスト、最適化、チャート等）を real3_bngx に集約
+        target = self.real3_webhook or self.test4_webhook
+        return [target] if target else []
 
     def flush_buffer(self, url):
         with self.lock:
@@ -513,7 +502,7 @@ class send_discord:
             ax1.annotate(f'VAL: {latest_val:.2f}', xy=(1.01, latest_val), xycoords=('axes fraction', 'data'), fontsize=8, color='blue', va='center')
         
         ax1.legend(loc='upper left', fontsize=8)
-        ax1.set_ylabel("Price [USDC]")
+        ax1.set_ylabel("Price [USDT]")
         ax1.grid(True, alpha=0.3)
         ax1.xaxis.set_major_formatter(md.DateFormatter("%m/%d %H:%M"))
         fig.autofmt_xdate(rotation=10)
@@ -635,14 +624,14 @@ class send_discord:
                     s=70,
                 )
 
-        ax1.set_ylabel("close [USDC]", fontsize=9)
+        ax1.set_ylabel("close [USDT]", fontsize=9)
         ax1.grid(True, axis='y', linestyle=':', alpha=0.3)
 
         # 5. 右軸 (twinx): 累積 PnL
         ax2 = ax1.twinx()
         b_plot = df['pnl'] if 'pnl' in df.columns else np.zeros(len(df))
         ax2.plot(x_indices, b_plot, "C1", label="pl", linewidth=1.5)
-        ax2.set_ylabel("pnl [USDC]", fontsize=9)
+        ax2.set_ylabel("pnl [USDT]", fontsize=9)
         ax2.grid(False)
 
         # 6. X軸目盛り設定 (日付表示)
@@ -655,7 +644,7 @@ class send_discord:
         ax1.set_xticklabels(tick_labels, rotation=15, ha="right", fontsize=8)
 
         final_pnl = df['pnl'].iloc[-1] if 'pnl' in df.columns else 0.0
-        ax1.set_title(f"{title_prefix}{label} | Final PnL: {final_pnl:.4f} USDC", fontsize=10, pad=10)
+        ax1.set_title(f"{title_prefix}{label} | Final PnL: {final_pnl:.4f} USDT", fontsize=10, pad=10)
 
         # 7. 凡例統合
         h1, l1 = ax1.get_legend_handles_labels()
@@ -698,7 +687,7 @@ class send_discord:
             optimal_lot_usdt = optimal_lot * price
 
         onhand_amount_usdt = onhand_amount * price
-        self.print_log(f"best lot : {optimal_lot_usdt:.2f} USDC, onhand_amount : {onhand_amount_usdt:.2f} USDC")
+        self.print_log(f"best lot : {optimal_lot_usdt:.2f} USDT, onhand_amount : {onhand_amount_usdt:.2f} USDT")
         time.sleep(1)
         self.print_log("-----------------------------------------")
         time.sleep(1)

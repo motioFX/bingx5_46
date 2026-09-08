@@ -89,12 +89,7 @@ def get_webhook_url(name: Optional[str] = None, config: Optional[Dict[str, Any]]
             return str(webhooks[name])
         return ""
 
-    # 未指定の場合: 実行環境に応じて最適チャンネルを自動選択
-    if sys.platform == "win32":
-        # Windows環境: テスト/バックテストチャンネル (#test4_backtest) を優先
-        return str(webhooks.get("test4_backtest") or webhooks.get("real3_bngx") or "")
-    else:
-        # Linux VPS本番環境: BingX本番チャンネル (#real3_bngx) を優先
-        return str(webhooks.get("real3_bngx") or webhooks.get("test4_backtest") or "")
+    # 未指定の場合: BingXチャンネル (#real3_bngx) を最優先
+    return str(webhooks.get("real3_bngx") or webhooks.get("test4_backtest") or "")
 
 

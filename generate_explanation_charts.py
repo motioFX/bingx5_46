@@ -98,7 +98,7 @@ def generate_explanation_charts():
     fig, (ax_top, ax_bot) = plt.subplots(2, 1, figsize=(14, 9), gridspec_kw={'height_ratios': [2.5, 1]}, sharex=True)
     
     # Plot price
-    ax_top.plot(df_slice.index, df_slice["close"], label=f"{target_sym} 価格 (USDC)", color="#1f77b4", linewidth=2.2)
+    ax_top.plot(df_slice.index, df_slice["close"], label=f"{target_sym} 価格 (USDT)", color="#1f77b4", linewidth=2.2)
     ax_top.scatter([peak_idx], [df_slice.loc[peak_idx, "close"]], color="red", s=150, zorder=5, label="24h上昇率が最大（検知・1H買い）")
     
     # Annotations
@@ -119,7 +119,7 @@ def generate_explanation_charts():
     )
 
     ax_top.set_title(f"【実例検証】24時間上昇率ランキング上位飛び乗りの実態（{target_sym}の価格推移）", fontsize=14, fontweight="bold", pad=12)
-    ax_top.set_ylabel("価格 (USDC)", fontsize=12)
+    ax_top.set_ylabel("価格 (USDT)", fontsize=12)
     ax_top.grid(True, linestyle="--", alpha=0.5)
     ax_top.legend(loc="upper left", fontsize=11)
 
