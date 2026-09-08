@@ -32,9 +32,6 @@ BINGX_TARGET_POSITION_VALUE_USDT = 15.0
 LEVERAGE_FACTOR = 10.0
 is_air = True  # シミュレーション・ペーパートレードモードを強制
 
-hyperliquid_mode = bingx_mode
-HYPERLIQUID_TARGET_POSITION_VALUE_USDT = BINGX_TARGET_POSITION_VALUE_USDT
-
 # Helper to read values
 def _to_float(value: Any, default: float) -> float:
     try:
@@ -77,7 +74,6 @@ except Exception as e:
     }
 
 apis = apis_bingx
-apis_hyperliquid = apis_bingx
 
 # ポジションログの頻度制御（秒）。
 POSITION_LOG_INTERVAL_SEC = 60 * 60
@@ -85,10 +81,7 @@ _last_position_log_ts = 0.0
 
 RestAPI_url = {
     'bingx': 'https://open-api.bingx.com',
-    'bingx_demo': 'https://open-api.bingx.com',
-    'hyperliquid': 'https://open-api.bingx.com',
-    'hyperliquid_testnet': 'https://open-api.bingx.com',
-    'hyperliquid_demo': 'https://open-api.bingx.com',
+    'bingx_demo': 'https://open-api-vst.bingx.com',
 }
 
 discord = send_discord()
@@ -518,7 +511,6 @@ class api_bingx:
         
         self.bingx_mode = bingx_mode
         self.bingx = api_bingx_helper(self.symbol, 'SWAP', coin, mode)
-        self.hyperliquid = self.bingx  # 下位互換用
 
         try:
             bx_spec = fetch_instrument_spec_bingx(self.symbol, mode)
@@ -945,18 +937,8 @@ async def flatten_all_positions_bingx(
         all_ok = all_ok and ok
     return all_ok
 
-# ==================== 下位互換用エイリアス ====================
-api_hyperliquid = api_bingx
-api_hyperliquid_helper = api_bingx_helper
-fetch_hyperliquid_candles = fetch_bingx_candles
-fetch_instrument_spec_hyperliquid = fetch_instrument_spec_bingx
-flatten_current_position_hyperliquid = flatten_current_position_bingx
-flatten_all_positions_hyperliquid = flatten_all_positions_bingx
+# ==================== 汎用エイリアス ====================
 flatten_current_position = flatten_current_position_bingx
 flatten_all_positions = flatten_all_positions_bingx
 fetch_all_position_symbols = fetch_all_position_symbols_bingx
-fetch_all_position_symbols_hyperliquid = fetch_all_position_symbols_bingx
-get_hyperliquid_orderbook = get_bingx_orderbook
-get_hyperliquid_universe_symbols = get_bingx_universe_symbols
-compute_hyperliquid_lot_size = compute_bingx_lot_size
 

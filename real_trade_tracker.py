@@ -72,7 +72,7 @@ def plot_real_trading_performance():
     else:
         df["dt_jst"] = df["timestamp"].dt.tz_convert("Asia/Tokyo")
 
-    ax.plot(df["dt_jst"], df["cum_pnl"], marker='o', markersize=6, color='#29b6f6', linewidth=2.2, label="Cumulative Real PnL (USDC)", zorder=3)
+    ax.plot(df["dt_jst"], df["cum_pnl"], marker='o', markersize=6, color='#29b6f6', linewidth=2.2, label="Cumulative Real PnL (USDT)", zorder=3)
     
     # 0ライン
     ax.axhline(0, color="#787b86", linestyle="--", alpha=0.5, zorder=2)
@@ -153,9 +153,9 @@ def plot_real_trading_performance():
     ax.set_ylim(min_pnl - pnl_range * 0.22, max_pnl + pnl_range * 0.25)
     ax.margins(x=0.10)
 
-    ax.set_title("Hyperliquid Real Trading Performance (Cumulative Realized PnL)", fontsize=12, color="#ffffff", pad=15, weight="bold")
+    ax.set_title("BingX Real Trading Performance (Cumulative Realized PnL)", fontsize=12, color="#ffffff", pad=15, weight="bold")
     ax.set_xlabel("Time (JST)", fontsize=10, color="#b2b5be")
-    ax.set_ylabel("Realized Cumulative PnL (USDC)", fontsize=10, color="#b2b5be")
+    ax.set_ylabel("Realized Cumulative PnL (USDT)", fontsize=10, color="#b2b5be")
     ax.tick_params(colors="#b2b5be", labelsize=9)
     ax.grid(True, linestyle=':', color="#363c4e", alpha=0.7)
     ax.legend(loc="upper left", facecolor="#1e222d", edgecolor="#363c4e", fontsize=9, labelcolor="#ffffff")

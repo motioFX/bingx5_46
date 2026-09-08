@@ -79,13 +79,9 @@ BINGX_IS_LIVE = False if not ALLOW_LIVE_TRADING else False
 #       False = リアル注文 (実際の BingX 取引所へ発注)
 BINGX_IS_AIR = True if not ALLOW_LIVE_TRADING else True
 
-# 下位互換用エイリアス
-HYPERLIQUID_IS_LIVE = BINGX_IS_LIVE
-HYPERLIQUID_IS_AIR = BINGX_IS_AIR
-
 # [ 3 ] ポジション・ロット設定
 BINGX_TARGET_POSITION_VALUE_USDT = 15.0
-HYPERLIQUID_TARGET_POSITION_VALUE_USDT = BINGX_TARGET_POSITION_VALUE_USDT
+TARGET_POSITION_VALUE_USDT = BINGX_TARGET_POSITION_VALUE_USDT
 LEVERAGE_FACTOR = 10.0
 MAX_ACTIVE_POSITIONS: int = 2  # 最大同時保有ポジション数 (資金効率と分散を最適化)
 MAX_SELECTED_SYMBOLS: int = 10  # 最大選定・監視銘柄数 (10銘柄体制へ拡張)
@@ -122,26 +118,20 @@ for _idx, _arg in enumerate(sys.argv):
 
 import bingx5_46_2api
 bingx5_46_2api.bingx_mode = 'live' if BINGX_IS_LIVE else 'demo'
-bingx5_46_2api.hyperliquid_mode = bingx5_46_2api.bingx_mode
 bingx5_46_2api.is_air = BINGX_IS_AIR
 bingx5_46_2api.BINGX_TARGET_POSITION_VALUE_USDT = BINGX_TARGET_POSITION_VALUE_USDT
-bingx5_46_2api.HYPERLIQUID_TARGET_POSITION_VALUE_USDT = BINGX_TARGET_POSITION_VALUE_USDT
 bingx5_46_2api.LEVERAGE_FACTOR = LEVERAGE_FACTOR
 
 from bingx5_46_2api import (
     api_bingx,
-    api_hyperliquid,
     apis,
     RestAPI_url,
     flatten_current_position,
     flatten_all_positions,
     fetch_all_position_symbols,
     bingx_mode,
-    hyperliquid_mode,
     fetch_instrument_spec_bingx,
-    fetch_instrument_spec_hyperliquid,
     compute_bingx_lot_size,
-    compute_hyperliquid_lot_size,
     normalize_symbol,
 )
 from bingx5_46_3logic import send_discord, logicinstance, PnLCalculator, MPStrategy, backtester, run_interval_comparison, resample_candles
@@ -177,7 +167,7 @@ else:
     asyncio.set_event_loop_policy(None)
 
 SKIP_MIX_ANALYSIS: bool = True
-is_air: bool = HYPERLIQUID_IS_AIR
+is_air: bool = BINGX_IS_AIR
 current_strategy_type: str = "range"
 
 import signal
@@ -348,26 +338,21 @@ def log_scoring_candidates(candidates: List[Dict[str, Any]]) -> None:
 
 
 async def fetch_last_price(symbol: str, product_type: str, mode: str) -> Optional[float]:
-    return await fetch_last_price_hyperliquid(symbol, product_type or 'PERP', mode)
+    return await fetch_last_price_bingx(symbol, product_type or 'SWAP', mode)
 
 
-async def fetch_last_price_hyperliquid(symbol: str, product_type: str, mode: str) -> Optional[float]:
-    base_url = RestAPI_url.get("hyperliquid_testnet") or RestAPI_url.get("hyperliquid_demo") if mode in ('paper', 'demo', 'testnet') else RestAPI_url["hyperliquid"]
+async def fetch_last_price_bingx(symbol: str, product_type: str, mode: str) -> Optional[float]:
     try:
-        async with pybotters.Client() as client:
-            res = await client.post(
-                f"{base_url}/info",
-                json={"type": "allMids"},
-                timeout=10
-            )
-            mids = await res.json()
-            if isinstance(mids, dict):
-                clean_sym = symbol.upper().replace("USDT", "").replace("USDC", "")
-                px = mids.get(clean_sym) or mids.get(symbol)
-                if px:
-                    return float(px)
+        from bingx5_46_2api import get_bingx_orderbook
+        bid, ask = get_bingx_orderbook(symbol)
+        if bid is not None and ask is not None:
+            return round((bid + ask) / 2.0, 6)
+        elif bid is not None:
+            return bid
+        elif ask is not None:
+            return ask
     except Exception as exc:
-        discord.print_log(f"Hyperliquid 価格取得エラー: {exc}")
+        discord.print_log(f"BingX 価格取得エラー ({symbol}): {exc}")
     return None
 
 
@@ -562,33 +547,56 @@ def load_traded_symbols() -> List[str]:
 
 
 async def fetch_all_asset_contexts() -> Dict[str, Dict[str, Any]]:
-    """Hyperliquid metaAndAssetCtxs から全銘柄のリアルタイム FR / OI / 出来高を取得"""
-    url = "https://api.hyperliquid.xyz/info"
-    payload = {"type": "metaAndAssetCtxs"}
+    """BingX Swap API から全銘柄のリアルタイム FR / 価格 / 出来高を取得"""
+    res: Dict[str, Dict[str, Any]] = {}
     try:
-        resp = requests.post(url, json=payload, timeout=10)
-        if resp.status_code == 200:
-            data = resp.json()
-            universe = data[0].get("universe", [])
-            ctxs = data[1] if len(data) > 1 else []
-            res = {}
-            for i, meta in enumerate(universe):
-                coin = meta.get("name", "")
-                ctx = ctxs[i] if i < len(ctxs) else {}
-                res[coin] = {
-                    "funding": float(ctx.get("funding", 0.0)),
-                    "openInterest": float(ctx.get("openInterest", 0.0)),
-                    "dayNtlVlm": float(ctx.get("dayNtlVlm", 0.0)),
-                    "markPx": float(ctx.get("markPx", 0.0)),
-                    "prevDayPx": float(ctx.get("prevDayPx", 0.0)),
+        # 1. premiumIndex から fundingRate と markPrice を取得
+        url_fr = "https://open-api.bingx.com/openApi/swap/v2/quote/premiumIndex"
+        resp_fr = requests.get(url_fr, timeout=10)
+        if resp_fr.status_code == 200:
+            data_fr = resp_fr.json()
+            for item in data_fr.get("data", []):
+                sym = normalize_symbol(item.get("symbol", ""))
+                coin = sym.replace("-USDT", "")
+                info = {
+                    "funding": float(item.get("lastFundingRate") or 0.0),
+                    "openInterest": 0.0,
+                    "dayNtlVlm": 0.0,
+                    "markPx": float(item.get("markPrice") or 0.0),
+                    "prevDayPx": 0.0,
                 }
-            return res
-        else:
-            print(f"[Warning] fetch_all_asset_contexts returned status {resp.status_code}")
-            return {}
+                res[sym] = info
+                res[coin] = info
+
+        # 2. ticker から quoteVolume と openPrice を取得
+        url_ticker = "https://open-api.bingx.com/openApi/swap/v2/quote/ticker"
+        resp_ticker = requests.get(url_ticker, timeout=10)
+        if resp_ticker.status_code == 200:
+            data_ticker = resp_ticker.json()
+            for item in data_ticker.get("data", []):
+                sym = normalize_symbol(item.get("symbol", ""))
+                coin = sym.replace("-USDT", "")
+                vol = float(item.get("quoteVolume") or 0.0)
+                open_px = float(item.get("openPrice") or 0.0)
+                last_px = float(item.get("lastPrice") or 0.0)
+
+                for k in (sym, coin):
+                    if k not in res:
+                        res[k] = {
+                            "funding": 0.0,
+                            "openInterest": 0.0,
+                            "dayNtlVlm": vol,
+                            "markPx": last_px,
+                            "prevDayPx": open_px,
+                        }
+                    else:
+                        res[k]["dayNtlVlm"] = vol
+                        res[k]["prevDayPx"] = open_px
+                        if res[k]["markPx"] == 0.0:
+                            res[k]["markPx"] = last_px
     except Exception as e:
-        print(f"[Warning] fetch_all_asset_contexts error: {e}")
-        return {}
+        print(f"[Warning] fetch_all_asset_contexts (BingX) error: {e}")
+    return res
 
 
 def remember_symbols(symbols: List[str]) -> List[str]:
@@ -615,17 +623,17 @@ def compute_lot_size(
     return round(base_qty, sz_decimals)
 
 
-def get_hyperliquid_granularity(bybit_interval: str) -> str:
+def get_bingx_granularity(bybit_interval: str) -> str:
     mapping = {'1': '1m', '3': '3m', '5': '5m', '15': '15m', '30': '30m', '60': '1h', '120': '2h', '240': '4h', 'D': '1d'}
     return mapping.get(str(bybit_interval), '1h')
 
 
-async def fetch_hyperliquid_candles(symbol: str, granularity: str, limit: int = 300) -> pd.DataFrame:
-    from bingx5_46_4mix_candle_Merged_Alt10 import fetch_hyperliquid_ohlcv
+async def fetch_bingx_candles(symbol: str, granularity: str, limit: int = 300) -> pd.DataFrame:
+    from bingx5_46_4mix_candle_Merged_Alt10 import fetch_bingx_ohlcv
     now_ms = int(time.time() * 1000)
     start_ms = now_ms - (limit * 3600 * 1000)
     try:
-        rows = await fetch_hyperliquid_ohlcv(symbol, "PERP", granularity.upper(), start_ms, now_ms)
+        rows = await fetch_bingx_ohlcv(symbol, "SWAP", granularity.upper(), start_ms, now_ms)
         if rows:
             df = pd.DataFrame(rows, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume', 'quote_volume'])
             df['timestamp'] = pd.to_datetime(df['timestamp'].astype(float), unit='ms')
@@ -650,11 +658,11 @@ async def fetch_hyperliquid_candles(symbol: str, granularity: str, limit: int = 
 
             return df
     except Exception as e:
-        print(f"fetch_hyperliquid_candles error: {e}")
+        print(f"fetch_bingx_candles error: {e}")
     return pd.DataFrame()
 
 
-async def generate_hyperliquid_backtest_chart(
+async def generate_bingx_backtest_chart(
     symbol: str, interval: str, df_loop: pd.DataFrame, best_mp: int, best_margin: float, best_er: float, trade_side: str, api, current_bg_target_value: float, bybit_exec_history=None, bybit_lot_size=None,
     strategy_type: str = "range", best_interval: int = 60
 ) -> None:
@@ -725,8 +733,8 @@ async def load_local_or_api_candles(symbol: str, limit: int = 300) -> pd.DataFra
         except Exception:
             pass
 
-    from bingx5_46_2api import fetch_hyperliquid_candles
-    return await fetch_hyperliquid_candles(symbol, "1h", limit=limit)
+    from bingx5_46_2api import fetch_bingx_candles
+    return await fetch_bingx_candles(symbol, "1h", limit=limit)
 
 
 async def validate_profitable_candidates(trade_side: str, mode: str, base_symbol: str, interval: str = "60") -> Tuple[List[str], Dict[str, Dict[str, Any]], Dict[str, Any]]:
@@ -735,11 +743,11 @@ async def validate_profitable_candidates(trade_side: str, mode: str, base_symbol
     各銘柄自身の最適パラメータでプラス成績（PnL > 100 USDT かつ 取引数 > 0）となる上位3銘柄を選定。
     銘柄ごとの個別最適化パラメータ辞書 (symbol_params_map) を生成・返却する。
     """
-    from bingx5_46_2api import api_hyperliquid
+    from bingx5_46_2api import api_bingx
     from bingx5_46_3logic import run_interval_comparison, backtester, logicinstance, resample_candles
 
     discord.print_log("候補銘柄（クジラ優先上位）の個別パラメータ最適化＆バックテスト検証を開始します...")
-    all_candidates_info = await select_top_hyperliquid_symbols(top_n=15, mode=mode)
+    all_candidates_info = await select_top_bingx_symbols(top_n=15, mode=mode)
     all_candidates = [info["symbol"] for info in all_candidates_info]
     
     profitable_cands = []
@@ -876,9 +884,9 @@ async def validate_profitable_candidates(trade_side: str, mode: str, base_symbol
                         )
                         eval_bars_10d = min(len(full_cand_bt), max(30, 240 * 60 // int(cand_inv if cand_inv else 60)))
                         chart_10d_df = full_cand_bt.tail(eval_bars_10d).reset_index(drop=True)
-                        bg_csv = f"backtest_data/klines100_{cand}_hyperliquid.csv"
+                        bg_csv = f"backtest_data/klines100_{cand}_bingx.csv"
                         chart_10d_df.to_csv(bg_csv, index=False)
-                        discord.plot_backtest(label=f"Hyperliquid_{cand}", csv_file=bg_csv, symbol=cand)
+                        discord.plot_backtest(label=f"BingX_{cand}", csv_file=bg_csv, symbol=cand)
                     except Exception as ch_err:
                         print(f"Cand chart error {cand}: {ch_err}")
                 else:
@@ -900,7 +908,7 @@ async def validate_profitable_candidates(trade_side: str, mode: str, base_symbol
     return profitable_cands, symbol_params_map, default_best_params
 
 
-async def select_top_hyperliquid_symbols(top_n: int = 10, mode: str = 'demo') -> List[Dict[str, Any]]:
+async def select_top_bingx_symbols(top_n: int = 10, mode: str = 'demo') -> List[Dict[str, Any]]:
     """Data/symbol_selection_scores.csv が存在しない場合は自動再計算し、スコアから上位銘柄を選定"""
     scores_file = Path(__file__).resolve().parent / "Data" / "symbol_selection_scores.csv"
     
@@ -928,11 +936,11 @@ async def select_top_hyperliquid_symbols(top_n: int = 10, mode: str = 'demo') ->
             tickers = df_scores.to_dict(orient="records")
         except Exception as e:
             print(f"[Symbol Selection Error] {e}")
-            from bingx5_46_4mix_candle_Merged_Alt10 import fetch_hyperliquid_tickers
-            tickers = fetch_hyperliquid_tickers()
+            from bingx5_46_4mix_candle_Merged_Alt10 import fetch_bingx_tickers
+            tickers = fetch_bingx_tickers()
     else:
-        from bingx5_46_4mix_candle_Merged_Alt10 import fetch_hyperliquid_tickers
-        tickers = fetch_hyperliquid_tickers()
+        from bingx5_46_4mix_candle_Merged_Alt10 import fetch_bingx_tickers
+        tickers = fetch_bingx_tickers()
 
     if not tickers:
         print("[Symbol Selection] 銘柄情報の取得に失敗。デフォルト銘柄を使用します。")
@@ -971,7 +979,7 @@ async def wait_until_next_hour():
 
 async def run_screening_and_optimization(mode: str, send_charts: bool = False) -> tuple:
     """フェーズA: 銘柄スクリーニング + パラメータ最適化 + 合格銘柄選抜（ロング専用）"""
-    from bingx5_46_2api import api_hyperliquid
+    from bingx5_46_2api import api_bingx
 
     # 1. 銘柄スクリーニング実行
     print("\n[Phase A] 銘柄スクリーニング・パラメータ最適化を開始します (LONG ONLY)...")
@@ -994,7 +1002,7 @@ async def run_screening_and_optimization(mode: str, send_charts: bool = False) -
             pass
 
     # 3. 上位候補銘柄取得 (前兆スコア & クジラ優先順位付き)
-    selected_symbols_info = await select_top_hyperliquid_symbols(top_n=15, mode=mode)
+    selected_symbols_info = await select_top_bingx_symbols(top_n=15, mode=mode)
     print(f"\n[Selection] Top {len(selected_symbols_info)} Selected Symbols (Precursor & Whale Prioritized):")
     for rank, info in enumerate(selected_symbols_info, 1):
         sym = info.get("symbol", "")
@@ -1076,20 +1084,20 @@ async def audit_and_retain_positions(
     old_params: Optional[Dict[str, Dict[str, Any]]] = None,
 ) -> Tuple[Dict[str, Any], Dict[str, Dict[str, Any]]]:
     """
-    Hyperliquid口座内の全PerpポジションをAPIから取得し、
+    BingX口座内の全PerpポジションをAPIから取得し、
     selected_symbols に含まれない残存ポジションがあっても強制成行決済せず、
     Graceful Exit（通常決済完了までの独立エグジット監視）として symbol_apis / symbol_params_map に登録・維持する。
     """
     from bingx5_46_2api import (
-        fetch_all_position_symbols_hyperliquid,
-        fetch_instrument_spec_hyperliquid,
-        api_hyperliquid_helper,
-        api_hyperliquid,
+        fetch_all_position_symbols_bingx,
+        fetch_instrument_spec_bingx,
+        api_bingx_helper,
+        api_bingx,
     )
 
     discord.print_log(f"[Account Audit] 口座全体の全ポジションをスキャン中... (新選定銘柄: {', '.join(selected_symbols)})")
     try:
-        all_pos_symbols = await fetch_all_position_symbols_hyperliquid(mode=mode)
+        all_pos_symbols = await fetch_all_position_symbols_bingx(mode=mode)
     except Exception as scan_err:
         discord.print_log(f"[Account Audit Error] 全ポジション取得失敗: {scan_err}")
         return symbol_apis, symbol_params_map
@@ -1103,7 +1111,7 @@ async def audit_and_retain_positions(
 
     for sym in all_pos_symbols:
         try:
-            local_api = api_hyperliquid_helper(sym, 'SWAP', 'USDT', mode)
+            local_api = api_bingx_helper(sym, 'SWAP', 'USDT', mode)
             pos = await local_api.get_positions()
             buy_qty = float(pos.get("buy", 0.0))
             sell_qty = float(pos.get("sell", 0.0))
@@ -1130,8 +1138,8 @@ async def audit_and_retain_positions(
                     if old_apis and sym in old_apis and old_apis[sym] is not None:
                         symbol_apis[sym] = old_apis[sym]
                     else:
-                        api = api_hyperliquid(symbol=sym, mode=mode)
-                        spec = fetch_instrument_spec_hyperliquid(sym, mode)
+                        api = api_bingx(symbol=sym, mode=mode)
+                        spec = fetch_instrument_spec_bingx(sym, mode)
                         if spec:
                             api.update_instrument_spec(spec)
                         symbol_apis[sym] = api
@@ -1151,7 +1159,7 @@ async def audit_and_retain_positions(
 async def run_technocore_keepalive_daemon(interval_hours: float = 24.0, retry_hours: float = 1.0):
     """
     Technocore DID/Agent の定期更新（7日削除タイマーリセット＆署名アクティビティ維持）を
-    Hyperliquidボットの裏で完全非同期に実行するバックグラウンドタスク。
+    BingXボットの裏で完全非同期に実行するバックグラウンドタスク。
     - 正常更新時: 次回は 24時間後（1日1回）に静かに実行
     - 一部警告・失敗時: 次回は 1時間後に自動再試行
     トレードボット本体の動作には一切干渉・影響しないフェイルセーフ設計。
@@ -1206,9 +1214,9 @@ async def run_technocore_keepalive_daemon(interval_hours: float = 24.0, retry_ho
 
 async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60'):
     from bingx5_46_2api import (
-        api_hyperliquid,
-        fetch_instrument_spec_hyperliquid,
-        flatten_current_position_hyperliquid,
+        api_bingx,
+        fetch_instrument_spec_bingx,
+        flatten_current_position_bingx,
     )
     from bingx5_46_3logic import PnLCalculator
 
@@ -1248,8 +1256,8 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
     # 各銘柄の api インスタンスを保持（トレーリングSL状態を維持するため）
     symbol_apis: Dict[str, Any] = {}
     for sym in selected_symbols:
-        api = api_hyperliquid(symbol=sym, mode=mode)
-        spec = fetch_instrument_spec_hyperliquid(sym, mode)
+        api = api_bingx(symbol=sym, mode=mode)
+        spec = fetch_instrument_spec_bingx(sym, mode)
         if spec:
             api.update_instrument_spec(spec)
         symbol_apis[sym] = api
@@ -1313,8 +1321,8 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                 if sym in old_apis and old_apis[sym] is not None:
                     symbol_apis[sym] = old_apis[sym]
                 else:
-                    api = api_hyperliquid(symbol=sym, mode=mode)
-                    spec = fetch_instrument_spec_hyperliquid(sym, mode)
+                    api = api_bingx(symbol=sym, mode=mode)
+                    spec = fetch_instrument_spec_bingx(sym, mode)
                     if spec:
                         api.update_instrument_spec(spec)
                     symbol_apis[sym] = api
@@ -1364,8 +1372,8 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                     if sym in symbol_apis:
                         new_symbol_apis[sym] = symbol_apis[sym]
                     else:
-                        api = api_hyperliquid(symbol=sym, mode=mode)
-                        spec = fetch_instrument_spec_hyperliquid(sym, mode)
+                        api = api_bingx(symbol=sym, mode=mode)
+                        spec = fetch_instrument_spec_bingx(sym, mode)
                         if spec:
                             api.update_instrument_spec(spec)
                         new_symbol_apis[sym] = api
@@ -1393,7 +1401,7 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
 
             # 2. 全銘柄のポジション状況とシグナル判定を一括評価
             for sym, api in list(symbol_apis.items()):
-                df = await fetch_hyperliquid_candles(sym, "1h", limit=300)
+                df = await fetch_bingx_candles(sym, "1h", limit=300)
                 if df.empty or len(df) < 20:
                     discord.print_log(f"[{sym}] ローソク足データ不足 (rows={len(df)}). スキップ。")
                     continue
@@ -1451,7 +1459,7 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                 balance = cycle_balance
                 has_long = float(position.get("buy", 0)) > 0
 
-                spec = api.hyperliquid.instrument_spec or {}
+                spec = api.bingx.instrument_spec or {}
                 lot_size = compute_lot_size(current_price, TARGET_POSITION_VALUE_USDT, spec)
 
                 pos_str = "LONG" if has_long else "FLAT"
@@ -1685,10 +1693,10 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
             if cycle_count == 1:
                 try:
                     from bingx5_46_2api import apis
-                    pnl_calc = PnLCalculator(apis_config=apis)
-                    df_pnl = await pnl_calc.get_hyperliquid_trade_history(apis)
+                    pnl_calc = PnLCalculator(apis_config=apis, mode=mode)
+                    df_pnl = await pnl_calc.get_bingx_trade_history(apis)
                     if isinstance(df_pnl, list) and df_pnl:
-                        pnl_calc.calculate_hyperliquid_pnl_from_df(pd.DataFrame(df_pnl))
+                        pnl_calc.calculate_bingx_pnl_from_df(pd.DataFrame(df_pnl))
                 except Exception as pnl_err:
                     discord.print_log(f"[PnL Warning]: {pnl_err}")
 
@@ -1703,7 +1711,7 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
 
 
 if __name__ == "__main__":
-    mode = 'live' if HYPERLIQUID_IS_LIVE else 'demo'
+    mode = 'live' if BINGX_IS_LIVE else 'demo'
     max_lot = 10.0
     interval = '60'
     try:

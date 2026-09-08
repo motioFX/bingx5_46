@@ -39,19 +39,19 @@ scores_csv_path = data_dir / "historical_selection_scores_1year.csv"
 if not scores_csv_path.exists():
     scores_csv_path = data_dir / "historical_selection_scores.csv"
 
-# 動的銘柄選定 (Bitget 24h 変動率 TOP 10 + BTCUSDT)
+# 動的銘柄選定 (BingX 24h 変動率 TOP 10 + BTC-USDT)
 try:
-    from bingx5_46_4mix_candle_Merged_Alt10 import fetch_hyperliquid_tickers
-    tickers = fetch_hyperliquid_tickers()
+    from bingx5_46_4mix_candle_Merged_Alt10 import fetch_bingx_tickers
+    tickers = fetch_bingx_tickers()
     symbols = [t["symbol"] for t in tickers if t.get("symbol")][:10]
-    if "BTC" not in symbols:
-        symbols.insert(0, "BTC")
+    if "BTC-USDT" not in symbols:
+        symbols.insert(0, "BTC-USDT")
     log(f"Dynamically selected {len(symbols)} symbols for historical download: {symbols}")
 except Exception as e:
     log(f"Failed to dynamically fetch top symbols: {e}. Falling back to default list.")
-    symbols = ["BTC", "ETH", "SOL"]
+    symbols = ["BTC-USDT", "ETH-USDT", "SOL-USDT"]
 
-from bingx5_46_4mix_candle_Merged_Alt10 import fetch_hyperliquid_ohlcv
+from bingx5_46_4mix_candle_Merged_Alt10 import fetch_bingx_ohlcv
 
 async def fetch_bitget_ohlcv(symbol: str, product_type: str, granularity: str, start_ms: int, end_ms: int) -> List[List[Any]]:
     url = REST_API_URL["bitget"] + "/api/v2/mix/market/history-candles"

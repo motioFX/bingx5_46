@@ -319,7 +319,6 @@ class send_discord:
         self.win32_webhook = self.test4_webhook
         self.default_webhook = self.real3_webhook
         self.webhook_url = self.test4_webhook if sys.platform == 'win32' else self.real3_webhook
-        self.hyperliquid_webhook = ""  # 本ボットからは送信しない
 
         if not self.real3_webhook and not self.test4_webhook:
             print("[WARN] Discord webhook for BingX (real3_bngx / test4_backtest) is not configured.")
@@ -707,7 +706,7 @@ class send_discord:
 
 discord = send_discord()
 
-# Hyperliquid PnL Calculator
+# BingX PnL Calculator
 class PnLCalculator:
     def __init__(self, apis_config=None, rest_api_url=None, symbol='BTC', mode='demo'):
         if apis_config is None:
@@ -721,66 +720,67 @@ class PnLCalculator:
         self.symbol = symbol
 
     async def calculate_pnl(self, days_back=30, symbol='BTC', symbols=None):
-        fills = await self.get_hyperliquid_trade_history(self.apis, days_back=days_back)
+        fills = await self.get_bingx_trade_history(self.apis, days_back=days_back)
         if not fills:
-            discord.print_log("Hyperliquid取引履歴が見つかりませんでした（新規口座、または最近の取引がない可能性があります）")
+            discord.print_log("BingX取引履歴が見つかりませんでした（新規口座、または最近の取引がない可能性があります）")
             return None
             
         df = pd.DataFrame(fills)
-        combined = self.calculate_hyperliquid_pnl_from_df(df)
+        combined = self.calculate_bingx_pnl_from_df(df)
         return combined
 
-    async def get_hyperliquid_trade_history(self, apis_hl, days_back=30):
-        cred_key = 'hyperliquid_testnet' if self.mode in ('paper', 'demo', 'testnet') else 'hyperliquid'
-        creds = apis_hl.get(cred_key) or apis_hl.get('hyperliquid_demo') or {}
-        if isinstance(creds, list):
-            creds = {}
-        account_address = creds.get("account_address", "")
-        if not account_address or account_address.startswith("0x000"):
-            return []
-
-        base_url = "https://api.hyperliquid-testnet.xyz" if self.mode in ('paper', 'demo') else "https://api.hyperliquid.xyz"
-
+    async def get_bingx_trade_history(self, apis_bx, days_back=30):
         try:
-            resp = requests.post(
-                f"{base_url}/info",
-                json={"type": "userFills", "user": account_address},
+            from bingx5_46_2api import sign_bingx, RestAPI_url
+            cred_key = 'bingx_demo' if self.mode in ('paper', 'demo', 'testnet') else 'bingx'
+            creds = apis_bx.get(cred_key) or {}
+            if isinstance(creds, list):
+                creds = {}
+            api_key = creds.get("api_key", "")
+            secret_key = creds.get("secret_key", "")
+            if not api_key or not secret_key:
+                return []
+            base_url = RestAPI_url.get(cred_key, 'https://open-api.bingx.com')
+            timestamp = int(time.time() * 1000)
+            query_str = f"timestamp={timestamp}"
+            sign = sign_bingx(secret_key, query_str)
+            headers = {"X-BX-APIKEY": api_key}
+            resp = requests.get(
+                f"{base_url}/openApi/swap/v2/trade/allOrders?{query_str}&signature={sign}",
+                headers=headers,
                 timeout=15
             )
-            data = resp.json()
-            if isinstance(data, list):
-                return data
+            if resp.status_code == 200:
+                data = resp.json()
+                if data.get("code") == 0:
+                    orders = data.get("data", {}).get("orders", [])
+                    if isinstance(orders, list):
+                        return orders
         except Exception as e:
-            discord.print_log(f"Hyperliquid trade history fetch error: {e}")
+            discord.print_log(f"BingX trade history fetch error: {e}")
         return []
 
-
-    def calculate_hyperliquid_pnl_from_df(self, df):
+    def calculate_bingx_pnl_from_df(self, df):
         if df.empty:
             return None
         df = df.copy()
-        if 'time' in df.columns:
-            df['execTime'] = pd.to_datetime(pd.to_numeric(df['time']), unit='ms')
+        time_col = 'updateTime' if 'updateTime' in df.columns else ('time' if 'time' in df.columns else None)
+        if time_col:
+            df['execTime'] = pd.to_datetime(pd.to_numeric(df[time_col]), unit='ms')
         else:
             return None
         df = df.sort_values('execTime')
         
-        if 'sz' in df.columns:
-            df['size'] = df['sz']
-        if 'px' in df.columns:
-            df['price'] = df['px']
-        if 'fee' not in df.columns:
-            df['fee'] = 0.0
-
-        for col in ('price', 'size', 'fee', 'closedPnl'):
+        for col in ('price', 'avgPrice', 'executedQty', 'fee', 'profit'):
             if col in df.columns:
                 df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0.0)
                 
         df['realized_pnl'] = 0.0
         df['cumulative_pnl'] = 0.0
         
-        if 'closedPnl' in df.columns:
-            df['realized_pnl'] = df['closedPnl'] - df['fee']
+        if 'profit' in df.columns:
+            fee_val = df['fee'] if 'fee' in df.columns else 0.0
+            df['realized_pnl'] = df['profit'] - fee_val
             df['cumulative_pnl'] = df['realized_pnl'].cumsum()
             return df
             
@@ -1503,9 +1503,9 @@ def run_interval_comparison(df_60m, lot, data_equity, side_mode="long", symbol="
     # 2. 10日間長期チャート (直近240h: 同一データフレームから完全転写)
     eval_bars_10d = min(len(full_margin_df), max(30, 240 * 60 // best_interval))
     chart_10d_df = full_margin_df.tail(eval_bars_10d).reset_index(drop=True)
-    bg_csv = f"backtest_data/klines100_{symbol}_hyperliquid.csv"
+    bg_csv = f"backtest_data/klines100_{symbol}_bingx.csv"
     chart_10d_df.to_csv(bg_csv, index=False)
-    discord.plot_backtest(label=f"Hyperliquid_{symbol}", csv_file=bg_csv, symbol=symbol)
+    discord.plot_backtest(label=f"BingX_{symbol}", csv_file=bg_csv, symbol=symbol)
 
     discord.print_log(f"\n★ 採用設定: 戦略={best_strategy.upper()} {side_mode.upper()}, 時間足={best_interval}m, MP期間={best_mp}, ER閾値={best_er}, Margin={best_margin}% (出来高プロファイル動的適応)")
     return results, best_strategy, best_interval, best_mp, best_er, best_margin

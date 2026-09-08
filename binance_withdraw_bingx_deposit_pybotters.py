@@ -19,7 +19,7 @@ import urllib.parse
 import pybotters
 from config_loader import load_config
 
-# config_loader 経由で hyperliquid_credentials.json から鍵とユーザー情報を取得
+# config_loader 経由で bingx_credentials.json から鍵とユーザー情報を取得
 _config = load_config()
 _apis = _config.get("apis", {})
 USER_INFO = _config.get("user_info", {})

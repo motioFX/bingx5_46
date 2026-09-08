@@ -1,5 +1,5 @@
 from __future__ import annotations
-"""Rebuild merged hourly datasets for top-volume Hyperliquid symbols.
+"""Rebuild merged hourly datasets for top-volume BingX symbols.
 Generates selection scores, normalized charts, and merged CSVs.
 """
 import argparse
@@ -36,7 +36,6 @@ if sys.platform == "win32":
 
 REST_API_URL = {
     "bingx": "https://open-api.bingx.com",
-    "hyperliquid": "https://open-api.bingx.com",
     "coinbase": "https://api.exchange.coinbase.com",
 }
 
@@ -73,7 +72,6 @@ class send_discord:
         self.win32_webhook = self.test4_webhook
         self.default_webhook = self.real3_webhook
         self.webhook_url = self.test4_webhook if sys.platform == "win32" else self.real3_webhook
-        self.hyperliquid_webhook = ""  # 本ボットからは送信しない
 
     def _get_target_webhooks(self, text: str = "") -> list[str]:
         if sys.platform == "win32":
@@ -216,8 +214,6 @@ def fetch_bingx_tickers(product_type: str = "SWAP", max_retries: int = 5) -> Lis
             time.sleep(2.0)
     return []
 
-fetch_hyperliquid_tickers = fetch_bingx_tickers
-
 
 def fetch_demo_available_symbols(product_type: str = "SWAP") -> set:
     tickers = fetch_bingx_tickers()
@@ -295,8 +291,6 @@ async def fetch_bingx_ohlcv(
     unique_rows.sort(key=lambda x: x[0])
     return unique_rows
 
-fetch_hyperliquid_ohlcv = fetch_bingx_ohlcv
-
 
 async def fetch_coinbase_candles_1h(start_ms: int, end_ms: int) -> List[Dict[str, Any]]:
     url = "https://api.exchange.coinbase.com/products/BTC-USD/candles"
@@ -372,8 +366,6 @@ async def fetch_bingx_funding_history(
         log(f"BingX funding rate fetch error for {clean_sym}: {e}")
     return results
 
-fetch_hyperliquid_funding_history = fetch_bingx_funding_history
-
 
 async def build_merged_dataset(
     symbol: str,
@@ -392,7 +384,7 @@ async def build_merged_dataset(
     log(f"Start unified fetch for {symbol} {start_utc.isoformat()} -> {end_utc.isoformat()}")
 
     # 1. OHLCV フェッチ
-    ohlcv_rows = await fetch_hyperliquid_ohlcv(symbol, product_type, granularity, start_ms, end_ms)
+    ohlcv_rows = await fetch_bingx_ohlcv(symbol, product_type, granularity, start_ms, end_ms)
 
     if not ohlcv_rows:
         raise RuntimeError(f"No OHLCV data returned for {symbol}.")
@@ -422,7 +414,7 @@ async def build_merged_dataset(
     df["timestamp"] = pd.to_datetime(df["timestamp"])
 
     # 2. Funding History (FR & Premium) フェッチ & マージ
-    funding_rows = await fetch_hyperliquid_funding_history(symbol, start_ms, end_ms)
+    funding_rows = await fetch_bingx_funding_history(symbol, start_ms, end_ms)
     if funding_rows:
         df_funding = (
             pd.DataFrame(funding_rows)
@@ -1067,10 +1059,10 @@ async def main():
             print(f"[Whale Warning] Failed to run fetch_whale_sentiment.py: {w_err}")
 
     # 1. 銘柄情報の取得 & クジラ流入データの紐付け
-    print("\n[Ranking Engine] Fetching Hyperliquid Tickers & Smart Metrics...")
-    tickers = fetch_hyperliquid_tickers()
+    print("\n[Ranking Engine] Fetching BingX Tickers & Smart Metrics...")
+    tickers = fetch_bingx_tickers()
     if not tickers:
-        print("[Error] Failed to fetch tickers from Hyperliquid API.")
+        print("[Error] Failed to fetch tickers from BingX API.")
         return
 
     whale_json_file = Path(__file__).resolve().parent / "Data" / "whale_market_state.json"
