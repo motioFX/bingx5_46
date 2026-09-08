@@ -242,9 +242,9 @@ def format_state_message(symbol: str, position: Dict[str, Any], open_orders_coun
     fee_info = f" (価格差: {raw_pnl:+.2f}, 手数料: -{total_fee:.2f})" if total_fee > 0 else ""
 
     if buy_qty > 0:
-        pos_str = f"🟢 保有: LONG {buy_qty} | 実質含み損益: {pnl:+.2f} USDC{fee_info}"
+        pos_str = f"🟢 保有: LONG {buy_qty} | 実質含み損益: {pnl:+.2f} USDT{fee_info}"
     elif sell_qty > 0:
-        pos_str = f"🔴 保有: SHORT {sell_qty} | 実質含み損益: {pnl:+.2f} USDC{fee_info}"
+        pos_str = f"🔴 保有: SHORT {sell_qty} | 実質含み損益: {pnl:+.2f} USDT{fee_info}"
     else:
         pos_str = f"⚪ 保有: なし (ノーポジ) | 方向: {trade_side.upper()}"
 
@@ -732,7 +732,7 @@ async def load_local_or_api_candles(symbol: str, limit: int = 300) -> pd.DataFra
 async def validate_profitable_candidates(trade_side: str, mode: str, base_symbol: str, interval: str = "60") -> Tuple[List[str], Dict[str, Dict[str, Any]], Dict[str, Any]]:
     """
     クジラ優先上位候補銘柄に対して個別最適化（MTF/MP/ER比較バックテスト）を実行し、
-    各銘柄自身の最適パラメータでプラス成績（PnL > 100 USDC かつ 取引数 > 0）となる上位3銘柄を選定。
+    各銘柄自身の最適パラメータでプラス成績（PnL > 100 USDT かつ 取引数 > 0）となる上位3銘柄を選定。
     銘柄ごとの個別最適化パラメータ辞書 (symbol_params_map) を生成・返却する。
     """
     from bingx5_46_2api import api_hyperliquid
@@ -752,8 +752,8 @@ async def validate_profitable_candidates(trade_side: str, mode: str, base_symbol
         "margin": 8.0,
     }
 
-    for cand in all_candidates:
-        if cand.upper() == "BTC":
+    for cand_idx, cand in enumerate(all_candidates):
+        if cand.upper() == "BTC" or cand.upper().replace("-USDT", "").replace("USDT", "") == "BTC":
             continue
 
         # クジラ判定で売り優勢（SHORT_ONLY）の銘柄はロング専用戦略の選定対象から除外
@@ -766,13 +766,52 @@ async def validate_profitable_candidates(trade_side: str, mode: str, base_symbol
         if len(profitable_cands) >= MAX_SELECTED_SYMBOLS:
             break
             
-        discord.print_log(f"個別最適化中: {cand} ...")
         cand_df = await load_local_or_api_candles(cand, limit=300)
         
+        # 爆上げモメンタム候補（prefer_breakout）の判定:
+        # 1. 前兆スコア上位3銘柄 (cand_idx < 3)
+        # 2. または出来高急増（直近出来高が24h平均の2.0倍以上）かつクジラ買い優勢 (cand_whale_sig == "LONG_ONLY")
+        is_momentum_candidate = (cand_idx < 3)
+        if not is_momentum_candidate and cand_df is not None and len(cand_df) >= 24:
+            vol_mean_24h = float(cand_df["volume"].tail(24).mean())
+            curr_vol = float(cand_df["volume"].iloc[-1])
+            if vol_mean_24h > 0 and (curr_vol / vol_mean_24h >= 2.0) and cand_whale_sig == "LONG_ONLY":
+                is_momentum_candidate = True
+
+        momentum_tag = " 🚀[爆上げモメンタム候補: BREAKOUT優先]" if is_momentum_candidate else ""
+        discord.print_log(f"個別最適化中: {cand} (Rank #{cand_idx+1}{momentum_tag}) ...")
+        
         if cand_df is not None and not cand_df.empty and len(cand_df) > 30:
+            # 下落トレンド除外チェック (LONG ONLY 厳格安全フィルター)
+            curr_c = float(cand_df["close"].iloc[-1])
+            ret_24h = (curr_c - float(cand_df["close"].iloc[-24])) / float(cand_df["close"].iloc[-24]) if len(cand_df) >= 24 else 0.0
+            ret_72h = (curr_c - float(cand_df["close"].iloc[-72])) / float(cand_df["close"].iloc[-72]) if len(cand_df) >= 72 else ret_24h
+            if ret_72h < -0.07 or ret_24h < -0.05:
+                discord.print_log(f"   [スキップ] {cand}: 直近下落トレンド (24h: {ret_24h*100:+.1f}%, 3d: {ret_72h*100:+.1f}%) のため選定候補から除外。")
+                continue
+
+            # 30d / 10d / 5d ノーマライズ前半高値下落型チェック
+            is_peak_first_half = False
+            for w_name, w_h in [("5d", 120), ("10d", 240), ("30d", 720)]:
+                if len(cand_df) >= 24:
+                    sub_c = cand_df["close"].tail(w_h).astype(float)
+                    if len(sub_c) >= 24 and sub_c.iloc[0] > 0:
+                        norm_c = sub_c / sub_c.iloc[0]
+                        p_idx = int(norm_c.argmax())
+                        p_ratio = p_idx / len(norm_c)
+                        f_norm = float(norm_c.iloc[-1])
+                        p_val = float(norm_c.max())
+                        if p_ratio < 0.50 and (f_norm < p_val * 0.90) and (f_norm < 1.0 or f_norm < p_val * 0.80):
+                            is_peak_first_half = True
+                            discord.print_log(f"   [スキップ] {cand}: {w_name}ノーマライズ前半高値下落型 (peak={p_ratio:.2f}, {p_val:.2f}x->{f_norm:.2f}x) のため除外。")
+                            break
+            if is_peak_first_half:
+                continue
+
             try:
                 results, cand_strat, cand_inv, cand_mp, cand_er, cand_margin = run_interval_comparison(
-                    df_60m=cand_df, lot=1.0, data_equity=100.0, side_mode=trade_side, symbol=cand
+                    df_60m=cand_df, lot=1.0, data_equity=100.0, side_mode=trade_side, symbol=cand,
+                    prefer_breakout=is_momentum_candidate
                 )
                 
                 # 有効な取引がある最良結果を抽出
@@ -1078,12 +1117,12 @@ async def audit_and_retain_positions(
             if sym in selected_set:
                 discord.print_log(
                     f"💎 [Position Retained] 【{sym}】新監視銘柄リストに選定されたためポジションを継続保有します。"
-                    f" (方向: {side}, 数量: {current_qty}, 含み損益: {pnl:+.2f} USDC)"
+                    f" (方向: {side}, 数量: {current_qty}, 含み損益: {pnl:+.2f} USDT)"
                 )
             else:
                 discord.print_log(
                     f"🛡️ [Graceful Exit] 【{sym}】新選定リスト外ですがポジション保有中です。"
-                    f" (方向: {side}, 数量: {current_qty}, 損益: {pnl:+.2f} USDC)"
+                    f" (方向: {side}, 数量: {current_qty}, 損益: {pnl:+.2f} USDT)"
                     f" → 強制決済せず、通常のエグジット判定完了まで独立監視を継続します。"
                 )
                 # symbol_apis に登録（既存のインスタンスがあれば引き継ぎ、なければ新設）
@@ -1177,20 +1216,22 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
     asyncio.create_task(run_technocore_keepalive_daemon(interval_hours=24.0, retry_hours=1.0))
 
     account_mode_str = "[LIVE Account] (本番口座)" if mode == "live" else "[DEMO Account] (デモ / テストネット口座)"
-    air_mode_str = "[AIR MODE ON] (発注監視のみ / API注文送信なし)" if is_air else "[REAL ORDER ON] (実際にHyperliquidへ注文送信)"
+    air_mode_str = "[AIR MODE ON] (発注監視のみ / API注文送信なし)" if is_air else "[REAL ORDER ON] (実際にBingXへ注文送信)"
 
     hours_str = ", ".join([f"{h:02d}:00" for h in sorted(ANALYSIS_HOURS)])
     start_msg = (
         "```\n"
-        " __  __  ___  _____  _  ___ \n"
-        "|  \\/  |/ _ \\|_   _|| |/ _ \\\n"
-        "| |\\/| | (_) | | |  | | (_) |\n"
-        "|_|  |_|\\___/  |_|  |_|\\___/ \n"
+        " ____  _               __  __\n"
+        "| __ )(_)_ __   __ _  \\ \\/ /\n"
+        "|  _ \\| | '_ \\ / _` |  \\  / \n"
+        "| |_) | | | | | (_| |  /  \\ \n"
+        "|____/|_|_| |_|\\__, | /_/\\_\\\n"
+        "               |___/        \n"
         "----------------------------\n"
         "  AUTO TRADING SYSTEM START \n"
         "----------------------------\n"
         "```\n"
-        f"[Hyperliquid Auto Trading System (LONG ONLY)]\n"
+        f"[BingX Auto Trading System (LONG ONLY)]\n"
         f"==================================================\n"
         f"  取引口座設定 : {account_mode_str}\n"
         f"  発注モード   : {air_mode_str}\n"
@@ -1416,7 +1457,7 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                 pos_str = "LONG" if has_long else "FLAT"
                 sig_str = "LONG↑" if long_signal else "---"
                 pnl_current = float(position.get("profit", 0.0)) if has_long else 0.0
-                pnl_str = f" | 含み損益: {pnl_current:+.2f} USDC" if has_long else ""
+                pnl_str = f" | 含み損益: {pnl_current:+.2f} USDT" if has_long else ""
 
                 whale_info = get_whale_sentiment_info(sym)
                 whale_sig = whale_info.get("signal", "NEUTRAL")
@@ -1513,7 +1554,7 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                     )
                     if closed:
                         record_real_trade(sym, "LONG", "CLOSE", current_price, float(position.get("buy", 0)), pnl_current, "実運用決済")
-                        discord.print_log(f"[{sym}] [CLOSE] 🟢 ロングポジション決済完了 (PnL: {pnl_current:+.2f} USDC)")
+                        discord.print_log(f"[{sym}] [CLOSE] 🟢 ロングポジション決済完了 (PnL: {pnl_current:+.2f} USDT)")
                         
                         # 1. 決済トレードチャート画像の生成 & 送信
                         exit_chart_file = plot_exit_chart(
@@ -1521,12 +1562,12 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                             pnl=pnl_current, exit_reason="VP_Trailing/Exit_Rule", side="LONG", whale_signal=whale_sig
                         )
                         if exit_chart_file and exit_chart_file.exists():
-                            discord.send_file(exit_chart_file, f"📊 【決済チャート】{sym} LONG 決済完了 (PnL: {pnl_current:+.2f} USDC)")
+                            discord.send_file(exit_chart_file, f"📊 【決済チャート】{sym} LONG 決済完了 (PnL: {pnl_current:+.2f} USDT)")
 
                         # 2. 累積 PnL パフォーマンスチャートの生成 & 送信
                         chart_file = plot_real_trading_performance()
                         if chart_file and chart_file.exists():
-                            discord.send_file(chart_file, f"📈 【実運用実績】累積損益パフォーマンス更新 (PnL: {pnl_current:+.2f} USDC)")
+                            discord.send_file(chart_file, f"📈 【実運用実績】累積損益パフォーマンス更新 (PnL: {pnl_current:+.2f} USDT)")
                         del active_positions[sym]
 
                         # 旧選定銘柄の決済完了時は監視リストから解放
@@ -1539,7 +1580,7 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                     else:
                         pnl_icon = "🟢" if pnl_current >= 0 else "🔴"
                         discord.print_log(f"──────────────────────────────────────────────────────────")
-                        discord.print_log(f"💰 【{sym} 現在の含み損益】: {pnl_current:+.2f} USDC {pnl_icon} (ロング継続保有中)")
+                        discord.print_log(f"💰 【{sym} 現在の含み損益】: {pnl_current:+.2f} USDT {pnl_icon} (ロング継続保有中)")
                         discord.print_log(f"──────────────────────────────────────────────────────────")
 
             # 3. 新規エントリー実行 (最大同時保有ポジション数制限: MAX_ACTIVE_POSITIONS)
@@ -1558,17 +1599,20 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                     candidates_to_enter.sort(key=lambda x: sym_rank_map.get(x["symbol"], 999))
 
                     available_slots = MAX_ACTIVE_POSITIONS - current_pos_count
-                    for best_cand in candidates_to_enter[:available_slots]:
-                        best_sym = best_cand["symbol"]
+                    all_cand_syms = ", ".join([c["symbol"] for c in candidates_to_enter])
+                    discord.print_log(
+                        f"[CANDIDATES] エントリーシグナル検出: {all_cand_syms} (空き枠: {available_slots}/{MAX_ACTIVE_POSITIONS})"
+                    )
 
-                        if len(candidates_to_enter) > available_slots:
-                            all_cand_syms = ", ".join([c["symbol"] for c in candidates_to_enter])
-                            other_syms = ", ".join([c["symbol"] for c in candidates_to_enter[available_slots:]])
+                    for cand_idx, best_cand in enumerate(candidates_to_enter):
+                        # 空き枠チェック（約定するたびに active_positions が増加）
+                        if len(active_positions) >= MAX_ACTIVE_POSITIONS:
                             discord.print_log(
-                                f"[PRIORITY ENTRY] 複数銘柄で同時エントリーシグナル発生 ({all_cand_syms})。"
-                                f" 上位銘柄 [{best_sym}] を優先選択しました。(見送り: {other_syms})"
+                                f"[ENTRY LIMIT] 最大ポジション枠({MAX_ACTIVE_POSITIONS})に達したため、残りの候補エントリーを終了します。"
                             )
+                            break
 
+                        best_sym = best_cand["symbol"]
                         api = symbol_apis[best_sym]
                         df = best_cand["df"]
                         position = best_cand["position"]
@@ -1577,7 +1621,7 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                         current_price = best_cand["current_price"]
                         whale_sig = best_cand["whale_sig"]
 
-                        discord.print_log(f"[{best_sym}] [ENTRY>>] ロングエントリーシグナル検出! (クジラ判定: {whale_sig})")
+                        discord.print_log(f"[{best_sym}] [ENTRY>>] ロングエントリー試行 ({cand_idx+1}/{len(candidates_to_enter)}) (クジラ判定: {whale_sig})")
                         entered = await api.long_entry(df, position, balance, lot_size, max_lot)
                         if entered:
                             active_positions[best_sym] = (True, df, position, current_price, 0.0)
@@ -1618,7 +1662,7 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                                 f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
                                 f"📌 **銘柄 / 方向**: `{best_sym}` (LONG 🟢)\n"
                                 f"💰 **約定価格**: `${current_price:.6f}`\n"
-                                f"📦 **発注数量**: `{lot_size:,.2f} {best_sym}` (約 `${entry_notional:,.2f} USDC`)\n"
+                                f"📦 **発注数量**: `{lot_size:,.2f} {best_sym}` (約 `${entry_notional:,.2f} USDT`)\n"
                                 f"⚙️ **適用戦略**: `{strat_desc}`\n"
                                 f"🐋 **クジラ判定**: `{whale_sig}` (流入: `${whale_flow_val:+,.0f}`)\n"
                                 f"📐 **Volume Profile 指標**:\n"
@@ -1632,6 +1676,8 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                                 discord.send_file(entry_chart_file, description=entry_msg)
                             else:
                                 discord.print_log(entry_msg)
+                        else:
+                            discord.print_log(f"[{best_sym}] [FALLTHROUGH] 約定しなかったため見送ります。次の候補銘柄へ移行します。")
 
 
 

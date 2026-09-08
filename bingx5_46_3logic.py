@@ -1303,14 +1303,18 @@ def compute_dynamic_center_margin(df: pd.DataFrame, strategy_type: str = "breako
     return round(float(center_margin), 1)
 
 
-def run_interval_comparison(df_60m, lot, data_equity, side_mode="long", symbol=""):
+def run_interval_comparison(df_60m, lot, data_equity, side_mode="long", symbol="", force_strategy=None, prefer_breakout=False):
     logic = logicinstance()
     bt_instance = backtester()
     results = {}
     fixed_initial_equity = 100.0
     os.makedirs("backtest_data", exist_ok=True)
     
-    strategy_types = ["range", "breakout"]
+    if force_strategy and force_strategy.lower() in ["breakout", "range"]:
+        strategy_types = [force_strategy.lower()]
+        discord.print_log(f"⚡ [{symbol}] 戦略強制モード適用: {force_strategy.upper()}_ONLY（爆上げモメンタム候補）")
+    else:
+        strategy_types = ["range", "breakout"]
     intervals = [60, 120, 180]
     mp_periods = [12, 24, 36, 48, 60, 72, 96, 120, 144, 168]
     er_thresholds = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
@@ -1403,7 +1407,7 @@ def run_interval_comparison(df_60m, lot, data_equity, side_mode="long", symbol="
 
     best_pnl_key = max(eval_pool.keys(), key=lambda x: eval_pool[x]['final_pnl'])
     best_pnl_disp = f"{symbol}_{best_pnl_key}" if (symbol and not str(best_pnl_key).startswith(symbol)) else best_pnl_key
-    best_pnl_msg = f"★ PnL最大: {best_pnl_disp} (PnL: {eval_pool[best_pnl_key]['final_pnl']:.4f} USDC, 取引: {eval_pool[best_pnl_key].get('trade_count', 0)}回)"
+    best_pnl_msg = f"★ PnL最大: {best_pnl_disp} (PnL: {eval_pool[best_pnl_key]['final_pnl']:.4f} USDT, 取引: {eval_pool[best_pnl_key].get('trade_count', 0)}回)"
     best_risk_key = min(eval_pool.keys(), key=lambda x: eval_pool[x]['DD_max'] if eval_pool[x]['DD_max'] == eval_pool[x]['DD_max'] else float('inf'))
     best_risk_disp = f"{symbol}_{best_risk_key}" if (symbol and not str(best_risk_key).startswith(symbol)) else best_risk_key
     best_risk_msg = f"★ リスク最小: {best_risk_disp} (最大DD: {eval_pool[best_risk_key]['DD_max']:.4f})"
@@ -1417,13 +1421,13 @@ def run_interval_comparison(df_60m, lot, data_equity, side_mode="long", symbol="
     discord.print_log("\n====== 戦略比較結果 ======")
     if best_range_key:
         r_disp = f"{symbol}_{best_range_key}" if (symbol and not str(best_range_key).startswith(symbol)) else best_range_key
-        discord.print_log(f"【レンジ戦略ベスト】: {r_disp} -> PnL: {results[best_range_key]['final_pnl']:.4f} USDC (取引: {results[best_range_key]['trade_count']}回)")
+        discord.print_log(f"【レンジ戦略ベスト】: {r_disp} -> PnL: {results[best_range_key]['final_pnl']:.4f} USDT (取引: {results[best_range_key]['trade_count']}回)")
     else:
         discord.print_log("【レンジ戦略ベスト】: 該当なし (期間中トレードなし)")
 
     if best_breakout_key:
         b_disp = f"{symbol}_{best_breakout_key}" if (symbol and not str(best_breakout_key).startswith(symbol)) else best_breakout_key
-        discord.print_log(f"【ブレイクアウト戦略ベスト】: {b_disp} -> PnL: {results[best_breakout_key]['final_pnl']:.4f} USDC (取引: {results[best_breakout_key]['trade_count']}回)")
+        discord.print_log(f"【ブレイクアウト戦略ベスト】: {b_disp} -> PnL: {results[best_breakout_key]['final_pnl']:.4f} USDT (取引: {results[best_breakout_key]['trade_count']}回)")
     else:
         discord.print_log("【ブレイクアウト戦略ベスト】: 該当なし (期間中トレードなし)")
     
@@ -1447,6 +1451,18 @@ def run_interval_comparison(df_60m, lot, data_equity, side_mode="long", symbol="
     time.sleep(1.0)
     discord.print_log(best_risk_msg)
     
+    # 爆上げモメンタム候補（prefer_breakout=True）の場合のブレイクアウト優先採用判定
+    if prefer_breakout and best_breakout_key:
+        bo_data = results[best_breakout_key]
+        rg_data = results[best_range_key] if best_range_key else None
+        # ブレイクアウトでプラス収益（> 100 USDT）かつ取引実績がある場合
+        if bo_data['final_pnl'] > 100.0 and bo_data.get('trade_count', 0) > 0:
+            # レンジのPnLに対して80%以上あれば、爆発力のあるブレイクアウトを優先採用
+            if not rg_data or bo_data['final_pnl'] >= rg_data['final_pnl'] * 0.80:
+                best_pnl_key = best_breakout_key
+                best_pnl_disp = f"{symbol}_{best_pnl_key}" if (symbol and not str(best_pnl_key).startswith(symbol)) else best_pnl_key
+                discord.print_log(f"🚀 [{symbol}] 爆上げモメンタム優遇: BREAKOUT戦略を優先採用! (ブレイクアウト: {bo_data['final_pnl']:.2f} USDT vs レンジ: {rg_data['final_pnl'] if rg_data else 0:.2f} USDT)")
+
     best_pnl_data = results[best_pnl_key]
     best_strategy = best_pnl_data['strategy_type']
     best_interval = best_pnl_data['interval']

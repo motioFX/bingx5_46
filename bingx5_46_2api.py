@@ -579,11 +579,31 @@ class api_bingx:
             discord.print_log(f"Insufficient funds for BingX long entry: need {lotamount:.2f} (with {LEVERAGE_FACTOR:.0f}x leverage), have {usdt_onhand_amount:.2f}")
             return False
 
+        # 板情報 (best_bid, best_ask) の取得
         best_bid, best_ask = get_bingx_orderbook(self.symbol, self.bingx.base_url)
-        order_price = best_bid if best_bid is not None else current_price
+        is_testnet = (self.mode in ('paper', 'demo', 'testnet')) or not BINGX_IS_LIVE
+
+        # 板飛び許容スプレッドの判定（実勢価格に対して +0.5% 以内）
+        MAX_SPREAD_TOLERANCE = 0.005  # 0.5%
+
+        def determine_target_price(bid: Optional[float], ask: Optional[float], ref_price: float) -> tuple[float, str]:
+            if is_testnet:
+                # Askが実勢価格に対して0.5%以内に収まる正常な板であれば、テストネット・デモの約定率確保のためAsk約定を許可
+                if ask is not None and ask <= ref_price * (1.0 + MAX_SPREAD_TOLERANCE):
+                    return ask, f"Demo Normal Ask (${ask:.4f})"
+                else:
+                    # 板飛び（スプレッド異常拡大 または Ask欠損）: 飛んだ高値Askは掴まず、Best Bidまたは実勢価格で指値待機
+                    target_bid = bid if (bid is not None and bid <= ref_price * (1.0 + MAX_SPREAD_TOLERANCE)) else ref_price
+                    ask_str = f"${ask:.4f}" if ask is not None else "None"
+                    return target_bid, f"Demo Safe Bid (${target_bid:.4f}, Ask={ask_str} 乖離大)"
+            else:
+                target_bid = bid if bid is not None else ref_price
+                return target_bid, f"Live Best Bid (${target_bid:.4f})"
+
+        order_price, price_type_str = determine_target_price(best_bid, best_ask, current_price)
         final_price = self.bingx._quantize_price(order_price)
 
-        discord.print_log(f"[BINGX] Placing Stage 1 Long (Maker Best Bid: ${final_price}): Target Qty {lot}")
+        discord.print_log(f"[BINGX] Placing Stage 1 Long ({price_type_str}): Target Qty {lot}")
         if is_air:
             discord.print_log(f"[AIR MODE] Executed BingX Long Entry: {self.symbol} Qty={lot} Price={final_price} (Mock)")
             self.entry_val = float(df['VAL'].iloc[-1]) if 'VAL' in df.columns else (current_price * 0.99)
@@ -601,7 +621,7 @@ class api_bingx:
         for attempt in range(3):
             await self.active_order_cancel()
             cur_bid, cur_ask = get_bingx_orderbook(self.symbol, self.bingx.base_url)
-            current_target = cur_bid if cur_bid is not None else order_price
+            current_target, order_mode_label = determine_target_price(cur_bid, cur_ask, current_price)
             attempt_price = self.bingx._quantize_price(current_target)
             needed_lot = self.bingx._quantize_quantity(target_lot - filled_qty)
             if needed_lot <= 0:
@@ -621,7 +641,7 @@ class api_bingx:
                     "POST", self.bingx.base_url, "/openApi/swap/v2/trade/order",
                     self.bingx.api_key, self.bingx.secret_key, params=order_params, timeout=10
                 )
-                discord.print_log(f"BingX Long Limit attempt {attempt+1}: price={attempt_price}, qty={needed_lot}, result={res}")
+                discord.print_log(f"BingX Long Limit ({order_mode_label}) attempt {attempt+1}: price={attempt_price}, qty={needed_lot}, result={res}")
             except Exception as e:
                 discord.print_log(f"BingX Long entry exception (attempt {attempt+1}): {e}")
 
@@ -706,11 +726,29 @@ class api_bingx:
             discord.print_log(f"Insufficient funds for BingX short entry: need {lotamount:.2f} (with {LEVERAGE_FACTOR:.0f}x leverage), have {usdt_onhand_amount:.2f}")
             return False
 
+        # 板情報 (best_bid, best_ask) の取得
         best_bid, best_ask = get_bingx_orderbook(self.symbol, self.bingx.base_url)
-        order_price = best_ask if best_ask is not None else current_price
+        is_testnet = (self.mode in ('paper', 'demo', 'testnet')) or not BINGX_IS_LIVE
+
+        MAX_SPREAD_TOLERANCE = 0.005  # 0.5%
+
+        def determine_short_target_price(bid: Optional[float], ask: Optional[float], ref_price: float) -> tuple[float, str]:
+            if is_testnet:
+                # Bidが実勢価格に対して-0.5%以内に収まる正常な板であれば、テストネット・デモの利便性のためBid約定を許可
+                if bid is not None and bid >= ref_price * (1.0 - MAX_SPREAD_TOLERANCE):
+                    return bid, f"Demo Normal Bid (${bid:.4f})"
+                else:
+                    target_ask = ask if (ask is not None and ask >= ref_price * (1.0 - MAX_SPREAD_TOLERANCE)) else ref_price
+                    bid_str = f"${bid:.4f}" if bid is not None else "None"
+                    return target_ask, f"Demo Safe Ask (${target_ask:.4f}, Bid={bid_str} 乖離大)"
+            else:
+                target_ask = ask if ask is not None else ref_price
+                return target_ask, f"Live Best Ask (${target_ask:.4f})"
+
+        order_price, price_type_str = determine_short_target_price(best_bid, best_ask, current_price)
         final_price = self.bingx._quantize_price(order_price)
 
-        discord.print_log(f"[BINGX] Placing Short Entry (Maker Best Ask: ${final_price}): Target Qty {lot}")
+        discord.print_log(f"[BINGX] Placing Short Entry ({price_type_str}): Target Qty {lot}")
         if is_air:
             discord.print_log(f"[AIR MODE] Executed BingX Short Entry: {self.symbol} Qty={lot} Price={final_price} (Mock)")
             self.entry_val = float(df['VAL'].iloc[-1]) if 'VAL' in df.columns else (current_price * 0.99)
@@ -728,7 +766,7 @@ class api_bingx:
         for attempt in range(3):
             await self.active_order_cancel()
             cur_bid, cur_ask = get_bingx_orderbook(self.symbol, self.bingx.base_url)
-            current_target = cur_ask if cur_ask is not None else order_price
+            current_target, order_mode_label = determine_short_target_price(cur_bid, cur_ask, current_price)
             attempt_price = self.bingx._quantize_price(current_target)
             needed_lot = self.bingx._quantize_quantity(target_lot - filled_qty)
             if needed_lot <= 0:
@@ -748,7 +786,7 @@ class api_bingx:
                     "POST", self.bingx.base_url, "/openApi/swap/v2/trade/order",
                     self.bingx.api_key, self.bingx.secret_key, params=order_params, timeout=10
                 )
-                discord.print_log(f"BingX Short Limit attempt {attempt+1}: price={attempt_price}, qty={needed_lot}, result={res}")
+                discord.print_log(f"BingX Short Limit ({order_mode_label}) attempt {attempt+1}: price={attempt_price}, qty={needed_lot}, result={res}")
             except Exception as e:
                 discord.print_log(f"BingX Short entry exception (attempt {attempt+1}): {e}")
 

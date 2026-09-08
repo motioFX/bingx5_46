@@ -459,6 +459,63 @@ async def build_merged_dataset(
     return df, out_file
 
 
+def check_normalized_peak_timing(df: pd.DataFrame) -> Tuple[bool, List[str]]:
+    """
+    30d (720h), 10d (240h), 5d (120h) の各期間において、
+    前半に高値（ピーク）を付けて後半にかけて下落・低迷しているかを判定する。
+    """
+    windows = [
+        ("5d", 5 * 24),    # 120h
+        ("10d", 10 * 24),  # 240h
+        ("30d", 30 * 24),  # 720h
+    ]
+    reasons = []
+    is_bad = False
+
+    for w_name, w_hours in windows:
+        if len(df) < 24:
+            continue
+        sub = df.tail(w_hours).reset_index(drop=True)
+        if len(sub) < 24:
+            continue
+
+        c_series = sub["close"].astype(float)
+        base_c = c_series.iloc[0]
+        if base_c <= 0:
+            continue
+        norm_c = c_series / base_c
+        final_norm = float(norm_c.iloc[-1])
+
+        # ピーク位置の特定
+        peak_idx = int(norm_c.argmax())
+        peak_ratio = peak_idx / len(norm_c)
+        peak_val = float(norm_c.max())
+
+        # 前半・後半の高値
+        half = len(sub) // 2
+        first_half_max = float(sub["high"].iloc[:half].max()) if "high" in sub.columns else float(c_series.iloc[:half].max())
+        second_half_max = float(sub["high"].iloc[half:].max()) if "high" in sub.columns else float(c_series.iloc[half:].max())
+        curr_c = float(c_series.iloc[-1])
+
+        # 判定条件:
+        # 1. 5d または 10d で、ピークが前半 (< 50%) にあり、直近がピークから10%以上下落かつマイナス (final_norm < 1.0)
+        # 2. または、前半高値に対して後半高値が大きく切り下がっており (second_half_max < first_half_max * 0.93)、直近価格も高値から下落
+        if w_name in ("5d", "10d"):
+            if peak_ratio < 0.50 and (final_norm < peak_val * 0.90) and (final_norm < 1.0 or final_norm < peak_val * 0.80):
+                is_bad = True
+                reasons.append(f"{w_name}前半高値(peak={peak_ratio:.2f}, max={peak_val:.2f}x->{final_norm:.2f}x)")
+            elif second_half_max < first_half_max * 0.93 and curr_c < first_half_max * 0.90:
+                is_bad = True
+                reasons.append(f"{w_name}高値切り下げ(前半max={first_half_max:.4f}, 後半max={second_half_max:.4f})")
+        elif w_name == "30d":
+            # 30d でピークが最序盤 (< 30%) にあり、直近が大きく沈んでいる場合
+            if peak_ratio < 0.30 and final_norm < 0.90 and (final_norm < peak_val * 0.75):
+                is_bad = True
+                reasons.append(f"30d長期衰退(peak={peak_ratio:.2f}, max={peak_val:.2f}x->{final_norm:.2f}x)")
+
+    return is_bad, reasons
+
+
 def generate_normalized_charts(all_dfs: List[pd.DataFrame], out_dir: Path, window_name: str, hours_limit: int) -> Tuple[Optional[Path], float, str]:
     """指定期間 (30d / 10d / 5d) の上位10銘柄の正規化比較チャートを作成し、地合い（Market State）を判定 (パフォーマンス順ランキング凡例)"""
     if not all_dfs:
@@ -859,6 +916,42 @@ async def scan_precursor_candidates(
                 fr_annual = float(t.get("fundingRate", 0.0)) * 100 * 365 * 24
             df["fundingRate"] = fr_annual
 
+            # -------------------------------------------------------------
+            # 【下落トレンド・暴落銘柄除外フィルター (LONG ONLY 厳格除外)】
+            # -------------------------------------------------------------
+            curr_close = df["close"].iloc[-1]
+            ret_24h = (curr_close - df["close"].iloc[-24]) / df["close"].iloc[-24] if len(df) >= 24 else 0.0
+            ret_3d = (curr_close - df["close"].iloc[-72]) / df["close"].iloc[-72] if len(df) >= 72 else ret_24h
+            ret_5d = (curr_close - df["close"].iloc[-120]) / df["close"].iloc[-120] if len(df) >= 120 else ret_3d
+            
+            sma50_series = df["close"].rolling(50, min_periods=20).mean()
+            sma50 = sma50_series.iloc[-1] if not sma50_series.empty else curr_close
+            is_below_sma50 = (curr_close < sma50) if not pd.isna(sma50) else False
+
+            # 下落トレンド判定:
+            # 1. 5日間で -10% 以下 または 3日間で -7% 以下の大幅急落 (暴落ナイフ)
+            # 2. 24時間騰落率が -5% 以下
+            # 3. 24時間騰落率がマイナス かつ 中期SMA50を明確に下回っている
+            if ret_5d < -0.10 or ret_3d < -0.07 or ret_24h < -0.05 or (ret_24h < -0.02 and is_below_sma50):
+                # 下落トレンドのためロング選定から完全除外
+                continue
+
+            # 4. 【チャート前半高値除外フィルター】
+            # 直近3日(72h)または5日(120h)において前半に高値を付け、後半の高値が大きく切り下がっている下落形状を除外
+            is_peak_in_first_half = False
+            for check_w in [72, 120]:
+                if len(df) >= check_w:
+                    sub_w = df.tail(check_w).reset_index(drop=True)
+                    half = check_w // 2
+                    first_max = sub_w["high"].iloc[:half].max()
+                    second_max = sub_w["high"].iloc[half:].max()
+                    # 前半高値に対して後半高値が7%以上切り下がり、現在値も高値から10%以上下落している形状
+                    if second_max < first_max * 0.93 and curr_close < first_max * 0.90:
+                        is_peak_in_first_half = True
+                        break
+            if is_peak_in_first_half:
+                continue
+
             df_res = breakout_precursor_engine(df)
             if df_res is None or df_res.empty:
                 continue
@@ -883,9 +976,12 @@ async def scan_precursor_candidates(
             # 3. OI / 出来高テンション
             if t_r >= 0.70: score += (t_r - 0.70) * 400
 
-            # 4. FRマイナス (ショート踏み上げ燃料: マイナスFR・低FRを加点)
+            # 4. FRマイナス (ショート踏み上げ燃料: 価格が崩れていない場合のみ加点)
             if fr_annual < 0:
-                score += min(350, 150 + abs(fr_annual) * 8)
+                if ret_24h >= 0 or ret_3d >= 0:
+                    score += min(350, 150 + abs(fr_annual) * 8)
+                else:
+                    score += 50  # 下落基調でのFRマイナスは踏み上げ期待が薄いため低加点
             elif fr_annual <= 5.0:
                 score += 50
 
@@ -1083,6 +1179,39 @@ async def main():
             )
             discord.send_file(zip_path, zip_desc)
 
+        # ==============================================================================
+        # 【30日・10日・5日 ノーマライズチャート前半高値除外フィルター】
+        # チャートの前半に高値を付けて後半下落している銘柄を選定ランキングから除外
+        # ==============================================================================
+        filtered_dfs = []
+        excluded_symbols = set()
+
+        for d in all_dfs:
+            sym_name = d["symbol"].iloc[0]
+            clean_name = sym_name.upper().replace("-USDT", "").replace("USDT", "").replace("USDC", "")
+            if clean_name == "BTC":
+                filtered_dfs.append(d)
+                continue
+
+            is_bad, bad_reasons = check_normalized_peak_timing(d)
+            if is_bad:
+                reason_str = ", ".join(bad_reasons)
+                print(f"   [Normalized Peak Drop] {sym_name}: {reason_str} -> 前半高値下落型のため除外します。")
+                excluded_symbols.add(sym_name)
+            else:
+                filtered_dfs.append(d)
+
+        # チャート作成・選定用データセットを健全銘柄に更新
+        plot_dfs = filtered_dfs
+
+        # prioritized_candidates および symbol_selection_scores.csv の更新
+        if excluded_symbols:
+            prioritized_candidates = [c for c in prioritized_candidates if c["symbol"] not in excluded_symbols]
+            df_scores = pd.DataFrame(prioritized_candidates)
+            df_scores["priority_rank"] = df_scores.index + 1
+            df_scores.to_csv(scores_path, index=False)
+            print(f"   [Scores Updated] 前半高値除外銘柄 ({', '.join(excluded_symbols)}) を除去し、ランキングを再構築しました。(残り {len(prioritized_candidates)} 銘柄)")
+
         # ① 30d, 10d, 5d の 3 期間で正規化比較チャート生成 & 地合い判定
         windows = [
             ("30d", 30 * 24),
@@ -1101,7 +1230,7 @@ async def main():
         summary_text += f"\n📊 **[1. マルチタイムフレーム地合い判定]**\n"
 
         for win_label, win_hours in windows:
-            chart_file, mean_norm, market_state = generate_normalized_charts(all_dfs, out_dir, win_label, win_hours)
+            chart_file, mean_norm, market_state = generate_normalized_charts(plot_dfs, out_dir, win_label, win_hours)
             final_st = "long_only" if market_state == "LONG" else "short_only"
             state_icon = "🟢" if market_state == "LONG" else "🔴"
             print(f"   └ [{win_label} Window] Mean Norm: {mean_norm:.4f} -> Market State: {market_state} ({final_st})")
