@@ -2,7 +2,7 @@
 set -e
 
 echo "=================================================="
-echo "  Hyperliquid Bot (Hype5_45) VPS Auto Setup"
+echo "  BingX Bot (bingx5_46) VPS Auto Setup"
 echo "=================================================="
 
 INSTALL_DIR="$HOME/bingx5_46"
@@ -23,7 +23,7 @@ fi
 # 3. 依存パッケージのインストール
 echo "[2/4] 必須ライブラリをインストール中..."
 "$VENV_DIR/bin/pip" install --upgrade pip
-"$VENV_DIR/bin/pip" install pybotters hyperliquid-python-sdk pandas numpy rich requests matplotlib cryptography
+"$VENV_DIR/bin/pip" install pybotters pandas numpy rich requests matplotlib cryptography
 
 # 4. 実行権限の設定
 echo "[3/4] 監視スクリプトに実行権限を付与中..."
