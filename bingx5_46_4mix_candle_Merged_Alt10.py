@@ -36,6 +36,7 @@ if sys.platform == "win32":
 
 REST_API_URL = {
     "bingx": "https://open-api.bingx.com",
+    "bingx_demo": "https://open-api-vst.bingx.com",
     "coinbase": "https://api.exchange.coinbase.com",
 }
 
@@ -153,8 +154,9 @@ def normalize_symbol(symbol: str) -> str:
     return sym
 
 
-def fetch_bingx_tickers(product_type: str = "SWAP", max_retries: int = 5) -> List[dict]:
-    url = f"{REST_API_URL['bingx']}/openApi/swap/v2/quote/ticker"
+def fetch_bingx_tickers(product_type: str = "SWAP", mode: str = "demo", max_retries: int = 5) -> List[dict]:
+    base_url = REST_API_URL["bingx_demo"] if mode in ("paper", "demo", "testnet") else REST_API_URL["bingx"]
+    url = f"{base_url}/openApi/swap/v2/quote/ticker"
     for attempt in range(max_retries):
         try:
             resp = requests.get(url, timeout=15)
@@ -227,8 +229,10 @@ async def fetch_bingx_ohlcv(
     granularity: str,
     start_ms: int,
     end_ms: int,
+    mode: str = "demo",
 ) -> List[List[Any]]:
-    url = f"{REST_API_URL['bingx']}/openApi/swap/v2/quote/klines"
+    base_url = REST_API_URL["bingx_demo"] if mode in ("paper", "demo", "testnet") else REST_API_URL["bingx"]
+    url = f"{base_url}/openApi/swap/v2/quote/klines"
     interval_map = {"1H": "1h", "2H": "2h", "4H": "4h", "1D": "1d"}
     bx_interval = interval_map.get(granularity, "1h")
     clean_sym = normalize_symbol(symbol)
@@ -341,8 +345,10 @@ async def fetch_bingx_funding_history(
     symbol: str,
     start_ms: int,
     end_ms: int,
+    mode: str = "demo",
 ) -> List[Dict[str, Any]]:
-    url = f"{REST_API_URL['bingx']}/openApi/swap/v2/quote/fundingRate"
+    base_url = REST_API_URL["bingx_demo"] if mode in ("paper", "demo", "testnet") else REST_API_URL["bingx"]
+    url = f"{base_url}/openApi/swap/v2/quote/fundingRate"
     clean_sym = normalize_symbol(symbol)
     results = []
     try:

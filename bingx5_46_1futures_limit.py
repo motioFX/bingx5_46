@@ -546,12 +546,14 @@ def load_traded_symbols() -> List[str]:
     return []
 
 
-async def fetch_all_asset_contexts() -> Dict[str, Dict[str, Any]]:
+async def fetch_all_asset_contexts(mode: str = 'demo') -> Dict[str, Dict[str, Any]]:
     """BingX Swap API から全銘柄のリアルタイム FR / 価格 / 出来高を取得"""
     res: Dict[str, Dict[str, Any]] = {}
+    cred_key = 'bingx_demo' if mode in ('paper', 'demo', 'testnet') else 'bingx'
+    base_url = RestAPI_url.get(cred_key, 'https://open-api-vst.bingx.com' if mode in ('paper', 'demo', 'testnet') else 'https://open-api.bingx.com')
     try:
         # 1. premiumIndex から fundingRate と markPrice を取得
-        url_fr = "https://open-api.bingx.com/openApi/swap/v2/quote/premiumIndex"
+        url_fr = f"{base_url}/openApi/swap/v2/quote/premiumIndex"
         resp_fr = requests.get(url_fr, timeout=10)
         if resp_fr.status_code == 200:
             data_fr = resp_fr.json()
@@ -569,7 +571,7 @@ async def fetch_all_asset_contexts() -> Dict[str, Dict[str, Any]]:
                 res[coin] = info
 
         # 2. ticker から quoteVolume と openPrice を取得
-        url_ticker = "https://open-api.bingx.com/openApi/swap/v2/quote/ticker"
+        url_ticker = f"{base_url}/openApi/swap/v2/quote/ticker"
         resp_ticker = requests.get(url_ticker, timeout=10)
         if resp_ticker.status_code == 200:
             data_ticker = resp_ticker.json()
@@ -628,12 +630,12 @@ def get_bingx_granularity(bybit_interval: str) -> str:
     return mapping.get(str(bybit_interval), '1h')
 
 
-async def fetch_bingx_candles(symbol: str, granularity: str, limit: int = 300) -> pd.DataFrame:
+async def fetch_bingx_candles(symbol: str, granularity: str, limit: int = 300, mode: str = 'demo') -> pd.DataFrame:
     from bingx5_46_4mix_candle_Merged_Alt10 import fetch_bingx_ohlcv
     now_ms = int(time.time() * 1000)
     start_ms = now_ms - (limit * 3600 * 1000)
     try:
-        rows = await fetch_bingx_ohlcv(symbol, "SWAP", granularity.upper(), start_ms, now_ms)
+        rows = await fetch_bingx_ohlcv(symbol, "SWAP", granularity.upper(), start_ms, now_ms, mode=mode)
         if rows:
             df = pd.DataFrame(rows, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume', 'quote_volume'])
             df['timestamp'] = pd.to_datetime(df['timestamp'].astype(float), unit='ms')
@@ -1392,7 +1394,7 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
             freed_symbols = []
 
             # 1. 全銘柄のリアルタイム資金調達率(FR)と建玉(OI)を一括取得
-            all_asset_ctxs = await fetch_all_asset_contexts()
+            all_asset_ctxs = await fetch_all_asset_contexts(mode=mode)
 
             # 口座総残高をサイクル開始時に1回取得
             first_api = next(iter(symbol_apis.values())) if symbol_apis else None
@@ -1401,7 +1403,7 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
 
             # 2. 全銘柄のポジション状況とシグナル判定を一括評価
             for sym, api in list(symbol_apis.items()):
-                df = await fetch_bingx_candles(sym, "1h", limit=300)
+                df = await fetch_bingx_candles(sym, "1h", limit=300, mode=mode)
                 if df.empty or len(df) < 20:
                     discord.print_log(f"[{sym}] ローソク足データ不足 (rows={len(df)}). スキップ。")
                     continue

@@ -131,11 +131,14 @@ def sign_bingx(secret_key: str, query_str: str) -> str:
 _bingx_contracts_cache: Dict[str, Any] = {}
 _bingx_contracts_last_fetch: float = 0.0
 
-def get_bingx_contracts(base_url: str = "https://open-api.bingx.com") -> List[Dict[str, Any]]:
+def get_bingx_contracts(base_url: Optional[str] = None, mode: str = 'demo') -> List[Dict[str, Any]]:
     global _bingx_contracts_cache, _bingx_contracts_last_fetch
     now = time.time()
     if _bingx_contracts_cache and (now - _bingx_contracts_last_fetch < 300):
         return list(_bingx_contracts_cache.values())
+    if base_url is None:
+        cred_key = 'bingx_demo' if mode in ('paper', 'demo', 'testnet') else 'bingx'
+        base_url = RestAPI_url.get(cred_key, 'https://open-api-vst.bingx.com' if mode in ('paper', 'demo', 'testnet') else 'https://open-api.bingx.com')
     try:
         resp = requests.get(f"{base_url}/openApi/swap/v2/quote/contracts", timeout=10)
         if resp.status_code == 200:
@@ -151,7 +154,7 @@ def get_bingx_contracts(base_url: str = "https://open-api.bingx.com") -> List[Di
 
 def fetch_instrument_spec_bingx(symbol: str, mode: str = 'demo') -> Optional[Dict[str, float]]:
     clean_sym = normalize_symbol(symbol).upper()
-    get_bingx_contracts()
+    get_bingx_contracts(mode=mode)
     contract = _bingx_contracts_cache.get(clean_sym)
     if contract:
         qty_precision = float(contract.get("quantityPrecision", 2))
@@ -178,11 +181,14 @@ def fetch_instrument_spec_bingx(symbol: str, mode: str = 'demo') -> Optional[Dic
     }
 
 def get_bingx_universe_symbols(mode: str = 'demo') -> Set[str]:
-    contracts = get_bingx_contracts()
+    contracts = get_bingx_contracts(mode=mode)
     return {c["symbol"].upper() for c in contracts if "symbol" in c}
 
-def get_bingx_orderbook(symbol: str, base_url: str = "https://open-api.bingx.com") -> Tuple[Optional[float], Optional[float]]:
+def get_bingx_orderbook(symbol: str, base_url: Optional[str] = None, mode: str = 'demo') -> Tuple[Optional[float], Optional[float]]:
     try:
+        if base_url is None:
+            cred_key = 'bingx_demo' if mode in ('paper', 'demo', 'testnet') else 'bingx'
+            base_url = RestAPI_url.get(cred_key, 'https://open-api-vst.bingx.com' if mode in ('paper', 'demo', 'testnet') else 'https://open-api.bingx.com')
         clean_sym = normalize_symbol(symbol)
         resp = requests.get(f"{base_url}/openApi/swap/v2/quote/bookTicker?symbol={clean_sym}", timeout=5)
         if resp.status_code == 200:
@@ -250,9 +256,9 @@ class api_bingx_helper:
         self.product_type = "SWAP"
         self.coin = coin
         self.mode = mode
-        self.base_url = RestAPI_url.get('bingx', 'https://open-api.bingx.com')
-        
         cred_key = 'bingx_demo' if self.mode in ('paper', 'demo', 'testnet') else 'bingx'
+        self.base_url = RestAPI_url.get(cred_key, 'https://open-api-vst.bingx.com' if self.mode in ('paper', 'demo', 'testnet') else 'https://open-api.bingx.com')
+        
         self.creds = apis_bingx.get(cred_key) or apis_bingx.get('bingx') or {}
         self.api_key = self.creds.get("api_key", "")
         self.secret_key = self.creds.get("secret_key", "")
@@ -905,7 +911,7 @@ async def fetch_all_position_symbols_bingx(coin: str = 'USDT', mode: str = 'demo
     secret_key = creds.get("secret_key", "")
     if not api_key or api_key.startswith("YOUR_") or is_air:
         return []
-    base_url = RestAPI_url.get('bingx', 'https://open-api.bingx.com')
+    base_url = RestAPI_url.get(cred_key, 'https://open-api-vst.bingx.com' if mode in ('paper', 'demo', 'testnet') else 'https://open-api.bingx.com')
     try:
         res = await _async_bingx_request("GET", base_url, "/openApi/swap/v2/user/positions", api_key, secret_key)
         if res.get("code") == 0:
