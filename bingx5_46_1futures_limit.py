@@ -378,19 +378,45 @@ def wait_until_analysis_time(target_hour: int = 9, target_minute: int = 0) -> No
 
 
 def get_whale_sentiment_info(symbol: str) -> Dict[str, Any]:
-    """Data/whale_market_state.json より銘柄（該当なしはBTC）のクジラセンチメント情報 (signal, long_ratio, short_ratio) を取得"""
+    """Data/whale_market_state.json より銘柄のクジラセンチメント情報 (signal, long_ratio, short_ratio) を取得"""
     whale_file = Path(__file__).resolve().parent / "Data" / "whale_market_state.json"
-    default_res = {"signal": "NEUTRAL", "long_ratio": 0.5, "short_ratio": 0.5, "whales_holding": 0}
+    default_res = {
+        "signal": "NEUTRAL",
+        "long_ratio": 0.5,
+        "short_ratio": 0.5,
+        "whales_holding": 0,
+        "net_val_usd": 0.0,
+        "net_val_formatted": "$0"
+    }
     if not whale_file.exists():
         return default_res
     try:
         with open(whale_file, "r", encoding="utf-8") as f:
             data = json.load(f)
             coins_sentiment = data.get("coins_sentiment", {})
+
+            # 1. 完全一致チェック
             if symbol in coins_sentiment:
                 return coins_sentiment[symbol]
-            if "BTC" in coins_sentiment:
+
+            # 2. 通貨コード正規化 (-USDT, -USDC, _, / を除去)
+            clean_coin = str(symbol).upper().split("-")[0].split("_")[0].split("/")[0]
+            clean_coin = clean_coin.replace("USDT", "").replace("USDC", "")
+            if clean_coin in coins_sentiment:
+                return coins_sentiment[clean_coin]
+
+            # 3. 1000倍プレフィックス銘柄対応 (1000SHIB -> kSHIB, 1000PEPE -> kPEPE, etc.)
+            if clean_coin.startswith("1000"):
+                k_coin = "k" + clean_coin[4:]
+                if k_coin in coins_sentiment:
+                    return coins_sentiment[k_coin]
+
+            # 4. BTC自身のリクエストの場合はBTCを返す
+            if clean_coin == "BTC" and "BTC" in coins_sentiment:
                 return coins_sentiment["BTC"]
+
+            # 5. 個別クジラデータが存在しないアルト銘柄は「中立 (NEUTRAL)」として扱う（BTC誤フォールバック防止）
+            return default_res
     except Exception as e:
         discord.print_log(f"[Whale Sentiment Error] 読み込み失敗: {e}")
     return default_res
