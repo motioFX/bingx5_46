@@ -74,20 +74,7 @@ BINGX_IS_AIR = True
 
 ---
 
-## 6. Technocore Agent（テクノコアエージェント）運用規約
-
-* **Bot起動時バックグラウンド自動常駐**:
-  * `bingx5_46_1futures_limit.py` 起動時に `run_technocore_keepalive_daemon(interval_hours=4.0)` を完全非同期タスクとして自動開始する。
-* **4時間定期生存更新**:
-  * **DID Note の定期更新（Compare-And-Set）**: 7日間保持期限タイマーをリセット。
-  * **署名付きアクティビティ送信**: `technocore-starter` ルームへ Ed25519 署名付き `status:v1` を送信。
-  * **Mailbox の空き枠獲得試行**: サーバー枠（10,240枠）に空きが出た場合に自動登録。
-* **フェイルセーフ設計**:
-  * Technocore側の通信等で例外が発生しても、トレード本体のループを絶対に停止させない。
-
----
-
-## 7. VPS常駐・プロセス管理規約
+## 6. VPS常駐・プロセス管理規約
 
 * **自動死活監視（Cron）**:
   * `/etc/crontab` または `crontab -l` にて `check_and_restart.sh` を5分間隔（`*/5 * * * *`）で実行し、プロセスダウン時は自動再起動する。
@@ -96,7 +83,7 @@ BINGX_IS_AIR = True
 
 ---
 
-## 8. コードデプロイ・同期運用規約（Git Push ➔ VPS Git Pull 方式）
+## 7. コードデプロイ・同期運用規約（Git Push ➔ VPS Git Pull 方式）
 
 * **SCP直接アップロードの禁止**:
   * Windowsローカル環境から VPS へプログラムコード（`.py` ファイル等）を SCP で直接上書きアップロードしてはならない（Git競合の原因となるため）。
@@ -109,12 +96,12 @@ BINGX_IS_AIR = True
 
 ---
 
-## 9. Windows / クロスプラットフォーム動作保証規約
+## 8. Windows / クロスプラットフォーム動作保証規約
 
 * **コマンドプロンプト / PowerShell 実行互換性**:
   * Windows側のコマンドプロンプト（cmd.exe）および PowerShell からスクリプトを実行した場合でも、未捕捉例外やエンコードエラー、OS固有のファイルパスエラー（`\` と `/` の差異）、パーミッションチェックの不整合等で異常終了しないようにコードを設計・テストすること。
 * **例外のフェイルセーフ防護**:
-  * バックグラウンドタスク（Technocore等）や外部API通信（Hyperliquid、Discord、Technocore）でネットワーク障害やHTTPエラー（503, 502, 429等）が発生しても、`SystemExit` 等でメインプロセスが巻き込まれ終了しないよう、`TechnocoreError` や `BaseException` レベルで安全に捕捉・隔離すること。
+  * 外部API通信（Hyperliquid、BingX、Discord等）でネットワーク障害やHTTPエラー（503, 502, 429等）が発生しても、`SystemExit` 等でメインプロセスが巻き込まれ終了しないよう、`Exception` や `BaseException` レベルで安全に捕捉・隔離すること。
 * **文字コード・パスの標準化**:
   * ファイルIOはすべて `encoding="utf-8"` を明示し、パス操作には `pathlib.Path` を使用すること。
 

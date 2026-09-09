@@ -1157,63 +1157,6 @@ async def audit_and_retain_positions(
 
     return symbol_apis, symbol_params_map
 
-
-async def run_technocore_keepalive_daemon(interval_hours: float = 24.0, retry_hours: float = 1.0):
-    """
-    Technocore DID/Agent の定期更新（7日削除タイマーリセット＆署名アクティビティ維持）を
-    BingXボットの裏で完全非同期に実行するバックグラウンドタスク。
-    - 正常更新時: 次回は 24時間後（1日1回）に静かに実行
-    - 一部警告・失敗時: 次回は 1時間後に自動再試行
-    トレードボット本体の動作には一切干渉・影響しないフェイルセーフ設計。
-    """
-    technocore_dir = Path(__file__).resolve().parent / "technocore_agent"
-    keepalive_script = technocore_dir / "keepalive.py"
-    if not keepalive_script.exists():
-        print("[Technocore] technocore_agent/keepalive.py が見つからないため、定期更新連携はスキップします。")
-        return
-
-    print(f"[Technocore] バックグラウンド定期更新タスクを開始しました (通常間隔: {interval_hours}時間ごと / 失敗時: {retry_hours}時間後リトライ)")
-    # 起動時スクリーニングの負荷を避けるため、初回は30秒待ってから実行
-    await asyncio.sleep(30)
-
-    while True:
-        next_wait_hours = interval_hours
-        try:
-            def _exec():
-                import sys
-                if str(technocore_dir) not in sys.path:
-                    sys.path.insert(0, str(technocore_dir))
-                import keepalive
-                return keepalive.run_refresh_cycle()
-
-            loop = asyncio.get_running_loop()
-            result = await loop.run_in_executor(None, _exec)
-            if isinstance(result, dict):
-                did = result.get("did", "")
-                refreshed = result.get("did_note_refreshed", False)
-                signed = bool(result.get("signed_activity"))
-                if refreshed and signed:
-                    status_str = "正常更新完了 (次回24時間後)"
-                    next_wait_hours = interval_hours
-                else:
-                    status_str = f"一部警告 (次回{retry_hours}時間後リトライ)"
-                    next_wait_hours = retry_hours
-                discord.print_log(f"[Technocore Agent] 定期更新: {status_str} ({did[:16]}...)")
-            else:
-                discord.print_log(f"[Technocore Warning] 定期更新結果が不正です (次回{retry_hours}時間後リトライ): {result}")
-                next_wait_hours = retry_hours
-        except asyncio.CancelledError:
-            break
-        except (Exception, SystemExit, BaseException) as exc:
-            discord.print_log(f"[Technocore Warning] 定期更新中に例外が発生しました (次回{retry_hours}時間後リトライ): {exc}")
-            next_wait_hours = retry_hours
-
-        try:
-            await asyncio.sleep(next_wait_hours * 3600)
-        except asyncio.CancelledError:
-            break
-
-
 async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60'):
     from bingx5_46_2api import (
         api_bingx,
@@ -1221,9 +1164,6 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
         flatten_current_position_bingx,
     )
     from bingx5_46_3logic import PnLCalculator
-
-    # Technocore 定期更新デーモンを完全非同期タスクとして起動 (成功時24時間 / 失敗時1時間リトライ)
-    asyncio.create_task(run_technocore_keepalive_daemon(interval_hours=24.0, retry_hours=1.0))
 
     account_mode_str = "[LIVE Account] (本番口座)" if mode == "live" else "[DEMO Account] (デモ / テストネット口座)"
     air_mode_str = "[AIR MODE ON] (発注監視のみ / API注文送信なし)" if is_air else "[REAL ORDER ON] (実際にBingXへ注文送信)"

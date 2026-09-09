@@ -12,7 +12,7 @@
 - Ensure all Python scripts run cleanly from Windows Command Prompt (`cmd.exe`) and PowerShell without unhandled exceptions, encoding crashes, or OS-specific path issues.
 - All file IO operations must explicitly declare `encoding="utf-8"`.
 - Use `pathlib.Path` for cross-platform path handling.
-- Background tasks (like Technocore Agent) and external APIs must be wrapped in fail-safe exception blocks (`except (TechnocoreError, BaseException):`) so that server downtimes (HTTP 503, timeouts) never terminate the main trading bot process.
+- External APIs and background tasks must be wrapped in fail-safe exception blocks (`except (Exception, BaseException):`) so that server downtimes (HTTP 503, timeouts) never terminate the main trading bot process.
 
 ## 3. Implementation Plan & Walkthrough Rule
 - ALWAYS write the Implementation Plan and Walkthrough artifacts entirely in Japanese.
