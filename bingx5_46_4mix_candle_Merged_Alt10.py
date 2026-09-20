@@ -233,10 +233,9 @@ async def fetch_bingx_ohlcv(
     granularity: str,
     start_ms: int,
     end_ms: int,
-    mode: str = "demo",
+    mode: str = "live",
 ) -> List[List[Any]]:
-    base_url = REST_API_URL["bingx_demo"] if mode in ("paper", "demo", "testnet") else REST_API_URL["bingx"]
-    url = f"{base_url}/openApi/swap/v2/quote/klines"
+    url = f"{REST_API_URL['bingx']}/openApi/swap/v2/quote/klines"
     interval_map = {"1H": "1h", "2H": "2h", "4H": "4h", "1D": "1d"}
     bx_interval = interval_map.get(granularity, "1h")
     clean_sym = normalize_symbol(symbol)
@@ -244,7 +243,7 @@ async def fetch_bingx_ohlcv(
     rows = []
     max_retries = 3
     curr_start = start_ms
-    step_ms = 1400 * 3600 * 1000  # 1400 hours (~58 days per page)
+    step_ms = 900 * 3600 * 1000  # 900 hours per request
     
     import aiohttp
     async with aiohttp.ClientSession() as session:
@@ -255,7 +254,7 @@ async def fetch_bingx_ohlcv(
                 "interval": bx_interval,
                 "startTime": str(curr_start),
                 "endTime": str(curr_end),
-                "limit": "1440"
+                "limit": "1000"
             }
             success = False
             for attempt in range(max_retries):
@@ -282,6 +281,9 @@ async def fetch_bingx_ohlcv(
                                     success = True
                                     curr_start = curr_end + 1
                                     break
+                            elif data.get("code") == 100410:
+                                # レート制限検知: バックオフ待機
+                                await asyncio.sleep(2.0 * (attempt + 1))
                 except Exception as e:
                     if attempt == max_retries - 1:
                         log(f"BingX OHLCV fetch error for {clean_sym} (attempt {attempt + 1}/{max_retries}): {e}")
@@ -1211,35 +1213,36 @@ async def main():
         top10_vol_symbols.insert(0, "BTC-USDT")
         top10_vol_symbols = top10_vol_symbols[:10]
 
-    # 全取得対象銘柄の統合: 前兆候補 + 取引高上位10 + 固定銘柄 + BTC
-    target_symbols = [t["symbol"] for t in prioritized_candidates]
-    for s in top10_vol_symbols + FIXED_SYMBOLS + ["BTC-USDT"]:
-        clean_s = normalize_symbol(s)
-        if clean_s not in target_symbols:
-            target_symbols.append(clean_s)
+    # 全銘柄（有効な全暗号資産USDT無期限先物）を完全ダウンロード対象とする
+    all_crypto_symbols = [t["symbol"] for t in crypto_tickers]
+    target_symbols = list(dict.fromkeys(all_crypto_symbols + [t["symbol"] for t in prioritized_candidates] + top10_vol_symbols + FIXED_SYMBOLS + ["BTC-USDT"]))
 
     ticker_map = {t.get("symbol"): t for t in tickers}
 
-    print(f"\n[Download Engine] Downloading 30-day+ OHLCV, Funding Rate & OI for {len(target_symbols)} symbols: {target_symbols}...")
+    print(f"\n[Download Engine] Downloading 30-day+ OHLCV, Funding Rate & OI for ALL {len(target_symbols)} symbols in parallel...")
 
-    all_dfs = []
-    for rank, sym in enumerate(target_symbols, 1):
-        try:
-            print(f"   Downloading {sym} (OHLCV + Funding Rate)...")
-            t_info = ticker_map.get(sym) or {}
-            df, file_path = await build_merged_dataset(
-                sym,
-                start_utc,
-                end_utc,
-                out_dir=out_dir,
-                rank=rank,
-                ticker_info=t_info,
-            )
-            all_dfs.append(df)
-            await asyncio.sleep(0.1)
-        except Exception as e:
-            print(f"   [Warning] Error fetching {sym}: {e}")
-            await asyncio.sleep(0.1)
+    sem = asyncio.Semaphore(12)
+    async def fetch_one(rank, sym):
+        async with sem:
+            try:
+                t_info = ticker_map.get(sym) or {}
+                df, _ = await build_merged_dataset(
+                    sym,
+                    start_utc,
+                    end_utc,
+                    out_dir=out_dir,
+                    rank=rank,
+                    ticker_info=t_info,
+                )
+                await asyncio.sleep(0.04)
+                return df
+            except Exception:
+                return None
+
+    tasks = [fetch_one(rank, sym) for rank, sym in enumerate(target_symbols, 1)]
+    results = await asyncio.gather(*tasks)
+    all_dfs = [df for df in results if df is not None and not df.empty]
+    print(f"[Download Engine] Successfully downloaded {len(all_dfs)}/{len(target_symbols)} symbols with valid data.")
 
     # 3. チャート作成および解析処理
     if all_dfs:
@@ -1261,26 +1264,42 @@ async def main():
         # ==============================================================================
         zip_name = f"{start_tag}_{end_tag}_all_symbols_merged.zip"
         zip_path = out_dir / zip_name
-        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
-            # 1. 統合マージドCSV
+        
+        # 主要個別銘柄（取引高上位 + 固定銘柄 + 前兆スコア上位 + BTC）
+        key_symbols = set(top10_vol_symbols + FIXED_SYMBOLS + [t["symbol"] for t in prioritized_candidates] + ["BTC-USDT"])
+
+        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
+            # 1. 全銘柄統合マージドCSV (全銘柄網羅)
             zf.write(dated_csv_path, arcname=dated_csv_name)
-            # 2. 銘柄別個別マージドCSV（バックテスト・検証用）
-            for sym in target_symbols:
+            # 2. 主要銘柄の個別CSV (検証用)
+            for sym in key_symbols:
                 ind_csv = out_dir / f"merged_{sym}.csv"
                 if ind_csv.exists():
                     zf.write(ind_csv, arcname=f"individual/merged_{sym}.csv")
+
+        zip_size_mb = zip_path.stat().st_size / (1024 * 1024)
+        send_target_zip = zip_path
+
+        # 12MB超過時の安全コンパクトZIP（全銘柄統合CSVのみ）
+        if zip_size_mb > 13.0:
+            compact_zip = out_dir / f"{start_tag}_{end_tag}_all_symbols_compact.zip"
+            with zipfile.ZipFile(compact_zip, "w", zipfile.ZIP_DEFLATED, compresslevel=9) as zf:
+                zf.write(dated_csv_path, arcname=dated_csv_name)
+            send_target_zip = compact_zip
+            zip_size_mb = send_target_zip.stat().st_size / (1024 * 1024)
 
         master_zip_path = out_dir / "historical_all_symbols_merged.zip"
         with zipfile.ZipFile(master_zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
             zf.write(merged_all_path, arcname="historical_all_symbols_merged.csv")
 
         discord = send_discord()
-        if not args.no_chart_send and zip_path.exists():
+        if not args.no_chart_send and send_target_zip.exists():
             zip_desc = (
-                f"📦 **【選定銘柄 32日分1HマージドデータZIP】** ({start_tag} -> {end_tag})\n"
-                f"選定上位{len(target_symbols)}銘柄（+BTC）の1時間足OHLCV・出来高・FR・OI統合データセット"
+                f"📦 **【BingX全銘柄 32日分1HマージドデータZIP】** ({start_tag} -> {end_tag})\n"
+                f"• 収録銘柄数: 全 `{len(all_dfs)}` 銘柄 (全データ行数: `{len(df_merged_all):,}` 行)\n"
+                f"• ファイルサイズ: `{zip_size_mb:.2f} MB` (Discord最適化)"
             )
-            discord.send_file(zip_path, zip_desc)
+            discord.send_file(send_target_zip, zip_desc)
 
         # ==============================================================================
         # 【30日・10日・5日 ノーマライズチャート前半高値除外フィルター】

@@ -220,9 +220,11 @@ async def fetch_symbol_klines(
                                         "symbol": symbol,
                                     })
                                 return symbol, rows
-                    await asyncio.sleep(0.3 * (attempt + 1))
+                            elif data.get("code") == 100410:
+                                await asyncio.sleep(2.0 * (attempt + 1))
+                    await asyncio.sleep(0.04)
             except Exception:
-                await asyncio.sleep(0.3 * (attempt + 1))
+                await asyncio.sleep(0.5 * (attempt + 1))
     return symbol, []
 
 
@@ -384,7 +386,7 @@ async def run_pipeline(
 
     # 3. チャンクごとの取得 & ZIP化 & Discord送信ループ (直近チャンクから順次実行)
     if not skip_download:
-        sem = asyncio.Semaphore(18)  # 同時リクエスト数
+        sem = asyncio.Semaphore(12)  # 同時リクエスト数 (安全マージン)
         timeout = aiohttp.ClientTimeout(total=15)
         connector = aiohttp.TCPConnector(limit=30)
 
