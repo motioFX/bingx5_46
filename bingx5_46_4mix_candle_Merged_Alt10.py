@@ -680,6 +680,82 @@ def generate_custom_normalized_charts(
     return out_file
 
 
+def check_mtf_long_eligibility(
+    df: pd.DataFrame,
+    symbol: str,
+    windows: Sequence[Tuple[str, int]] = (("30d", 720), ("10d", 240), ("5d", 120))
+) -> Tuple[bool, Dict[str, Any]]:
+    """
+    固定銘柄のマルチタイムフレーム (30d, 10d, 5d) における最高値発生位置を検証。
+    各ウィンドウの前半（0〜50%）に最高値がある場合は「ロング判定アウト (見送り 🔴)」。
+    3期間すべてで後半（50〜100%）に最高値がある銘柄のみ「完全ロング認識 (トレードOK 🟢)」と認定する。
+    """
+    if df is None or df.empty or len(df) < 12:
+        return False, {
+            "symbol": symbol,
+            "is_eligible": False,
+            "status": "DATA_INSUFFICIENT",
+            "rejection_reasons": ["データ不足"],
+            "window_results": {}
+        }
+
+    closes = df["close"].astype(float).values
+    highs = df["high"].astype(float).values if "high" in df.columns else closes
+    
+    total_bars = len(closes)
+    window_results = {}
+    all_passed = True
+    rejection_reasons = []
+
+    for w_name, w_hours in windows:
+        bars_count = min(total_bars, w_hours)
+        if bars_count < 12:
+            all_passed = False
+            rejection_reasons.append(f"{w_name}足数不足")
+            window_results[w_name] = {
+                "passed": False,
+                "peak_ratio": 0.0,
+                "peak_price": 0.0,
+                "curr_price": float(closes[-1]),
+                "reason": "足数不足"
+            }
+            continue
+
+        w_highs = highs[-bars_count:]
+        w_closes = closes[-bars_count:]
+        
+        peak_idx = int(np.argmax(w_highs))
+        peak_ratio = peak_idx / float(bars_count)  # 0.0 (最古) 〜 1.0 (最新)
+        peak_price = float(w_highs[peak_idx])
+        curr_price = float(w_closes[-1])
+        
+        # 前半判定: peak_ratio < 0.50 は前半高値（アウト）
+        # 後半判定: peak_ratio >= 0.50 は後半高値（セーフ）
+        is_first_half_peak = (peak_ratio < 0.50)
+        passed = not is_first_half_peak
+        
+        if not passed:
+            all_passed = False
+            rejection_reasons.append(f"{w_name}前半高値(位置:{peak_ratio*100:.1f}%)")
+
+        window_results[w_name] = {
+            "passed": passed,
+            "peak_ratio": peak_ratio,
+            "peak_price": peak_price,
+            "curr_price": curr_price,
+            "drawdown_from_peak_pct": ((curr_price - peak_price) / peak_price * 100.0) if peak_price > 0 else 0.0
+        }
+
+    status_str = "ELIGIBLE" if all_passed else "OUT_FIRST_HALF_PEAK"
+    return all_passed, {
+        "symbol": symbol,
+        "is_eligible": all_passed,
+        "status": status_str,
+        "rejection_reasons": rejection_reasons,
+        "window_results": window_results
+    }
+
+
 def export_top10_gainers_csv(
     top10_gainers: List[dict],
     prioritized_candidates: List[dict],
@@ -1400,24 +1476,73 @@ async def main():
             if not args.no_chart_send and chart_file and chart_file.exists():
                 discord.send_file(chart_file, f"📈 **【マルチタイムフレーム乖離判定 [{win_label.upper()}]】** 地合い: `{market_state}` (平均: `{mean_norm:.4f}`)")
 
-        # ④ ブレイクアウト前兆 Top 10 銘柄 (前兆スコア & クジラ流入順)
+        # ④ 固定5銘柄 MTF完全ロング判定レポート (HYPE, NEAR, ZEC, ARB, UNI)
         print("\n==================================================================================")
-        print(" [Step 2: Precursor Score Top 10 & Whale Inflow Priority Ranking]")
+        print(" [Step 2: Fixed 5 Symbols MTF Complete Long Eligibility Assessment]")
         print("==================================================================================")
-        summary_text += f"\n👑 **[2. ブレイクアウト前兆 Top 10 銘柄]**\n"
-        for rank, t in enumerate(prioritized_candidates, 1):
-            sym = t.get("symbol", "")
-            price = float(t.get("lastPr", 0))
-            score_val = float(t.get("score", 0))
-            w_fmt = t.get("whale_net_val_fmt", "$0")
-            tag = t.get("whale_tag", "⚪ クジラ中立")
-            tier = t.get("tier", 2)
-            gk_r = float(t.get("gk_vol_rank", 0.5))
-            fr_pct = float(t.get("fr_annual_pct", 0.0))
-            line_str = f" #{rank:2d} [Tier {tier}] | {sym:8s} | Score: {score_val:5.1f} | GK_Vol: {gk_r:.2f} | FR: {fr_pct:+6.1f}%/年 | Whale: {w_fmt} ({tag})"
-            log(line_str)
-            summary_text += f"`#{rank:02d}` [T{tier}] **{sym:8s}** | Score: `{score_val:.1f}` | GK: `{gk_r:.2f}` | FR: `{fr_pct:+.1f}%` | Whale: `{w_fmt}`\n"
+        summary_text += f"\n👑 **[2. 固定5銘柄 MTF完全ロング判定レポート]**\n"
+        
+        df_map_all = {}
+        for d in all_dfs:
+            if isinstance(d, pd.DataFrame) and not d.empty and "symbol" in d.columns:
+                df_map_all[normalize_symbol(d["symbol"].iloc[0])] = d
+
+        eligible_symbols = []
+        mtf_reports = {}
+
+        for sym in FIXED_SYMBOLS:
+            clean_sym = normalize_symbol(sym)
+            df_sym = df_map_all.get(clean_sym)
+            if df_sym is None or df_sym.empty:
+                cand_file = out_dir / f"historical_candles/{clean_sym}_1h.csv"
+                if not cand_file.exists():
+                    cand_file = out_dir / f"merged_{clean_sym.replace('-USDT','')}.csv"
+                if cand_file.exists():
+                    try:
+                        df_sym = pd.read_csv(cand_file)
+                    except Exception:
+                        df_sym = None
+
+            is_ok, report = check_mtf_long_eligibility(df_sym, clean_sym)
+            mtf_reports[clean_sym] = report
+            if is_ok:
+                eligible_symbols.append(clean_sym)
+                status_badge = "🟢 【トレードOK】"
+            else:
+                status_badge = "🔴 【見送り (アウト)】"
+
+            w_strs = []
+            for w_name in ["30d", "10d", "5d"]:
+                w_info = report.get("window_results", {}).get(w_name)
+                if w_info:
+                    p_pct = int(w_info["peak_ratio"] * 100)
+                    icon = "🟢" if w_info["passed"] else "🔴"
+                    w_strs.append(f"{w_name}:{p_pct}%{icon}")
+                else:
+                    w_strs.append(f"{w_name}:-")
+            w_line = " ".join(w_strs)
+
+            log_line = f" • {clean_sym:10s} : {status_badge} | MTF: {w_line}"
+            if not is_ok and report.get("rejection_reasons"):
+                log_line += f" | 除外理由: {', '.join(report['rejection_reasons'])}"
+            log(log_line)
+
+            summary_text += f"• **{clean_sym}**: {status_badge} (`{w_line}`)\n"
+
         print("----------------------------------------------------------------------------------")
+        log(f"MTF完全ロング適格銘柄: {', '.join(eligible_symbols) if eligible_symbols else 'なし（全銘柄前半高値除外）'}")
+
+        # trade_eligible_symbols.json に保存
+        eligible_file = out_dir / "trade_eligible_symbols.json"
+        eligible_data = {
+            "eligible_symbols": eligible_symbols,
+            "target_symbols": list(FIXED_SYMBOLS),
+            "evaluated_at": datetime.now(timezone.utc).isoformat(),
+            "reports": mtf_reports
+        }
+        with open(eligible_file, "w", encoding="utf-8") as f:
+            json.dump(eligible_data, f, indent=2, ensure_ascii=False)
+        log(f"Saved trade eligible symbols to {eligible_file}")
 
         summary_text += f"========================================"
         if not args.no_chart_send:

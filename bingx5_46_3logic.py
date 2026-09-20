@@ -14,19 +14,49 @@ import matplotlib.pyplot as plt
 import matplotlib.dates as md
 from rich import print
 import sys
+if hasattr(sys.stdout, "reconfigure"):
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
 from bingx5_46_5backtest_mm import make_mm_pl, Backtest, AirExchange
 from config_loader import get_webhook_url
 
 
 def calc_add_pct(n: int) -> float:
-    """Return add-on percentage based on position count."""
+    """Return add-on percentage based on position count (Pine Script RSIMA3 spec)."""
     if n <= 3:
-        return 0.001  # 0.2%
+        return 0.002  # 0.2%
     if n <= 5:
-        return 0.002  # 0.3%
+        return 0.003  # 0.3%
     if n <= 8:
-        return 0.01   # 0.4%
-    return 0.02       # 0.5%
+        return 0.004  # 0.4%
+    return 0.005       # 0.5%
+
+
+def calc_rma(series: pd.Series, length: int) -> pd.Series:
+    """Pine Script ta.rma (Wilder's Moving Average)"""
+    alpha = 1.0 / length
+    return series.ewm(alpha=alpha, adjust=False).mean()
+
+
+def calc_rsi(series: pd.Series, length: int = 9) -> pd.Series:
+    """Pine Script ta.rsi based on RMA"""
+    delta = series.diff()
+    up = delta.clip(lower=0.0)
+    down = -delta.clip(upper=0.0)
+    
+    rma_up = calc_rma(up, length)
+    rma_down = calc_rma(down, length)
+    
+    rs = rma_up / rma_down.replace(0.0, np.nan)
+    rsi_vals = np.where(rma_down == 0.0, 100.0, np.where(rma_up == 0.0, 0.0, 100.0 - (100.0 / (1.0 + rs))))
+    return pd.Series(rsi_vals, index=series.index).fillna(50.0)
+
+
+def calc_ema(series: pd.Series, length: int) -> pd.Series:
+    """Exponential Moving Average (EMA)"""
+    return series.ewm(span=length, adjust=False).mean()
 
 
 class logicinstance:
@@ -217,7 +247,7 @@ class logicinstance:
         
         return df
 
-    def make_logic(self, df, market_profile_period=720, er_threshold=0.3, strategy_type="range", use_decay=True, decay_half_life=None, vol_surge_mult=1.2, fr_threshold=0.00002):
+    def make_logic(self, df, market_profile_period=720, er_threshold=0.3, strategy_type="range", use_decay=True, decay_half_life=None, vol_surge_mult=1.2, fr_threshold=0.00002, **kwargs):
         atr_period = 10
         df[f'atr_{atr_period}'] = self.make_atr(df, atr_period)
         
@@ -271,21 +301,61 @@ class logicinstance:
         df['long_range'] = df['long_range_raw'] & (df['er'] > er_threshold)
         df['short_range'] = df['short_range_raw'] & (df['er'] > er_threshold)
         
-        if strategy_type in ("breakout", "squeeze_breakout"):
+        # --- エンベロープ (Envelope) 戦略シグナル ---
+        env_l = int(kwargs.get('env_len', 15))
+        env_lp = float(kwargs.get('env_lower_pct', 2.0))
+        env_up = float(kwargs.get('env_upper_pct', 2.0))
+        env_ml = int(kwargs.get('env_malen', 200))
+        basis = calc_ema(df['close'], env_l)
+        mabasis = calc_ema(df['close'], env_ml) if len(df) >= env_ml else basis
+        df['basis'] = basis
+        df['mabasis'] = mabasis
+        df['env_lower'] = basis * (1.0 - env_lp / 100.0)
+        df['env_upper'] = basis * (1.0 + env_up / 100.0)
+        df['long_envelope'] = df['close'] < df['env_lower']
+        df['longclose_envelope'] = df['close'] > df['basis']
+        
+        # --- RSI MA (RSIMA3) 戦略シグナル ---
+        r_len = int(kwargs.get('rsi_len', 9))
+        l_len = int(kwargs.get('lma_len', 7))
+        r_lep = float(kwargs.get('lEp', 40.0))
+        r_lcp = float(kwargs.get('lCp', 60.0))
+        rsi_series = calc_rsi(df['close'], r_len)
+        lrsiMA_series = calc_ema(rsi_series, l_len)
+        df['rsi'] = rsi_series
+        df['lrsiMA'] = lrsiMA_series
+        rsi_gc = self.crossover(df['rsi'], df['lrsiMA'])
+        df['long_rsima'] = rsi_gc & (df['lrsiMA'] < r_lep) & (df['rsi'] < r_lcp)
+        df['longclose_rsima'] = df['rsi'] > r_lcp
+
+        strat_lower = str(strategy_type).lower()
+        if strat_lower == "envelope":
+            df['long'] = df['long_envelope']
+            df['short'] = False
+            df['longclose'] = df['longclose_envelope']
+            df['shortclose'] = False
+        elif strat_lower == "rsima":
+            df['long'] = df['long_rsima']
+            df['short'] = False
+            df['longclose'] = df['longclose_rsima']
+            df['shortclose'] = False
+        elif strat_lower in ("breakout", "squeeze_breakout"):
             df['long'] = df['long_breakout']
             df['short'] = df['short_breakout']
-        elif strategy_type == "adaptive":
-            # 高ER時はBreakout（ER条件付き）、低ER時はRange（ER条件なし=素のシグナル）
+            df['longclose'] = False
+            df['shortclose'] = False
+        elif strat_lower == "adaptive":
             df['long'] = np.where(df['er'] > er_threshold, df['long_breakout'], df['long_range_raw'])
             df['short'] = np.where(df['er'] > er_threshold, df['short_breakout'], df['short_range_raw'])
+            df['longclose'] = False
+            df['shortclose'] = False
         else:
             df['long'] = df['long_range']
             df['short'] = df['short_range']
+            df['longclose'] = False
+            df['shortclose'] = False
         
-        df['lowest_support'] = df['low'].rolling(window=market_profile_period, min_periods=10).min().ffill()
-        
-        df['longclose'] = False
-        df['shortclose'] = False
+        df['lowest_support'] = df['low'].rolling(window=max(1, int(market_profile_period)), min_periods=1).min().ffill()
 
         rows_before = len(df)
         required_cols = [c for c in ['open', 'high', 'low', 'close', 'POC', 'VAH', 'VAL', 'er'] if c in df.columns]
@@ -1296,212 +1366,396 @@ def compute_dynamic_center_margin(df: pd.DataFrame, strategy_type: str = "breako
     return round(float(center_margin), 1)
 
 
-def run_interval_comparison(df_60m, lot, data_equity, side_mode="long", symbol="", force_strategy=None, prefer_breakout=False):
-    logic = logicinstance()
-    bt_instance = backtester()
-    results = {}
-    fixed_initial_equity = 100.0
-    os.makedirs("backtest_data", exist_ok=True)
+def simulate_envelope_strategy(
+    df: pd.DataFrame,
+    length: int = 15,
+    lower_pct: float = 2.0,
+    upper_pct: float = 2.0,
+    malen: int = 200,
+    max_trades: int = 1,
+    initial_equity: float = 100.0,
+    fee_rate: float = 0.0006
+) -> dict:
+    closes = df["close"].values
+    n = len(closes)
+    if n < max(length, 10):
+        return {"final_pnl": 0.0, "trade_count": 0, "win_rate": 0.0, "DD_max": 0.0, "max_unrealized_loss": 0.0}
+
+    close_s = pd.Series(closes)
+    basis = calc_ema(close_s, length).values
+    mabasis = calc_ema(close_s, malen).values if malen <= n else basis
     
-    if force_strategy and force_strategy.lower() in ["breakout", "range"]:
-        strategy_types = [force_strategy.lower()]
-        discord.print_log(f"⚡ [{symbol}] 戦略強制モード適用: {force_strategy.upper()}_ONLY（爆上げモメンタム候補）")
-    else:
-        strategy_types = ["range", "breakout"]
-    intervals = [60, 120, 180]
-    mp_periods = [12, 24, 36, 48, 60, 72, 96, 120, 144, 168]
-    er_thresholds = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
+    lower = basis * (1.0 - lower_pct / 100.0)
+    upper = basis * (1.0 + upper_pct / 100.0)
     
-    base_cols = ['timestamp', 'open', 'high', 'low', 'close', 'volume']
-    for extra in ['turnover', 'fundingRate', 'funding', 'funding_rate', 'openInterest', 'oi']:
-        if extra in df_60m.columns and extra not in base_cols:
-            base_cols.append(extra)
-    df_raw = df_60m[base_cols].copy()
+    pos_qty = 0.0
+    pos_cost = 0.0
+    avg_price = 0.0
+    pos_count = 0
     
-    for strat in strategy_types:
-        discord.print_log(f"\n====== 戦略: {strat.upper()} の最適化を開始 ======")
-        for interval in intervals:
-            interval_label = f"{interval}m"
-            
-            df_interval = resample_candles(df_raw, interval)
-            
-            if df_interval is None or df_interval.empty or len(df_interval) < 30:
-                continue
-            
-            for mp_period in mp_periods:
-                atr_multi = 1.5
-                
-                df_copy = df_interval.copy()
-                df_copy = logic.make_logic(df_copy, market_profile_period=mp_period, er_threshold=0, strategy_type=strat)
-                
-                for er_th in er_thresholds:
-                    df_run = df_copy.copy()
-                    if strat == "breakout":
-                        df_run['long'] = (
-                            (logic.crossover(df_run['close'], df_run['VAH'])) & 
-                            (df_run['er'] > er_th) & 
-                            (df_run.get('is_vol_surge', True)) & 
-                            (df_run.get('is_fr_favorable', True)) & 
-                            (df_run.get('is_oi_surge', True))
-                        )
-                        df_run['short'] = (logic.crossunder(df_run['close'], df_run['VAL'])) & (df_run['er'] > er_th)
-                    else:
-                        df_run['long'] = (logic.crossover(df_run['close'], df_run['VAL'])) & (df_run['er'] > er_th)
-                        df_run['short'] = (logic.crossunder(df_run['close'], df_run['VAH'])) & (df_run['er'] > er_th)
-                        
-                    eval_bars = max(20, 120 * 60 // interval)
-                    df_eval = df_run.tail(eval_bars).reset_index(drop=True)
-                    
-                    label = f"{strat}_{interval_label}_MP{mp_period}_ER{er_th}"
-                    
-                    # 動的中心値マージンの算出
-                    sl_center = compute_dynamic_center_margin(df_eval, strategy_type=strat, side_mode=side_mode)
-                    
-                    result_df = bt_instance.run_backtest(
-                        df=df_eval,
-                        lot=lot,
-                        data_equity=fixed_initial_equity,
-                        side_mode=side_mode,
-                        mp_period=mp_period,
-                        atr_tp_multi=atr_multi,
-                        er_threshold=er_th,
-                        strategy_type=strat,
-                        sl_margin_pct=sl_center
-                    )
-                    
-                    metrics = getattr(bt_instance, 'last_metrics', {})
-                    final_pnl = result_df['pnl'].iloc[-1] if not result_df.empty and 'pnl' in result_df.columns else 0
-                    
-                    results[label] = {
-                        'strategy_type': strat,
-                        'df': result_df,
-                        'final_pnl': final_pnl,
-                        'interval': interval,
-                        'mp_period': mp_period,
-                        'er_threshold': er_th,
-                        'atr_multi': atr_multi,
-                        'sl_center_margin': sl_center,
-                        'DD_max': metrics.get('DD_max', 0),
-                        'DD_per': metrics.get('DD_per', 0),
-                        'max_unrealized_loss': metrics.get('max_unrealized_loss', 0),
-                        'win_rate': metrics.get('win_rate', 0),
-                        'PF': metrics.get('PF', float('inf')),
-                        'trade_count': metrics.get('trade_count', 0)
-                    }
-                    print(f"{label}: PnL={final_pnl:.4f} | DD={metrics.get('DD_max', 0):.4f} | 取引={metrics.get('trade_count', 0)} (SL={sl_center}%)")
-                    time.sleep(0.002)
+    cum_realized_pnl = 0.0
+    cum_fees = 0.0
+    trades = []
+    equity_curve = [initial_equity]
+    unrealized_list = [0.0]
+    exec_history = []
+    
+    trade_size_usdt = initial_equity / max_trades
+    
+    for i in range(1, n):
+        c = closes[i]
+        b = basis[i]
+        low_band = lower[i]
+        ts = df["timestamp"].iloc[i] if "timestamp" in df.columns else i
         
-    if not results:
-        discord.print_log("全バックテスト結果なし")
-        return results, "range", 60, 48, 0.3, 1.5
+        # 決済チェック (close > basis かつ avg_price 以上で利確)
+        if pos_qty > 0:
+            if c > b and c > avg_price:
+                sell_val = pos_qty * c
+                fee = sell_val * fee_rate
+                pnl = sell_val - pos_cost - fee
+                cum_realized_pnl += pnl
+                cum_fees += fee
+                trades.append(pnl)
+                exec_history.append({"timestamp": ts, "price": c, "size": -pos_qty, "type": "SELL"})
+                pos_qty = 0.0
+                pos_cost = 0.0
+                avg_price = 0.0
+                pos_count = 0
+                
+        # エントリーチェック (close < lower)
+        if pos_count < max_trades:
+            can_enter = False
+            if pos_count == 0:
+                if c < low_band:
+                    can_enter = True
+            else:
+                add_pct = calc_add_pct(pos_count)
+                if c < low_band and c < avg_price * (1.0 - add_pct):
+                    can_enter = True
+                    
+            if can_enter:
+                buy_val = trade_size_usdt
+                qty = buy_val / c
+                fee = buy_val * fee_rate
+                cum_fees += fee
+                pos_cost += buy_val
+                pos_qty += qty
+                avg_price = pos_cost / pos_qty
+                pos_count += 1
+                exec_history.append({"timestamp": ts, "price": c, "size": qty, "type": "BUY"})
+                
+        unrealized = (pos_qty * c - pos_cost) if pos_qty > 0 else 0.0
+        unrealized_list.append(unrealized)
+        current_eq = initial_equity + cum_realized_pnl + unrealized - cum_fees
+        equity_curve.append(current_eq)
+        
+    eq_series = pd.Series(equity_curve)
+    peak = eq_series.cummax()
+    dd = peak - eq_series
+    dd_max = float(dd.max()) if not dd.empty else 0.0
     
-    active_results = {k: v for k, v in results.items() if v.get('trade_count', 0) > 0}
+    trade_cnt = len(trades)
+    win_cnt = sum(1 for t in trades if t > 0)
+    win_rate = (win_cnt / trade_cnt * 100.0) if trade_cnt > 0 else 0.0
+    final_pnl = float(equity_curve[-1]) - initial_equity
+    min_unrealized = float(min(unrealized_list)) if unrealized_list else 0.0
+    
+    return {
+        "final_pnl": final_pnl,
+        "trade_count": trade_cnt,
+        "win_rate": win_rate,
+        "DD_max": dd_max,
+        "max_unrealized_loss": min_unrealized,
+        "strategy": "envelope",
+        "equity_curve": equity_curve,
+        "exec_history": exec_history,
+        "params": {
+            "length": length,
+            "lower_pct": lower_pct,
+            "upper_pct": upper_pct,
+            "malen": malen,
+            "max_trades": max_trades
+        }
+    }
+
+
+def simulate_rsima_strategy(
+    df: pd.DataFrame,
+    rsi_len: int = 9,
+    lma_len: int = 7,
+    lEp: float = 40.0,
+    lCp: float = 60.0,
+    max_trades: int = 1,
+    initial_equity: float = 100.0,
+    fee_rate: float = 0.0006
+) -> dict:
+    closes = df["close"].values
+    n = len(closes)
+    if n < max(rsi_len, lma_len) + 5:
+        return {"final_pnl": 0.0, "trade_count": 0, "win_rate": 0.0, "DD_max": 0.0, "max_unrealized_loss": 0.0}
+
+    close_s = pd.Series(closes)
+    rsi_s = calc_rsi(close_s, rsi_len)
+    lrsiMA_s = calc_ema(rsi_s, lma_len)
+    
+    rsi = rsi_s.values
+    lrsiMA = lrsiMA_s.values
+    
+    pos_qty = 0.0
+    pos_cost = 0.0
+    avg_price = 0.0
+    pos_count = 0
+    
+    cum_realized_pnl = 0.0
+    cum_fees = 0.0
+    trades = []
+    equity_curve = [initial_equity]
+    unrealized_list = [0.0]
+    exec_history = []
+    
+    trade_size_usdt = initial_equity / max_trades
+    
+    for i in range(1, n):
+        c = closes[i]
+        r = rsi[i]
+        r_prev = rsi[i-1]
+        ma_val = lrsiMA[i]
+        ma_prev = lrsiMA[i-1]
+        ts = df["timestamp"].iloc[i] if "timestamp" in df.columns else i
+        
+        # ゴールデンクロス判定: rsi > lrsiMA かつ 前足では rsi <= lrsiMA
+        gc = (r > ma_val) and (r_prev <= ma_prev)
+        
+        # 決済チェック: rsi > lCp かつ c > avg_price で利確
+        if pos_qty > 0:
+            if r > lCp and c > avg_price:
+                sell_val = pos_qty * c
+                fee = sell_val * fee_rate
+                pnl = sell_val - pos_cost - fee
+                cum_realized_pnl += pnl
+                cum_fees += fee
+                trades.append(pnl)
+                exec_history.append({"timestamp": ts, "price": c, "size": -pos_qty, "type": "SELL"})
+                pos_qty = 0.0
+                pos_cost = 0.0
+                avg_price = 0.0
+                pos_count = 0
+                
+        # エントリーチェック: lrsiMA < lEp and rsi < lCp
+        if pos_count < max_trades and gc:
+            if ma_val < lEp and r < lCp:
+                can_enter = False
+                if pos_count == 0:
+                    can_enter = True
+                else:
+                    add_pct = calc_add_pct(pos_count)
+                    if c < avg_price * (1.0 - add_pct):
+                        can_enter = True
+                        
+                if can_enter:
+                    buy_val = trade_size_usdt
+                    qty = buy_val / c
+                    fee = buy_val * fee_rate
+                    cum_fees += fee
+                    pos_cost += buy_val
+                    pos_qty += qty
+                    avg_price = pos_cost / pos_qty
+                    pos_count += 1
+                    exec_history.append({"timestamp": ts, "price": c, "size": qty, "type": "BUY"})
+                    
+        unrealized = (pos_qty * c - pos_cost) if pos_qty > 0 else 0.0
+        unrealized_list.append(unrealized)
+        current_eq = initial_equity + cum_realized_pnl + unrealized - cum_fees
+        equity_curve.append(current_eq)
+        
+    eq_series = pd.Series(equity_curve)
+    peak = eq_series.cummax()
+    dd = peak - eq_series
+    dd_max = float(dd.max()) if not dd.empty else 0.0
+    
+    trade_cnt = len(trades)
+    win_cnt = sum(1 for t in trades if t > 0)
+    win_rate = (win_cnt / trade_cnt * 100.0) if trade_cnt > 0 else 0.0
+    final_pnl = float(equity_curve[-1]) - initial_equity
+    min_unrealized = float(min(unrealized_list)) if unrealized_list else 0.0
+    
+    return {
+        "final_pnl": final_pnl,
+        "trade_count": trade_cnt,
+        "win_rate": win_rate,
+        "DD_max": dd_max,
+        "max_unrealized_loss": min_unrealized,
+        "strategy": "rsima",
+        "equity_curve": equity_curve,
+        "exec_history": exec_history,
+        "params": {
+            "rsi_len": rsi_len,
+            "lma_len": lma_len,
+            "lEp": lEp,
+            "lCp": lCp,
+            "max_trades": max_trades
+        }
+    }
+
+
+def optimize_symbol_strategy(
+    df: pd.DataFrame,
+    symbol: str = "",
+    max_trades: int = 1,
+    initial_equity: float = 100.0,
+    force_strategy: Optional[str] = None
+) -> Tuple[str, Dict[str, Any], Dict[str, Any], list]:
+    """
+    対象銘柄に対して Envelope 戦略と RSI MA 戦略のグリッドサーチを実行し、
+    PnLが最大となる戦略と最適パラメータを決定する。
+    """
+    results = {}
+    
+    # 1. Envelope 戦略グリッドサーチ
+    if force_strategy is None or force_strategy.lower() == "envelope":
+        env_lengths = [10, 15, 20, 25]
+        env_lower_pcts = [1.5, 2.0, 2.5, 3.0]
+        env_malens = [100, 200]
+        
+        for l in env_lengths:
+            for lp in env_lower_pcts:
+                for ml in env_malens:
+                    res = simulate_envelope_strategy(
+                        df, length=l, lower_pct=lp, upper_pct=lp, malen=ml,
+                        max_trades=max_trades, initial_equity=initial_equity
+                    )
+                    label = f"Envelope_L{l}_P{lp}_MA{ml}"
+                    results[label] = res
+
+    # 2. RSIMA 戦略グリッドサーチ
+    if force_strategy is None or force_strategy.lower() == "rsima":
+        rsi_lengths = [7, 9, 14]
+        lma_lengths = [5, 7, 10]
+        lEps = [30, 35, 40, 45]
+        lCps = [55, 60, 65, 70]
+        
+        for rl in rsi_lengths:
+            for ml in lma_lengths:
+                for ep in lEps:
+                    for cp in lCps:
+                        res = simulate_rsima_strategy(
+                            df, rsi_len=rl, lma_len=ml, lEp=ep, lCp=cp,
+                            max_trades=max_trades, initial_equity=initial_equity
+                        )
+                        label = f"RSIMA_R{rl}_M{ml}_Ep{ep}_Cp{cp}"
+                        results[label] = res
+
+    if not results:
+        default_res = {
+            "strategy": "envelope",
+            "final_pnl": 0.0,
+            "trade_count": 0,
+            "win_rate": 0.0,
+            "DD_max": 0.0,
+            "max_unrealized_loss": 0.0,
+            "params": {"length": 15, "lower_pct": 2.0, "upper_pct": 2.0, "malen": 200, "max_trades": max_trades}
+        }
+        return "envelope", default_res["params"], default_res, []
+
+    active_results = {k: v for k, v in results.items() if v.get("trade_count", 0) > 0}
     eval_pool = active_results if active_results else results
 
-    best_pnl_key = max(eval_pool.keys(), key=lambda x: eval_pool[x]['final_pnl'])
-    best_pnl_disp = f"{symbol}_{best_pnl_key}" if (symbol and not str(best_pnl_key).startswith(symbol)) else best_pnl_key
-    best_pnl_msg = f"★ PnL最大: {best_pnl_disp} (PnL: {eval_pool[best_pnl_key]['final_pnl']:.4f} USDT, 取引: {eval_pool[best_pnl_key].get('trade_count', 0)}回)"
-    best_risk_key = min(eval_pool.keys(), key=lambda x: eval_pool[x]['DD_max'] if eval_pool[x]['DD_max'] == eval_pool[x]['DD_max'] else float('inf'))
-    best_risk_disp = f"{symbol}_{best_risk_key}" if (symbol and not str(best_risk_key).startswith(symbol)) else best_risk_key
-    best_risk_msg = f"★ リスク最小: {best_risk_disp} (最大DD: {eval_pool[best_risk_key]['DD_max']:.4f})"
-    
-    range_active = {k: v for k, v in results.items() if v['strategy_type'] == 'range' and v.get('trade_count', 0) > 0}
-    best_range_key = max(range_active.keys(), key=lambda x: range_active[x]['final_pnl']) if range_active else None
+    best_key = max(eval_pool.keys(), key=lambda k: eval_pool[k]["final_pnl"])
+    best_res = eval_pool[best_key]
+    best_strat = best_res["strategy"]
+    best_params = best_res["params"]
 
-    breakout_active = {k: v for k, v in results.items() if v['strategy_type'] == 'breakout' and v.get('trade_count', 0) > 0}
-    best_breakout_key = max(breakout_active.keys(), key=lambda x: breakout_active[x]['final_pnl']) if breakout_active else None
-    
-    discord.print_log("\n====== 戦略比較結果 ======")
-    if best_range_key:
-        r_disp = f"{symbol}_{best_range_key}" if (symbol and not str(best_range_key).startswith(symbol)) else best_range_key
-        discord.print_log(f"【レンジ戦略ベスト】: {r_disp} -> PnL: {results[best_range_key]['final_pnl']:.4f} USDT (取引: {results[best_range_key]['trade_count']}回)")
-    else:
-        discord.print_log("【レンジ戦略ベスト】: 該当なし (期間中トレードなし)")
+    sorted_results = sorted(results.items(), key=lambda x: x[1]["final_pnl"], reverse=True)
+    top10 = sorted_results[:10]
 
-    if best_breakout_key:
-        b_disp = f"{symbol}_{best_breakout_key}" if (symbol and not str(best_breakout_key).startswith(symbol)) else best_breakout_key
-        discord.print_log(f"【ブレイクアウト戦略ベスト】: {b_disp} -> PnL: {results[best_breakout_key]['final_pnl']:.4f} USDT (取引: {results[best_breakout_key]['trade_count']}回)")
-    else:
-        discord.print_log("【ブレイクアウト戦略ベスト】: 該当なし (期間中トレードなし)")
+    return best_strat, best_params, best_res, top10
+
+
+def run_interval_comparison(df_60m, lot=1.0, data_equity=100.0, side_mode="long", symbol="", force_strategy=None, prefer_breakout=False, max_trades=1):
+    """
+    エンベロープ戦略および RSI MA 戦略の網羅的グリッドサーチを実行し、
+    各銘柄のPnLが最大となる戦略と最適パラメータを選定する。
+    """
+    logic = logicinstance()
+    os.makedirs("backtest_data", exist_ok=True)
+    fixed_initial_equity = float(data_equity) if (data_equity is not None and data_equity > 0) else 100.0
     
-    discord.print_log("【時間足×戦略タイプ×MP期間×ER比較バックテスト結果 (Top 10)】")
-    header = f"{'設定':<35} {'PnL':>11} {'DD_max':>8} {'含み損':>8} {'取引':>6}"
+    discord.print_log(f"\n====== [{symbol}] エンベロープ ＆ RSI MA 個別最適化（PnL最大化）開始 ======")
+    best_strat, best_params, best_res, top10 = optimize_symbol_strategy(
+        df=df_60m,
+        symbol=symbol,
+        max_trades=max_trades,
+        initial_equity=fixed_initial_equity,
+        force_strategy=force_strategy
+    )
+    
+    # 探索結果辞書の再フォーマット（呼び出し元互換用）
+    results = {}
+    for label, data in top10:
+        results[label] = {
+            'strategy_type': data['strategy'],
+            'final_pnl': data['final_pnl'],
+            'interval': 60,
+            'mp_period': data['params'].get('malen', data['params'].get('lma_len', 7)),
+            'er_threshold': data['params'].get('lower_pct', data['params'].get('lEp', 40)),
+            'atr_multi': 1.5,
+            'sl_center_margin': data['params'].get('lower_pct', 2.0),
+            'DD_max': data.get('DD_max', 0.0),
+            'max_unrealized_loss': data.get('max_unrealized_loss', 0.0),
+            'win_rate': data.get('win_rate', 0.0),
+            'trade_count': data.get('trade_count', 0),
+            'params': data['params']
+        }
+    
+    discord.print_log("【個別最適化バックテスト結果 (Top 10)】")
+    header = f"{'設定':<35} {'PnL [USDT]':>12} {'DD_max':>8} {'勝率':>7} {'取引':>6}"
     separator = "-" * 73
-    
-    sorted_results = sorted(results.items(), key=lambda item: item[1]['final_pnl'], reverse=True)
-    top_results = sorted_results[:10]
-    
     all_rows = []
-    for label, data in top_results:
+    for label, data in top10:
         row_disp = f"{symbol}_{label}" if (symbol and not str(label).startswith(symbol)) else label
-        all_rows.append(f"{row_disp:<35} {data['final_pnl']:>11.4f} {data['DD_max']:>8.4f} {data['max_unrealized_loss']:>8.4f} {data['trade_count']:>6}")
-    
+        all_rows.append(f"{row_disp:<35} {data['final_pnl']:>+12.4f} {data['DD_max']:>8.4f} {data['win_rate']:>6.1f}% {data['trade_count']:>6}")
     table_lines = ["```", header, separator] + all_rows + ["```"]
     discord.print_log("\n".join(table_lines))
     
-    time.sleep(1.0)
-    discord.print_log(best_pnl_msg)
-    time.sleep(1.0)
-    discord.print_log(best_risk_msg)
-    
-    # 爆上げモメンタム候補（prefer_breakout=True）の場合のブレイクアウト優先採用判定
-    if prefer_breakout and best_breakout_key:
-        bo_data = results[best_breakout_key]
-        rg_data = results[best_range_key] if best_range_key else None
-        # ブレイクアウトでプラス収益（> 100 USDT）かつ取引実績がある場合
-        if bo_data['final_pnl'] > 100.0 and bo_data.get('trade_count', 0) > 0:
-            # レンジのPnLに対して80%以上あれば、爆発力のあるブレイクアウトを優先採用
-            if not rg_data or bo_data['final_pnl'] >= rg_data['final_pnl'] * 0.80:
-                best_pnl_key = best_breakout_key
-                best_pnl_disp = f"{symbol}_{best_pnl_key}" if (symbol and not str(best_pnl_key).startswith(symbol)) else best_pnl_key
-                discord.print_log(f"🚀 [{symbol}] 爆上げモメンタム優遇: BREAKOUT戦略を優先採用! (ブレイクアウト: {bo_data['final_pnl']:.2f} USDT vs レンジ: {rg_data['final_pnl'] if rg_data else 0:.2f} USDT)")
+    best_disp = f"{symbol}_{best_strat.upper()}"
+    discord.print_log(f"★ PnL最大選定: {best_disp} -> 純利益: {best_res['final_pnl']:+.4f} USDT (勝率: {best_res['win_rate']:.1f}%, 取引: {best_res['trade_count']}回, 最大DD: {best_res['DD_max']:.4f})")
+    discord.print_log(f"   └ 採用パラメータ: {best_params}")
 
-    best_pnl_data = results[best_pnl_key]
-    best_strategy = best_pnl_data['strategy_type']
-    best_interval = best_pnl_data['interval']
-    best_mp = best_pnl_data['mp_period']
-    best_er = best_pnl_data['er_threshold']
-    best_atr = best_pnl_data['atr_multi']
-    best_margin = best_pnl_data.get('sl_center_margin', 1.0)
-    
-    # 最適化設定（動的マージン適用）でのチャート生成・描画
-    df_interval = resample_candles(df_raw, best_interval)
-    df_logic = logic.make_logic(df_interval, market_profile_period=best_mp, er_threshold=0, strategy_type=best_strategy)
-    df_run_margin = df_logic.copy()
-    if best_strategy == "breakout":
-        df_run_margin['long'] = (
-            (logic.crossover(df_run_margin['close'], df_run_margin['VAH'])) & 
-            (df_run_margin['er'] > best_er) & 
-            (df_run_margin.get('is_vol_surge', True)) & 
-            (df_run_margin.get('is_fr_favorable', True)) & 
-            (df_run_margin.get('is_oi_surge', True))
-        )
-        df_run_margin['short'] = (logic.crossunder(df_run_margin['close'], df_run_margin['VAL'])) & (df_run_margin['er'] > best_er)
-    else:
-        df_run_margin['long'] = (logic.crossover(df_run_margin['close'], df_run_margin['VAL'])) & (df_run_margin['er'] > best_er)
-        df_run_margin['short'] = (logic.crossunder(df_run_margin['close'], df_run_margin['VAH'])) & (df_run_margin['er'] > best_er)
-    
-    full_margin_df = bt_instance.run_backtest(
-        df=df_run_margin, lot=lot, data_equity=fixed_initial_equity, side_mode=side_mode,
-        mp_period=best_mp, atr_tp_multi=best_atr, er_threshold=best_er,
-        strategy_type=best_strategy, sl_margin_pct=best_margin
-    )
-    # 1. 5日間最適化チャート (直近120h)
-    eval_bars_5d = max(20, 120 * 60 // best_interval)
-    chart_5d_df = full_margin_df.tail(eval_bars_5d).reset_index(drop=True)
-    best_csv = f"backtest_data/klines100_{best_pnl_key}_margin{best_margin}.csv"
-    chart_5d_df.to_csv(best_csv, index=False)
-    discord.plot_backtest(label=f"Margin{best_margin}%", csv_file=best_csv, symbol=symbol)
-    
-    # 2. 10日間長期チャート (直近240h: 同一データフレームから完全転写)
-    eval_bars_10d = min(len(full_margin_df), max(30, 240 * 60 // best_interval))
-    chart_10d_df = full_margin_df.tail(eval_bars_10d).reset_index(drop=True)
-    bg_csv = f"backtest_data/klines100_{symbol}_bingx.csv"
-    chart_10d_df.to_csv(bg_csv, index=False)
-    discord.plot_backtest(label=f"BingX_{symbol}", csv_file=bg_csv, symbol=symbol)
+    # バックテストチャートの生成
+    try:
+        df_chart = df_60m.copy()
+        df_chart['timestamp'] = pd.to_datetime(df_chart['timestamp'])
+        if 'equity_curve' in best_res and len(best_res['equity_curve']) == len(df_chart):
+            df_chart['pnl'] = best_res['equity_curve']
+            df_chart['PL_graph'] = best_res['equity_curve']
+        else:
+            df_chart['pnl'] = fixed_initial_equity + best_res['final_pnl']
+            df_chart['PL_graph'] = fixed_initial_equity + best_res['final_pnl']
+            
+        df_chart['exec_buy_price'] = np.nan
+        df_chart['exec_sell_price'] = np.nan
+        for ex in best_res.get('exec_history', []):
+            ex_ts = pd.to_datetime(ex['timestamp'])
+            mask = df_chart['timestamp'] == ex_ts
+            if mask.any():
+                if ex['size'] > 0:
+                    df_chart.loc[mask, 'exec_buy_price'] = ex['price']
+                else:
+                    df_chart.loc[mask, 'exec_sell_price'] = ex['price']
+                    
+        eval_bars_10d = min(len(df_chart), 240)
+        chart_10d_df = df_chart.tail(eval_bars_10d).reset_index(drop=True)
+        bg_csv = f"backtest_data/klines100_{symbol}_bingx.csv"
+        chart_10d_df.to_csv(bg_csv, index=False)
+        discord.plot_backtest(label=f"BingX_{symbol}_{best_strat.upper()}", csv_file=bg_csv, symbol=symbol)
+    except Exception as ch_err:
+        print(f"[Chart Error] {symbol}: {ch_err}")
 
-    discord.print_log(f"\n★ 採用設定: 戦略={best_strategy.upper()} {side_mode.upper()}, 時間足={best_interval}m, MP期間={best_mp}, ER閾値={best_er}, Margin={best_margin}% (出来高プロファイル動的適応)")
-    return results, best_strategy, best_interval, best_mp, best_er, best_margin
+    cand_mp = best_params.get('malen', best_params.get('lma_len', 7))
+    cand_er = best_params.get('lower_pct', best_params.get('lEp', 40))
+    cand_margin = best_params.get('lower_pct', 2.0)
+    return results, best_strat, 60, cand_mp, cand_er, cand_margin
 
 
 class VPTrailingManager:

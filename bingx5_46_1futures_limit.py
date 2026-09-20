@@ -84,13 +84,32 @@ BINGX_TARGET_POSITION_VALUE_USDT = 15.0
 TARGET_POSITION_VALUE_USDT = BINGX_TARGET_POSITION_VALUE_USDT
 LEVERAGE_FACTOR = 10.0
 MAX_ACTIVE_POSITIONS: int = 2  # 最大同時保有ポジション数 (資金効率と分散を最適化)
-MAX_SELECTED_SYMBOLS: int = 10  # 最大選定・監視銘柄数 (10銘柄体制へ拡張)
+MAX_SELECTED_SYMBOLS: int = 5  # 最大選定・監視銘柄数 (固定5銘柄)
 
-# [ 4 ] 定期銘柄選定・リセット時刻（JST時間: 0〜23時）
+# [ 4 ] ナンピン数設定 (Pyramiding / Scale-in count: 1〜10、初期値: 1)
+MAX_TRADES_COUNT: int = 1
+
+# [ 5 ] 固定選定銘柄
+FIXED_SYMBOLS: List[str] = ["HYPE-USDT", "NEAR-USDT", "ZEC-USDT", "ARB-USDT", "UNI-USDT"]
+
+# [ 6 ] 定期銘柄選定・リセット時刻（JST時間: 0〜23時）
 #       デフォルト: [1, 9, 17] (01:00, 09:00, 17:00 JST / 8時間ごと・主要セッション＆FR節目)。
 #       CLI引数 (--analysis-hours / --reset-hours / --reset-hour) での上書き指定も可能。
 ANALYSIS_HOURS: List[int] = [1, 9, 17]
 DAILY_ANALYSIS_MINUTE = 0
+
+# コマンドライン引数からのナンピン数オーバーライド
+for _idx, _arg in enumerate(sys.argv):
+    if _arg in ("--max-trades", "--pyramiding", "--nanpin") and _idx + 1 < len(sys.argv):
+        try:
+            MAX_TRADES_COUNT = max(1, min(10, int(sys.argv[_idx + 1].strip())))
+        except ValueError:
+            pass
+    elif _arg.startswith("--max-trades=") or _arg.startswith("--pyramiding=") or _arg.startswith("--nanpin="):
+        try:
+            MAX_TRADES_COUNT = max(1, min(10, int(_arg.split("=")[1].strip())))
+        except ValueError:
+            pass
 
 # コマンドライン引数からの選定時刻オーバーライド処理
 for _idx, _arg in enumerate(sys.argv):
@@ -772,85 +791,56 @@ async def validate_profitable_candidates(trade_side: str, mode: str, base_symbol
     銘柄ごとの個別最適化パラメータ辞書 (symbol_params_map) を生成・返却する。
     """
     from bingx5_46_2api import api_bingx
-    from bingx5_46_3logic import run_interval_comparison, backtester, logicinstance, resample_candles
+    from bingx5_46_3logic import run_interval_comparison, logicinstance, resample_candles
 
-    discord.print_log("候補銘柄（クジラ優先上位）の個別パラメータ最適化＆バックテスト検証を開始します...")
-    all_candidates_info = await select_top_bingx_symbols(top_n=15, mode=mode)
-    all_candidates = [info["symbol"] for info in all_candidates_info]
+    discord.print_log("👑 【固定5銘柄 MTF完全ロング判定 ＆ Envelope / RSI MA 個別最適化】を開始します...")
     
+    # 1. trade_eligible_symbols.json から MTF 完全ロング判定合格銘柄をロード
+    eligible_file = Path(__file__).resolve().parent / "Data" / "trade_eligible_symbols.json"
+    target_cands = []
+    if eligible_file.exists():
+        try:
+            with open(eligible_file, "r", encoding="utf-8") as ef:
+                el_data = json.load(ef)
+                target_cands = el_data.get("eligible_symbols", [])
+                discord.print_log(f"   [MTF判定済] トレード適格銘柄: {', '.join(target_cands) if target_cands else 'なし (全銘柄見送り)'}")
+        except Exception as e:
+            discord.print_log(f"   [Warning] eligible_symbols 読込失敗: {e}")
+
+    # ファイル未生成または空の場合は固定5銘柄をデフォルト対象とする
+    if not target_cands:
+        target_cands = list(FIXED_SYMBOLS)
+        discord.print_log(f"   [デフォルト採用] 固定5銘柄を最適化対象に設定: {', '.join(target_cands)}")
+
     profitable_cands = []
     symbol_params_map: Dict[str, Dict[str, Any]] = {}
     default_best_params: Dict[str, Any] = {
-        "strategy": "breakout",
+        "strategy": "rsima",
         "interval": 60,
-        "mp": 48,
-        "er": 0.1,
-        "margin": 8.0,
+        "mp": 7,
+        "er": 40.0,
+        "margin": 2.0,
+        "params": {"rsi_len": 9, "lma_len": 7, "lEp": 40.0, "lCp": 60.0, "max_trades": MAX_TRADES_COUNT}
     }
 
-    for cand_idx, cand in enumerate(all_candidates):
-        if cand.upper() == "BTC" or cand.upper().replace("-USDT", "").replace("USDT", "") == "BTC":
-            continue
-
-        # クジラ判定で売り優勢（SHORT_ONLY）の銘柄はロング専用戦略の選定対象から除外
+    for cand_idx, cand in enumerate(target_cands):
         cand_whale_info = get_whale_sentiment_info(cand)
         cand_whale_sig = cand_whale_info.get("signal", "NEUTRAL")
         if cand_whale_sig == "SHORT_ONLY":
-            discord.print_log(f"   [スキップ] {cand}: クジラ判定が売り優勢 ({cand_whale_sig}) のため選定候補から除外。")
+            discord.print_log(f"   [スキップ] {cand}: クジラ判定が売り優勢 ({cand_whale_sig}) のため選定対象から除外。")
             continue
 
-        if len(profitable_cands) >= MAX_SELECTED_SYMBOLS:
-            break
-            
         cand_df = await load_local_or_api_candles(cand, limit=300)
+        discord.print_log(f"個別最適化中: {cand} (ナンピン数: {MAX_TRADES_COUNT}) ...")
         
-        # 爆上げモメンタム候補（prefer_breakout）の判定:
-        # 1. 前兆スコア上位3銘柄 (cand_idx < 3)
-        # 2. または出来高急増（直近出来高が24h平均の2.0倍以上）かつクジラ買い優勢 (cand_whale_sig == "LONG_ONLY")
-        is_momentum_candidate = (cand_idx < 3)
-        if not is_momentum_candidate and cand_df is not None and len(cand_df) >= 24:
-            vol_mean_24h = float(cand_df["volume"].tail(24).mean())
-            curr_vol = float(cand_df["volume"].iloc[-1])
-            if vol_mean_24h > 0 and (curr_vol / vol_mean_24h >= 2.0) and cand_whale_sig == "LONG_ONLY":
-                is_momentum_candidate = True
-
-        momentum_tag = " 🚀[爆上げモメンタム候補: BREAKOUT優先]" if is_momentum_candidate else ""
-        discord.print_log(f"個別最適化中: {cand} (Rank #{cand_idx+1}{momentum_tag}) ...")
-        
-        if cand_df is not None and not cand_df.empty and len(cand_df) > 30:
-            # 下落トレンド除外チェック (LONG ONLY 厳格安全フィルター)
-            curr_c = float(cand_df["close"].iloc[-1])
-            ret_24h = (curr_c - float(cand_df["close"].iloc[-24])) / float(cand_df["close"].iloc[-24]) if len(cand_df) >= 24 else 0.0
-            ret_72h = (curr_c - float(cand_df["close"].iloc[-72])) / float(cand_df["close"].iloc[-72]) if len(cand_df) >= 72 else ret_24h
-            if ret_72h < -0.07 or ret_24h < -0.05:
-                discord.print_log(f"   [スキップ] {cand}: 直近下落トレンド (24h: {ret_24h*100:+.1f}%, 3d: {ret_72h*100:+.1f}%) のため選定候補から除外。")
-                continue
-
-            # 30d / 10d / 5d ノーマライズ前半高値下落型チェック
-            is_peak_first_half = False
-            for w_name, w_h in [("5d", 120), ("10d", 240), ("30d", 720)]:
-                if len(cand_df) >= 24:
-                    sub_c = cand_df["close"].tail(w_h).astype(float)
-                    if len(sub_c) >= 24 and sub_c.iloc[0] > 0:
-                        norm_c = sub_c / sub_c.iloc[0]
-                        p_idx = int(norm_c.argmax())
-                        p_ratio = p_idx / len(norm_c)
-                        f_norm = float(norm_c.iloc[-1])
-                        p_val = float(norm_c.max())
-                        if p_ratio < 0.50 and (f_norm < p_val * 0.90) and (f_norm < 1.0 or f_norm < p_val * 0.80):
-                            is_peak_first_half = True
-                            discord.print_log(f"   [スキップ] {cand}: {w_name}ノーマライズ前半高値下落型 (peak={p_ratio:.2f}, {p_val:.2f}x->{f_norm:.2f}x) のため除外。")
-                            break
-            if is_peak_first_half:
-                continue
-
+        if cand_df is not None and not cand_df.empty and len(cand_df) > 20:
             try:
                 results, cand_strat, cand_inv, cand_mp, cand_er, cand_margin = run_interval_comparison(
                     df_60m=cand_df, lot=1.0, data_equity=100.0, side_mode=trade_side, symbol=cand,
-                    prefer_breakout=is_momentum_candidate
+                    max_trades=MAX_TRADES_COUNT
                 )
                 
-                # 有効な取引がある最良結果を抽出
+                # 有効な最良結果を抽出
                 active_results = {k: v for k, v in results.items() if v.get('trade_count', 0) > 0}
                 if active_results:
                     best_key = max(active_results.keys(), key=lambda x: active_results[x]['final_pnl'])
@@ -859,15 +849,17 @@ async def validate_profitable_candidates(trade_side: str, mode: str, base_symbol
                     trade_cnt = int(best_res.get('trade_count', 0))
                     win_rt = float(best_res.get('win_rate', 0.0))
                     max_dd = float(best_res.get('DD_max', 0.0))
+                    cand_p = best_res.get('params', {})
                 else:
                     cand_pnl = 0.0
                     trade_cnt = 0
                     win_rt = 0.0
                     max_dd = 0.0
+                    cand_p = {}
 
                 cand_params = {
                     "strategy": cand_strat,
-                    "interval": cand_inv,
+                    "interval": 60,
                     "mp": cand_mp,
                     "er": cand_er,
                     "margin": cand_margin,
@@ -875,57 +867,24 @@ async def validate_profitable_candidates(trade_side: str, mode: str, base_symbol
                     "trade_count": trade_cnt,
                     "win_rate": win_rt,
                     "max_dd": max_dd,
+                    "params": cand_p
                 }
                 symbol_params_map[cand] = cand_params
 
-                # 基準残高100ドルに対してプラス収支かつ取引実績あり
-                if cand_pnl > 100.0 and trade_cnt > 0:
-                    profit_val = cand_pnl - 100.0
+                if cand_pnl > 0 and trade_cnt > 0:
                     discord.print_log(
-                        f"   [合格] {cand}: 戦略={cand_strat.upper()} {trade_side.upper()} "
-                        f"(MP={cand_mp}, ER={cand_er}, Margin={cand_margin}%, {cand_inv}m) -> "
-                        f"純利益: +${profit_val:.2f} (取引: {trade_cnt}回, 勝率: {win_rt:.1f}%)"
+                        f"   [合格 🟢] {cand}: 戦略={cand_strat.upper()} | "
+                        f"純利益: +${cand_pnl:.2f} USDT (取引: {trade_cnt}回, 勝率: {win_rt:.1f}%, DD: {max_dd:.2f})"
                     )
                     profitable_cands.append(cand)
-                    
-                    # 合格銘柄の長期バックテストチャートを出力
-                    try:
-                        bt = backtester()
-                        logic = logicinstance()
-                        df_interval = resample_candles(cand_df, int(cand_inv))
-                        df_logic = logic.make_logic(
-                            df_interval,
-                            market_profile_period=cand_mp,
-                            er_threshold=cand_er,
-                            strategy_type=cand_strat,
-                        )
-                        full_cand_bt = bt.run_backtest(
-                            df=df_logic,
-                            lot=1.0,
-                            data_equity=100.0,
-                            side_mode=trade_side,
-                            mp_period=cand_mp,
-                            atr_tp_multi=1.5,
-                            er_threshold=cand_er,
-                            strategy_type=cand_strat,
-                            sl_margin_pct=cand_margin,
-                        )
-                        eval_bars_10d = min(len(full_cand_bt), max(30, 240 * 60 // int(cand_inv if cand_inv else 60)))
-                        chart_10d_df = full_cand_bt.tail(eval_bars_10d).reset_index(drop=True)
-                        bg_csv = f"backtest_data/klines100_{cand}_bingx.csv"
-                        chart_10d_df.to_csv(bg_csv, index=False)
-                        discord.plot_backtest(label=f"BingX_{cand}", csv_file=bg_csv, symbol=cand)
-                    except Exception as ch_err:
-                        print(f"Cand chart error {cand}: {ch_err}")
                 else:
-                    discord.print_log(f"   [不合格] {cand}: PnL = ${cand_pnl:.2f} (取引: {trade_cnt}回)")
+                    discord.print_log(f"   [不合格 🔴] {cand}: PnL = ${cand_pnl:.2f} (取引: {trade_cnt}回)")
 
             except Exception as opt_err:
                 discord.print_log(f"   [最適化エラー] {cand}: {opt_err}")
 
         await asyncio.sleep(0.05)
 
-    # 1位または合格リストから代表パラメータを設定
     if profitable_cands:
         first_sym = profitable_cands[0]
         default_best_params = symbol_params_map.get(first_sym, default_best_params)
@@ -1058,44 +1017,37 @@ async def run_screening_and_optimization(mode: str, send_charts: bool = False, s
         trade_side=trade_side, mode=mode, base_symbol=base_sym
     )
 
-    # バックテスト合格銘柄 + クジラ適格上位で補完し、確実にMAX_SELECTED_SYMBOLS銘柄を選定
+    # バックテスト合格銘柄を優先し、未合格でも固定5銘柄から選定
     selected_set = set(profitable_cands)
-    for info in selected_symbols_info:
-        sym_cand = info.get("symbol", "")
-        if sym_cand.upper() == "BTC" or sym_cand in selected_set:
-            continue
-        cand_whale = get_whale_sentiment_info(sym_cand).get("signal", "NEUTRAL")
-        if cand_whale != "SHORT_ONLY":
-            profitable_cands.append(sym_cand)
-            selected_set.add(sym_cand)
-        if len(profitable_cands) >= MAX_SELECTED_SYMBOLS:
+    selected_symbols = list(profitable_cands)
+    for sym in FIXED_SYMBOLS:
+        if sym not in selected_set:
+            selected_symbols.append(sym)
+        if len(selected_symbols) >= MAX_SELECTED_SYMBOLS:
             break
 
-    # それでもMAX_SELECTED_SYMBOLS銘柄に満たない場合はスコア順で補完
-    if len(profitable_cands) < MAX_SELECTED_SYMBOLS:
-        for info in selected_symbols_info:
-            sym_cand = info.get("symbol", "")
-            if sym_cand.upper() != "BTC" and sym_cand not in selected_set:
-                profitable_cands.append(sym_cand)
-                selected_set.add(sym_cand)
-            if len(profitable_cands) >= MAX_SELECTED_SYMBOLS:
-                break
+    selected_symbols = selected_symbols[:MAX_SELECTED_SYMBOLS]
+    print(f"\n[Selection Result] 選定{len(selected_symbols)}銘柄 (固定5銘柄 MTF完全ロング・個別最適化): {', '.join(selected_symbols)}")
 
-    selected_symbols = profitable_cands[:MAX_SELECTED_SYMBOLS]
-    print(f"\n[Selection Result] 選定{len(selected_symbols)}銘柄 (クジラ適格 & 前兆上位): {', '.join(selected_symbols)}")
-
-    # 選定銘柄の個別最適化パラメータをログ表示
-    discord.print_log("\n★ 【銘柄別 個別最適化パラメータ一覧】")
+    # 選定銘柄の個別最適化パラメータをDiscordログ表示
+    discord.print_log("\n★ 【銘柄別 個別最適化パラメータ一覧 (Envelope / RSI MA)】")
     for sym in selected_symbols:
         p = symbol_params_map.get(sym, default_best_params)
         pnl_val = p.get('pnl', 0.0)
         wr_val = p.get('win_rate', 0.0)
         tc_val = p.get('trade_count', 0)
-        profit_str = f"+${(pnl_val - 100.0):.2f}" if pnl_val >= 100.0 else f"${pnl_val:.2f}"
+        dd_val = p.get('max_dd', 0.0)
+        strat = p.get('strategy', 'rsima').upper()
+        p_detail = p.get('params', {})
+        
+        if strat == "ENVELOPE":
+            param_str = f"Len={p_detail.get('length', 15)}, Band=±{p_detail.get('lower_pct', 2.0)}%, MALen={p_detail.get('malen', 200)}"
+        else:
+            param_str = f"RSI={p_detail.get('rsi_len', 9)}, MALen={p_detail.get('lma_len', 7)}, L-Entry<{p_detail.get('lEp', 40)}, L-Exit>{p_detail.get('lCp', 60)}"
+
         discord.print_log(
-            f"   📌 [{sym}] 戦略={p['strategy'].upper()} {trade_side.upper()} | 確定足={p['interval']}m | "
-            f"MP={p['mp']} | ER={p['er']} | Margin={p['margin']}% | "
-            f"純利益: {profit_str} (取引: {tc_val}回, 勝率: {wr_val:.1f}%)"
+            f"   📌 [{sym}] 戦略={strat} (ナンピン数:{MAX_TRADES_COUNT}) | {param_str} | "
+            f"純利益: {pnl_val:+.4f} USDT (取引: {tc_val}回, 勝率: {wr_val:.1f}%, DD: {dd_val:.4f})"
         )
 
     global current_strategy_type
@@ -1431,14 +1383,24 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                     discord.print_log(f"[{sym}] データ不足 (rows={len(df)}). スキップ。")
                     continue
 
+                cand_strat = sym_params.get("strategy", "rsima")
+                cand_p = sym_params.get("params", {})
                 df = logic.make_logic(
                     df,
-                    market_profile_period=sym_params["mp"],
-                    er_threshold=sym_params["er"],
-                    strategy_type=sym_params["strategy"],
+                    market_profile_period=sym_params.get("mp", 7),
+                    er_threshold=sym_params.get("er", 40.0),
+                    strategy_type=cand_strat,
+                    env_len=cand_p.get("length", 15),
+                    env_lower_pct=cand_p.get("lower_pct", 2.0),
+                    env_upper_pct=cand_p.get("upper_pct", 2.0),
+                    env_malen=cand_p.get("malen", 200),
+                    rsi_len=cand_p.get("rsi_len", 9),
+                    lma_len=cand_p.get("lma_len", 7),
+                    lEp=cand_p.get("lEp", 40.0),
+                    lCp=cand_p.get("lCp", 60.0),
                 )
 
-                required_cols = ["long", "VAH", "VAL", "POC"]
+                required_cols = ["long", "close"]
                 missing = [c for c in required_cols if c not in df.columns]
                 if missing:
                     discord.print_log(f"[{sym}] シグナルカラム不足: {missing}. スキップ。")
@@ -1551,14 +1513,25 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                 whale_sig = get_whale_sentiment_info(sym).get("signal", "NEUTRAL")
 
                 if has_long:
-                    closed = await api.long_close(
-                        df, position, commission=0.0,
-                        sl_margin_pct=sym_params["margin"],
-                        strategy_type=sym_params["strategy"],
-                    )
+                    cand_strat = sym_params.get("strategy", "rsima")
+                    longclose_sig = bool(df["longclose"].iloc[-1]) if "longclose" in df.columns else False
+                    is_take_profit = longclose_sig and (current_price > entry_px)
+                    exit_reason = f"TakeProfit_{cand_strat.upper()}" if is_take_profit else "VP_Trailing"
+
+                    if is_take_profit:
+                        discord.print_log(f"[{sym}] [TAKE PROFIT] 🎯 新戦略利確シグナル点灯 (現在値: ${current_price:.4f} > 建値: ${entry_px:.4f}, 戦略: {cand_strat.upper()})")
+                        from bingx5_46_2api import flatten_current_position_bingx
+                        await flatten_current_position_bingx(sym, "USDT", mode, exit_reason, force_market=True)
+                        closed = True
+                    else:
+                        closed = await api.long_close(
+                            df, position, commission=0.0,
+                            sl_margin_pct=sym_params.get("margin", 2.0),
+                            strategy_type=cand_strat,
+                        )
                     if closed:
-                        record_real_trade(sym, "LONG", "CLOSE", current_price, float(position.get("buy", 0)), pnl_current, "実運用決済")
-                        discord.print_log(f"[{sym}] [CLOSE] 🟢 ロングポジション決済完了 (PnL: {pnl_current:+.2f} USDT)")
+                        record_real_trade(sym, "LONG", "CLOSE", current_price, float(position.get("buy", 0)), pnl_current, f"実運用決済 ({exit_reason})")
+                        discord.print_log(f"[{sym}] [CLOSE] 🟢 ロングポジション決済完了 (PnL: {pnl_current:+.2f} USDT, 理由: {exit_reason})")
                         
                         # 1. 決済トレードチャート画像の生成 & 送信
                         exit_chart_file = plot_exit_chart(
