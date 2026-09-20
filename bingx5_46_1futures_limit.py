@@ -66,18 +66,18 @@ except Exception as e:
     pass
 # ==================== 動作モード設定 ====================
 # [ 0 ] 安全ロック (Safety Interlock)
-#       ユーザー指示: デモ/テストネットキー確認前のためトレード完全禁止
-ALLOW_LIVE_TRADING = False
+#       本番口座(Live)への誤発注防止のため、本番トレードは完全安全ロック
+ALLOW_LIVE_TRADING = False  # 本番リアル口座への発注APIを物理的に完全遮断
 
 # [ 1 ] BingX 口座指定
 #       True  = 本番口座 (Live Account)
-#       False = デモ口座 (Demo Account)
-BINGX_IS_LIVE = False if not ALLOW_LIVE_TRADING else False
+#       False = デモ口座 (Demo Account / VST: Virtual Simulation Trading)
+BINGX_IS_LIVE = False
 
 # [ 2 ] BingX 注文実行・APIキー指定 (AIR Mode)
-#       True  = AIRモード (指値・注文を実際に発注せずペーパートレードシミュレーション)
-#       False = リアル注文 (実際の BingX 取引所へ発注)
-BINGX_IS_AIR = True if not ALLOW_LIVE_TRADING else True
+#       False = リアル注文 (BingX VST デモ取引所へ実際に発注・約定・管理)
+#       True  = AIRモード (--air または --mock 引数指定時のみ仮想シミュレーション)
+BINGX_IS_AIR = ("--air" in sys.argv or "--mock" in sys.argv)
 
 # [ 3 ] ポジション・ロット設定
 BINGX_TARGET_POSITION_VALUE_USDT = 15.0
@@ -1166,8 +1166,8 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
     )
     from bingx5_46_3logic import PnLCalculator
 
-    account_mode_str = "[LIVE Account] (本番口座)" if mode == "live" else "[DEMO Account] (デモ / テストネット口座)"
-    air_mode_str = "[AIR MODE ON] (発注監視のみ / API注文送信なし)" if is_air else "[REAL ORDER ON] (実際にBingXへ注文送信)"
+    account_mode_str = "[LIVE Account] (本番口座)" if mode == "live" else "[DEMO Account] (BingX VST デモ口座)"
+    air_mode_str = "[AIR MODE ON] (シミュレーション・仮想ペーパートレード)" if bingx5_46_2api.is_air else "[REAL VST ORDER ON] (実際にBingX VST取引所へ発注・約定・管理)"
 
     hours_str = ", ".join([f"{h:02d}:00" for h in sorted(ANALYSIS_HOURS)])
     start_msg = (

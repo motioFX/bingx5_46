@@ -24,13 +24,13 @@ except ImportError:
     HAS_AIOHTTP = False
 
 #====================〇 API 設定値〇====================
-# ユーザー指示: デモ/テストネットAPIキー確認前のため、トレードは行わない（完全安全ロック）
-ALLOW_LIVE_TRADING = False  # False の場合、取引所への発注APIを物理的に完全遮断
+# ユーザー指示: 本番リアル口座への誤発注防止のため、本番トレードは完全安全ロック
+ALLOW_LIVE_TRADING = False  # 本番口座(Live)への発注APIを物理的に完全遮断
 
 bingx_mode = 'demo'  # 'live' または 'demo'
 BINGX_TARGET_POSITION_VALUE_USDT = 15.0
 LEVERAGE_FACTOR = 10.0
-is_air = True  # シミュレーション・ペーパートレードモードを強制
+is_air = False  # デモモード時は実際のBingX VSTデモ取引所へ実発注連携（--air引数指定時のみモック）
 
 # Helper to read values
 def _to_float(value: Any, default: float) -> float:
@@ -213,10 +213,16 @@ async def _async_bingx_request(
     params: Optional[dict] = None,
     timeout: int = 10
 ) -> dict:
-    # 取引安全ブロック: トレード禁止またはAIRモード時は、取引所への発注/取消/レバレッジ変更等の取引系APIを物理的に完全遮断
+    # 取引安全ブロック:
+    # 1. 本番取引所 (open-api.bingx.com) への発注は ALLOW_LIVE_TRADING=True かつ not is_air の時のみ許可
+    # 2. デモ取引所 (open-api-vst.bingx.com) への発注は not is_air の時に許可 (ALLOW_LIVE_TRADING=False でも安全にVSTデモ取引可能)
     is_trade_endpoint = "/openApi/swap/v2/trade/" in endpoint
-    if is_trade_endpoint and (is_air or not ALLOW_LIVE_TRADING):
-        return {"code": 0, "msg": "MOCK_ORDER_AIR_MODE_TRADE_LOCKED", "data": {"orderId": "MOCK_AIR_ORDER"}}
+    is_live_base = ("open-api.bingx.com" in base_url) and ("open-api-vst.bingx.com" not in base_url)
+    if is_trade_endpoint:
+        if is_live_base and (not ALLOW_LIVE_TRADING or is_air):
+            return {"code": 0, "msg": "MOCK_ORDER_LIVE_TRADE_LOCKED", "data": {"orderId": "MOCK_AIR_ORDER"}}
+        elif is_air:
+            return {"code": 0, "msg": "MOCK_ORDER_AIR_MODE_ENABLED", "data": {"orderId": "MOCK_AIR_ORDER"}}
 
     params = params.copy() if params else {}
     is_public = endpoint.startswith("/openApi/swap/v2/quote/")
@@ -424,7 +430,12 @@ class api_bingx_helper:
                 "DELETE", self.base_url, "/openApi/swap/v2/trade/allOpenOrders",
                 self.api_key, self.secret_key, params={"symbol": self.symbol}, timeout=10
             )
-            return res.get("code") == 0
+            is_ok = (res.get("code") == 0)
+            if is_ok:
+                discord.print_log(f"[{self.symbol}] 全未約定指値の取り消しに成功しました。")
+            else:
+                discord.print_log(f"[{self.symbol}] 指値取り消し結果: {res.get('msg', res)}")
+            return is_ok
         except Exception as e:
             discord.print_log(f"BingX active_order_cancel error: {e}")
             return False
@@ -861,44 +872,63 @@ async def flatten_current_position_bingx(
     product_type: str = 'SWAP'
 ) -> bool:
     local_api = api_bingx_helper(symbol, 'SWAP', coin, mode)
+
+    # 1. 成行クローズ前に、まず必ず全ての未約定指値（利確指値・ナンピン指値等）を先行キャンセル
+    discord.print_log(f"[BINGX] {reason}: 成行決済シーケンス開始。まず【{symbol}】の全未約定指値を先行キャンセルします...")
+    await local_api.active_order_cancel()
+    # 取引所側での指値取り消し・ポジション数量のロック解除を確実に待機 (0.5秒)
+    await asyncio.sleep(0.5)
+
+    # 2. ロック解除後の最新ポジション状態を再取得
     position = await local_api.get_positions()
     buy_qty = float(position.get("buy", 0.0))
     sell_qty = float(position.get("sell", 0.0))
 
     if buy_qty <= 0 and sell_qty <= 0:
+        discord.print_log(f"[BINGX] {reason}: 保有ポジションなし (FLAT確認済み)。決済完了。")
         return True
 
-    discord.print_log(f"[BINGX] {reason}: starting flatten (buy={buy_qty}, sell={sell_qty}).")
+    discord.print_log(f"[BINGX] {reason}: 全未約定指値キャンセル完了。成行決済発注を実行 (buy_qty={buy_qty}, sell_qty={sell_qty}).")
     if is_air:
         discord.print_log(f"[AIR MODE] BingX flatten execution skipped: Reason: {reason} (Mock only)")
         return True
-
-    await local_api.active_order_cancel()
 
     if not local_api.api_key or local_api.api_key.startswith("YOUR_"):
         return True
 
     try:
         if buy_qty > 0:
+            order_qty = local_api._quantize_quantity(buy_qty)
             params = {
                 "symbol": local_api.symbol,
                 "side": "SELL",
                 "positionSide": "LONG",
                 "type": "MARKET",
-                "quantity": str(local_api._quantize_quantity(buy_qty))
+                "quantity": str(order_qty)
             }
             res = await _async_bingx_request("POST", local_api.base_url, "/openApi/swap/v2/trade/order", local_api.api_key, local_api.secret_key, params=params)
-            discord.print_log(f"BingX market_close Long result: {res}")
+            discord.print_log(f"BingX market_close Long (Qty={order_qty}) result: {res}")
         elif sell_qty > 0:
+            order_qty = local_api._quantize_quantity(sell_qty)
             params = {
                 "symbol": local_api.symbol,
                 "side": "BUY",
                 "positionSide": "SHORT",
                 "type": "MARKET",
-                "quantity": str(local_api._quantize_quantity(sell_qty))
+                "quantity": str(order_qty)
             }
             res = await _async_bingx_request("POST", local_api.base_url, "/openApi/swap/v2/trade/order", local_api.api_key, local_api.secret_key, params=params)
-            discord.print_log(f"BingX market_close Short result: {res}")
+            discord.print_log(f"BingX market_close Short (Qty={order_qty}) result: {res}")
+
+        # 3. 成行決済後のポジション解消確認 (0.5秒待機)
+        await asyncio.sleep(0.5)
+        after_pos = await local_api.get_positions()
+        after_buy = float(after_pos.get("buy", 0.0))
+        after_sell = float(after_pos.get("sell", 0.0))
+        if after_buy == 0 and after_sell == 0:
+            discord.print_log(f"[BINGX] 🏁 【{symbol}】成行クローズ正常完了 (残存ポジション: 0 FLAT)")
+        else:
+            discord.print_log(f"[BINGX] ⚠️ 【{symbol}】成行クローズ後に残存建玉を検出: buy={after_buy}, sell={after_sell}")
         return True
     except Exception as e:
         discord.print_log(f"BingX flatten error: {e}")
