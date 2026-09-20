@@ -1005,7 +1005,7 @@ async def wait_until_next_hour():
         await asyncio.sleep(wait_seconds)
 
 
-async def run_screening_and_optimization(mode: str, send_charts: bool = False) -> tuple:
+async def run_screening_and_optimization(mode: str, send_charts: bool = False, skip_zip: bool = False) -> tuple:
     """フェーズA: 銘柄スクリーニング + パラメータ最適化 + 合格銘柄選抜（ロング専用）"""
     from bingx5_46_2api import api_bingx
 
@@ -1017,6 +1017,8 @@ async def run_screening_and_optimization(mode: str, send_charts: bool = False) -
             cmd = [sys.executable, str(mix_script)]
             if not send_charts:
                 cmd.append("--no-chart-send")
+            if skip_zip:
+                cmd.append("--skip-zip")
             subprocess.run(cmd, check=True)
         except Exception as sub_err:
             print(f"[Screening Error] 銘柄スクリーニング実行エラー: {sub_err}")
@@ -1221,8 +1223,31 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
     else:
         print("[Banner Skipped by --no-banner]")
 
-    # ========== フェーズA: 起動時スクリーニング & 最適化 (チャート付き) ==========
-    trade_side, symbol_params_map, best_params, selected_symbols = await run_screening_and_optimization(mode, send_charts=True)
+    # ========== 【トレード前準備 ステップ2】: 全銘柄1時間足データ（1年分）古い順小分けDiscord送信 ==========
+    skip_history = ("--skip-history" in sys.argv or "--no-history" in sys.argv)
+    if not skip_history:
+        discord.print_log("\n📦 【トレード前準備: ステップ2】 全銘柄1時間足データ（過去1年分: 365日）を古い順に小分けZIP送信します...")
+        download_script = Path(__file__).resolve().parent / "download_historical_candles.py"
+        if download_script.exists():
+            try:
+                # 過去1年分 (365日、30日チャンク) を古い順で取得・Discord送信 (チャートは次ステップで生成するためスキップ)
+                cmd_hist = [
+                    sys.executable, str(download_script),
+                    "--days", "365",
+                    "--chunk-days", "30",
+                    "--skip-charts"
+                ]
+                subprocess.run(cmd_hist, check=True)
+                discord.print_log("✅ 全銘柄1時間足データ（過去1年分）の小分け送信が正常に完了しました。（直近データが最後に到着）")
+            except Exception as dl_err:
+                discord.print_log(f"⚠️ 全銘柄1年分データ取得で警告が発生しました (後続準備を継続): {dl_err}")
+    else:
+        print("[History Download Skipped by --skip-history]")
+
+    # ========== 【トレード前準備 ステップ3 & 4 & 5】: チャート出力 ➔ MTF乖離判定＆ブレイクアウトTop10 ➔ 個別最適化 ==========
+    trade_side, symbol_params_map, best_params, selected_symbols = await run_screening_and_optimization(
+        mode, send_charts=True, skip_zip=(not skip_history)
+    )
 
     # 各銘柄の api インスタンスを保持（トレーリングSL状態を維持するため）
     symbol_apis: Dict[str, Any] = {}

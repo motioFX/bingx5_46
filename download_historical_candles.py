@@ -199,7 +199,7 @@ async def fetch_symbol_klines(
         "limit": str(limit),
     }
     async with sem:
-        for attempt in range(3):
+        for attempt in range(5):
             try:
                 async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=12)) as resp:
                     if resp.status == 200:
@@ -220,11 +220,13 @@ async def fetch_symbol_klines(
                                         "symbol": symbol,
                                     })
                                 return symbol, rows
-                            elif data.get("code") == 100410:
-                                await asyncio.sleep(2.0 * (attempt + 1))
-                    await asyncio.sleep(0.04)
+                        elif data.get("code") == 100410:
+                            # レート制限検知: 指数バックオフ待機
+                            await asyncio.sleep(3.0 * (attempt + 1))
+                            continue
+                    await asyncio.sleep(0.08)
             except Exception:
-                await asyncio.sleep(0.5 * (attempt + 1))
+                await asyncio.sleep(1.0 * (attempt + 1))
     return symbol, []
 
 
@@ -379,16 +381,20 @@ async def run_pipeline(
         if total_covered >= total_days:
             break
 
-    log(f"Total Chunks to fetch: {len(chunks)} (Chunk size: ~{chunk_days} days, Target: {total_days} days)")
+    chunks.reverse()  # 過去（1年前）から直近へ古い順にソート（直近データが最後に届くよう制御）
+    log(f"Total Chunks to fetch: {len(chunks)} (Chunk size: ~{chunk_days} days, Target: {total_days} days, Order: OLDEST FIRST)")
 
     # 銘柄別データのローカルメモリ保持用（直近分はチャート生成に利用）
     latest_symbols_df: Dict[str, pd.DataFrame] = {}
 
-    # 3. チャンクごとの取得 & ZIP化 & Discord送信ループ (直近チャンクから順次実行)
+    # 主要個別銘柄（個別CSVとしてZIPに含める対象）
+    key_individual_symbols = set(top10_volume_symbols + FIXED_SYMBOLS + ["BTC-USDT"])
+
+    # 3. チャンクごとの取得 & ZIP化 & Discord送信ループ (古い順から順次実行)
     if not skip_download:
-        sem = asyncio.Semaphore(12)  # 同時リクエスト数 (安全マージン)
+        sem = asyncio.Semaphore(8)  # 同時リクエスト数 (安全マージン)
         timeout = aiohttp.ClientTimeout(total=15)
-        connector = aiohttp.TCPConnector(limit=30)
+        connector = aiohttp.TCPConnector(limit=20)
 
         async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
             for chunk_idx, (chunk_start, chunk_end) in enumerate(chunks, 1):
@@ -422,8 +428,8 @@ async def run_pipeline(
                     ind_dfs[sym] = df_sym
                     all_chunk_rows.extend(rows)
 
-                    # 直近チャンク（Chunk 1）のデータをチャート用に保持
-                    if chunk_idx == 1:
+                    # 最終チャンク（直近分）のデータをチャート用・選定用に保持
+                    if chunk_idx == len(chunks):
                         latest_symbols_df[sym] = df_sym
 
                     # ローカル累積CSVに追記保存
@@ -442,29 +448,27 @@ async def run_pipeline(
                 log(f"Fetched {valid_count}/{len(all_symbols)} symbols with valid data in {t1 - t0:.1f}s")
 
                 if not all_chunk_rows:
-                    log(f"No historical data returned for {chunk_label}. Past limit reached.")
-                    if chunk_idx > 1:
-                        log("Stopping pagination as past history is exhausted.")
-                        break
+                    log(f"No historical data returned for {chunk_label}.")
                     continue
 
-                # ZIPアーカイブ作成 (12MB弱に収まる設計)
+                # ZIPアーカイブ作成 (全銘柄統合CSV + 主要銘柄個別CSV -> 8~10MBに最適化)
                 zip_filename = f"bingx_1h_all_symbols_{s_tag}_{e_tag}.zip"
                 zip_path = chunks_dir / zip_filename
 
                 log(f"Creating ZIP archive: {zip_filename}...")
                 df_chunk_all = pd.DataFrame(all_chunk_rows).drop_duplicates(subset=["timestamp", "symbol"]).sort_values(by=["timestamp", "symbol"]).reset_index(drop=True)
 
-                # ZIP作成: 統合マージドCSV + 各銘柄CSV
                 with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
-                    # 1. 統合CSV
+                    # 1. 全銘柄統合CSV (全銘柄590+網羅)
                     merged_csv_str = df_chunk_all.to_csv(index=False)
                     zf.writestr(f"all_symbols_1h_{s_tag}_{e_tag}.csv", merged_csv_str)
                     
-                    # 2. 個別銘柄CSV（検証・バックテスト用）
-                    for sym, df_s in ind_dfs.items():
-                        s_csv = df_s[["timestamp", "open", "high", "low", "close", "volume", "symbol"]].to_csv(index=False)
-                        zf.writestr(f"individual/{sym}_1h.csv", s_csv)
+                    # 2. 主要個別銘柄CSV（検証用）
+                    for sym in key_individual_symbols:
+                        df_s = ind_dfs.get(sym)
+                        if df_s is not None and not df_s.empty:
+                            s_csv = df_s[["timestamp", "open", "high", "low", "close", "volume", "symbol"]].to_csv(index=False)
+                            zf.writestr(f"individual/{sym}_1h.csv", s_csv)
 
                 zip_size_mb = zip_path.stat().st_size / (1024 * 1024)
                 log(f"ZIP Archive created: {zip_filename} ({zip_size_mb:.2f} MB)")
@@ -491,7 +495,7 @@ async def run_pipeline(
                     discord.send_file(send_target_zip, desc)
 
                 # API負荷軽減の短い待機
-                await asyncio.sleep(1.0)
+                await asyncio.sleep(4.0)
     else:
         log("Skip download flag is set. Loading existing candles from local cache for charts...")
         for sym in top10_volume_symbols + FIXED_SYMBOLS:

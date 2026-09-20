@@ -1149,6 +1149,7 @@ async def main():
     parser.add_argument("--start", type=str, default=DEFAULT_START_STR, help="ISO start timestamp")
     parser.add_argument("--top-n", type=int, default=15, help="Number of alt symbols to select")
     parser.add_argument("--no-chart-send", action="store_true", help="Do not send charts to Discord")
+    parser.add_argument("--skip-zip", action="store_true", help="Skip sending 32d zip (e.g. after 1-year download)")
     args = parser.parse_args()
 
     # 0. クジラ分析スクリプトを自動更新実行
@@ -1293,7 +1294,7 @@ async def main():
             zf.write(merged_all_path, arcname="historical_all_symbols_merged.csv")
 
         discord = send_discord()
-        if not args.no_chart_send and send_target_zip.exists():
+        if not args.skip_zip and not args.no_chart_send and send_target_zip.exists():
             zip_desc = (
                 f"📦 **【BingX全銘柄 32日分1HマージドデータZIP】** ({start_tag} -> {end_tag})\n"
                 f"• 収録銘柄数: 全 `{len(all_dfs)}` 銘柄 (全データ行数: `{len(df_merged_all):,}` 行)\n"
@@ -1351,18 +1352,7 @@ async def main():
         )
         summary_text += f"\n📊 **[1. マルチタイムフレーム地合い判定]**\n"
 
-        for win_label, win_hours in windows:
-            chart_file, mean_norm, market_state = generate_normalized_charts(plot_dfs, out_dir, win_label, win_hours)
-            final_st = "long_only" if market_state == "LONG" else "short_only"
-            state_icon = "🟢" if market_state == "LONG" else "🔴"
-            print(f"   └ [{win_label} Window] Mean Norm: {mean_norm:.4f} -> Market State: {market_state} ({final_st})")
-            summary_text += f"• **[{win_label.upper()}]**: {state_icon} `{market_state}` (平均騰落: `{mean_norm:.4f}`)\n"
-            window_states.append((win_label, market_state, mean_norm))
-
-            if not args.no_chart_send and chart_file and chart_file.exists():
-                discord.send_file(chart_file, f"Normalized Performance [{win_label}] Top 10 ({market_state})")
-
-        # ② 取引高上位 10 銘柄のノーマライズチャート (30D, 10D, 5D)
+        # ① 取引高上位 10 銘柄のノーマライズチャート (30D, 10D, 5D)
         print("\n[Volume Top 10 Charts] Generating 30d, 10d, 5d Normalized Charts...")
         for win_label, win_hours in windows:
             vol_chart = generate_custom_normalized_charts(
@@ -1378,7 +1368,7 @@ async def main():
             if not args.no_chart_send and vol_chart and vol_chart.exists():
                 discord.send_file(vol_chart, f"📊 **【BingX 取引高上位10銘柄 ノーマライズチャート [{win_label.upper()}]】**")
 
-        # ③ 固定選定銘柄 (HYPE, NEAR, ZEC, ARB, UNI + BTC) のノーマライズチャート (30D, 10D, 5D)
+        # ② 固定選定銘柄 (HYPE, NEAR, ZEC, ARB, UNI + BTC) のノーマライズチャート (30D, 10D, 5D)
         print("\n[Fixed Selection Charts] Generating 30d, 10d, 5d Normalized Charts...")
         fixed_target_list = list(FIXED_SYMBOLS)
         if "BTC-USDT" not in fixed_target_list:
@@ -1397,7 +1387,20 @@ async def main():
             if not args.no_chart_send and fixed_chart and fixed_chart.exists():
                 discord.send_file(fixed_chart, f"🎯 **【固定選定銘柄 (HYPE, NEAR, ZEC, ARB, UNI) ノーマライズチャート [{win_label.upper()}]】**")
 
-        # ④ 前兆スコア Top 10
+        # ③ 30d, 10d, 5d のマルチタイムフレーム乖離判定 & 地合い判定
+        print("\n[MTF Divergence Analysis] Analyzing 30d, 10d, 5d Market Divergence & States...")
+        for win_label, win_hours in windows:
+            chart_file, mean_norm, market_state = generate_normalized_charts(plot_dfs, out_dir, win_label, win_hours)
+            final_st = "long_only" if market_state == "LONG" else "short_only"
+            state_icon = "🟢" if market_state == "LONG" else "🔴"
+            print(f"   └ [{win_label} Window] Mean Norm: {mean_norm:.4f} -> Market State: {market_state} ({final_st})")
+            summary_text += f"• **[{win_label.upper()}]**: {state_icon} `{market_state}` (平均騰落: `{mean_norm:.4f}`)\n"
+            window_states.append((win_label, market_state, mean_norm))
+
+            if not args.no_chart_send and chart_file and chart_file.exists():
+                discord.send_file(chart_file, f"📈 **【マルチタイムフレーム乖離判定 [{win_label.upper()}]】** 地合い: `{market_state}` (平均: `{mean_norm:.4f}`)")
+
+        # ④ ブレイクアウト前兆 Top 10 銘柄 (前兆スコア & クジラ流入順)
         print("\n==================================================================================")
         print(" [Step 2: Precursor Score Top 10 & Whale Inflow Priority Ranking]")
         print("==================================================================================")
