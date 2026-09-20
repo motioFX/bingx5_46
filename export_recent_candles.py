@@ -113,9 +113,9 @@ def export_recent_candles(days: int = 60, send_discord_flag: bool = True, all_sy
     start_fmt = pd.to_datetime(first_dt).strftime("%Y/%m/%d %H:%M")
     end_fmt = pd.to_datetime(last_dt).strftime("%Y/%m/%d %H:%M")
 
-    # 取得時刻（何時取得か）のタグを生成
+    # 取得時刻（何時取得か）のタグを生成（英数字表記: 例 "15h", "17h"）
     now_jst = datetime.now(JST)
-    acq_tag = now_jst.strftime("%H時取得")
+    acq_tag = f"{now_jst.strftime('%H')}h"
     acq_fmt = now_jst.strftime("%Y/%m/%d %H:%M JST")
 
     # ZIPファイル名設定（何日から何日までのデータか、何時取得かを明確に命名）

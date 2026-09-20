@@ -1329,7 +1329,7 @@ async def main():
         start_tag = start_utc.strftime("%Y%m%d")
         end_tag = end_utc.strftime("%Y%m%d")
         now_jst = datetime.now(JST)
-        acq_tag = now_jst.strftime("%H時取得")
+        acq_tag = f"{now_jst.strftime('%H')}h"
         dated_csv_name = f"{start_tag}_to_{end_tag}_{acq_tag}_all_symbols_merged.csv"
         dated_csv_path = out_dir / dated_csv_name
         df_merged_all.to_csv(dated_csv_path, index=False, encoding="utf-8-sig")

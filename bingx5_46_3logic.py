@@ -498,27 +498,31 @@ class send_discord:
                 self.timers[url] = timer
                 timer.start()
 
-    def _send_file(self, content_text, file_path, file_name, mime_type):
+    def _send_file(self, content_text, file_path, file_name, mime_type) -> bool:
         webhooks = self._get_target_webhooks(content_text)
+        if not webhooks:
+            return False
+        success = True
         for url in webhooks:
             self.flush_buffer(url)
             try:
                 payload = {"content": content_text}
-                with open(file_path, f"rb") as f:
+                with open(file_path, "rb") as f:
                     files = {"file": (file_name, f, mime_type)}
-                    response = requests.post(url, data=payload, files=files, timeout=30)
+                    response = requests.post(url, data=payload, files=files, timeout=90)
                     response.raise_for_status()
             except requests.exceptions.RequestException as e:
                 print(f"Failed to send file {file_name} to {url}:", e)
-                pass
+                success = False
+        return success
 
-    def send_file(self, file_path, description=""):
+    def send_file(self, file_path, description="") -> bool:
         p = Path(file_path) if not isinstance(file_path, Path) else file_path
         if not p.exists():
             print(f"[send_discord] File not found: {p}")
-            return
+            return False
         mime = "image/png" if p.suffix.lower() == ".png" else "image/jpeg" if p.suffix.lower() in (".jpg", ".jpeg") else "application/octet-stream"
-        self._send_file(description, str(p), p.name, mime)
+        return bool(self._send_file(description, str(p), p.name, mime))
 
     def plot_kline(self, symbol=""):
         df = pd.read_csv("backtest_data/klines100.csv")
