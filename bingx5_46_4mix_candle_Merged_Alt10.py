@@ -1330,7 +1330,7 @@ async def main():
         end_tag = end_utc.strftime("%Y%m%d")
         now_jst = datetime.now(JST)
         acq_tag = f"{now_jst.strftime('%H')}h"
-        dated_csv_name = f"{start_tag}_to_{end_tag}_{acq_tag}_all_symbols_merged.csv"
+        dated_csv_name = f"bingx_all_symbols_1h_{start_tag}_to_{end_tag}_{acq_tag}.csv"
         dated_csv_path = out_dir / dated_csv_name
         df_merged_all.to_csv(dated_csv_path, index=False, encoding="utf-8-sig")
 
@@ -1338,13 +1338,13 @@ async def main():
         # 【必須ルール】正規化（normalize）処理の前に、選定全銘柄+BTCの過去32日分データを
         # 1回すべてダウンロード完了し、必ずまとめてZIPファイル化してDiscordへ送信する
         # ==============================================================================
-        zip_name = f"{start_tag}_to_{end_tag}_{acq_tag}_all_symbols_merged.zip"
+        zip_name = f"bingx_all_symbols_1h_{start_tag}_to_{end_tag}_{acq_tag}.zip"
         zip_path = out_dir / zip_name
         
         # 主要個別銘柄（取引高上位 + 固定銘柄 + 前兆スコア上位 + BTC）
         key_symbols = set(top10_vol_symbols + FIXED_SYMBOLS + [t["symbol"] for t in prioritized_candidates] + ["BTC-USDT"])
 
-        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
+        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED, compresslevel=9) as zf:
             # 1. 全銘柄統合マージドCSV (全銘柄網羅)
             zf.write(dated_csv_path, arcname=dated_csv_name)
             # 2. 主要銘柄の個別CSV (検証用)
@@ -1355,14 +1355,6 @@ async def main():
 
         zip_size_mb = zip_path.stat().st_size / (1024 * 1024)
         send_target_zip = zip_path
-
-        # 12MB超過時の安全コンパクトZIP（全銘柄統合CSVのみ）
-        if zip_size_mb > 13.0:
-            compact_zip = out_dir / f"{start_tag}_to_{end_tag}_{acq_tag}_all_symbols_compact.zip"
-            with zipfile.ZipFile(compact_zip, "w", zipfile.ZIP_DEFLATED, compresslevel=9) as zf:
-                zf.write(dated_csv_path, arcname=dated_csv_name)
-            send_target_zip = compact_zip
-            zip_size_mb = send_target_zip.stat().st_size / (1024 * 1024)
 
         master_zip_path = out_dir / "historical_all_symbols_merged.zip"
         with zipfile.ZipFile(master_zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
