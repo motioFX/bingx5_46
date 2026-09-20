@@ -384,11 +384,11 @@ class send_discord:
         self.real3_webhook = get_webhook_url("real3_bngx")
         self.test4_webhook = get_webhook_url("test4_backtest")
 
-        # 互換用エイリアス
+        # 互換用エイリアス（BingX関連はすべて #real3_bngx へ全集約）
         self.bingx_webhook = self.real3_webhook
-        self.win32_webhook = self.test4_webhook
+        self.win32_webhook = self.real3_webhook
         self.default_webhook = self.real3_webhook
-        self.webhook_url = self.test4_webhook if sys.platform == 'win32' else self.real3_webhook
+        self.webhook_url = self.real3_webhook or self.test4_webhook
 
         if not self.real3_webhook and not self.test4_webhook:
             print("[WARN] Discord webhook for BingX (real3_bngx / test4_backtest) is not configured.")
@@ -401,12 +401,8 @@ class send_discord:
         self.timers = send_discord._shared_timers
 
     def _get_target_webhooks(self, text: str = "") -> list[str]:
-        if sys.platform == 'win32':
-            # Windowsローカル環境: テスト用 (#test4_backtest) へ全集約
-            target = self.test4_webhook or self.real3_webhook
-        else:
-            # Linux VPS環境: BingX本番チャンネル (#real3_bngx) へ全集約（バックテスト・最適化含む）
-            target = self.real3_webhook or self.test4_webhook
+        # BingX関連の全通知（バックテスト・最適化・ログ・チャート含む）を #real3_bngx へ全集約
+        target = self.real3_webhook or self.test4_webhook
         return [target] if target else []
 
     def flush_buffer(self, url):

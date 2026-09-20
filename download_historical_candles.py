@@ -95,12 +95,10 @@ class send_discord:
     def __init__(self) -> None:
         self.real3_webhook = get_webhook_url("real3_bngx")
         self.test4_webhook = get_webhook_url("test4_backtest")
-        self.webhook_url = self.test4_webhook if sys.platform == "win32" else self.real3_webhook
+        self.webhook_url = self.real3_webhook or self.test4_webhook
 
     def _get_target_webhooks(self) -> list[str]:
-        target = self.test4_webhook if sys.platform == "win32" else self.real3_webhook
-        if not target:
-            target = self.real3_webhook or self.test4_webhook
+        target = self.real3_webhook or self.test4_webhook
         return [target] if target else []
 
     def send_message(self, content: str) -> bool:
