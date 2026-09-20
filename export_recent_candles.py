@@ -113,15 +113,20 @@ def export_recent_candles(days: int = 60, send_discord_flag: bool = True, all_sy
     start_fmt = pd.to_datetime(first_dt).strftime("%Y/%m/%d %H:%M")
     end_fmt = pd.to_datetime(last_dt).strftime("%Y/%m/%d %H:%M")
 
-    # ZIPファイル名設定（何日から何日までのデータかを明確に命名）
+    # 取得時刻（何時取得か）のタグを生成
+    now_jst = datetime.now(JST)
+    acq_tag = now_jst.strftime("%H時取得")
+    acq_fmt = now_jst.strftime("%Y/%m/%d %H:%M JST")
+
+    # ZIPファイル名設定（何日から何日までのデータか、何時取得かを明確に命名）
     mode_prefix = "all_symbols" if all_symbols else "fixed5"
-    zip_name = f"bingx_{mode_prefix}_1h_{start_tag}_{end_tag}.zip"
+    zip_name = f"bingx_{mode_prefix}_1h_{start_tag}_to_{end_tag}_{acq_tag}.zip"
     zip_path = out_dir / zip_name
 
-    print(f"📦 ZIPアーカイブ作成中: {zip_path.name} (期間: {start_tag} ～ {end_tag}) ...")
+    print(f"📦 ZIPアーカイブ作成中: {zip_path.name} (期間: {start_tag} ～ {end_tag}, 取得: {acq_tag}) ...")
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
-        # 1. 全銘柄統合マスターCSV (日付範囲を明確化)
-        master_csv_name = f"bingx_all_symbols_1h_{start_tag}_{end_tag}_master.csv" if all_symbols else f"bingx_fixed5_1h_{start_tag}_{end_tag}_master.csv"
+        # 1. 全銘柄統合マスターCSV (日付範囲・取得時刻を明確化)
+        master_csv_name = f"bingx_{mode_prefix}_1h_{start_tag}_to_{end_tag}_{acq_tag}_master.csv"
         master_csv_str = df_all.to_csv(index=False)
         zf.writestr(master_csv_name, master_csv_str)
 
@@ -130,7 +135,7 @@ def export_recent_candles(days: int = 60, send_discord_flag: bool = True, all_sy
         for sym_k, df_k in ind_dfs.items():
             if not all_symbols or sym_k in export_individuals or f"{sym_k}-USDT" in export_individuals:
                 s_csv = df_k.to_csv(index=False)
-                zf.writestr(f"individual/{sym_k}_1h_{start_tag}_{end_tag}.csv", s_csv)
+                zf.writestr(f"individual/{sym_k}_1h_{start_tag}_to_{end_tag}_{acq_tag}.csv", s_csv)
 
     zip_size_mb = zip_path.stat().st_size / (1024 * 1024)
     print(f"✅ ZIP作成完了: {zip_path.name} ({zip_size_mb:.2f} MB)")
@@ -138,7 +143,7 @@ def export_recent_candles(days: int = 60, send_discord_flag: bool = True, all_sy
     # 12MB超過時の安全コンパクトZIP（マスターCSV単体）
     send_target = zip_path
     if zip_size_mb > 13.0:
-        compact_name = f"bingx_{mode_prefix}_1h_{start_tag}_{end_tag}_master.zip"
+        compact_name = f"bingx_{mode_prefix}_1h_{start_tag}_to_{end_tag}_{acq_tag}_master.zip"
         compact_path = out_dir / compact_name
         with zipfile.ZipFile(compact_path, "w", zipfile.ZIP_DEFLATED, compresslevel=9) as zf:
             zf.writestr(master_csv_name, master_csv_str)
@@ -149,8 +154,9 @@ def export_recent_candles(days: int = 60, send_discord_flag: bool = True, all_sy
         discord = send_discord()
         if should_upload_file(send_target):
             desc = (
-                f"📊 **【バックテスト用】BingX {target_label} 1時間足データ ({start_tag} ～ {end_tag})**\n"
+                f"📊 **【バックテスト用】BingX {target_label} 1時間足データ ({start_tag} ～ {end_tag} / {acq_tag})**\n"
                 f"• 対象期間: `{start_fmt}` ～ `{end_fmt} JST` ({days}日間 / {hours_limit}本)\n"
+                f"• 取得日時: `{acq_fmt}` ({acq_tag})\n"
                 f"• ファイル名: `{send_target.name}`\n"
                 f"• 収録銘柄数: 全 `{valid_count}` 銘柄 (総行数: `{len(df_all):,}` 行)\n"
                 f"• ファイルサイズ: `{send_target.stat().st_size / (1024*1024):.2f} MB` (Discord最適化)\n"

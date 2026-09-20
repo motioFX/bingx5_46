@@ -1328,7 +1328,9 @@ async def main():
         # 日付スタンプ付きCSVおよびZIPアーカイブの作成
         start_tag = start_utc.strftime("%Y%m%d")
         end_tag = end_utc.strftime("%Y%m%d")
-        dated_csv_name = f"{start_tag}_{end_tag}_all_symbols_merged.csv"
+        now_jst = datetime.now(JST)
+        acq_tag = now_jst.strftime("%H時取得")
+        dated_csv_name = f"{start_tag}_to_{end_tag}_{acq_tag}_all_symbols_merged.csv"
         dated_csv_path = out_dir / dated_csv_name
         df_merged_all.to_csv(dated_csv_path, index=False, encoding="utf-8-sig")
 
@@ -1336,7 +1338,7 @@ async def main():
         # 【必須ルール】正規化（normalize）処理の前に、選定全銘柄+BTCの過去32日分データを
         # 1回すべてダウンロード完了し、必ずまとめてZIPファイル化してDiscordへ送信する
         # ==============================================================================
-        zip_name = f"{start_tag}_{end_tag}_all_symbols_merged.zip"
+        zip_name = f"{start_tag}_to_{end_tag}_{acq_tag}_all_symbols_merged.zip"
         zip_path = out_dir / zip_name
         
         # 主要個別銘柄（取引高上位 + 固定銘柄 + 前兆スコア上位 + BTC）
@@ -1356,7 +1358,7 @@ async def main():
 
         # 12MB超過時の安全コンパクトZIP（全銘柄統合CSVのみ）
         if zip_size_mb > 13.0:
-            compact_zip = out_dir / f"{start_tag}_{end_tag}_all_symbols_compact.zip"
+            compact_zip = out_dir / f"{start_tag}_to_{end_tag}_{acq_tag}_all_symbols_compact.zip"
             with zipfile.ZipFile(compact_zip, "w", zipfile.ZIP_DEFLATED, compresslevel=9) as zf:
                 zf.write(dated_csv_path, arcname=dated_csv_name)
             send_target_zip = compact_zip
@@ -1371,8 +1373,10 @@ async def main():
             if should_upload_file(send_target_zip):
                 log(f"📤 [Discord送信中] {send_target_zip.name} (新規またはデータ更新あり)...")
                 zip_desc = (
-                    f"📦 **【BingX全銘柄 32日分1HマージドデータZIP】** ({start_tag} -> {end_tag})\n"
+                    f"📦 **【BingX全銘柄 32日分1HマージドデータZIP】** ({start_tag} ～ {end_tag} / {acq_tag})\n"
+                    f"• 取得日時: `{now_jst.strftime('%Y/%m/%d %H:%M JST')}` ({acq_tag})\n"
                     f"• 収録銘柄数: 全 `{len(all_dfs)}` 銘柄 (全データ行数: `{len(df_merged_all):,}` 行)\n"
+                    f"• ファイル名: `{send_target_zip.name}`\n"
                     f"• ファイルサイズ: `{zip_size_mb:.2f} MB` (Discord最適化)"
                 )
                 discord.send_file(send_target_zip, zip_desc)
