@@ -21,6 +21,7 @@ import pandas as pd
 import pybotters
 import requests
 from config_loader import get_webhook_url
+from upload_registry import should_upload_file, record_file_uploaded
 
 if hasattr(sys.stdout, "reconfigure"):
     try:
@@ -1367,12 +1368,17 @@ async def main():
 
         discord = send_discord()
         if not args.skip_zip and not args.no_chart_send and send_target_zip.exists():
-            zip_desc = (
-                f"📦 **【BingX全銘柄 32日分1HマージドデータZIP】** ({start_tag} -> {end_tag})\n"
-                f"• 収録銘柄数: 全 `{len(all_dfs)}` 銘柄 (全データ行数: `{len(df_merged_all):,}` 行)\n"
-                f"• ファイルサイズ: `{zip_size_mb:.2f} MB` (Discord最適化)"
-            )
-            discord.send_file(send_target_zip, zip_desc)
+            if should_upload_file(send_target_zip):
+                log(f"📤 [Discord送信中] {send_target_zip.name} (新規またはデータ更新あり)...")
+                zip_desc = (
+                    f"📦 **【BingX全銘柄 32日分1HマージドデータZIP】** ({start_tag} -> {end_tag})\n"
+                    f"• 収録銘柄数: 全 `{len(all_dfs)}` 銘柄 (全データ行数: `{len(df_merged_all):,}` 行)\n"
+                    f"• ファイルサイズ: `{zip_size_mb:.2f} MB` (Discord最適化)"
+                )
+                discord.send_file(send_target_zip, zip_desc)
+                record_file_uploaded(send_target_zip, rows=len(df_merged_all))
+            else:
+                log(f"📦 [アップロード不要] {send_target_zip.name} はすでにDiscord送信完了済み（データ変更なし）のため送信をスキップしました。")
 
         # ==============================================================================
         # 【30日・10日・5日 ノーマライズチャート前半高値除外フィルター】

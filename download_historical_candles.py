@@ -34,6 +34,7 @@ import pandas as pd
 import requests
 
 from config_loader import get_webhook_url
+from upload_registry import should_upload_file, record_file_uploaded, register_existing_files
 
 # 標準出力のUTF-8設定
 if hasattr(sys.stdout, "reconfigure"):
@@ -390,6 +391,9 @@ async def run_pipeline(
 
     # 3. チャンクごとの取得 & ZIP化 & Discord送信ループ (古い順から順次実行)
     if not skip_download:
+        # 既存ZIPファイルを既送信レジストリに事前登録（過去アップロード分の重複防止）
+        register_existing_files(chunks_dir, "*.zip")
+
         sem = asyncio.Semaphore(8)  # 同時リクエスト数 (安全マージン)
         timeout = aiohttp.ClientTimeout(total=15)
         connector = aiohttp.TCPConnector(limit=20)
@@ -401,6 +405,17 @@ async def run_pipeline(
                 s_tag = chunk_start.astimezone(JST).strftime("%Y%m%d")
                 e_tag = chunk_end.astimezone(JST).strftime("%Y%m%d")
                 chunk_label = f"Chunk {chunk_idx}/{len(chunks)} [{s_tag} -> {e_tag} JST]"
+                zip_filename = f"bingx_1h_all_symbols_{s_tag}_{e_tag}.zip"
+                zip_path = chunks_dir / zip_filename
+                compact_zip_path = chunks_dir / f"bingx_1h_master_{s_tag}_{e_tag}.zip"
+
+                is_last_chunk = (chunk_idx == len(chunks))
+
+                # 過去確定チャンク判定: 既存ZIPが存在し、すでにアップロード済みで変更なし、かつ最終チャンクでない場合はスキップ
+                target_existing = compact_zip_path if compact_zip_path.exists() else (zip_path if zip_path.exists() else None)
+                if target_existing and not should_upload_file(target_existing) and not is_last_chunk:
+                    log(f"⚡ [{chunk_label}] {target_existing.name} はすでにDiscord送信完了済み（データ変更なし）のためスキップします。")
+                    continue
 
                 log(f"\n--- Fetching {chunk_label} for {len(all_symbols)} symbols ---")
                 t0 = time.time()
@@ -450,9 +465,6 @@ async def run_pipeline(
                     continue
 
                 # ZIPアーカイブ作成 (全銘柄統合CSV + 主要銘柄個別CSV -> 8~10MBに最適化)
-                zip_filename = f"bingx_1h_all_symbols_{s_tag}_{e_tag}.zip"
-                zip_path = chunks_dir / zip_filename
-
                 log(f"Creating ZIP archive: {zip_filename}...")
                 df_chunk_all = pd.DataFrame(all_chunk_rows).drop_duplicates(subset=["timestamp", "symbol"]).sort_values(by=["timestamp", "symbol"]).reset_index(drop=True)
 
@@ -481,19 +493,23 @@ async def run_pipeline(
                     send_target_zip = compact_zip_path
                     log(f"Compact ZIP created: {compact_zip_path.name} ({compact_zip_path.stat().st_size / (1024*1024):.2f} MB)")
 
-                # Discordへ即座に送信
+                # Discordへ送信（未送信またはデータ更新があった場合のみ）
                 if discord:
-                    desc = (
-                        f"📦 **【BingX 1時間足 全銘柄データ (小分け {chunk_idx}/{len(chunks)})】**\n"
-                        f"• 期間: `{s_tag}` ～ `{e_tag}` ({chunk_days}日間)\n"
-                        f"• 取得銘柄数: `{valid_count}` / `{len(all_symbols)}` 銘柄\n"
-                        f"• 総レコード数: `{len(df_chunk_all):,}` 行\n"
-                        f"• ファイルサイズ: `{send_target_zip.stat().st_size / (1024*1024):.2f} MB`"
-                    )
-                    discord.send_file(send_target_zip, desc)
-
-                # API負荷軽減の短い待機
-                await asyncio.sleep(4.0)
+                    if should_upload_file(send_target_zip):
+                        log(f"📤 [Discord送信中] {send_target_zip.name} (新規またはデータ変更あり)...")
+                        desc = (
+                            f"📦 **【BingX 1時間足 全銘柄データ (小分け {chunk_idx}/{len(chunks)})】**\n"
+                            f"• 期間: `{s_tag}` ～ `{e_tag}` ({chunk_days}日間)\n"
+                            f"• 取得銘柄数: `{valid_count}` / `{len(all_symbols)}` 銘柄\n"
+                            f"• 総レコード数: `{len(df_chunk_all):,}` 行\n"
+                            f"• ファイルサイズ: `{send_target_zip.stat().st_size / (1024*1024):.2f} MB`"
+                        )
+                        sent = discord.send_file(send_target_zip, desc)
+                        if sent:
+                            record_file_uploaded(send_target_zip, rows=len(df_chunk_all))
+                        await asyncio.sleep(4.0)
+                    else:
+                        log(f"📦 [アップロード不要] {send_target_zip.name} はすでにDiscord送信完了済み（変更なし）のため送信をスキップしました。")
     else:
         log("Skip download flag is set. Loading existing candles from local cache for charts...")
         for sym in top10_volume_symbols + FIXED_SYMBOLS:
