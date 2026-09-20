@@ -1216,7 +1216,10 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
         f"  銘柄選定時刻 : 毎日 {hours_str} JST (8時間ごと)\n"
         f"=================================================="
     )
-    discord.print_log(start_msg)
+    if "--no-banner" not in sys.argv:
+        discord.print_log(start_msg)
+    else:
+        print("[Banner Skipped by --no-banner]")
 
     # ========== フェーズA: 起動時スクリーニング & 最適化 (チャート付き) ==========
     trade_side, symbol_params_map, best_params, selected_symbols = await run_screening_and_optimization(mode, send_charts=True)
