@@ -64,6 +64,9 @@ NORMALIZED_WINDOWS: Sequence[NormalizedWindow] = (
 
 DEFAULT_PRODUCT_TYPE = "PERP"
 
+# 固定選定銘柄 (HYPE, NEAR, ZEC, ARB, UNI)
+FIXED_SYMBOLS = ["HYPE-USDT", "NEAR-USDT", "ZEC-USDT", "ARB-USDT", "UNI-USDT"]
+
 
 class send_discord:
     def __init__(self) -> None:
@@ -583,6 +586,96 @@ def generate_normalized_charts(all_dfs: List[pd.DataFrame], out_dir: Path, windo
 
     log(f"Normalized chart Top 10 [{window_name}] saved to {out_file} | Mean Norm: {mean_norm:.4f} -> Market State: {market_state}")
     return out_file, mean_norm, market_state
+
+
+def generate_custom_normalized_charts(
+    all_dfs: List[pd.DataFrame],
+    target_symbols: Sequence[str],
+    out_dir: Path,
+    window_name: str,
+    hours_limit: int,
+    title: str,
+    file_prefix: str = "custom_normalized",
+    benchmark_symbol: Optional[str] = "BTC-USDT"
+) -> Optional[Path]:
+    """任意の銘柄リスト（取引高上位10や固定銘柄）を対象にノーマライズ比較チャートを作成"""
+    if not all_dfs:
+        return None
+
+    # DataFrameマップの構築
+    df_map = {}
+    for d in all_dfs:
+        if isinstance(d, pd.DataFrame) and not d.empty and "symbol" in d.columns:
+            sym_key = normalize_symbol(d["symbol"].iloc[0])
+            df_map[sym_key] = d
+
+    plot_items = []
+    for sym in target_symbols:
+        clean_sym = normalize_symbol(sym)
+        df = df_map.get(clean_sym)
+        if df is None or df.empty or "close" not in df.columns:
+            continue
+        df_sliced = df.tail(hours_limit).reset_index(drop=True)
+        if len(df_sliced) < 2:
+            continue
+
+        c_series = df_sliced["close"].astype(float)
+        base_px = c_series.iloc[0]
+        if base_px <= 0:
+            continue
+
+        norm_series = c_series / base_px
+        final_norm = float(norm_series.iloc[-1])
+        ts_series = pd.to_datetime(df_sliced["timestamp"])
+        plot_items.append({
+            "symbol": clean_sym,
+            "ts": ts_series,
+            "norm": norm_series,
+            "final_norm": final_norm,
+            "is_benchmark": (clean_sym == benchmark_symbol)
+        })
+
+    if not plot_items:
+        return None
+
+    # パフォーマンス順ソート（ベンチマークは末尾へ）
+    non_bm = [item for item in plot_items if not item["is_benchmark"]]
+    bm = [item for item in plot_items if item["is_benchmark"]]
+    non_bm.sort(key=lambda x: x["final_norm"], reverse=True)
+    sorted_items = non_bm + bm
+
+    fig, ax = plt.subplots(figsize=(11.5, 6.0), dpi=150)
+    colors = plt.cm.tab10(np.linspace(0, 1, max(1, len(non_bm))))
+    c_idx = 0
+
+    for item in sorted_items:
+        sym = item["symbol"]
+        fn = item["final_norm"]
+        pct = (fn - 1.0) * 100.0
+        sign_str = "+" if pct >= 0 else ""
+
+        if item["is_benchmark"]:
+            label = f"Ref: {sym:<8} ({fn:.2f}x | {sign_str}{pct:.1f}%)"
+            ax.plot(item["ts"], item["norm"], label=label, color="gray", linestyle="--", linewidth=1.8, alpha=0.85, zorder=2)
+        else:
+            c_idx += 1
+            label = f"{c_idx:>2}. {sym:<10} ({fn:.2f}x | {sign_str}{pct:.1f}%)"
+            color = colors[c_idx - 1]
+            ax.plot(item["ts"], item["norm"], label=label, color=color, linewidth=2.0, zorder=3)
+
+    ax.axhline(1.0, color="black", linestyle=":", linewidth=1.2, alpha=0.7, zorder=1)
+    ax.set_title(f"{title} [{window_name}] (Normalized Base = 1.0)", fontsize=13, fontweight="bold", pad=12)
+    ax.set_xlabel("Time (JST)", fontsize=10)
+    ax.set_ylabel("Normalized Price Ratio", fontsize=10)
+    ax.legend(loc="upper left", bbox_to_anchor=(1.01, 1), borderaxespad=0., fontsize=9)
+    ax.grid(True, linestyle="--", alpha=0.35)
+    plt.tight_layout()
+
+    out_file = out_dir / f"{file_prefix}_{window_name}.png"
+    plt.savefig(out_file, bbox_inches="tight")
+    plt.close(fig)
+    log(f"Custom normalized chart saved to {out_file}")
+    return out_file
 
 
 def export_top10_gainers_csv(
@@ -1108,11 +1201,22 @@ async def main():
     # 4. 選定候補 Top 10 銘柄の OHLCV & Funding データ取得 (過去30日分+アルファ: 32日間)・ファイル保存
     end_utc = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0)
     start_utc = end_utc - timedelta(days=32)
+    # 暗号資産取引高上位10銘柄
+    crypto_tickers = [
+        t for t in tickers 
+        if not any(x in t.get("symbol", "").upper() for x in ["NCSK", "2USD", "GOLD"])
+    ]
+    top10_vol_symbols = [t["symbol"] for t in crypto_tickers[:10]]
+    if "BTC-USDT" not in top10_vol_symbols:
+        top10_vol_symbols.insert(0, "BTC-USDT")
+        top10_vol_symbols = top10_vol_symbols[:10]
 
+    # 全取得対象銘柄の統合: 前兆候補 + 取引高上位10 + 固定銘柄 + BTC
     target_symbols = [t["symbol"] for t in prioritized_candidates]
-    btc_sym = "BTC-USDT" if any("-USDT" in str(s) for s in target_symbols) else "BTC"
-    if btc_sym not in target_symbols and "BTC" not in target_symbols:
-        target_symbols.insert(0, btc_sym)
+    for s in top10_vol_symbols + FIXED_SYMBOLS + ["BTC-USDT"]:
+        clean_s = normalize_symbol(s)
+        if clean_s not in target_symbols:
+            target_symbols.append(clean_s)
 
     ticker_map = {t.get("symbol"): t for t in tickers}
 
@@ -1239,7 +1343,42 @@ async def main():
             if not args.no_chart_send and chart_file and chart_file.exists():
                 discord.send_file(chart_file, f"Normalized Performance [{win_label}] Top 10 ({market_state})")
 
-        # ② 前兆スコア Top 10
+        # ② 取引高上位 10 銘柄のノーマライズチャート (30D, 10D, 5D)
+        print("\n[Volume Top 10 Charts] Generating 30d, 10d, 5d Normalized Charts...")
+        for win_label, win_hours in windows:
+            vol_chart = generate_custom_normalized_charts(
+                all_dfs=all_dfs,
+                target_symbols=top10_vol_symbols,
+                out_dir=out_dir,
+                window_name=win_label,
+                hours_limit=win_hours,
+                title="BingX Top 10 Volume Normalized Performance",
+                file_prefix="normalized_top10_volume",
+                benchmark_symbol="BTC-USDT"
+            )
+            if not args.no_chart_send and vol_chart and vol_chart.exists():
+                discord.send_file(vol_chart, f"📊 **【BingX 取引高上位10銘柄 ノーマライズチャート [{win_label.upper()}]】**")
+
+        # ③ 固定選定銘柄 (HYPE, NEAR, ZEC, ARB, UNI + BTC) のノーマライズチャート (30D, 10D, 5D)
+        print("\n[Fixed Selection Charts] Generating 30d, 10d, 5d Normalized Charts...")
+        fixed_target_list = list(FIXED_SYMBOLS)
+        if "BTC-USDT" not in fixed_target_list:
+            fixed_target_list.append("BTC-USDT")
+        for win_label, win_hours in windows:
+            fixed_chart = generate_custom_normalized_charts(
+                all_dfs=all_dfs,
+                target_symbols=fixed_target_list,
+                out_dir=out_dir,
+                window_name=win_label,
+                hours_limit=win_hours,
+                title="BingX Fixed Selection (HYPE, NEAR, ZEC, ARB, UNI) Normalized",
+                file_prefix="normalized_fixed_symbols",
+                benchmark_symbol="BTC-USDT"
+            )
+            if not args.no_chart_send and fixed_chart and fixed_chart.exists():
+                discord.send_file(fixed_chart, f"🎯 **【固定選定銘柄 (HYPE, NEAR, ZEC, ARB, UNI) ノーマライズチャート [{win_label.upper()}]】**")
+
+        # ④ 前兆スコア Top 10
         print("\n==================================================================================")
         print(" [Step 2: Precursor Score Top 10 & Whale Inflow Priority Ranking]")
         print("==================================================================================")
