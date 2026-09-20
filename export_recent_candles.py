@@ -105,23 +105,32 @@ def export_recent_candles(days: int = 60, send_discord_flag: bool = True, all_sy
     df_all = pd.DataFrame(all_rows).drop_duplicates(subset=["timestamp", "symbol"]).sort_values(by=["timestamp", "symbol"]).reset_index(drop=True)
     print(f"\n✅ 全データ統合完了: {valid_count} 銘柄, 総レコード数: {len(df_all):,} 行")
 
-    # ZIPファイル名設定
+    # 実際の日付範囲（JST）から開始日と終了日を正確に取得
+    first_dt = df_all["datetime_jst"].iloc[0]
+    last_dt = df_all["datetime_jst"].iloc[-1]
+    start_tag = pd.to_datetime(first_dt).strftime("%Y%m%d")
+    end_tag = pd.to_datetime(last_dt).strftime("%Y%m%d")
+    start_fmt = pd.to_datetime(first_dt).strftime("%Y/%m/%d %H:%M")
+    end_fmt = pd.to_datetime(last_dt).strftime("%Y/%m/%d %H:%M")
+
+    # ZIPファイル名設定（何日から何日までのデータかを明確に命名）
     mode_prefix = "all_symbols" if all_symbols else "fixed5"
-    zip_name = f"bingx_{mode_prefix}_recent_{days}days_backtest.zip"
+    zip_name = f"bingx_{mode_prefix}_1h_{start_tag}_{end_tag}.zip"
     zip_path = out_dir / zip_name
 
-    print(f"📦 ZIPアーカイブ作成中: {zip_path.name} ...")
+    print(f"📦 ZIPアーカイブ作成中: {zip_path.name} (期間: {start_tag} ～ {end_tag}) ...")
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
-        # 1. 全銘柄統合マスターCSV (Geminiで一括読み込み可能)
+        # 1. 全銘柄統合マスターCSV (日付範囲を明確化)
+        master_csv_name = f"bingx_all_symbols_1h_{start_tag}_{end_tag}_master.csv" if all_symbols else f"bingx_fixed5_1h_{start_tag}_{end_tag}_master.csv"
         master_csv_str = df_all.to_csv(index=False)
-        zf.writestr(f"bingx_all_symbols_recent_{days}d_master.csv", master_csv_str)
+        zf.writestr(master_csv_name, master_csv_str)
 
-        # 2. 主要銘柄（または全銘柄）の個別CSVを同梱
+        # 2. 主要銘柄（または個別銘柄）のCSVを同梱
         export_individuals = set(FIXED_SYMBOLS + [f.replace("-USDT", "") for f in FIXED_SYMBOLS]) if all_symbols else set(ind_dfs.keys())
         for sym_k, df_k in ind_dfs.items():
             if not all_symbols or sym_k in export_individuals or f"{sym_k}-USDT" in export_individuals:
                 s_csv = df_k.to_csv(index=False)
-                zf.writestr(f"individual/{sym_k}_recent_{days}d.csv", s_csv)
+                zf.writestr(f"individual/{sym_k}_1h_{start_tag}_{end_tag}.csv", s_csv)
 
     zip_size_mb = zip_path.stat().st_size / (1024 * 1024)
     print(f"✅ ZIP作成完了: {zip_path.name} ({zip_size_mb:.2f} MB)")
@@ -129,10 +138,10 @@ def export_recent_candles(days: int = 60, send_discord_flag: bool = True, all_sy
     # 12MB超過時の安全コンパクトZIP（マスターCSV単体）
     send_target = zip_path
     if zip_size_mb > 13.0:
-        compact_name = f"bingx_{mode_prefix}_recent_{days}days_master.zip"
+        compact_name = f"bingx_{mode_prefix}_1h_{start_tag}_{end_tag}_master.zip"
         compact_path = out_dir / compact_name
         with zipfile.ZipFile(compact_path, "w", zipfile.ZIP_DEFLATED, compresslevel=9) as zf:
-            zf.writestr(f"bingx_all_symbols_recent_{days}d_master.csv", master_csv_str)
+            zf.writestr(master_csv_name, master_csv_str)
         send_target = compact_path
         print(f"  ※安全制限適用: コンパクトZIP ({send_target.stat().st_size / (1024*1024):.2f} MB) を作成しました。")
 
@@ -140,14 +149,15 @@ def export_recent_candles(days: int = 60, send_discord_flag: bool = True, all_sy
         discord = send_discord()
         if should_upload_file(send_target):
             desc = (
-                f"📊 **【バックテスト用】BingX {target_label} 直近{days}日間 (約{days//30}ヶ月分) OHLCVデータ**\n"
-                f"• 期間: 直近 `{days}` 日間 ({hours_limit}時間足)\n"
+                f"📊 **【バックテスト用】BingX {target_label} 1時間足データ ({start_tag} ～ {end_tag})**\n"
+                f"• 対象期間: `{start_fmt}` ～ `{end_fmt} JST` ({days}日間 / {hours_limit}本)\n"
+                f"• ファイル名: `{send_target.name}`\n"
                 f"• 収録銘柄数: 全 `{valid_count}` 銘柄 (総行数: `{len(df_all):,}` 行)\n"
                 f"• ファイルサイズ: `{send_target.stat().st_size / (1024*1024):.2f} MB` (Discord最適化)\n"
                 f"• 内容: 全銘柄統合マスターCSV ＋ 主要銘柄個別CSV\n"
                 f"※スマホのGeminiやPCのバックテスト環境にそのまま添付・利用可能です。"
             )
-            print(f"📤 Discord (#real3_bngx) へアップロード中...")
+            print(f"📤 Discord (#real3_bngx) へアップロード中: {send_target.name} ...")
             sent = discord.send_file(send_target, desc)
             if sent:
                 record_file_uploaded(send_target, rows=len(df_all))
