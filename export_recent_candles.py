@@ -1,10 +1,12 @@
 """
-Gemini分析・スマホバックテスト用 直近データ抽出 ＆ Discord送信ツール
+Gemini分析・スマホ/PCバックテスト用 直近全銘柄データ抽出 ＆ Discord自動送信ツール
 (export_recent_candles.py)
 
-固定5銘柄 (HYPE, NEAR, ZEC, ARB, UNI) + BTC の直近1ヶ月分 / 2ヶ月分OHLCVデータを
-軽量CSVおよびZIPとして抽出し、スマホのGeminiにそのまま添付できる形式で
+BingX全銘柄（約590銘柄以上）の直近1〜2ヶ月分（デフォルト: 60日間 = 1,440時間足）を抽出し、
+全銘柄統合マスターCSV ＋ 主要銘柄個別CSVを1つの最適化ZIP（8〜10MB）として生成して
 Discord (#real3_bngx) へ送信します。
+
+スマホのGeminiアプリやPCのバックテスト環境にそのまま取り込んで利用可能です。
 """
 
 import argparse
@@ -12,102 +14,159 @@ import sys
 import zipfile
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
+from typing import List, Optional
 import pandas as pd
 
 from config_loader import get_webhook_url
 from bingx5_46_3logic import send_discord
+from upload_registry import should_upload_file, record_file_uploaded
 
 JST = timezone(timedelta(hours=9))
-FIXED_SYMBOLS = ["HYPE-USDT", "NEAR-USDT", "ZEC-USDT", "ARB-USDT", "UNI-USDT", "BTC-USDT"]
+FIXED_SYMBOLS = ["HYPE-USDT", "NEAR-USDT", "ZEC-USDT", "ARB-USDT", "UNI-USDT", "BTC-USDT", "ETH-USDT", "SOL-USDT", "DOGE-USDT", "XRP-USDT"]
 
 
-def export_recent_candles(days: int = 60, send_discord_flag: bool = True) -> Path:
+def export_recent_candles(days: int = 60, send_discord_flag: bool = True, all_symbols: bool = True) -> Optional[Path]:
     base_dir = Path(__file__).resolve().parent
     candles_dir = base_dir / "Data" / "historical_candles"
     out_dir = base_dir / "Data" / "gemini_export"
     out_dir.mkdir(parents=True, exist_ok=True)
 
     hours_limit = days * 24
-    exported_files = []
 
-    print(f"\n[Export] 固定銘柄の直近 {days} 日分 ({hours_limit} 時間足) を抽出中...")
+    # 対象銘柄CSVリストを決定
+    if all_symbols:
+        csv_files = sorted(list(candles_dir.glob("*_1h.csv")))
+        target_label = "全銘柄"
+    else:
+        csv_files = []
+        for sym in FIXED_SYMBOLS:
+            clean_sym = sym.replace("-USDT", "").replace("USDT", "").upper()
+            for name in [f"{sym}_1h.csv", f"{clean_sym}-USDT_1h.csv", f"{clean_sym}_1h.csv"]:
+                p = candles_dir / name
+                if p.exists():
+                    csv_files.append(p)
+                    break
+        target_label = "固定銘柄"
 
-    for sym in FIXED_SYMBOLS:
-        clean_sym = sym.replace("-USDT", "").replace("USDT", "").upper()
-        # 候補ファイル探索
-        cand_file = None
-        for name in [f"{sym}_1h.csv", f"{clean_sym}-USDT_1h.csv", f"{clean_sym}_1h.csv"]:
-            p = candles_dir / name
-            if p.exists():
-                cand_file = p
-                break
+    if not csv_files:
+        print(f"[Export Error] {candles_dir} にローソク足CSVが見つかりません。")
+        return None
 
-        if not cand_file:
-            print(f"  ⚠️ {sym}: ローカル蓄積CSVが見つかりません。スキップします。")
-            continue
+    print(f"\n[Export] {target_label} ({len(csv_files)} 銘柄) の直近 {days} 日分 ({hours_limit} 時間足) を抽出中...")
 
+    all_rows = []
+    ind_dfs = {}
+    valid_count = 0
+
+    out_cols = ["timestamp", "datetime_jst", "symbol", "open", "high", "low", "close", "volume"]
+
+    for idx, cand_path in enumerate(csv_files, 1):
+        sym_name = cand_path.name.replace("_1h.csv", "")
         try:
-            df = pd.read_csv(cand_file)
+            df = pd.read_csv(cand_path)
             if df.empty or "close" not in df.columns:
                 continue
 
-            # timestamp を ISO/日時文字列形式に整形
-            if pd.to_numeric(df["timestamp"], errors="coerce").notna().all():
-                df["datetime_jst"] = pd.to_datetime(df["timestamp"], unit="ms").dt.tz_localize("UTC").dt.tz_convert(JST).dt.strftime("%Y-%m-%d %H:%M")
+            # timestamp を ISO/JST文字列に変換
+            if "timestamp" in df.columns:
+                if pd.to_numeric(df["timestamp"], errors="coerce").notna().all():
+                    df["datetime_jst"] = pd.to_datetime(df["timestamp"], unit="ms").dt.tz_localize("UTC").dt.tz_convert(JST).dt.strftime("%Y-%m-%d %H:%M")
+                else:
+                    df["datetime_jst"] = pd.to_datetime(df["timestamp"]).dt.strftime("%Y-%m-%d %H:%M")
             else:
-                df["datetime_jst"] = pd.to_datetime(df["timestamp"]).dt.strftime("%Y-%m-%d %H:%M")
+                continue
 
-            # 直近N本を抽出
+            if "symbol" not in df.columns:
+                df["symbol"] = sym_name
+
+            # 直近N本（60日 = 1440本）を抽出
             sub_df = df.tail(hours_limit).copy().reset_index(drop=True)
-            
-            # Gemini用に分かりやすい列構成に整形
-            out_cols = ["datetime_jst", "open", "high", "low", "close", "volume"]
+            if len(sub_df) < 5:
+                continue
+
+            valid_count += 1
             avail = [c for c in out_cols if c in sub_df.columns]
             export_sub = sub_df[avail]
 
-            out_csv_name = f"{sym}_recent_{days}d.csv"
-            out_csv_path = out_dir / out_csv_name
-            export_sub.to_csv(out_csv_path, index=False, encoding="utf-8")
-            file_kb = out_csv_path.stat().st_size / 1024
-            print(f"  ✅ {sym:9s}: {len(export_sub)} 行抽出完了 ({file_kb:.1f} KB) -> {out_csv_name}")
-            exported_files.append(out_csv_path)
+            # 主要銘柄または個別抽出用
+            ind_dfs[sym_name] = export_sub
+            all_rows.extend(export_sub.to_dict(orient="records"))
+
+            if idx % 100 == 0 or idx == len(csv_files):
+                print(f"  ... 処理中: {idx}/{len(csv_files)} 銘柄完了 (有効: {valid_count})")
 
         except Exception as e:
-            print(f"  ❌ {sym} 抽出エラー: {e}")
+            pass
 
-    if not exported_files:
-        print("[Export] 有効なデータが抽出できませんでした。")
-        return out_dir
+    if not all_rows:
+        print("[Export Error] 有効なデータが抽出できませんでした。")
+        return None
 
-    # コンパクトなZIPアーカイブにまとめる (スマホで1タップ保存可能)
-    zip_name = f"bingx_fixed5_recent_{days}days_for_gemini.zip"
+    df_all = pd.DataFrame(all_rows).drop_duplicates(subset=["timestamp", "symbol"]).sort_values(by=["timestamp", "symbol"]).reset_index(drop=True)
+    print(f"\n✅ 全データ統合完了: {valid_count} 銘柄, 総レコード数: {len(df_all):,} 行")
+
+    # ZIPファイル名設定
+    mode_prefix = "all_symbols" if all_symbols else "fixed5"
+    zip_name = f"bingx_{mode_prefix}_recent_{days}days_backtest.zip"
     zip_path = out_dir / zip_name
-    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED, compresslevel=9) as zf:
-        for f in exported_files:
-            zf.write(f, arcname=f.name)
 
-    zip_kb = zip_path.stat().st_size / 1024
-    print(f"\n📦 Gemini用ZIPアーカイブ作成完了: {zip_path.name} ({zip_kb:.1f} KB)")
+    print(f"📦 ZIPアーカイブ作成中: {zip_path.name} ...")
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
+        # 1. 全銘柄統合マスターCSV (Geminiで一括読み込み可能)
+        master_csv_str = df_all.to_csv(index=False)
+        zf.writestr(f"bingx_all_symbols_recent_{days}d_master.csv", master_csv_str)
+
+        # 2. 主要銘柄（または全銘柄）の個別CSVを同梱
+        export_individuals = set(FIXED_SYMBOLS + [f.replace("-USDT", "") for f in FIXED_SYMBOLS]) if all_symbols else set(ind_dfs.keys())
+        for sym_k, df_k in ind_dfs.items():
+            if not all_symbols or sym_k in export_individuals or f"{sym_k}-USDT" in export_individuals:
+                s_csv = df_k.to_csv(index=False)
+                zf.writestr(f"individual/{sym_k}_recent_{days}d.csv", s_csv)
+
+    zip_size_mb = zip_path.stat().st_size / (1024 * 1024)
+    print(f"✅ ZIP作成完了: {zip_path.name} ({zip_size_mb:.2f} MB)")
+
+    # 12MB超過時の安全コンパクトZIP（マスターCSV単体）
+    send_target = zip_path
+    if zip_size_mb > 13.0:
+        compact_name = f"bingx_{mode_prefix}_recent_{days}days_master.zip"
+        compact_path = out_dir / compact_name
+        with zipfile.ZipFile(compact_path, "w", zipfile.ZIP_DEFLATED, compresslevel=9) as zf:
+            zf.writestr(f"bingx_all_symbols_recent_{days}d_master.csv", master_csv_str)
+        send_target = compact_path
+        print(f"  ※安全制限適用: コンパクトZIP ({send_target.stat().st_size / (1024*1024):.2f} MB) を作成しました。")
 
     if send_discord_flag:
         discord = send_discord()
-        desc = (
-            f"📱 **【スマホGemini分析用】固定5銘柄 直近{days}日間 (約{days//30}ヶ月分) OHLCVデータ**\n"
-            f"• 期間: 直近 `{days}` 日間 ({hours_limit}本)\n"
-            f"• 収録銘柄: `HYPE`, `NEAR`, `ZEC`, `ARB`, `UNI` (+ `BTC`)\n"
-            f"• ファイルサイズ: `{zip_kb:.1f} KB` (軽量・Gemini直渡し最適化)\n"
-            f"※スマホのDiscordでダウンロードして、そのままGeminiに添付してバックテスト・分析できます。"
-        )
-        discord.send_file(zip_path, desc)
-        print("🚀 Discord (#real3_bngx) へ送信完了しました。")
+        if should_upload_file(send_target):
+            desc = (
+                f"📊 **【バックテスト用】BingX {target_label} 直近{days}日間 (約{days//30}ヶ月分) OHLCVデータ**\n"
+                f"• 期間: 直近 `{days}` 日間 ({hours_limit}時間足)\n"
+                f"• 収録銘柄数: 全 `{valid_count}` 銘柄 (総行数: `{len(df_all):,}` 行)\n"
+                f"• ファイルサイズ: `{send_target.stat().st_size / (1024*1024):.2f} MB` (Discord最適化)\n"
+                f"• 内容: 全銘柄統合マスターCSV ＋ 主要銘柄個別CSV\n"
+                f"※スマホのGeminiやPCのバックテスト環境にそのまま添付・利用可能です。"
+            )
+            print(f"📤 Discord (#real3_bngx) へアップロード中...")
+            sent = discord.send_file(send_target, desc)
+            if sent:
+                record_file_uploaded(send_target, rows=len(df_all))
+                print(f"🚀 Discord送信完了 ＆ レジストリ記録完了: {send_target.name}")
+        else:
+            print(f"📦 [アップロード不要] {send_target.name} はすでにDiscord送信完了済み（データ変更なし）のため送信をスキップしました。")
 
-    return zip_path
+    return send_target
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Export recent candles for Gemini backtesting")
+    parser = argparse.ArgumentParser(description="Export recent candles for backtesting and Gemini analysis")
     parser.add_argument("--days", type=int, default=60, help="Number of days to export (default: 60 = 2 months)")
+    parser.add_argument("--fixed-only", action="store_true", help="Export fixed symbols only (default: all symbols)")
     parser.add_argument("--no-send", action="store_true", help="Do not send to Discord")
     args = parser.parse_args()
 
-    export_recent_candles(days=args.days, send_discord_flag=(not args.no_send))
+    export_recent_candles(
+        days=args.days,
+        send_discord_flag=(not args.no_send),
+        all_symbols=(not args.fixed_only)
+    )
