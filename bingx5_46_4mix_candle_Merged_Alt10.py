@@ -1341,17 +1341,9 @@ async def main():
         zip_name = f"bingx_all_symbols_1h_{start_tag}_to_{end_tag}_{acq_tag}.zip"
         zip_path = out_dir / zip_name
         
-        # 主要個別銘柄（取引高上位 + 固定銘柄 + 前兆スコア上位 + BTC）
-        key_symbols = set(top10_vol_symbols + FIXED_SYMBOLS + [t["symbol"] for t in prioritized_candidates] + ["BTC-USDT"])
-
         with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED, compresslevel=9) as zf:
-            # 1. 全銘柄統合マージドCSV (全銘柄網羅)
+            # 全銘柄統合マージドCSV 1ファイルのみ格納（個別ファイルは含めずシンプル化）
             zf.write(dated_csv_path, arcname=dated_csv_name)
-            # 2. 主要銘柄の個別CSV (検証用)
-            for sym in key_symbols:
-                ind_csv = out_dir / f"merged_{sym}.csv"
-                if ind_csv.exists():
-                    zf.write(ind_csv, arcname=f"individual/merged_{sym}.csv")
 
         zip_size_mb = zip_path.stat().st_size / (1024 * 1024)
         send_target_zip = zip_path
@@ -1369,7 +1361,8 @@ async def main():
                     f"• 取得日時: `{now_jst.strftime('%Y/%m/%d %H:%M JST')}` ({acq_tag})\n"
                     f"• 収録銘柄数: 全 `{len(all_dfs)}` 銘柄 (全データ行数: `{len(df_merged_all):,}` 行)\n"
                     f"• ファイル名: `{send_target_zip.name}`\n"
-                    f"• ファイルサイズ: `{zip_size_mb:.2f} MB` (Discord最適化)"
+                    f"• ファイルサイズ: `{zip_size_mb:.2f} MB` (Discord最適化)\n"
+                    f"• 内容: 全銘柄統合CSV（`{dated_csv_name}` 1ファイルのみ格納）"
                 )
                 discord.send_file(send_target_zip, zip_desc)
                 record_file_uploaded(send_target_zip, rows=len(df_merged_all))

@@ -125,17 +125,10 @@ def export_recent_candles(days: int = 60, send_discord_flag: bool = True, all_sy
 
     print(f"📦 ZIPアーカイブ作成中: {zip_path.name} (期間: {start_tag} ～ {end_tag}, 取得: {acq_tag}) ...")
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED, compresslevel=9) as zf:
-        # 1. 全銘柄統合CSV (日付範囲・取得時刻を明確化)
+        # 全銘柄統合CSV 1ファイルのみをZIPに格納（個別CSVは含めず軽量化）
         all_csv_name = f"bingx_{mode_prefix}_1h_{start_tag}_to_{end_tag}_{acq_tag}.csv"
         all_csv_str = df_all.to_csv(index=False)
         zf.writestr(all_csv_name, all_csv_str)
-
-        # 2. 主要銘柄（または個別銘柄）のCSVを同梱
-        export_individuals = set(FIXED_SYMBOLS + [f.replace("-USDT", "") for f in FIXED_SYMBOLS]) if all_symbols else set(ind_dfs.keys())
-        for sym_k, df_k in ind_dfs.items():
-            if not all_symbols or sym_k in export_individuals or f"{sym_k}-USDT" in export_individuals:
-                s_csv = df_k.to_csv(index=False)
-                zf.writestr(f"individual/{sym_k}_1h_{start_tag}_to_{end_tag}_{acq_tag}.csv", s_csv)
 
     zip_size_mb = zip_path.stat().st_size / (1024 * 1024)
     print(f"✅ ZIP作成完了: {zip_path.name} ({zip_size_mb:.2f} MB)")
@@ -152,7 +145,7 @@ def export_recent_candles(days: int = 60, send_discord_flag: bool = True, all_sy
                 f"• ファイル名: `{send_target.name}`\n"
                 f"• 収録銘柄数: 全 `{valid_count}` 銘柄 (総行数: `{len(df_all):,}` 行)\n"
                 f"• ファイルサイズ: `{send_target.stat().st_size / (1024*1024):.2f} MB`\n"
-                f"• 内容: 全銘柄統合CSV ＋ 主要銘柄個別CSV\n"
+                f"• 内容: 全銘柄統合CSV（`{all_csv_name}` 1ファイルのみ格納）\n"
                 f"※スマホのGeminiやPCのバックテスト環境にそのまま添付・利用可能です。"
             )
             print(f"📤 Discord (#real3_bngx) へアップロード中: {send_target.name} ...")
