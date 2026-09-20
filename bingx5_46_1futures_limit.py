@@ -737,18 +737,37 @@ async def generate_bingx_backtest_chart(
         print(f"[Chart Error] {symbol} チャート生成失敗: {e}")
 
 
-async def load_local_or_api_candles(symbol: str, limit: int = 300) -> pd.DataFrame:
+async def load_local_or_api_candles(symbol: str, limit: int = 1440) -> pd.DataFrame:
     """
-    4mix処理で既に生成済みのローカルCSV (Data/merged_{symbol}.csv) を最優先で読み込み、
-    存在しない場合のみ API から取得する。
-    標準OHLCV列および FR / OI 列を安全に抽出して返す。
+    1年分蓄積データ (Data/historical_candles/{symbol}_1h.csv) を最優先で読み込み、
+    直近指定本数 (デフォルト: 1440本 = 約2ヶ月分) を返す。
+    存在しない場合は merged_{symbol}.csv や API から取得する。
     """
     clean_sym = symbol.replace("USDT", "").replace("USDC", "").upper()
     data_dir = Path(__file__).resolve().parent / "Data"
-    cand_csv = data_dir / f"merged_{clean_sym}.csv"
-    
     target_cols = ["timestamp", "open", "high", "low", "close", "volume", "fundingRate", "openInterest", "funding", "oi"]
 
+    # 1. 過去1年分蓄積ローソク足CSV (historical_candles/{symbol}_1h.csv) を最優先探索
+    candles_dir = data_dir / "historical_candles"
+    for cand_name in [f"{symbol}_1h.csv", f"{clean_sym}-USDT_1h.csv", f"{clean_sym}_1h.csv"]:
+        cand_path = candles_dir / cand_name
+        if cand_path.exists():
+            try:
+                df = pd.read_csv(cand_path)
+                if not df.empty and "close" in df.columns:
+                    df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms" if pd.to_numeric(df["timestamp"], errors="coerce").notna().all() else None)
+                    df = df.sort_values("timestamp").reset_index(drop=True)
+                    available_cols = [c for c in target_cols if c in df.columns]
+                    df = df[available_cols].copy()
+                    if limit and len(df) > limit:
+                        df = df.tail(limit).reset_index(drop=True)
+                    if len(df) >= 20:
+                        return df
+            except Exception:
+                pass
+
+    # 2. 32日分マージドデータ (Data/merged_{clean_sym}.csv)
+    cand_csv = data_dir / f"merged_{clean_sym}.csv"
     if cand_csv.exists():
         try:
             df = pd.read_csv(cand_csv)
@@ -763,6 +782,7 @@ async def load_local_or_api_candles(symbol: str, limit: int = 300) -> pd.DataFra
         except Exception:
             pass
 
+    # 3. 32日分統合マスターCSV
     all_merged_csv = data_dir / "historical_all_symbols_merged.csv"
     if all_merged_csv.exists():
         try:
@@ -780,8 +800,9 @@ async def load_local_or_api_candles(symbol: str, limit: int = 300) -> pd.DataFra
         except Exception:
             pass
 
+    # 4. APIから直近足を取得
     from bingx5_46_2api import fetch_bingx_candles
-    return await fetch_bingx_candles(symbol, "1h", limit=limit)
+    return await fetch_bingx_candles(symbol, "1h", limit=min(limit, 1000))
 
 
 async def validate_profitable_candidates(trade_side: str, mode: str, base_symbol: str, interval: str = "60") -> Tuple[List[str], Dict[str, Dict[str, Any]], Dict[str, Any]]:
@@ -830,8 +851,8 @@ async def validate_profitable_candidates(trade_side: str, mode: str, base_symbol
             discord.print_log(f"   [スキップ] {cand}: クジラ判定が売り優勢 ({cand_whale_sig}) のため選定対象から除外。")
             continue
 
-        cand_df = await load_local_or_api_candles(cand, limit=300)
-        discord.print_log(f"個別最適化中: {cand} (ナンピン数: {MAX_TRADES_COUNT}) ...")
+        cand_df = await load_local_or_api_candles(cand, limit=1440)
+        discord.print_log(f"個別最適化中: {cand} (直近2ヶ月分/{len(cand_df) if cand_df is not None else 0}本, ナンピン数: {MAX_TRADES_COUNT}) ...")
         
         if cand_df is not None and not cand_df.empty and len(cand_df) > 20:
             try:
