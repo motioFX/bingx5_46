@@ -50,20 +50,24 @@ try:
         apis_raw = apis_raw.get(sys.platform) or apis_raw.get("default") or {}
     default_key = bingx_cfg.get("api_key", "")
     default_secret = bingx_cfg.get("secret_key", "")
+    main_key = apis_raw.get("bingx", {}).get("api_key") or default_key
+    main_secret = apis_raw.get("bingx", {}).get("secret_key") or default_secret
     trade_key = apis_raw.get("bingx_trade", {}).get("api_key") or default_key
     trade_secret = apis_raw.get("bingx_trade", {}).get("secret_key") or default_secret
+    demo_key = apis_raw.get("bingx_demo", {}).get("api_key") or main_key
+    demo_secret = apis_raw.get("bingx_demo", {}).get("secret_key") or main_secret
     apis_bingx = {
         "bingx": {
-            "api_key": apis_raw.get("bingx", {}).get("api_key") or default_key,
-            "secret_key": apis_raw.get("bingx", {}).get("secret_key") or default_secret
+            "api_key": main_key,
+            "secret_key": main_secret
         },
         "bingx_trade": {
             "api_key": trade_key,
             "secret_key": trade_secret
         },
         "bingx_demo": {
-            "api_key": apis_raw.get("bingx_demo", {}).get("api_key") or default_key,
-            "secret_key": apis_raw.get("bingx_demo", {}).get("secret_key") or default_secret
+            "api_key": demo_key,
+            "secret_key": demo_secret
         }
     }
 except Exception as e:
@@ -265,9 +269,13 @@ class api_bingx_helper:
         cred_key = 'bingx_demo' if self.mode in ('paper', 'demo', 'testnet') else 'bingx'
         self.base_url = RestAPI_url.get(cred_key, 'https://open-api-vst.bingx.com' if self.mode in ('paper', 'demo', 'testnet') else 'https://open-api.bingx.com')
         
-        self.creds = apis_bingx.get(cred_key) or apis_bingx.get('bingx') or {}
+        self.creds = apis_bingx.get(cred_key) or {}
         self.api_key = self.creds.get("api_key", "")
         self.secret_key = self.creds.get("secret_key", "")
+        if not self.api_key:
+            fallback = apis_bingx.get('bingx', {})
+            self.api_key = fallback.get("api_key", "")
+            self.secret_key = fallback.get("secret_key", "")
         self.instrument_spec = instrument_spec or fetch_instrument_spec_bingx(self.symbol, self.mode) or {}
 
     def is_symbol_supported(self, symbol: Optional[str] = None) -> bool:
