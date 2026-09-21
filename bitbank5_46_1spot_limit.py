@@ -1040,7 +1040,7 @@ async def audit_and_retain_positions(
 
     for sym in all_pos_symbols:
         try:
-            local_api = api_bingx_helper(sym, 'SWAP', 'USDT', mode)
+            local_api = api_bingx_helper(sym, 'JPY', mode)
             pos = await local_api.get_positions()
             buy_qty = float(pos.get("buy", 0.0))
             sell_qty = float(pos.get("sell", 0.0))
@@ -1049,6 +1049,10 @@ async def audit_and_retain_positions(
             side = "LONG" if buy_qty > 0 else ("SHORT" if sell_qty > 0 else "FLAT")
 
             if current_qty <= 0:
+                continue
+
+            # 長期保有BTCの保護（ボットの売買・決済対象外）
+            if sym == "btc_jpy" and current_qty <= 0.0001:
                 continue
 
             if sym in selected_set:
@@ -1173,6 +1177,14 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
         selected_symbols, symbol_apis, symbol_params_map, best_params, mode
     )
 
+    # 💎 起動時: 長期運用 BTC/JPY 状況の表示＆通知
+    try:
+        from long_term_btc_tracker import report_long_term_btc
+        discord.print_log("\n💎 【ボット起動時 初期状態: 長期運用 BTC/JPY 状況】")
+        await report_long_term_btc(mode=mode, to_discord=True)
+    except Exception as btc_err:
+        discord.print_log(f"⚠️ 長期BTC状況取得エラー: {btc_err}")
+
     logic = logicinstance()
     last_screening_slot = (datetime.now(JST).date(), datetime.now(JST).hour)
     cycle_count = 0
@@ -1247,6 +1259,15 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
             last_screening_slot = current_slot
             logic = logicinstance()
             discord.print_log(f"[Periodic Reset Complete] 新しい選定銘柄 (LONG ONLY): {', '.join(selected_symbols)} | 現在の全監視対象: {', '.join(symbol_apis.keys())}")
+
+            # 💎 1日3回選定時: 長期運用 BTC/JPY 状況の表示＆通知 (JST 1:00, 9:00, 17:00)
+            try:
+                from long_term_btc_tracker import report_long_term_btc
+                discord.print_log(f"\n💎 【定期銘柄選定時 ({now_jst.hour:02d}:00 JST) 長期運用 BTC/JPY 状況】")
+                await report_long_term_btc(mode=mode, to_discord=True)
+            except Exception as btc_err:
+                discord.print_log(f"⚠️ 長期BTC状況取得エラー: {btc_err}")
+
             continue
 
         # ========== 毎時: クジラセンチメント更新のみ（パラメータ最適化は8時間ごと定期選定時のみ） ==========

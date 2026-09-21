@@ -98,12 +98,18 @@ BITBANK_SPECS: Dict[str, Dict[str, float]] = {
     "mona_jpy": {"sz_decimals": 4.0, "qty_step": 0.0001, "min_qty": 0.0001, "price_place": 3.0},
     "bcc_jpy": {"sz_decimals": 4.0, "qty_step": 0.0001, "min_qty": 0.0001, "price_place": 0.0},
     "xlm_jpy": {"sz_decimals": 4.0, "qty_step": 0.0001, "min_qty": 0.0001, "price_place": 3.0},
-    "bat_jpy": {"sz_decimals": 4.0, "qty_step": 0.0001, "min_qty": 0.0001, "price_place": 3.0},
-    "omg_jpy": {"sz_decimals": 4.0, "qty_step": 0.0001, "min_qty": 0.0001, "price_place": 3.0},
-    "dot_jpy": {"sz_decimals": 4.0, "qty_step": 0.0001, "min_qty": 0.0001, "price_place": 1.0},
+    "klay_jpy": {"sz_decimals": 4.0, "qty_step": 0.0001, "min_qty": 0.0001, "price_place": 3.0},
+    "mkr_jpy": {"sz_decimals": 4.0, "qty_step": 0.0001, "min_qty": 0.0001, "price_place": 0.0},
     "matic_jpy": {"sz_decimals": 4.0, "qty_step": 0.0001, "min_qty": 0.0001, "price_place": 3.0},
+    "dot_jpy": {"sz_decimals": 4.0, "qty_step": 0.0001, "min_qty": 0.0001, "price_place": 3.0},
+    "trx_jpy": {"sz_decimals": 4.0, "qty_step": 0.0001, "min_qty": 0.0001, "price_place": 3.0},
+    "chz_jpy": {"sz_decimals": 4.0, "qty_step": 0.0001, "min_qty": 0.0001, "price_place": 3.0},
     "ada_jpy": {"sz_decimals": 4.0, "qty_step": 0.0001, "min_qty": 0.0001, "price_place": 3.0},
 }
+
+# ==================== 長期保有BTC保護枠 ====================
+# 口座内に存在する長期運用BTC（約0.2434 BTC）をボットの売買・決済対象から完全に除外・保護
+LONG_TERM_PROTECTED_BTC: float = 0.2434
 
 
 def fetch_instrument_spec_bitbank(symbol: str, mode: str = 'demo') -> Dict[str, float]:
@@ -279,7 +285,13 @@ class api_bitbank_helper:
                     if asset_info.get("asset", "").lower() == self.base_asset:
                         onhand_coin = float(asset_info.get("onhand_amount", 0.0))
                         break
-                position['buy'] = onhand_coin
+
+                if self.base_asset == "btc":
+                    position['raw_onhand'] = onhand_coin
+                    position['protected_cold'] = LONG_TERM_PROTECTED_BTC
+                    position['buy'] = max(0.0, float(np.round(onhand_coin - LONG_TERM_PROTECTED_BTC, 6)))
+                else:
+                    position['buy'] = onhand_coin
 
             # 保有がある場合、平均取得単価を trade_history から算出
             if position['buy'] > 0:
@@ -659,6 +671,28 @@ async def flatten_current_position_bitbank(
         return True
 
     order_qty = local_api._quantize_quantity(buy_qty)
+
+    # 長期保有BTC二重安全物理ガード
+    if clean_sym == "btc_jpy":
+        try:
+            res_assets = await local_api._request_private("GET", "/v1/user/assets")
+            current_btc = 0.0
+            if res_assets.get("success") == 1 and "data" in res_assets:
+                for a in res_assets["data"].get("assets", []):
+                    if a.get("asset", "").lower() == "btc":
+                        current_btc = float(a.get("onhand_amount", 0.0))
+            if current_btc <= LONG_TERM_PROTECTED_BTC:
+                discord.print_log(f"🛡️ [SECURITY LOCK] BTC残高({current_btc:.4f})が長期保護枠({LONG_TERM_PROTECTED_BTC:.4f})以下のため、売却を完全遮断しました。")
+                return True
+            available_sell = max(0.0, current_btc - LONG_TERM_PROTECTED_BTC)
+            order_qty = min(order_qty, local_api._quantize_quantity(available_sell))
+            if order_qty <= 0:
+                discord.print_log(f"🛡️ [SECURITY LOCK] 売却可能BTC数量が0のためスキップします。")
+                return True
+        except Exception as guard_err:
+            discord.print_log(f"🛡️ [SECURITY LOCK ERROR] {guard_err}")
+            return False
+
     discord.print_log(f"[BITBANK] {reason}: 保有コイン売却を実行 (数量: {order_qty} {local_api.base_asset.upper()}).")
 
     if is_air:
@@ -686,7 +720,7 @@ async def flatten_current_position_bitbank(
 
 
 async def fetch_all_position_symbols_bitbank(coin: str = 'JPY', mode: str = 'demo') -> list[str]:
-    """現在残高を保有している銘柄リストを取得"""
+    """現在残高を保有している銘柄リストを取得 (長期保護BTCは除外)"""
     helper = api_bitbank_helper("btc_jpy", coin, mode)
     if not helper.api_key or helper.api_key.startswith("YOUR_"):
         return []
@@ -698,6 +732,9 @@ async def fetch_all_position_symbols_bitbank(coin: str = 'JPY', mode: str = 'dem
                 asset = a.get("asset", "").lower()
                 onhand = float(a.get("onhand_amount", 0.0))
                 if asset != "jpy" and onhand > 0:
+                    # 長期保有BTC保護: 0.2434 BTC 以下の場合はボットのアクティブポジションから除外
+                    if asset == "btc" and onhand <= LONG_TERM_PROTECTED_BTC:
+                        continue
                     pair = f"{asset}_jpy"
                     if pair in BITBANK_SPECS:
                         symbols.append(pair)
