@@ -1374,9 +1374,11 @@ def simulate_envelope_strategy(
     malen: int = 200,
     max_trades: int = 1,
     initial_equity: float = 100.0,
-    fee_rate: float = 0.0006
+    fee_rate: float = 0.0006,
+    callback_pct: float = 0.008
 ) -> dict:
     closes = df["close"].values
+    highs = df["high"].values if "high" in df.columns else closes
     n = len(closes)
     if n < max(length, 10):
         return {"final_pnl": 0.0, "trade_count": 0, "win_rate": 0.0, "DD_max": 0.0, "max_unrealized_loss": 0.0}
@@ -1393,6 +1395,9 @@ def simulate_envelope_strategy(
     avg_price = 0.0
     pos_count = 0
     
+    trailing_tp_active = False
+    trail_peak = 0.0
+
     cum_realized_pnl = 0.0
     cum_fees = 0.0
     trades = []
@@ -1404,24 +1409,35 @@ def simulate_envelope_strategy(
     
     for i in range(1, n):
         c = closes[i]
+        h = highs[i]
         b = basis[i]
         low_band = lower[i]
         ts = df["timestamp"].iloc[i] if "timestamp" in df.columns else i
         
-        # 決済チェック (close > basis かつ avg_price 以上で利確)
+        # 決済チェック (Trailing Take-Profit: close > basis かつ avg_price 以上で利確モード突入後、最高値から反落で成行利確)
         if pos_qty > 0:
-            if c > b and c > avg_price:
-                sell_val = pos_qty * c
-                fee = sell_val * fee_rate
-                pnl = sell_val - pos_cost - fee
-                cum_realized_pnl += pnl
-                cum_fees += fee
-                trades.append(pnl)
-                exec_history.append({"timestamp": ts, "price": c, "size": -pos_qty, "type": "SELL"})
-                pos_qty = 0.0
-                pos_cost = 0.0
-                avg_price = 0.0
-                pos_count = 0
+            if not trailing_tp_active:
+                if c > b and c > avg_price:
+                    trailing_tp_active = True
+                    trail_peak = max(c, h)
+            
+            if trailing_tp_active:
+                trail_peak = max(trail_peak, h)
+                trail_stop = max(trail_peak * (1.0 - callback_pct), avg_price * (1.0 + fee_rate))
+                if c < trail_stop:
+                    sell_val = pos_qty * c
+                    fee = sell_val * fee_rate
+                    pnl = sell_val - pos_cost - fee
+                    cum_realized_pnl += pnl
+                    cum_fees += fee
+                    trades.append(pnl)
+                    exec_history.append({"timestamp": ts, "price": c, "size": -pos_qty, "type": "SELL"})
+                    pos_qty = 0.0
+                    pos_cost = 0.0
+                    avg_price = 0.0
+                    pos_count = 0
+                    trailing_tp_active = False
+                    trail_peak = 0.0
                 
         # エントリーチェック (close < lower)
         if pos_count < max_trades:
@@ -1488,9 +1504,11 @@ def simulate_rsima_strategy(
     lCp: float = 60.0,
     max_trades: int = 1,
     initial_equity: float = 100.0,
-    fee_rate: float = 0.0006
+    fee_rate: float = 0.0006,
+    callback_pct: float = 0.008
 ) -> dict:
     closes = df["close"].values
+    highs = df["high"].values if "high" in df.columns else closes
     n = len(closes)
     if n < max(rsi_len, lma_len) + 5:
         return {"final_pnl": 0.0, "trade_count": 0, "win_rate": 0.0, "DD_max": 0.0, "max_unrealized_loss": 0.0}
@@ -1507,6 +1525,9 @@ def simulate_rsima_strategy(
     avg_price = 0.0
     pos_count = 0
     
+    trailing_tp_active = False
+    trail_peak = 0.0
+
     cum_realized_pnl = 0.0
     cum_fees = 0.0
     trades = []
@@ -1518,6 +1539,7 @@ def simulate_rsima_strategy(
     
     for i in range(1, n):
         c = closes[i]
+        h = highs[i]
         r = rsi[i]
         r_prev = rsi[i-1]
         ma_val = lrsiMA[i]
@@ -1527,20 +1549,30 @@ def simulate_rsima_strategy(
         # ゴールデンクロス判定: rsi > lrsiMA かつ 前足では rsi <= lrsiMA
         gc = (r > ma_val) and (r_prev <= ma_prev)
         
-        # 決済チェック: rsi > lCp かつ c > avg_price で利確
+        # 決済チェック (Trailing Take-Profit: rsi > lCp かつ avg_price 以上で利確モード突入後、最高値から反落で成行利確)
         if pos_qty > 0:
-            if r > lCp and c > avg_price:
-                sell_val = pos_qty * c
-                fee = sell_val * fee_rate
-                pnl = sell_val - pos_cost - fee
-                cum_realized_pnl += pnl
-                cum_fees += fee
-                trades.append(pnl)
-                exec_history.append({"timestamp": ts, "price": c, "size": -pos_qty, "type": "SELL"})
-                pos_qty = 0.0
-                pos_cost = 0.0
-                avg_price = 0.0
-                pos_count = 0
+            if not trailing_tp_active:
+                if r > lCp and c > avg_price:
+                    trailing_tp_active = True
+                    trail_peak = max(c, h)
+            
+            if trailing_tp_active:
+                trail_peak = max(trail_peak, h)
+                trail_stop = max(trail_peak * (1.0 - callback_pct), avg_price * (1.0 + fee_rate))
+                if c < trail_stop:
+                    sell_val = pos_qty * c
+                    fee = sell_val * fee_rate
+                    pnl = sell_val - pos_cost - fee
+                    cum_realized_pnl += pnl
+                    cum_fees += fee
+                    trades.append(pnl)
+                    exec_history.append({"timestamp": ts, "price": c, "size": -pos_qty, "type": "SELL"})
+                    pos_qty = 0.0
+                    pos_cost = 0.0
+                    avg_price = 0.0
+                    pos_count = 0
+                    trailing_tp_active = False
+                    trail_peak = 0.0
                 
         # エントリーチェック: lrsiMA < lEp and rsi < lCp
         if pos_count < max_trades and gc:

@@ -975,14 +975,108 @@ async def select_top_bingx_symbols(top_n: int = 10, mode: str = 'demo') -> List[
     return sorted_tickers[:top_n]
 
 
-async def wait_until_next_hour():
-    """毎時00分05秒まで待機する（前足確定の安全マージン5秒）"""
+TRAILING_TP_FILE = Path(__file__).resolve().parent / "Data" / "trailing_tp_state.json"
+
+def load_trailing_tp_states() -> dict:
+    if TRAILING_TP_FILE.exists():
+        try:
+            with open(TRAILING_TP_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {}
+
+def save_trailing_tp_states(states: dict):
+    try:
+        TRAILING_TP_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with open(TRAILING_TP_FILE, "w", encoding="utf-8") as f:
+            json.dump(states, f, indent=2, ensure_ascii=False)
+    except Exception:
+        pass
+
+
+async def wait_until_next_hour(
+    symbol_apis: Optional[dict] = None,
+    trailing_tp_states: Optional[dict] = None,
+    mode: str = "demo"
+):
+    """毎時00分05秒まで待機する（前足確定の安全マージン5秒）。
+    ポジション保有＆利確モード中の銘柄がある場合、60秒ごとに現在価格をチェックし、
+    利確トレーリングの最高値追従および反落ストップ割れの即時成行利確を行う。"""
     now = datetime.now(JST)
     next_hour = now.replace(minute=0, second=5, microsecond=0) + timedelta(hours=1)
     wait_seconds = (next_hour - now).total_seconds()
     if wait_seconds > 0:
         discord.print_log(f"[Wait] 次の1時間足確定まで {wait_seconds/60:.1f} 分待機 (次回: {next_hour.strftime('%H:%M:%S')} JST)", level="debug")
-        await asyncio.sleep(wait_seconds)
+    
+    while True:
+        now = datetime.now(JST)
+        rem_sec = (next_hour - now).total_seconds()
+        if rem_sec <= 2.0:
+            if rem_sec > 0:
+                await asyncio.sleep(rem_sec)
+            break
+            
+        sleep_step = min(60.0, max(rem_sec - 1.0, 1.0))
+        await asyncio.sleep(sleep_step)
+        
+        now = datetime.now(JST)
+        if now >= next_hour:
+            break
+            
+        # ポジション保有中銘柄のリアルタイム利確トレーリング監視
+        if symbol_apis and trailing_tp_states:
+            active_keys = [k for k, v in list(trailing_tp_states.items()) if v.get("active")]
+            if not active_keys:
+                continue
+            for sym in active_keys:
+                api = symbol_apis.get(sym)
+                if not api:
+                    continue
+                try:
+                    pos = await api.get_positions()
+                    buy_qty = float(pos.get("buy", 0.0))
+                    if buy_qty <= 0:
+                        trailing_tp_states.pop(sym, None)
+                        save_trailing_tp_states(trailing_tp_states)
+                        continue
+                    
+                    entry_px = float(pos.get("buy_pos", 0.0))
+                    if entry_px <= 0:
+                        continue
+                        
+                    from bingx5_46_2api import get_bingx_orderbook, flatten_current_position_bingx
+                    best_bid, best_ask = get_bingx_orderbook(sym, api.bingx.base_url)
+                    cur_px = best_bid if (best_bid and best_bid > 0) else entry_px
+                    
+                    ttp = trailing_tp_states.get(sym)
+                    if not ttp or not ttp.get("active"):
+                        continue
+                    
+                    # 最高値の追従更新
+                    if cur_px > ttp.get("peak_price", entry_px):
+                        ttp["peak_price"] = cur_px
+                    
+                    callback_pct = 0.008  # 0.8%
+                    min_guarantee = entry_px * 1.001  # 建値+手数料0.1%保証
+                    ttp["trail_stop"] = max(ttp["peak_price"] * (1.0 - callback_pct), min_guarantee)
+                    trailing_tp_states[sym] = ttp
+                    save_trailing_tp_states(trailing_tp_states)
+                    
+                    # 反落成行利確チェック
+                    if cur_px < ttp["trail_stop"]:
+                        strat = ttp.get("strategy", "TTP").upper()
+                        exit_reason = f"TrailingTP_{strat}"
+                        pnl_est = (cur_px - entry_px) * buy_qty
+                        discord.print_log(
+                            f"[{sym}] [REALTIME TRAILING TP] 🎯 リアルタイム利確トレーリング成立!\n"
+                            f"   └ 現在値: ${cur_px:,.4f} < 利確ライン: ${ttp['trail_stop']:,.4f} (最高値: ${ttp['peak_price']:,.4f} から反落) | 概算PnL: {pnl_est:+.2f} USDT ➔ 成行利確"
+                        )
+                        await flatten_current_position_bingx(sym, "USDT", mode, exit_reason, force_market=True)
+                        trailing_tp_states.pop(sym, None)
+                        save_trailing_tp_states(trailing_tp_states)
+                except Exception as mon_err:
+                    pass
 
 
 async def run_screening_and_optimization(mode: str, send_charts: bool = False, skip_zip: bool = False) -> tuple:
@@ -1240,6 +1334,7 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
     last_screening_slot = (datetime.now(JST).date(), datetime.now(JST).hour)
     cycle_count = 0
     previous_hourly_oi: Dict[str, float] = {}
+    trailing_tp_states = load_trailing_tp_states()
 
     discord.print_log(f"[Phase B] 1時間足エントリー/クローズループを開始します。新選定銘柄: {', '.join(selected_symbols)} (全監視: {', '.join(symbol_apis.keys())})")
 
@@ -1253,10 +1348,10 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
         if cycle_count == 1:
             if "--loop" in sys.argv and not (now_jst.minute == 0 and now_jst.second < 30):
                 discord.print_log(f"[Sync] 初回起動時刻: {now_jst.strftime('%H:%M:%S')} JST。確定足と同期するため次の正時まで待機します。")
-                await wait_until_next_hour()
+                await wait_until_next_hour(symbol_apis=symbol_apis, trailing_tp_states=trailing_tp_states, mode=mode)
                 now_jst = datetime.now(JST)
         else:
-            await wait_until_next_hour()
+            await wait_until_next_hour(symbol_apis=symbol_apis, trailing_tp_states=trailing_tp_states, mode=mode)
             now_jst = datetime.now(JST)
 
         # --loop フラグがない場合は1サイクルのみ実行
@@ -1536,21 +1631,71 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                 if has_long:
                     cand_strat = sym_params.get("strategy", "rsima")
                     longclose_sig = bool(df["longclose"].iloc[-1]) if "longclose" in df.columns else False
-                    is_take_profit = longclose_sig and (current_price > entry_px)
-                    exit_reason = f"TakeProfit_{cand_strat.upper()}" if is_take_profit else "VP_Trailing"
+                    
+                    ttp = trailing_tp_states.get(sym, {
+                        "active": False,
+                        "peak_price": entry_px,
+                        "trail_stop": entry_px * 1.001,
+                        "entry_price": entry_px,
+                        "strategy": cand_strat
+                    })
 
-                    if is_take_profit:
-                        discord.print_log(f"[{sym}] [TAKE PROFIT] 🎯 新戦略利確シグナル点灯 (現在値: ${current_price:.4f} > 建値: ${entry_px:.4f}, 戦略: {cand_strat.upper()})")
-                        from bingx5_46_2api import flatten_current_position_bingx
-                        await flatten_current_position_bingx(sym, "USDT", mode, exit_reason, force_market=True)
-                        closed = True
+                    # 利確シグナル点灯時のトレーリング発動（未発動の場合）
+                    if not ttp.get("active", False) and longclose_sig and (current_price > entry_px):
+                        ttp["active"] = True
+                        cur_high = max(current_price, float(df["high"].iloc[-1]) if "high" in df.columns else current_price)
+                        ttp["peak_price"] = cur_high
+                        ttp["entry_price"] = entry_px
+                        ttp["strategy"] = cand_strat
+                        callback_pct = 0.008  # 0.8%
+                        min_guarantee = entry_px * 1.001  # 建値+手数料0.1%保証
+                        ttp["trail_stop"] = max(cur_high * (1.0 - callback_pct), min_guarantee)
+                        trailing_tp_states[sym] = ttp
+                        save_trailing_tp_states(trailing_tp_states)
+                        discord.print_log(
+                            f"[{sym}] [TRAILING TP ACTIVATED] 🔥 利益確定トレーリング開始!\n"
+                            f"   └ 現在値: ${current_price:,.4f} (建値: ${entry_px:,.4f}) | 高値: ${ttp['peak_price']:,.4f} | 利確ライン: ${ttp['trail_stop']:,.4f} (-0.8%)"
+                        )
+
+                    # トレーリング利確モード中の判定
+                    if ttp.get("active", False):
+                        cur_high = max(current_price, float(df["high"].iloc[-1]) if "high" in df.columns else current_price)
+                        if cur_high > ttp["peak_price"]:
+                            ttp["peak_price"] = cur_high
+                        callback_pct = 0.008
+                        min_guarantee = entry_px * 1.001
+                        ttp["trail_stop"] = max(ttp["peak_price"] * (1.0 - callback_pct), min_guarantee)
+                        trailing_tp_states[sym] = ttp
+                        save_trailing_tp_states(trailing_tp_states)
+
+                        if current_price < ttp["trail_stop"]:
+                            exit_reason = f"TrailingTP_{cand_strat.upper()}"
+                            discord.print_log(
+                                f"[{sym}] [TRAILING TP TRIGGERED] 🎯 利確トレーリング成立!\n"
+                                f"   └ 現在値: ${current_price:,.4f} < 利確ライン: ${ttp['trail_stop']:,.4f} (最高値: ${ttp['peak_price']:,.4f} から反落) ➔ 成行利確決済"
+                            )
+                            from bingx5_46_2api import flatten_current_position_bingx
+                            await flatten_current_position_bingx(sym, "USDT", mode, exit_reason, force_market=True)
+                            closed = True
+                            trailing_tp_states.pop(sym, None)
+                            save_trailing_tp_states(trailing_tp_states)
+                        else:
+                            discord.print_log(
+                                f"[{sym}] [TRAILING TP HOLD] 🟢 利確トレーリング継続中 (現在値: ${current_price:,.4f}, ピーク: ${ttp['peak_price']:,.4f}, 利確ライン: ${ttp['trail_stop']:,.4f})"
+                            )
+                            closed = False
                     else:
+                        # 利確シグナル未到達時は通常の Volume Profile SL (損切り/撤退) を判定
                         closed = await api.long_close(
                             df, position, commission=0.0,
                             sl_margin_pct=sym_params.get("margin", 2.0),
                             strategy_type=cand_strat,
                         )
+                        exit_reason = "VP_Trailing"
+
                     if closed:
+                        trailing_tp_states.pop(sym, None)
+                        save_trailing_tp_states(trailing_tp_states)
                         record_real_trade(sym, "LONG", "CLOSE", current_price, float(position.get("buy", 0)), pnl_current, f"実運用決済 ({exit_reason})")
                         discord.print_log(f"[{sym}] [CLOSE] 🟢 ロングポジション決済完了 (PnL: {pnl_current:+.2f} USDT, 理由: {exit_reason})")
                         
@@ -1576,9 +1721,12 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                             if sym in symbol_params_map:
                                 del symbol_params_map[sym]
                     else:
+                        ttp_info = ""
+                        if ttp.get("active", False):
+                            ttp_info = f" [利確トレーリング中: ピーク=${ttp['peak_price']:,.4f}, 撤退=${ttp['trail_stop']:,.4f}]"
                         pnl_icon = "🟢" if pnl_current >= 0 else "🔴"
                         discord.print_log(f"──────────────────────────────────────────────────────────")
-                        discord.print_log(f"💰 【{sym} 現在の含み損益】: {pnl_current:+.2f} USDT {pnl_icon} (ロング継続保有中)")
+                        discord.print_log(f"💰 【{sym} 現在の含み損益】: {pnl_current:+.2f} USDT {pnl_icon}{ttp_info} (ロング継続保有中)")
                         discord.print_log(f"──────────────────────────────────────────────────────────")
 
             # 3. 新規エントリー実行 (最大同時保有ポジション数制限: MAX_ACTIVE_POSITIONS)
