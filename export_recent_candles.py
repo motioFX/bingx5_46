@@ -18,7 +18,7 @@ from typing import List, Optional
 import pandas as pd
 
 from config_loader import get_webhook_url
-from bingx5_46_3logic import send_discord
+from bitbank5_46_3logic import send_discord
 from upload_registry import should_upload_file, record_file_uploaded
 
 JST = timezone(timedelta(hours=9))

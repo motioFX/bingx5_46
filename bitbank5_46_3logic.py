@@ -19,7 +19,8 @@ if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8")
     except Exception:
         pass
-from bingx5_46_5backtest_mm import make_mm_pl, Backtest, AirExchange
+
+from bitbank5_46_5backtest_mm import make_mm_pl, Backtest, AirExchange
 from config_loader import get_webhook_url
 
 
@@ -774,7 +775,7 @@ class PnLCalculator:
     def __init__(self, apis_config=None, rest_api_url=None, symbol='BTC', mode='demo'):
         if apis_config is None:
             try:
-                from bingx5_46_2api import apis
+                from bitbank5_46_2api import apis
                 apis_config = apis
             except Exception:
                 apis_config = {}
@@ -794,7 +795,7 @@ class PnLCalculator:
 
     async def get_bingx_trade_history(self, apis_bx, days_back=30):
         try:
-            from bingx5_46_2api import sign_bingx, RestAPI_url
+            from bitbank5_46_2api import sign_bingx, RestAPI_url
             cred_key = 'bingx_demo' if self.mode in ('paper', 'demo', 'testnet') else 'bingx'
             creds = apis_bx.get(cred_key) or {}
             if isinstance(creds, list):

@@ -3,17 +3,24 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, Optional
 
-CONFIG_PATH = Path(__file__).resolve().parent / "bingx_credentials.json"
+# 設定ファイルの探索優先度: bitbank_credentials.json -> bingx_credentials.json
+_PARENT_DIR = Path(__file__).resolve().parent
+BITBANK_CONFIG_PATH = _PARENT_DIR / "bitbank_credentials.json"
+BINGX_CONFIG_PATH = _PARENT_DIR / "bingx_credentials.json"
+CONFIG_PATH = BITBANK_CONFIG_PATH if BITBANK_CONFIG_PATH.exists() else BINGX_CONFIG_PATH
+
+# ==================== Bitbank API 公式エンドポイント ====================
+BITBANK_PUBLIC_URL = "https://public.bitbank.cc"
+BITBANK_REST_URL = "https://api.bitbank.cc"
+BITBANK_WSS_URL = "wss://stream.bitbank.cc"
 
 
 def load_config(path: Optional[Path] = None) -> Dict[str, Any]:
-    target_path = path or CONFIG_PATH
+    target_path = path or (BITBANK_CONFIG_PATH if BITBANK_CONFIG_PATH.exists() else BINGX_CONFIG_PATH)
     if not target_path.exists():
-        # Fallback empty config structure to prevent hard crashes before credentials are configured
         return {
             "apis": {
-                "bingx": {"api_key": "", "secret_key": ""},
-                "bingx_demo": {"api_key": "", "secret_key": ""}
+                "bitbank": ["", ""]
             },
             "webhooks": {}
         }
@@ -25,7 +32,7 @@ def load_config(path: Optional[Path] = None) -> Dict[str, Any]:
         return {"apis": {}, "webhooks": {}}
 
 
-def _load_config(path: Path = CONFIG_PATH) -> Dict[str, Any]:
+def _load_config(path: Optional[Path] = None) -> Dict[str, Any]:
     return load_config(path)
 
 
@@ -41,8 +48,26 @@ def _platform_value(section: str, platform: Optional[str] = None, config: Option
 
 
 def load_api_keys(platform: Optional[str] = None, config: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """
+    pybotters互換のAPIキー辞書を返します。
+    例: {"bitbank": ["API_KEY", "SECRET_KEY"]}
+    """
     apis = _platform_value("apis", platform, config)
-    return apis if isinstance(apis, dict) else {}
+    if not isinstance(apis, dict):
+        return {}
+    
+    # bitbankキーが直接またはプラットフォーム直下にあるかチェック
+    if "bitbank" in apis:
+        return apis
+    
+    # 形式変換: {"bitbank": {"api_key": "...", "secret_key": "..."}} の場合 -> ["key", "secret"]
+    formatted = {}
+    for k, v in apis.items():
+        if isinstance(v, dict) and "api_key" in v and "secret_key" in v:
+            formatted[k] = [v["api_key"], v["secret_key"]]
+        else:
+            formatted[k] = v
+    return formatted
 
 
 # Webhook チャンネル名正規化エイリアスマップ
@@ -89,7 +114,5 @@ def get_webhook_url(name: Optional[str] = None, config: Optional[Dict[str, Any]]
             return str(webhooks[name])
         return ""
 
-    # 未指定の場合: 全環境で BingX本番チャンネル (#real3_bngx) を最優先
-    return str(webhooks.get("real3_bngx") or webhooks.get("test4_backtest") or "")
-
-
+    # 未指定の場合: bitbank本番チャンネル (#real1_bitbank) を最優先、次いで #test4_backtest
+    return str(webhooks.get("real1_bitbank") or webhooks.get("test4_backtest") or webhooks.get("win32") or "")

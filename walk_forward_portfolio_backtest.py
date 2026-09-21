@@ -31,8 +31,8 @@ import matplotlib.dates as mdates
 SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPT_DIR))
 
-from bingx5_46_5backtest_mm import make_mm_pl, AirExchange
-from bingx5_46_3logic import logicinstance, backtester, resample_candles
+from bitbank5_46_5backtest_mm import make_mm_pl, AirExchange
+from bitbank5_46_3logic import logicinstance, backtester, resample_candles
 
 JST = timezone(timedelta(hours=9))
 

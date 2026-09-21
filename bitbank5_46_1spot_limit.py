@@ -60,41 +60,42 @@ if script_dir not in sys.path:
     sys.path.insert(0, script_dir)
 
 try:
-    # Measure clock offset or test connectivity to BingX
-    requests.get('https://open-api.bingx.com/openApi/swap/v2/quote/contracts', timeout=5)
-except Exception as e:
+    # Test connectivity to Bitbank Public API
+    requests.get('https://public.bitbank.cc/btc_jpy/ticker', timeout=5)
+except Exception:
     pass
 # ==================== 動作モード設定 ====================
 # [ 0 ] 安全ロック (Safety Interlock)
 #       本番口座(Live)への誤発注防止のため、本番トレードは完全安全ロック
 ALLOW_LIVE_TRADING = False  # 本番リアル口座への発注APIを物理的に完全遮断
 
-# [ 1 ] BingX 口座指定
-#       True  = 本番口座 (Live Account)
-#       False = デモ口座 (Demo Account / VST: Virtual Simulation Trading)
-BINGX_IS_LIVE = False
+# [ 1 ] Bitbank 口座指定
+#       True  = 本番口座 (Live Account - 実際の残高・ポジション・板データをAPIから取得)
+BITBANK_IS_LIVE = True
 
-# [ 2 ] BingX 注文実行・APIキー指定 (AIR Mode)
-#       False = リアル注文 (BingX VST デモ取引所へ実際に発注・約定・管理)
-#       True  = AIRモード (--air または --mock 引数指定時のみ仮想シミュレーション)
-BINGX_IS_AIR = ("--air" in sys.argv or "--mock" in sys.argv)
+# [ 2 ] Bitbank 注文実行・APIキー指定 (AIR Mode)
+#       True  = AIRモード (ペーパートレードシミュレーション: 実発注APIを呼ばずにモック約定)
+#       False = リアル注文 (ALLOW_LIVE_TRADING=True かつ --real-trade 指定時のみ実発注)
+BITBANK_IS_AIR = ("--real-trade" not in sys.argv) or ("--air" in sys.argv)
 
 # [ 3 ] ポジション・ロット設定
-BINGX_TARGET_POSITION_VALUE_USDT = 15.0
-TARGET_POSITION_VALUE_USDT = BINGX_TARGET_POSITION_VALUE_USDT
-LEVERAGE_FACTOR = 10.0
-MAX_ACTIVE_POSITIONS: int = 2  # 最大同時保有ポジション数 (資金効率と分散を最適化)
-MAX_SELECTED_SYMBOLS: int = 5  # 最大選定・監視銘柄数 (固定5銘柄)
+BITBANK_TARGET_POSITION_VALUE_JPY = 15000.0  # 目標投資額 15,000 円
+TARGET_POSITION_VALUE_JPY = BITBANK_TARGET_POSITION_VALUE_JPY
+TARGET_POSITION_VALUE_USDT = TARGET_POSITION_VALUE_JPY
+LEVERAGE_FACTOR = 1.0  # 現物取引のため 1.0 倍
+MAX_ACTIVE_POSITIONS: int = 2  # 最大同時保有ポジション数
+MAX_SELECTED_SYMBOLS: int = 11  # 最大監視銘柄数 (Bitbank指定11銘柄)
 
-# [ 4 ] ナンピン数設定 (Pyramiding / Scale-in count: 1〜10、初期値: 1)
+# [ 4 ] ナンピン数設定 (初期値: 1)
 MAX_TRADES_COUNT: int = 1
 
-# [ 5 ] 固定選定銘柄
-FIXED_SYMBOLS: List[str] = ["HYPE-USDT", "NEAR-USDT", "ZEC-USDT", "ARB-USDT", "UNI-USDT"]
+# [ 5 ] 固定選定銘柄 (Bitbank指定11銘柄: BTC, ETH, XRP, SOL, DOGE, BNB, ARB, SUI, AVAX, RNDR/RENDER, LINK)
+FIXED_SYMBOLS: List[str] = [
+    "btc_jpy", "eth_jpy", "xrp_jpy", "sol_jpy", "doge_jpy",
+    "bnb_jpy", "arb_jpy", "sui_jpy", "avax_jpy", "render_jpy", "link_jpy"
+]
 
 # [ 6 ] 定期銘柄選定・リセット時刻（JST時間: 0〜23時）
-#       デフォルト: [1, 9, 17] (01:00, 09:00, 17:00 JST / 8時間ごと・主要セッション＆FR節目)。
-#       CLI引数 (--analysis-hours / --reset-hours / --reset-hour) での上書き指定も可能。
 ANALYSIS_HOURS: List[int] = [1, 9, 17]
 DAILY_ANALYSIS_MINUTE = 0
 
@@ -135,25 +136,36 @@ for _idx, _arg in enumerate(sys.argv):
             pass
 # ========================================================================
 
-import bingx5_46_2api
-bingx5_46_2api.bingx_mode = 'live' if BINGX_IS_LIVE else 'demo'
-bingx5_46_2api.is_air = BINGX_IS_AIR
-bingx5_46_2api.BINGX_TARGET_POSITION_VALUE_USDT = BINGX_TARGET_POSITION_VALUE_USDT
-bingx5_46_2api.LEVERAGE_FACTOR = LEVERAGE_FACTOR
+import bitbank5_46_2api
+bitbank5_46_2api.bitbank_mode = 'live' if BITBANK_IS_LIVE else 'demo'
+bitbank5_46_2api.is_air = BITBANK_IS_AIR
+bitbank5_46_2api.BITBANK_TARGET_POSITION_VALUE_JPY = BITBANK_TARGET_POSITION_VALUE_JPY
+bitbank5_46_2api.LEVERAGE_FACTOR = LEVERAGE_FACTOR
+bitbank5_46_2api.ALLOW_LIVE_TRADING = ALLOW_LIVE_TRADING
 
-from bingx5_46_2api import (
+from bitbank5_46_2api import (
+    api_bitbank,
     api_bingx,
     apis,
     RestAPI_url,
+    fetch_bitbank_candles,
+    fetch_bingx_candles,
     flatten_current_position,
     flatten_all_positions,
     fetch_all_position_symbols,
-    bingx_mode,
-    fetch_instrument_spec_bingx,
-    compute_bingx_lot_size,
+    fetch_instrument_spec_bitbank,
+    compute_bitbank_lot_size,
     normalize_symbol,
 )
-from bingx5_46_3logic import send_discord, logicinstance, PnLCalculator, MPStrategy, backtester, run_interval_comparison, resample_candles
+from bitbank5_46_3logic import (
+    send_discord,
+    logicinstance,
+    PnLCalculator,
+    MPStrategy,
+    backtester,
+    run_interval_comparison,
+    resample_candles,
+)
 
 from datetime import datetime, timezone, timedelta
 from decimal import Decimal, ROUND_HALF_UP
@@ -170,7 +182,7 @@ def clear_and_reset_daily_memory(symbol_apis: dict) -> None:
     """1日1回、古いメモリ・キャッシュ・変数を完全に初期化・物理破棄する"""
     symbol_apis.clear()
     gc.collect()
-    from bingx5_46_3logic import send_discord
+    from bitbank5_46_3logic import send_discord
     discord = send_discord()
     discord.print_log("[Daily Reset] 1日1回のデイリー状態・メモリを完全クリア＆リセットしました。")
 
@@ -186,7 +198,7 @@ else:
     asyncio.set_event_loop_policy(None)
 
 SKIP_MIX_ANALYSIS: bool = True
-is_air: bool = BINGX_IS_AIR
+is_air: bool = BITBANK_IS_AIR
 current_strategy_type: str = "range"
 
 import signal
@@ -212,7 +224,7 @@ else:
     interval_map ={'1m':1,'3m':3,'5m':5,'15m':15,'30m':30,'1h':60,'4h':240,'6h':360,'12h':720,'1d':1440}
 
 JST = timezone(timedelta(hours=9))
-MIX_SCRIPT_PATH = Path(__file__).resolve().parent / "bingx5_46_4mix_candle_Merged_Alt10.py"
+MIX_SCRIPT_PATH = Path(__file__).resolve().parent / "download_historical_candles.py"
 SCORES_CSV_PATH = MIX_SCRIPT_PATH.parent / "Data" / "symbol_selection_scores.csv"
 
 TARGET_POSITION_VALUE_USDT = 100.0
@@ -356,22 +368,16 @@ def log_scoring_candidates(candidates: List[Dict[str, Any]]) -> None:
         )
 
 
-async def fetch_last_price(symbol: str, product_type: str, mode: str) -> Optional[float]:
-    return await fetch_last_price_bingx(symbol, product_type or 'SWAP', mode)
-
-
-async def fetch_last_price_bingx(symbol: str, product_type: str, mode: str) -> Optional[float]:
+async def fetch_last_price(symbol: str, product_type: str = 'spot', mode: str = 'demo') -> Optional[float]:
+    clean_sym = normalize_symbol(symbol)
     try:
-        from bingx5_46_2api import get_bingx_orderbook
-        bid, ask = get_bingx_orderbook(symbol)
-        if bid is not None and ask is not None:
-            return round((bid + ask) / 2.0, 6)
-        elif bid is not None:
-            return bid
-        elif ask is not None:
-            return ask
+        resp = requests.get(f"{BITBANK_PUBLIC_URL}/{clean_sym}/ticker", timeout=5)
+        if resp.status_code == 200:
+            data = resp.json()
+            if data.get("success") == 1:
+                return float(data.get("data", {}).get("last", 0.0))
     except Exception as exc:
-        discord.print_log(f"BingX 価格取得エラー ({symbol}): {exc}")
+        discord.print_log(f"Bitbank 価格取得エラー ({symbol}): {exc}")
     return None
 
 
@@ -592,57 +598,29 @@ def load_traded_symbols() -> List[str]:
 
 
 async def fetch_all_asset_contexts(mode: str = 'demo') -> Dict[str, Dict[str, Any]]:
-    """BingX Swap API から全銘柄のリアルタイム FR / 価格 / 出来高を取得"""
+    """Bitbank Public Ticker から各銘柄の最新価格・出来高を取得"""
     res: Dict[str, Dict[str, Any]] = {}
-    cred_key = 'bingx_demo' if mode in ('paper', 'demo', 'testnet') else 'bingx'
-    base_url = RestAPI_url.get(cred_key, 'https://open-api-vst.bingx.com' if mode in ('paper', 'demo', 'testnet') else 'https://open-api.bingx.com')
-    try:
-        # 1. premiumIndex から fundingRate と markPrice を取得
-        url_fr = f"{base_url}/openApi/swap/v2/quote/premiumIndex"
-        resp_fr = requests.get(url_fr, timeout=10)
-        if resp_fr.status_code == 200:
-            data_fr = resp_fr.json()
-            for item in data_fr.get("data", []):
-                sym = normalize_symbol(item.get("symbol", ""))
-                coin = sym.replace("-USDT", "")
-                info = {
-                    "funding": float(item.get("lastFundingRate") or 0.0),
-                    "openInterest": 0.0,
-                    "dayNtlVlm": 0.0,
-                    "markPx": float(item.get("markPrice") or 0.0),
-                    "prevDayPx": 0.0,
-                }
-                res[sym] = info
-                res[coin] = info
-
-        # 2. ticker から quoteVolume と openPrice を取得
-        url_ticker = f"{base_url}/openApi/swap/v2/quote/ticker"
-        resp_ticker = requests.get(url_ticker, timeout=10)
-        if resp_ticker.status_code == 200:
-            data_ticker = resp_ticker.json()
-            for item in data_ticker.get("data", []):
-                sym = normalize_symbol(item.get("symbol", ""))
-                coin = sym.replace("-USDT", "")
-                vol = float(item.get("quoteVolume") or 0.0)
-                open_px = float(item.get("openPrice") or 0.0)
-                last_px = float(item.get("lastPrice") or 0.0)
-
-                for k in (sym, coin):
-                    if k not in res:
-                        res[k] = {
-                            "funding": 0.0,
-                            "openInterest": 0.0,
-                            "dayNtlVlm": vol,
-                            "markPx": last_px,
-                            "prevDayPx": open_px,
-                        }
-                    else:
-                        res[k]["dayNtlVlm"] = vol
-                        res[k]["prevDayPx"] = open_px
-                        if res[k]["markPx"] == 0.0:
-                            res[k]["markPx"] = last_px
-    except Exception as e:
-        print(f"[Warning] fetch_all_asset_contexts (BingX) error: {e}")
+    for sym in FIXED_SYMBOLS:
+        try:
+            norm_sym = normalize_symbol(sym)
+            resp = requests.get(f"{BITBANK_PUBLIC_URL}/{norm_sym}/ticker", timeout=5)
+            if resp.status_code == 200:
+                data = resp.json()
+                if data.get("success") == 1 and "data" in data:
+                    t = data["data"]
+                    last_px = float(t.get("last", 0.0))
+                    vol = float(t.get("vol", 0.0))
+                    info = {
+                        "funding": 0.0,
+                        "openInterest": 0.0,
+                        "dayNtlVlm": vol,
+                        "markPx": last_px,
+                        "prevDayPx": last_px,
+                    }
+                    res[norm_sym] = info
+                    res[norm_sym.split('_')[0]] = info
+        except Exception:
+            pass
     return res
 
 
@@ -659,15 +637,10 @@ def build_pnl_symbol_pool(trade_plan: Optional[Dict[str, Any]], current_symbol: 
 
 def compute_lot_size(
     price: Optional[float],
-    target_position_value_usdt: float,
+    target_position_value_jpy: float,
     spec: Dict[str, float],
 ) -> float:
-    sz_decimals = int(spec.get("sz_decimals", 4.0))
-    min_qty = spec.get("min_qty", 10**(-sz_decimals))
-    if price is None or price <= 0:
-        return min_qty
-    base_qty = target_position_value_usdt / price
-    return round(base_qty, sz_decimals)
+    return compute_bitbank_lot_size(price or 0.0, target_position_value_jpy, spec)
 
 
 def get_bingx_granularity(bybit_interval: str) -> str:
@@ -675,38 +648,8 @@ def get_bingx_granularity(bybit_interval: str) -> str:
     return mapping.get(str(bybit_interval), '1h')
 
 
-async def fetch_bingx_candles(symbol: str, granularity: str, limit: int = 300, mode: str = 'demo') -> pd.DataFrame:
-    from bingx5_46_4mix_candle_Merged_Alt10 import fetch_bingx_ohlcv
-    now_ms = int(time.time() * 1000)
-    start_ms = now_ms - (limit * 3600 * 1000)
-    try:
-        rows = await fetch_bingx_ohlcv(symbol, "SWAP", granularity.upper(), start_ms, now_ms, mode=mode)
-        if rows:
-            df = pd.DataFrame(rows, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume', 'quote_volume'])
-            df['timestamp'] = pd.to_datetime(df['timestamp'].astype(float), unit='ms')
-            df['open'] = df['open'].astype(float)
-            df['high'] = df['high'].astype(float)
-            df['low'] = df['low'].astype(float)
-            df['close'] = df['close'].astype(float)
-            df['volume'] = df['volume'].astype(float)
-            df = df.sort_values('timestamp').reset_index(drop=True)
-
-            # --- 確定足（クローズ完了足）のみを厳格に抽出 ---
-            # 最新行が現在進行形で形成中の未確定足である場合を除外し、前足確定バーのみを返す
-            if not df.empty:
-                granularity_sec_map = {"1H": 3600, "2H": 7200, "4H": 14400, "1D": 86400}
-                gran_sec = granularity_sec_map.get(granularity.upper(), 3600)
-                now_utc = datetime.now(timezone.utc)
-                last_ts = pd.to_datetime(df['timestamp'].iloc[-1], utc=True)
-                candle_close_time = last_ts + timedelta(seconds=gran_sec)
-                # 現在時刻が足のクローズ予定時刻に達していなければ未確定足なので除外
-                if candle_close_time > now_utc:
-                    df = df.iloc[:-1].reset_index(drop=True)
-
-            return df
-    except Exception as e:
-        print(f"fetch_bingx_candles error: {e}")
-    return pd.DataFrame()
+async def fetch_candles_bitbank(symbol: str, granularity: str = "1h", limit: int = 300, mode: str = 'demo') -> pd.DataFrame:
+    return await fetch_bitbank_candles(symbol, interval=granularity, limit=limit, mode=mode)
 
 
 async def generate_bingx_backtest_chart(
@@ -715,7 +658,7 @@ async def generate_bingx_backtest_chart(
 ) -> None:
     try:
         if df_loop is not None and not df_loop.empty and len(df_loop) >= 30:
-            from bingx5_46_3logic import generate_backtest_chart_with_trades
+            from bitbank5_46_3logic import generate_backtest_chart_with_trades
             img_path = generate_backtest_chart_with_trades(
                 symbol=symbol,
                 interval=interval,
@@ -801,8 +744,8 @@ async def load_local_or_api_candles(symbol: str, limit: int = 1440) -> pd.DataFr
             pass
 
     # 4. APIから直近足を取得
-    from bingx5_46_2api import fetch_bingx_candles
-    return await fetch_bingx_candles(symbol, "1h", limit=min(limit, 1000))
+    from bitbank5_46_2api import fetch_bitbank_candles
+    return await fetch_bitbank_candles(symbol, "1h", limit=min(limit, 1000))
 
 
 async def validate_profitable_candidates(trade_side: str, mode: str, base_symbol: str, interval: str = "60") -> Tuple[List[str], Dict[str, Dict[str, Any]], Dict[str, Any]]:
@@ -811,8 +754,8 @@ async def validate_profitable_candidates(trade_side: str, mode: str, base_symbol
     各銘柄自身の最適パラメータでプラス成績（PnL > 100 USDT かつ 取引数 > 0）となる上位3銘柄を選定。
     銘柄ごとの個別最適化パラメータ辞書 (symbol_params_map) を生成・返却する。
     """
-    from bingx5_46_2api import api_bingx
-    from bingx5_46_3logic import run_interval_comparison, logicinstance, resample_candles
+    from bitbank5_46_2api import api_bitbank
+    from bitbank5_46_3logic import run_interval_comparison, logicinstance, resample_candles
 
     discord.print_log("👑 【固定5銘柄 MTF完全ロング判定 ＆ Envelope / RSI MA 個別最適化】を開始します...")
     
@@ -828,10 +771,10 @@ async def validate_profitable_candidates(trade_side: str, mode: str, base_symbol
         except Exception as e:
             discord.print_log(f"   [Warning] eligible_symbols 読込失敗: {e}")
 
-    # ファイル未生成または空の場合は固定5銘柄をデフォルト対象とする
+    # ファイル未生成または空の場合は指定銘柄をデフォルト対象とする
     if not target_cands:
         target_cands = list(FIXED_SYMBOLS)
-        discord.print_log(f"   [デフォルト採用] 固定5銘柄を最適化対象に設定: {', '.join(target_cands)}")
+        discord.print_log(f"   [デフォルト採用] 指定銘柄を最適化対象に設定: {', '.join(target_cands)}")
 
     profitable_cands = []
     symbol_params_map: Dict[str, Dict[str, Any]] = {}
@@ -923,7 +866,7 @@ async def select_top_bingx_symbols(top_n: int = 10, mode: str = 'demo') -> List[
     # スコアファイルが存在しない場合は、銘柄選定スクリプトを自動発注・再計算
     if not scores_file.exists():
         print("[Symbol Selection] symbol_selection_scores.csv が見つかりません。最新データを自動スクリーニング・生成します...")
-        mix_script = Path(__file__).resolve().parent / "bingx5_46_4mix_candle_Merged_Alt10.py"
+        mix_script = Path(__file__).resolve().parent / "download_historical_candles.py"
         if mix_script.exists():
             try:
                 import subprocess
@@ -944,34 +887,19 @@ async def select_top_bingx_symbols(top_n: int = 10, mode: str = 'demo') -> List[
             tickers = df_scores.to_dict(orient="records")
         except Exception as e:
             print(f"[Symbol Selection Error] {e}")
-            from bingx5_46_4mix_candle_Merged_Alt10 import fetch_bingx_tickers
-            tickers = fetch_bingx_tickers()
+            tickers = []
     else:
-        from bingx5_46_4mix_candle_Merged_Alt10 import fetch_bingx_tickers
-        tickers = fetch_bingx_tickers()
+        tickers = []
 
     if not tickers:
-        print("[Symbol Selection] 銘柄情報の取得に失敗。デフォルト銘柄を使用します。")
-        return [{"symbol": "ETH-USDT", "lastPr": 2500.0, "usdtVolume": 1e8}, {"symbol": "SOL-USDT", "lastPr": 105.0, "usdtVolume": 1e8}]
+        return [{"symbol": s} for s in FIXED_SYMBOLS[:top_n]]
     
     # BTCを除外して優先順序通りに抽出
     def _is_btc_sym(s: str) -> bool:
-        clean = str(s).upper().replace("-", "").replace("_", "").replace("USDT", "").replace("USDC", "")
+        clean = str(s).upper().replace("-", "").replace("_", "").replace("USDT", "").replace("USDC", "").replace("JPY", "")
         return clean == "BTC"
 
     sorted_tickers = [t for t in tickers if not _is_btc_sym(t.get("symbol", ""))]
-
-    # 取引所の universe に存在する銘柄のみにフィルタリング
-    try:
-        from bingx5_46_2api import get_bingx_universe_symbols
-        valid_universe = get_bingx_universe_symbols(mode=mode)
-        if valid_universe:
-            filtered = [t for t in sorted_tickers if normalize_symbol(t.get("symbol", "")).upper() in valid_universe]
-            if filtered:
-                sorted_tickers = filtered
-    except Exception as filter_err:
-        print(f"[Symbol Selection Warning] Universe フィルタエラー: {filter_err}")
-
     return sorted_tickers[:top_n]
 
 
@@ -987,18 +915,16 @@ async def wait_until_next_hour():
 
 async def run_screening_and_optimization(mode: str, send_charts: bool = False, skip_zip: bool = False) -> tuple:
     """フェーズA: 銘柄スクリーニング + パラメータ最適化 + 合格銘柄選抜（ロング専用）"""
-    from bingx5_46_2api import api_bingx
+    from bitbank5_46_2api import api_bitbank
 
     # 1. 銘柄スクリーニング実行
     print("\n[Phase A] 銘柄スクリーニング・パラメータ最適化を開始します (LONG ONLY)...")
-    mix_script = Path(__file__).resolve().parent / "bingx5_46_4mix_candle_Merged_Alt10.py"
+    mix_script = Path(__file__).resolve().parent / "download_historical_candles.py"
     if mix_script.exists():
         try:
             cmd = [sys.executable, str(mix_script)]
             if not send_charts:
-                cmd.append("--no-chart-send")
-            if skip_zip:
-                cmd.append("--skip-zip")
+                cmd.append("--skip-charts")
             subprocess.run(cmd, check=True)
         except Exception as sub_err:
             print(f"[Screening Error] 銘柄スクリーニング実行エラー: {sub_err}")
@@ -1038,7 +964,7 @@ async def run_screening_and_optimization(mode: str, send_charts: bool = False, s
         trade_side=trade_side, mode=mode, base_symbol=base_sym
     )
 
-    # バックテスト合格銘柄を優先し、未合格でも固定5銘柄から選定
+    # バックテスト合格銘柄を優先し、未合格でも指定銘柄から選定
     selected_set = set(profitable_cands)
     selected_symbols = list(profitable_cands)
     for sym in FIXED_SYMBOLS:
@@ -1048,7 +974,7 @@ async def run_screening_and_optimization(mode: str, send_charts: bool = False, s
             break
 
     selected_symbols = selected_symbols[:MAX_SELECTED_SYMBOLS]
-    print(f"\n[Selection Result] 選定{len(selected_symbols)}銘柄 (固定5銘柄 MTF完全ロング・個別最適化): {', '.join(selected_symbols)}")
+    print(f"\n[Selection Result] 選定{len(selected_symbols)}銘柄 (指定銘柄 MTF完全ロング・個別最適化): {', '.join(selected_symbols)}")
 
     # 選定銘柄の個別最適化パラメータをDiscordログ表示
     discord.print_log("\n★ 【銘柄別 個別最適化パラメータ一覧 (Envelope / RSI MA)】")
@@ -1087,15 +1013,15 @@ async def audit_and_retain_positions(
     old_params: Optional[Dict[str, Dict[str, Any]]] = None,
 ) -> Tuple[Dict[str, Any], Dict[str, Dict[str, Any]]]:
     """
-    BingX口座内の全PerpポジションをAPIから取得し、
+    Bitbank口座内の全保有銘柄をAPIから取得し、
     selected_symbols に含まれない残存ポジションがあっても強制成行決済せず、
     Graceful Exit（通常決済完了までの独立エグジット監視）として symbol_apis / symbol_params_map に登録・維持する。
     """
-    from bingx5_46_2api import (
-        fetch_all_position_symbols_bingx,
-        fetch_instrument_spec_bingx,
-        api_bingx_helper,
-        api_bingx,
+    from bitbank5_46_2api import (
+        fetch_all_position_symbols_bitbank as fetch_all_position_symbols_bingx,
+        fetch_instrument_spec_bitbank as fetch_instrument_spec_bingx,
+        api_bitbank_helper as api_bingx_helper,
+        api_bitbank as api_bingx,
     )
 
     discord.print_log(f"[Account Audit] 口座全体の全ポジションをスキャン中... (新選定銘柄: {', '.join(selected_symbols)})")
@@ -1159,34 +1085,34 @@ async def audit_and_retain_positions(
     return symbol_apis, symbol_params_map
 
 async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60'):
-    from bingx5_46_2api import (
-        api_bingx,
-        fetch_instrument_spec_bingx,
-        flatten_current_position_bingx,
+    from bitbank5_46_2api import (
+        api_bitbank,
+        fetch_instrument_spec_bitbank,
+        flatten_current_position_bitbank,
     )
-    from bingx5_46_3logic import PnLCalculator
+    from bitbank5_46_3logic import PnLCalculator
 
-    account_mode_str = "[LIVE Account] (本番口座)" if mode == "live" else "[DEMO Account] (BingX VST デモ口座)"
-    air_mode_str = "[AIR MODE ON] (シミュレーション・仮想ペーパートレード)" if bingx5_46_2api.is_air else "[REAL VST ORDER ON] (実際にBingX VST取引所へ発注・約定・管理)"
+    account_mode_str = "[LIVE Account] (Bitbank 本番口座 接続中)" if BITBANK_IS_LIVE else "[OFFLINE/MOCK]"
+    air_mode_str = "[AIR TRADE ON] (本番リアルタイム監視 ＆ ペーパートレード発注)" if BITBANK_IS_AIR else "[REAL ORDER ON] (実際にBitbank取引所へ発注)"
 
     hours_str = ", ".join([f"{h:02d}:00" for h in sorted(ANALYSIS_HOURS)])
     start_msg = (
         "```\n"
-        " ____  _               __  __\n"
-        "| __ )(_)_ __   __ _  \\ \\/ /\n"
-        "|  _ \\| | '_ \\ / _` |  \\  / \n"
-        "| |_) | | | | | (_| |  /  \\ \n"
-        "|____/|_|_| |_|\\__, | /_/\\_\\\n"
-        "               |___/        \n"
-        "----------------------------\n"
-        "  AUTO TRADING SYSTEM START \n"
-        "----------------------------\n"
+        " ____  _ _   _                 _    \n"
+        "| __ )(_) |_| |__   __ _ _ __ | | __\n"
+        "|  _ \\| | __| '_ \\ / _` | '_ \\| |/ /\n"
+        "| |_) | | |_| |_) | (_| | | | |   < \n"
+        "|____/|_|\\__|_.__/ \\__,_|_| |_|_|\\_\\\n"
+        "------------------------------------\n"
+        "   BITBANK AUTO TRADING SYSTEM 5.46 \n"
+        "------------------------------------\n"
         "```\n"
-        f"[BingX Auto Trading System (LONG ONLY)]\n"
+        f"[Bitbank 5.46 Auto Trading System (Spot / LONG ONLY)]\n"
         f"==================================================\n"
         f"  取引口座設定 : {account_mode_str}\n"
         f"  発注モード   : {air_mode_str}\n"
-        f"  戦略方向     : LONG ONLY (上昇特化)\n"
+        f"  目標投資額   : {BITBANK_TARGET_POSITION_VALUE_JPY:,.0f} JPY (現物 1.0倍)\n"
+        f"  戦略方向     : LONG ONLY (現物買い ＆ 手仕舞い売り)\n"
         f"  ローソク足   : 1時間足 (1H)\n"
         f"  銘柄選定時刻 : 毎日 {hours_str} JST (8時間ごと)\n"
         f"=================================================="
@@ -1196,37 +1122,48 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
     else:
         print("[Banner Skipped by --no-banner]")
 
-    # ========== 【トレード前準備 ステップ2】: 全銘柄1時間足データ（1年分）古い順小分けDiscord送信 ==========
+    # ========== 【トレード前準備 ステップ2】: 全銘柄1時間足データ（1年分）取得＆日時付き統合CSV送信 ==========
     skip_history = ("--skip-history" in sys.argv or "--no-history" in sys.argv)
     if not skip_history:
-        discord.print_log("\n📦 【トレード前準備: ステップ2】 全銘柄1時間足データ（過去1年分: 365日）を古い順に小分けZIP送信します...")
+        discord.print_log("\n📦 【トレード前準備: ステップ2】 Bitbank 全銘柄1年分1時間足データ同期・送信確認中...")
         download_script = Path(__file__).resolve().parent / "download_historical_candles.py"
         if download_script.exists():
             try:
-                # 過去1年分 (365日、30日チャンク) を古い順で取得・Discord送信 (チャートは次ステップで生成するためスキップ)
                 cmd_hist = [
                     sys.executable, str(download_script),
                     "--days", "365",
-                    "--chunk-days", "30",
-                    "--skip-charts"
                 ]
-                subprocess.run(cmd_hist, check=True)
-                discord.print_log("✅ 全銘柄1時間足データ（過去1年分）の小分け送信が正常に完了しました。（直近データが最後に到着）")
-            except Exception as dl_err:
-                discord.print_log(f"⚠️ 全銘柄1年分データ取得で警告が発生しました (後続準備を継続): {dl_err}")
-    else:
-        print("[History Download Skipped by --skip-history]")
+                ret = subprocess.run(cmd_hist, timeout=300, capture_output=True, text=True, encoding="utf-8")
+                if ret.returncode == 0:
+                    discord.print_log("✅ 【ステップ2完了】 Bitbank 全銘柄1年分データの同期・送信が完了しました。")
+                else:
+                    err_snippet = (ret.stderr or ret.stdout or "")[-300:]
+                    discord.print_log(f"⚠️ 【ステップ2注意】 データ取得終了コード: {ret.returncode}\n{err_snippet}")
+            except subprocess.TimeoutExpired:
+                discord.print_log("⚠️ 【ステップ2注意】 データ取得がタイムアウト（300秒）しました。バックグラウンド処理を継続します。")
+            except Exception as e:
+                discord.print_log(f"⚠️ 【ステップ2例外】 データ取得処理中にエラーが発生しました: {e}")
 
-    # ========== 【トレード前準備 ステップ3 & 4 & 5】: チャート出力 ➔ MTF乖離判定＆ブレイクアウトTop10 ➔ 個別最適化 ==========
-    trade_side, symbol_params_map, best_params, selected_symbols = await run_screening_and_optimization(
-        mode, send_charts=True, skip_zip=(not skip_history)
-    )
+
+
+    # ========== 【トレード前準備 ステップ3 & 4 & 5】: 指定11銘柄設定 ==========
+    selected_symbols = [normalize_symbol(s) for s in FIXED_SYMBOLS][:MAX_SELECTED_SYMBOLS]
+    symbol_params_map: Dict[str, Dict[str, Any]] = {}
+    best_params: Dict[str, Any] = {
+        "strategy": "rsima",
+        "interval": 60,
+        "mp": 7,
+        "er": 40.0,
+        "params": {"rsi_len": 9, "lma_len": 7, "lEp": 40.0, "lCp": 60.0}
+    }
+    for s in selected_symbols:
+        symbol_params_map[s] = best_params
 
     # 各銘柄の api インスタンスを保持（トレーリングSL状態を維持するため）
     symbol_apis: Dict[str, Any] = {}
     for sym in selected_symbols:
-        api = api_bingx(symbol=sym, mode=mode)
-        spec = fetch_instrument_spec_bingx(sym, mode)
+        api = api_bitbank(symbol=sym, mode=mode)
+        spec = fetch_instrument_spec_bitbank(sym, mode)
         if spec:
             api.update_instrument_spec(spec)
         symbol_apis[sym] = api
@@ -1341,8 +1278,8 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                     if sym in symbol_apis:
                         new_symbol_apis[sym] = symbol_apis[sym]
                     else:
-                        api = api_bingx(symbol=sym, mode=mode)
-                        spec = fetch_instrument_spec_bingx(sym, mode)
+                        api = api_bitbank(symbol=sym, mode=mode)
+                        spec = fetch_instrument_spec_bitbank(sym, mode)
                         if spec:
                             api.update_instrument_spec(spec)
                         new_symbol_apis[sym] = api
@@ -1360,17 +1297,17 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
             selected_set = set(selected_symbols)
             freed_symbols = []
 
-            # 1. 全銘柄のリアルタイム資金調達率(FR)と建玉(OI)を一括取得
+            # 1. 全銘柄のリアルタイム価格・出来高を一括取得
             all_asset_ctxs = await fetch_all_asset_contexts(mode=mode)
 
             # 口座総残高をサイクル開始時に1回取得
             first_api = next(iter(symbol_apis.values())) if symbol_apis else None
-            cycle_balance = await first_api.get_account() if first_api else 1000.0
+            cycle_balance = await first_api.get_account() if first_api else 100000.0
             hourly_summary_rows = []
 
             # 2. 全銘柄のポジション状況とシグナル判定を一括評価
             for sym, api in list(symbol_apis.items()):
-                df = await fetch_bingx_candles(sym, "1h", limit=300, mode=mode)
+                df = await fetch_bitbank_candles(sym, "1h", limit=300, mode=mode)
                 if df.empty or len(df) < 20:
                     discord.print_log(f"[{sym}] ローソク足データ不足 (rows={len(df)}). スキップ。")
                     continue
@@ -1444,21 +1381,22 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                 pos_str = "LONG" if has_long else "FLAT"
                 sig_str = "LONG↑" if long_signal else "---"
                 pnl_current = float(position.get("profit", 0.0)) if has_long else 0.0
-                pnl_str = f" | 含み損益: {pnl_current:+.2f} USDT" if has_long else ""
+                pnl_str = f" | 含み損益: {pnl_current:+,.0f} 円" if has_long else ""
 
                 whale_info = get_whale_sentiment_info(sym)
                 whale_sig = whale_info.get("signal", "NEUTRAL")
 
                 strat_name = sym_params.get("strategy", "RANGE").upper()
+                px_fmt = f"{current_price:,.3f} 円" if current_price < 1000 else f"{current_price:,.0f} 円"
                 discord.print_log(
-                    f"[{sym}] Price: ${current_price:,.4f} | Pos: {pos_str}{pnl_str} | Signal: {sig_str} ({strat_name}) | "
-                    f"FR: {funding_val:+.6f} | VolSurge: {vol_surge:.1f}x | OIΔ: {oi_delta_pct:+.1f}% | "
-                    f"VAH: ${vah:,.4f} | VAL: ${val:,.4f} | POC: ${poc:,.4f} | 口座残高: ${balance:.2f}",
+                    f"[{sym}] Price: {px_fmt} | Pos: {pos_str}{pnl_str} | Signal: {sig_str} ({strat_name}) | "
+                    f"VolSurge: {vol_surge:.1f}x | "
+                    f"VAH: {vah:,.0f} | VAL: {val:,.0f} | POC: {poc:,.0f} | 口座残高: {balance:,.0f} 円",
                     level="debug"
                 )
 
                 whale_tag_short = "🟢買い" if whale_sig == "LONG_ONLY" else ("🔴売り" if whale_sig == "SHORT_ONLY" else "⚪中立")
-                pos_tag_short = f"LONG({pnl_current:+.1f})" if has_long else "FLAT"
+                pos_tag_short = f"LONG({pnl_current:+.0f})" if has_long else "FLAT"
                 sig_tag_short = "LONG↑" if long_signal else "---"
                 hourly_summary_rows.append({
                     "sym": sym,
@@ -1504,15 +1442,15 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
             if hourly_summary_rows:
                 next_hour_str = (now_jst.replace(minute=0, second=5, microsecond=0) + timedelta(hours=1)).strftime('%H:%M:%S')
                 summary_lines = [
-                    f"⏱ [Cycle #{cycle_count}] {now_jst.strftime('%H:%M')} JST | 残高: ${cycle_balance:.2f}",
+                    f"⏱ [Cycle #{cycle_count}] {now_jst.strftime('%H:%M')} JST | 口座残高: {cycle_balance:,.0f} 円",
                     "───────────────────────────────────",
-                    "銘柄     現在値    保有   シグナル  大口",
+                    "銘柄       現在値    保有   シグナル  大口",
                     "───────────────────────────────────",
                 ]
                 for r in hourly_summary_rows:
                     px = r["price"]
-                    px_str = f"${px:,.4f}" if px < 10 else (f"${px:,.2f}" if px < 1000 else f"${px:,.1f}")
-                    summary_lines.append(f"{r['sym']:<6s} {px_str:>9s}  {r['pos']:<6s}  {r['sig']:^6s}  {r['whale']}")
+                    px_str = f"{px:,.3f}円" if px < 1000 else f"{px:,.0f}円"
+                    summary_lines.append(f"{r['sym']:<8s} {px_str:>10s}  {r['pos']:<6s}  {r['sig']:^6s}  {r['whale']}")
                 summary_lines.append("───────────────────────────────────")
                 summary_lines.append(f"次回確定: {next_hour_str} JST")
                 discord.print_log("```text\n" + "\n".join(summary_lines) + "\n```")
@@ -1540,9 +1478,9 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                     exit_reason = f"TakeProfit_{cand_strat.upper()}" if is_take_profit else "VP_Trailing"
 
                     if is_take_profit:
-                        discord.print_log(f"[{sym}] [TAKE PROFIT] 🎯 新戦略利確シグナル点灯 (現在値: ${current_price:.4f} > 建値: ${entry_px:.4f}, 戦略: {cand_strat.upper()})")
-                        from bingx5_46_2api import flatten_current_position_bingx
-                        await flatten_current_position_bingx(sym, "USDT", mode, exit_reason, force_market=True)
+                        discord.print_log(f"[{sym}] [TAKE PROFIT] 🎯 新戦略利確シグナル点灯 (現在値: {current_price:,.0f}円 > 建値: {entry_px:,.0f}円, 戦略: {cand_strat.upper()})")
+                        from bitbank5_46_2api import flatten_current_position_bitbank
+                        await flatten_current_position_bitbank(sym, "JPY", mode, exit_reason, force_market=True)
                         closed = True
                     else:
                         closed = await api.long_close(
@@ -1682,7 +1620,7 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
             # PnL 損益グラフ更新 (初回のみ)
             if cycle_count == 1:
                 try:
-                    from bingx5_46_2api import apis
+                    from bitbank5_46_2api import apis
                     pnl_calc = PnLCalculator(apis_config=apis, mode=mode)
                     df_pnl = await pnl_calc.get_bingx_trade_history(apis)
                     if isinstance(df_pnl, list) and df_pnl:
@@ -1700,12 +1638,16 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
         await asyncio.sleep(1)
 
 
-if __name__ == "__main__":
-    mode = 'live' if BINGX_IS_LIVE else 'demo'
+async def main():
+    mode = 'live' if BITBANK_IS_LIVE else 'demo'
     max_lot = 10.0
     interval = '60'
+    await start(mode, max_lot, interval)
+
+
+if __name__ == "__main__":
     try:
-        asyncio.run(start(mode, max_lot, interval))
+        asyncio.run(main())
     except KeyboardInterrupt:
         print("\nProgram stopped by user.")
 

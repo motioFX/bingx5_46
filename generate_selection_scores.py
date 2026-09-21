@@ -9,12 +9,12 @@ from pathlib import Path
 
 JST = timezone(timedelta(hours=9))
 
-# 同一ディレクトリの bingx5_46_5backtest_mm から PnL 集計ロジックをインポート
+# 同一ディレクトリの bitbank5_46_5backtest_mm から PnL 集計ロジックをインポート
 sys.path.append(str(Path(__file__).resolve().parent))
 try:
-    from bingx5_46_5backtest_mm import make_mm_pl
+    from bitbank5_46_5backtest_mm import make_mm_pl
 except Exception as e:
-    print(f"Warning: Failed to import make_mm_pl from bingx5_46_5backtest_mm.py: {e}")
+    print(f"Warning: Failed to import make_mm_pl from bitbank5_46_5backtest_mm.py: {e}")
     make_mm_pl = None
 
 # --- パラメータ（ウェイト係数）の定義 ---

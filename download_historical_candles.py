@@ -1,12 +1,15 @@
-"""BingX全銘柄 1時間足データ過去遡及取得 & 小分けDiscord自動送信パイプライン
-取引高上位10銘柄 & 固定銘柄（HYPE, NEAR, ZEC, ARB, UNI）のノーマライズチャート（30D / 10D / 5D）自動生成
+"""Bitbank 全銘柄 1時間足データ（1年分 / 365日）遡及取得 & 日時付き統合CSV生成・Discord送信パイプライン
 
 仕様:
-1. BingX USDT無期限先物 全銘柄（約920銘柄）の1時間足を直近から過去2年分（最大730日）遡及取得。
-2. Discord送信サイズ制限（12MB弱）に合わせ、約30日（またはサイズ上限）ごとに小分けZIP化。
-3. 直近チャンクから順次ZIP化してDiscordへ即時送信し、手元にバックテスト用データを蓄積。
-4. 取引高上位10銘柄のノーマライズチャート（30D / 10D / 5D）を生成・送信。
-5. 固定選定銘柄（HYPE, NEAR, ZEC, ARB, UNI + BTC）のノーマライズチャート（30D / 10D / 5D）を生成・送信。
+1. Bitbank 全JPY現物ペア（約47銘柄）の1時間足を過去365日分遡及取得。
+2. 差分キャッシュ更新: すでに取得済みのローカルCSV（Data/historical_candles/{symbol}_1h.csv）がある場合、完了済みの日付をスキップして高速化。
+3. 日時付き統合CSVの生成:
+   ファイル名: bitbank_all_symbols_1h_{YYYYMMDD_HHMMSS}.csv
+   保存先: Data/bitbank_all_symbols_1h_{YYYYMMDD_HHMMSS}.csv
+4. Discord送信:
+   小分けではなく、全データが入った1個のファイル（日時付きCSV）を送信。
+   ※ Discordのファイルサイズ上限（10MB/25MB）を超える場合は、安全のため同名の日時付きZIP（約4〜5MB）に自動圧縮して送信。
+5. ノーマライズ比較チャート（30D / 10D / 5D）も併せて送信。
 """
 from __future__ import annotations
 
@@ -33,8 +36,8 @@ import numpy as np
 import pandas as pd
 import requests
 
-from config_loader import get_webhook_url
-from upload_registry import should_upload_file, record_file_uploaded, register_existing_files
+from config_loader import get_webhook_url, BITBANK_PUBLIC_URL
+from upload_registry import should_upload_file, record_file_uploaded
 
 # 標準出力のUTF-8設定
 if hasattr(sys.stdout, "reconfigure"):
@@ -49,13 +52,11 @@ if sys.platform == "win32":
 JST = timezone(timedelta(hours=9))
 UTC = timezone.utc
 
-REST_API_URL = {
-    "bingx": "https://open-api.bingx.com",
-    "bingx_demo": "https://open-api-vst.bingx.com",
-}
-
-# 固定選定銘柄リスト
-FIXED_SYMBOLS = ["HYPE-USDT", "NEAR-USDT", "ZEC-USDT", "ARB-USDT", "UNI-USDT"]
+# 固定選定銘柄リスト (Bitbank指定11銘柄: BTC, ETH, XRP, SOL, DOGE, BNB, ARB, SUI, AVAX, RNDR/RENDER, LINK)
+FIXED_SYMBOLS = [
+    "btc_jpy", "eth_jpy", "xrp_jpy", "sol_jpy", "doge_jpy",
+    "bnb_jpy", "arb_jpy", "sui_jpy", "avax_jpy", "render_jpy", "link_jpy"
+]
 
 # チャート期間設定 (ラベル, 時間数)
 CHART_WINDOWS = [
@@ -76,36 +77,34 @@ def log(message: str) -> None:
 
 
 def normalize_symbol(symbol: str) -> str:
-    sym = str(symbol).strip().upper()
-    if "_" in sym:
-        sym = sym.replace("_", "-")
-    if sym.endswith("-USDT"):
-        return sym
-    if sym.endswith("USDT") and "-" not in sym:
-        return f"{sym[:-4]}-USDT"
-    if sym.endswith("-USDC"):
-        return sym
-    if sym.endswith("USDC") and "-" not in sym:
-        return f"{sym[:-4]}-USDC"
-    if "-" not in sym:
-        return f"{sym}-USDT"
+    sym = str(symbol).strip().lower()
+    if "-" in sym:
+        sym = sym.replace("-", "_")
+    if sym.endswith("_usdt"):
+        sym = sym.replace("_usdt", "_jpy")
+    elif sym.endswith("usdt"):
+        sym = f"{sym[:-4]}_jpy"
+    elif "_" not in sym:
+        sym = f"{sym}_jpy"
+    if sym in ("rndr_jpy", "rndr"):
+        sym = "render_jpy"
     return sym
 
 
 class send_discord:
     def __init__(self) -> None:
-        self.real3_webhook = get_webhook_url("real3_bngx")
+        self.real1_webhook = get_webhook_url("real1_bitbank")
         self.test4_webhook = get_webhook_url("test4_backtest")
-        self.webhook_url = self.real3_webhook or self.test4_webhook
+        self.webhook_url = self.real1_webhook or self.test4_webhook
 
     def _get_target_webhooks(self) -> list[str]:
-        target = self.real3_webhook or self.test4_webhook
+        target = self.real1_webhook or self.test4_webhook
         return [target] if target else []
 
     def send_message(self, content: str) -> bool:
         webhooks = self._get_target_webhooks()
         if not webhooks:
-            log("[Discord] No webhook configured. Skipping send_message.")
+            log("[Discord] Webhookが設定されていません。送信をスキップします。")
             return False
         success = True
         for url in webhooks:
@@ -113,480 +112,416 @@ class send_discord:
                 resp = requests.post(url, json={"content": content}, timeout=15)
                 resp.raise_for_status()
             except Exception as e:
-                log(f"[Discord Error] send_message failed: {e}")
+                log(f"[Discord Error] メッセージ送信失敗: {e}")
                 success = False
         return success
 
     def send_file(self, file_path: Path, description: str = "") -> bool:
+        """ファイルを Discord に送信。サイズが大きすぎる場合は ZIP 圧縮して自動フォールバック"""
+        if not file_path.exists():
+            log(f"[Discord Error] ファイルが見つかりません: {file_path}")
+            return False
         webhooks = self._get_target_webhooks()
         if not webhooks:
-            log(f"[Discord] No webhook configured. Skipping send_file for {file_path.name}.")
+            log("[Discord] Webhookが設定されていません。送信をスキップします。")
             return False
-        if not file_path.exists():
-            log(f"[Discord Error] File not found: {file_path}")
-            return False
+
+        file_size_mb = file_path.stat().st_size / (1024 * 1024)
+        target_upload_path = file_path
+        mime_type = "text/csv" if target_upload_path.suffix == ".csv" else (
+            "image/png" if target_upload_path.suffix == ".png" else "application/zip"
+        )
+
+        # 10MBを超えるCSVの場合、Discord制限（通常10MB〜25MB）に配慮してZIP圧縮版を用意
+        created_temp_zip = None
+        if target_upload_path.suffix == ".csv" and file_size_mb > 10.0:
+            log(f"   ℹ️ CSVサイズが {file_size_mb:.2f} MB のため、Discord上限対策として同名ZIPを作成します...")
+            zip_path = target_upload_path.with_suffix(".zip")
+            with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+                zf.write(target_upload_path, arcname=target_upload_path.name)
+            zip_size_mb = zip_path.stat().st_size / (1024 * 1024)
+            log(f"   ZIP圧縮完了: {zip_path.name} ({zip_size_mb:.2f} MB)")
+            target_upload_path = zip_path
+            mime_type = "application/zip"
+            description = f"{description}\n*(※Discordファイル容量制限対策のためZIP圧縮形式で送信しています)*"
+
         success = True
         for url in webhooks:
             try:
-                file_size_mb = file_path.stat().st_size / (1024 * 1024)
-                log(f"[Discord] Sending {file_path.name} ({file_size_mb:.2f} MB) to Discord...")
-                with file_path.open("rb") as fh:
-                    files = {"file": (file_path.name, fh)}
-                    data = {"content": description} if description else {}
-                    resp = requests.post(url, data=data, files=files, timeout=60)
+                with open(target_upload_path, "rb") as f:
+                    resp = requests.post(
+                        url,
+                        data={"content": description},
+                        files={"file": (target_upload_path.name, f, mime_type)},
+                        timeout=180
+                    )
                     resp.raise_for_status()
-                log(f"[Discord] Successfully uploaded {file_path.name}")
             except Exception as e:
-                log(f"[Discord Error] Failed to send file {file_path.name}: {e}")
+                log(f"[Discord Error] ファイル送信失敗 ({target_upload_path.name}): {e}")
                 success = False
+
         return success
 
 
-def fetch_bingx_tickers(filter_non_crypto: bool = True) -> List[Dict[str, Any]]:
-    """BingXからUSDT無期限先物の全銘柄ティッカーを取得し、取引高降順でソート"""
-    url = f"{REST_API_URL['bingx']}/openApi/swap/v2/quote/ticker"
-    for attempt in range(3):
-        try:
-            resp = requests.get(url, timeout=15)
-            if resp.status_code == 200:
-                data = resp.json()
-                if data.get("code") == 0:
-                    raw_tickers = data.get("data", [])
-                    results = []
-                    for it in raw_tickers:
-                        sym = normalize_symbol(it.get("symbol", ""))
-                        if not sym.endswith("-USDT"):
-                            continue
-                        # 非暗号資産トークン（ゴールドやインデックス等）の除外
-                        if filter_non_crypto:
-                            base = sym.replace("-USDT", "").upper()
-                            if "NCSK" in base or "2USD" in base or "GOLD" in base:
-                                continue
-                        vol = float(it.get("quoteVolume") or 0.0)
-                        last_px = float(it.get("lastPrice") or 0.0)
-                        results.append({
-                            "symbol": sym,
-                            "lastPrice": last_px,
-                            "quoteVolume": vol,
-                            "priceChangePercent": float(it.get("priceChangePercent") or 0.0),
-                        })
-                    results.sort(key=lambda x: x["quoteVolume"], reverse=True)
-                    log(f"Fetched {len(results)} active USDT perpetual tickers from BingX")
-                    return results
-            time.sleep(1.0)
-        except Exception as e:
-            log(f"Warning: fetch_bingx_tickers attempt {attempt+1} failed: {e}")
-            time.sleep(2.0)
+# ==================== Bitbank API 通信 ====================
+async def fetch_bitbank_tickers() -> List[Dict[str, Any]]:
+    """Bitbank の全ティッカーを取得し、JPYペアを出来高（vol）順にソート"""
+    url = f"{BITBANK_PUBLIC_URL}/tickers"
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    if data.get("success") == 1:
+                        tickers = data.get("data", [])
+                        jpy_tickers = [t for t in tickers if t.get("pair", "").endswith("_jpy")]
+                        jpy_tickers.sort(key=lambda x: float(x.get("vol", 0.0)), reverse=True)
+                        return jpy_tickers
+    except Exception as e:
+        log(f"[Bitbank API Error] fetch_bitbank_tickers failed: {e}")
     return []
 
 
-async def fetch_symbol_klines(
+async def fetch_candle_day(
     session: aiohttp.ClientSession,
     symbol: str,
-    start_ms: int,
-    end_ms: int,
+    date_str: str,
     sem: asyncio.Semaphore,
-    limit: int = 1000
-) -> Tuple[str, List[Dict[str, Any]]]:
-    """1銘柄の指定期間の1時間足OHLCVを取得"""
-    url = f"{REST_API_URL['bingx']}/openApi/swap/v2/quote/klines"
-    params = {
-        "symbol": symbol,
-        "interval": "1h",
-        "startTime": str(start_ms),
-        "endTime": str(end_ms),
-        "limit": str(limit),
-    }
-    async with sem:
-        for attempt in range(5):
+    max_retries: int = 3
+) -> List[List[Any]]:
+    """1日分の1時間足OHLCVを取得"""
+    url = f"{BITBANK_PUBLIC_URL}/{symbol}/candlestick/1hour/{date_str}"
+    for attempt in range(max_retries):
+        async with sem:
             try:
-                async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=12)) as resp:
+                async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
                     if resp.status == 200:
                         data = await resp.json()
-                        if data.get("code") == 0:
-                            items = data.get("data", [])
-                            if isinstance(items, list):
-                                rows = []
-                                for it in items:
-                                    t = int(it.get("time") or 0)
-                                    rows.append({
-                                        "timestamp": t,
-                                        "open": float(it.get("open") or 0.0),
-                                        "high": float(it.get("high") or 0.0),
-                                        "low": float(it.get("low") or 0.0),
-                                        "close": float(it.get("close") or 0.0),
-                                        "volume": float(it.get("volume") or 0.0),
-                                        "symbol": symbol,
-                                    })
-                                return symbol, rows
-                        elif data.get("code") == 100410:
-                            # レート制限検知: 指数バックオフ待機
-                            await asyncio.sleep(3.0 * (attempt + 1))
-                            continue
-                    await asyncio.sleep(0.08)
+                        if data.get("success") == 1 and "data" in data:
+                            candlestick = data["data"].get("candlestick", [])
+                            if candlestick and "ohlcv" in candlestick[0]:
+                                return candlestick[0]["ohlcv"]
+                    elif resp.status == 429:
+                        await asyncio.sleep(1.0 + attempt * 1.5)
+                        continue
+                    elif resp.status == 404:
+                        # まだ上場していない過去日などはスキップ
+                        return []
             except Exception:
-                await asyncio.sleep(1.0 * (attempt + 1))
-    return symbol, []
+                await asyncio.sleep(0.5 + attempt * 0.5)
+    return []
 
 
-def generate_normalized_chart(
-    symbols_data: Dict[str, pd.DataFrame],
+async def download_symbol_candles(
+    session: aiohttp.ClientSession,
+    symbol: str,
+    dates: List[str],
+    sem: asyncio.Semaphore
+) -> pd.DataFrame:
+    """指定銘柄の指定日付リスト全日の1時間足を並行取得"""
+    if not dates:
+        return pd.DataFrame()
+    tasks = [fetch_candle_day(session, symbol, d, sem) for d in dates]
+    results = await asyncio.gather(*tasks)
+
+    all_rows = []
+    for day_rows in results:
+        if day_rows:
+            all_rows.extend(day_rows)
+
+    if not all_rows:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(all_rows, columns=['open', 'high', 'low', 'close', 'volume', 'timestamp'])
+    for col in ['open', 'high', 'low', 'close', 'volume']:
+        df[col] = pd.to_numeric(df[col], errors='coerce')
+    df['timestamp'] = pd.to_datetime(df['timestamp'].astype(float), unit='ms')
+    df = df.drop_duplicates(subset=['timestamp']).sort_values('timestamp').reset_index(drop=True)
+    return df
+
+
+def get_existing_dates_for_symbol(csv_path: Path) -> Set[str]:
+    """既存CSVからすでに完了している日付（UTC）のセットを取得"""
+    if not csv_path.exists():
+        return set()
+    try:
+        df = pd.read_csv(csv_path, usecols=['timestamp'])
+        df['timestamp'] = pd.to_datetime(df['timestamp'])
+        today_str = datetime.now(timezone.utc).strftime("%Y%m%d")
+        df['date_str'] = df['timestamp'].dt.strftime("%Y%m%d")
+        counts = df['date_str'].value_counts()
+        completed = set(counts[counts >= 24].index)
+        completed.discard(today_str)  # 今日は再取得対象
+        return completed
+    except Exception:
+        return set()
+
+
+# ==================== ノーマライズチャート生成 ====================
+def generate_normalized_charts(
+    df_dict: Dict[str, pd.DataFrame],
     target_symbols: List[str],
-    window_name: str,
-    hours: int,
-    title: str,
-    out_path: Path,
-    benchmark_symbol: Optional[str] = "BTC-USDT"
-) -> Optional[Path]:
-    """ノーマライズ比較チャート（Base=1.0、パフォーマンス順凡例）を生成"""
-    plot_items = []
-    
-    for sym in target_symbols:
-        df = symbols_data.get(sym)
-        if df is None or df.empty or len(df) < 2:
+    out_dir: Path,
+    timestamp_tag: str,
+    prefix: str = "bitbank"
+) -> List[Path]:
+    """価格を100%基準に正規化した比較チャートを生成（ファイル名に日時タグ付与）"""
+    created_charts = []
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    for label, hours in CHART_WINDOWS:
+        plt.figure(figsize=(12, 6))
+        plotted_any = False
+
+        for sym in target_symbols:
+            if sym not in df_dict or df_dict[sym].empty:
+                continue
+            df = df_dict[sym].copy()
+            if len(df) < 5:
+                continue
+            df = df.tail(hours)
+            base_price = df["close"].iloc[0]
+            if base_price <= 0:
+                continue
+            norm_series = (df["close"] / base_price - 1.0) * 100.0
+            plt.plot(df["timestamp"], norm_series, label=sym.upper(), linewidth=1.5)
+            plotted_any = True
+
+        if not plotted_any:
+            plt.close()
             continue
-        sub = df.tail(hours).copy().reset_index(drop=True)
-        if len(sub) < 2:
-            continue
-        base_px = float(sub["close"].iloc[0])
-        if base_px <= 0:
-            continue
-        sub["norm"] = sub["close"] / base_px
-        final_norm = float(sub["norm"].iloc[-1])
-        plot_items.append({
-            "symbol": sym,
-            "df": sub,
-            "final_norm": final_norm,
-            "is_benchmark": (sym == benchmark_symbol)
-        })
 
-    if not plot_items:
-        log(f"Warning: No valid data to plot for {title} [{window_name}]")
-        return None
+        plt.title(f"Bitbank Top Assets Normalized Return ({label.upper()})", fontsize=14, fontweight="bold")
+        plt.xlabel("Date (JST)", fontsize=10)
+        plt.ylabel("Return (%)", fontsize=10)
+        plt.grid(True, linestyle="--", alpha=0.5)
+        plt.legend(loc="upper left", bbox_to_anchor=(1.01, 1.0), fontsize=9)
+        plt.gca().xaxis.set_major_formatter(mdates.DateFormatter("%m/%d %H:%M", tz=JST))
+        plt.tight_layout()
 
-    # パフォーマンス順にソート (ベンチマーク以外)
-    non_bm = [item for item in plot_items if not item["is_benchmark"]]
-    bm = [item for item in plot_items if item["is_benchmark"]]
-    non_bm.sort(key=lambda x: x["final_norm"], reverse=True)
-    sorted_items = non_bm + bm
+        # 日時タグ付きファイル名
+        out_path = out_dir / f"{prefix}_normalized_{label}_{timestamp_tag}.png"
+        plt.savefig(out_path, dpi=120)
+        plt.close()
+        created_charts.append(out_path)
 
-    # プロット描画
-    fig, ax = plt.subplots(figsize=(11.5, 6.0), dpi=150)
-    
-    # カラーマップ
-    colors = plt.cm.tab10(np.linspace(0, 1, len(non_bm)))
-    c_idx = 0
-
-    for item in sorted_items:
-        sym = item["symbol"]
-        sub = item["df"]
-        fn = item["final_norm"]
-        pct = (fn - 1.0) * 100.0
-        sign_str = "+" if pct >= 0 else ""
-
-        if item["is_benchmark"]:
-            label = f"Ref: {sym:<8} ({fn:.2f}x | {sign_str}{pct:.1f}%)"
-            ax.plot(sub["dt_jst"], sub["norm"], label=label, color="gray", linestyle="--", linewidth=1.8, alpha=0.85, zorder=2)
-        else:
-            c_idx += 1
-            label = f"{c_idx:>2}. {sym:<10} ({fn:.2f}x | {sign_str}{pct:.1f}%)"
-            color = colors[c_idx - 1]
-            ax.plot(sub["dt_jst"], sub["norm"], label=label, color=color, linewidth=2.0, zorder=3)
-
-    ax.axhline(1.0, color="black", linestyle=":", linewidth=1.2, alpha=0.7, zorder=1)
-    ax.set_title(f"{title} [{window_name}] (Normalized Base = 1.0)", fontsize=13, fontweight="bold", pad=12)
-    ax.set_xlabel("Date / Time (JST)", fontsize=10)
-    ax.set_ylabel("Normalized Price Ratio", fontsize=10)
-    ax.legend(loc="upper left", bbox_to_anchor=(1.01, 1), borderaxespad=0., fontsize=9)
-    ax.grid(True, linestyle="--", alpha=0.35)
-
-    # X軸の日時フォーマット調整
-    ax.xaxis.set_major_formatter(mdates.DateFormatter("%m/%d %H:%M", tz=JST))
-    plt.xticks(rotation=20)
-    plt.tight_layout()
-
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    plt.savefig(out_path, bbox_inches="tight")
-    plt.close(fig)
-    log(f"Saved normalized chart: {out_path.name}")
-    return out_path
+    return created_charts
 
 
+# ==================== メイン実行パイプライン ====================
 async def run_pipeline(
-    total_days: int = 730,
-    chunk_days: int = 30,
-    test_mode: bool = False,
-    skip_download: bool = False,
+    days: int = 365,
+    top_n: int = 0,
+    force: bool = False,
+    force_upload: bool = False,
     skip_charts: bool = False,
-    no_discord: bool = False
+    skip_upload: bool = False,
+    symbols_override: Optional[List[str]] = None
 ) -> None:
-    """BingX全銘柄 過去データ遡及取得 & 小分けDiscord送信 & ノーマライズチャート生成 メインパイプライン"""
-    script_dir = Path(__file__).resolve().parent
-    data_dir = script_dir / "Data"
-    data_dir.mkdir(parents=True, exist_ok=True)
-    chunks_dir = data_dir / "historical_chunks"
-    chunks_dir.mkdir(parents=True, exist_ok=True)
+    discord = send_discord()
+    data_dir = Path(__file__).resolve().parent / "Data"
     candles_dir = data_dir / "historical_candles"
     candles_dir.mkdir(parents=True, exist_ok=True)
-    charts_dir = data_dir / "charts"
-    charts_dir.mkdir(parents=True, exist_ok=True)
+    plots_dir = data_dir / "plots"
+    plots_dir.mkdir(parents=True, exist_ok=True)
 
-    discord = send_discord() if not no_discord else None
+    # 実行日時タグ（JST: YYYYMMDD_HHMMSS）
+    now_jst = datetime.now(JST).strftime("%Y%m%d_%H%M%S")
 
-    # 1. 銘柄一覧の取得
-    log("=================================================================")
-    log(" Starting BingX All-Symbols Historical Pipeline")
-    log("=================================================================")
-    tickers = fetch_bingx_tickers(filter_non_crypto=True)
-    if not tickers:
-        log("Error: Failed to fetch tickers from BingX API. Exiting.")
+    log("=" * 70)
+    log("🚀 [Bitbank 5.46] 全銘柄1年分（365日）1時間足データ取得＆統合CSV送信パイプライン開始")
+    log(f"   期間: 過去 {days} 日間 | 実行日時タグ: {now_jst}")
+    log("=" * 70)
+
+    # 1. 取得対象銘柄の決定
+    tickers = await fetch_bitbank_tickers()
+    if symbols_override:
+        target_symbols = [normalize_symbol(s) for s in symbols_override]
+        log(f"📌 指定銘柄 ({len(target_symbols)} 銘柄): {', '.join(target_symbols)}")
+    elif top_n > 0 and tickers:
+        top_pairs = [t["pair"] for t in tickers[:top_n]]
+        for f_sym in FIXED_SYMBOLS:
+            if f_sym not in top_pairs:
+                top_pairs.append(f_sym)
+        target_symbols = top_pairs
+        log(f"📌 出来高上位＋固定 ({len(target_symbols)} 銘柄): {', '.join(target_symbols)}")
+    elif tickers:
+        target_symbols = [t["pair"] for t in tickers]
+        log(f"📌 Bitbank 全 {len(target_symbols)} JPY現物銘柄を対象にします")
+    else:
+        target_symbols = FIXED_SYMBOLS
+        log(f"⚠️ ティッカー取得失敗のため固定5銘柄を使用: {', '.join(target_symbols)}")
+
+    # 2. 日付リストの生成 (古い順)
+    today = datetime.now(timezone.utc).date()
+    start_date = today - timedelta(days=days)
+    all_dates = []
+    curr = start_date
+    while curr <= today:
+        all_dates.append(curr.strftime("%Y%m%d"))
+        curr += timedelta(days=1)
+
+    log(f"📅 取得対象期間: {all_dates[0]} 〜 {all_dates[-1]} ({len(all_dates)} 日分)")
+
+    sem = asyncio.Semaphore(12)  # 同時接続数12
+    total_downloaded_days = 0
+
+    async with aiohttp.ClientSession() as session:
+        all_symbol_dfs: Dict[str, pd.DataFrame] = {}
+
+        log("\n📥 各銘柄の1時間足データを並行取得・差分更新中...")
+        for sym_idx, sym in enumerate(target_symbols, 1):
+            csv_path = candles_dir / f"{sym}_1h.csv"
+
+            # 差分判定: force でない場合はすでに取得済みの日付を除外
+            if not force and csv_path.exists():
+                existing_dates = get_existing_dates_for_symbol(csv_path)
+                dates_to_fetch = [d for d in all_dates if d not in existing_dates]
+            else:
+                dates_to_fetch = all_dates
+
+            if dates_to_fetch:
+                df_new = await download_symbol_candles(session, sym, dates_to_fetch, sem)
+                total_downloaded_days += len(dates_to_fetch)
+            else:
+                df_new = pd.DataFrame()
+
+            # 既存CSVとマージして保存
+            if csv_path.exists():
+                try:
+                    old_df = pd.read_csv(csv_path)
+                    old_df['timestamp'] = pd.to_datetime(old_df['timestamp'])
+                    if not df_new.empty:
+                        merged_df = pd.concat([old_df, df_new]).drop_duplicates(subset=['timestamp']).sort_values('timestamp').reset_index(drop=True)
+                        merged_df.to_csv(csv_path, index=False, encoding="utf-8")
+                    else:
+                        merged_df = old_df
+                except Exception:
+                    if not df_new.empty:
+                        df_new.to_csv(csv_path, index=False, encoding="utf-8")
+                        merged_df = df_new
+                    else:
+                        merged_df = pd.DataFrame()
+            else:
+                if not df_new.empty:
+                    df_new.to_csv(csv_path, index=False, encoding="utf-8")
+                    merged_df = df_new
+                else:
+                    merged_df = pd.DataFrame()
+
+            if not merged_df.empty:
+                merged_df['timestamp'] = pd.to_datetime(merged_df['timestamp'])
+                all_symbol_dfs[sym] = merged_df
+
+            if sym_idx % 5 == 0 or sym_idx == len(target_symbols):
+                log(f"   [{sym_idx:2d}/{len(target_symbols)}] {sym} 完了 (取得済レコード数: {len(merged_df):,} 行)")
+
+    log(f"\n✅ 全 {len(target_symbols)} 銘柄のローカルCSV保存が完了しました (新規DL日次ブロック: {total_downloaded_days:,} 件)")
+
+    # 3. 日時付き統合CSVファイルの作成 (Data/bitbank_all_symbols_1h_{YYYYMMDD_HHMMSS}.csv)
+    merged_rows = []
+    for sym in target_symbols:
+        csv_path = candles_dir / f"{sym}_1h.csv"
+        if csv_path.exists():
+            try:
+                df = pd.read_csv(csv_path)
+                df["symbol"] = sym
+                merged_rows.append(df)
+            except Exception:
+                pass
+
+    if not merged_rows:
+        log("❌ データが存在しないため処理を終了します。")
         return
 
-    all_symbols = [t["symbol"] for t in tickers]
-    # 固定銘柄がリストに含まれることを保証
-    for fs in FIXED_SYMBOLS + ["BTC-USDT"]:
-        if fs not in all_symbols:
-            all_symbols.append(fs)
+    master_df = pd.concat(merged_rows, ignore_index=True)
+    # タイムスタンプ順にソート
+    master_df['timestamp'] = pd.to_datetime(master_df['timestamp'])
+    master_df = master_df.sort_values(by=['timestamp', 'symbol']).reset_index(drop=True)
 
-    # 取引高上位10銘柄の特定 (BTCを含む上位10、またはアルト上位10+BTC)
-    top10_volume_symbols = [t["symbol"] for t in tickers[:10]]
-    if "BTC-USDT" not in top10_volume_symbols:
-        top10_volume_symbols.insert(0, "BTC-USDT")
-        top10_volume_symbols = top10_volume_symbols[:10]
+    # ① 日時付き統合CSV（被らないように保存）
+    dated_csv_name = f"bitbank_all_symbols_1h_{now_jst}.csv"
+    dated_csv_path = data_dir / dated_csv_name
+    master_df.to_csv(dated_csv_path, index=False, encoding="utf-8")
+    dated_csv_size_mb = dated_csv_path.stat().st_size / (1024 * 1024)
+    log(f"\n📄 日時付き統合CSVを保存しました: {dated_csv_name} ({len(master_df):,} 行 / {dated_csv_size_mb:.2f} MB)")
 
-    log(f"Target Universe: {len(all_symbols)} symbols")
-    log(f"Top 10 Volume Symbols: {top10_volume_symbols}")
-    log(f"Fixed Symbols: {FIXED_SYMBOLS}")
+    # ② 固定名マスターCSVも最新化
+    fixed_master_csv = data_dir / "historical_all_symbols_merged.csv"
+    master_df.to_csv(fixed_master_csv, index=False, encoding="utf-8")
+    log(f"📄 固定マスターCSVも更新しました: {fixed_master_csv.name}")
 
-    # テストモード設定
-    if test_mode:
-        log(">>> RUNNING IN TEST MODE (First 20 symbols, 5 days only) <<<")
-        all_symbols = (top10_volume_symbols + FIXED_SYMBOLS + all_symbols[:15])[:20]
-        # 重複削除
-        all_symbols = list(dict.fromkeys(all_symbols))
-        total_days = 5
-        chunk_days = 5
+    # 4. Discord へ全データ入りの1個のファイルを送信
+    if not skip_upload:
+        log("\n📤 Discord へ全銘柄統合データを送信中...")
+        desc = (
+            f"📊 **[Bitbank 5.46 全銘柄1年分データ]**\n"
+            f"• 銘柄数: `{len(target_symbols)}` 銘柄 (JPY現物全銘柄)\n"
+            f"• 期間: 過去 `{days}` 日分 (〜{all_dates[-1]})\n"
+            f"• 総レコード数: `{len(master_df):,}` 行 ({dated_csv_size_mb:.2f} MB)\n"
+            f"• ファイル名: `{dated_csv_name}`"
+        )
+        send_ok = discord.send_file(dated_csv_path, description=desc)
+        if send_ok:
+            record_file_uploaded(dated_csv_path)
+            log(f"   ✅ Discord 送信完了: {dated_csv_name}")
+        else:
+            log(f"   ⚠️ Discord 送信に失敗しました。")
 
-    # 2. 直近から過去へのチャンク分割
-    now_utc = datetime.now(UTC).replace(minute=0, second=0, microsecond=0)
-    chunks: List[Tuple[datetime, datetime]] = []
-    curr_end = now_utc
+    # 5. ノーマライズ比較チャート生成 & 送信
+    if not skip_charts:
+        log("\n📊 ノーマライズ比較チャートを生成中...")
+        chart_symbols = list(FIXED_SYMBOLS)
 
-    while True:
-        curr_start = curr_end - timedelta(days=chunk_days)
-        chunks.append((curr_start, curr_end))
-        curr_end = curr_start
-        total_covered = (now_utc - curr_start).days
-        if total_covered >= total_days:
-            break
 
-    chunks.reverse()  # 過去（1年前）から直近へ古い順にソート（直近データが最後に届くよう制御）
-    log(f"Total Chunks to fetch: {len(chunks)} (Chunk size: ~{chunk_days} days, Target: {total_days} days, Order: OLDEST FIRST)")
-
-    # 銘柄別データのローカルメモリ保持用（直近分はチャート生成に利用）
-    latest_symbols_df: Dict[str, pd.DataFrame] = {}
-
-    # 主要個別銘柄（個別CSVとしてZIPに含める対象）
-    key_individual_symbols = set(top10_volume_symbols + FIXED_SYMBOLS + ["BTC-USDT"])
-
-    # 3. チャンクごとの取得 & ZIP化 & Discord送信ループ (古い順から順次実行)
-    if not skip_download:
-        # 既存ZIPファイルを既送信レジストリに事前登録（過去アップロード分の重複防止）
-        register_existing_files(chunks_dir, "*.zip")
-
-        sem = asyncio.Semaphore(8)  # 同時リクエスト数 (安全マージン)
-        timeout = aiohttp.ClientTimeout(total=15)
-        connector = aiohttp.TCPConnector(limit=20)
-
-        async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
-            for chunk_idx, (chunk_start, chunk_end) in enumerate(chunks, 1):
-                start_ms = int(chunk_start.timestamp() * 1000)
-                end_ms = int(chunk_end.timestamp() * 1000)
-                s_tag = chunk_start.astimezone(JST).strftime("%Y%m%d")
-                e_tag = chunk_end.astimezone(JST).strftime("%Y%m%d")
-                chunk_label = f"Chunk {chunk_idx}/{len(chunks)} [{s_tag} -> {e_tag} JST]"
-                zip_filename = f"bingx_1h_all_symbols_{s_tag}_{e_tag}.zip"
-                zip_path = chunks_dir / zip_filename
-                compact_zip_path = chunks_dir / f"bingx_1h_master_{s_tag}_{e_tag}.zip"
-
-                is_last_chunk = (chunk_idx == len(chunks))
-
-                # 過去確定チャンク判定: 既存ZIPが存在し、すでにアップロード済みで変更なし、かつ最終チャンクでない場合はスキップ
-                target_existing = compact_zip_path if compact_zip_path.exists() else (zip_path if zip_path.exists() else None)
-                if target_existing and not should_upload_file(target_existing) and not is_last_chunk:
-                    log(f"⚡ [{chunk_label}] {target_existing.name} はすでにDiscord送信完了済み（データ変更なし）のためスキップします。")
-                    continue
-
-                log(f"\n--- Fetching {chunk_label} for {len(all_symbols)} symbols ---")
-                t0 = time.time()
-
-                tasks = [
-                    fetch_symbol_klines(session, sym, start_ms, end_ms, sem, limit=chunk_days * 24 + 10)
-                    for sym in all_symbols
-                ]
-                results = await asyncio.gather(*tasks)
-                t1 = time.time()
-
-                # データ集約
-                valid_count = 0
-                all_chunk_rows = []
-                ind_dfs: Dict[str, pd.DataFrame] = {}
-
-                for sym, rows in results:
-                    if not rows:
-                        continue
-                    valid_count += 1
-                    df_sym = pd.DataFrame(rows).drop_duplicates(subset=["timestamp"]).sort_values("timestamp").reset_index(drop=True)
-                    df_sym["dt_jst"] = pd.to_datetime(df_sym["timestamp"], unit="ms").dt.tz_localize("UTC").dt.tz_convert(JST)
-                    ind_dfs[sym] = df_sym
-                    all_chunk_rows.extend(rows)
-
-                    # 最終チャンク（直近分）のデータをチャート用・選定用に保持
-                    if chunk_idx == len(chunks):
-                        latest_symbols_df[sym] = df_sym
-
-                    # ローカル累積CSVに追記保存
-                    sym_csv = candles_dir / f"{sym}_1h.csv"
-                    if sym_csv.exists():
-                        try:
-                            old_df = pd.read_csv(sym_csv)
-                            comb_df = pd.concat([old_df, df_sym[["timestamp", "open", "high", "low", "close", "volume", "symbol"]]], ignore_index=True)
-                            comb_df = comb_df.drop_duplicates(subset=["timestamp"]).sort_values("timestamp").reset_index(drop=True)
-                            comb_df.to_csv(sym_csv, index=False, encoding="utf-8")
-                        except Exception:
-                            df_sym[["timestamp", "open", "high", "low", "close", "volume", "symbol"]].to_csv(sym_csv, index=False, encoding="utf-8")
-                    else:
-                        df_sym[["timestamp", "open", "high", "low", "close", "volume", "symbol"]].to_csv(sym_csv, index=False, encoding="utf-8")
-
-                log(f"Fetched {valid_count}/{len(all_symbols)} symbols with valid data in {t1 - t0:.1f}s")
-
-                if not all_chunk_rows:
-                    log(f"No historical data returned for {chunk_label}.")
-                    continue
-
-                # ZIPアーカイブ作成 (全銘柄統合CSV + 主要銘柄個別CSV -> 8~10MBに最適化)
-                log(f"Creating ZIP archive: {zip_filename}...")
-                df_chunk_all = pd.DataFrame(all_chunk_rows).drop_duplicates(subset=["timestamp", "symbol"]).sort_values(by=["timestamp", "symbol"]).reset_index(drop=True)
-
-                with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
-                    # 1. 全銘柄統合CSV (全銘柄590+網羅)
-                    merged_csv_str = df_chunk_all.to_csv(index=False)
-                    zf.writestr(f"all_symbols_1h_{s_tag}_{e_tag}.csv", merged_csv_str)
-                    
-                    # 2. 主要個別銘柄CSV（検証用）
-                    for sym in key_individual_symbols:
-                        df_s = ind_dfs.get(sym)
-                        if df_s is not None and not df_s.empty:
-                            s_csv = df_s[["timestamp", "open", "high", "low", "close", "volume", "symbol"]].to_csv(index=False)
-                            zf.writestr(f"individual/{sym}_1h.csv", s_csv)
-
-                zip_size_mb = zip_path.stat().st_size / (1024 * 1024)
-                log(f"ZIP Archive created: {zip_filename} ({zip_size_mb:.2f} MB)")
-
-                # もし個別CSV込みで12MBを超える場合は、Discord送信制限安全策として統合CSVのみのZIPを代替作成
-                send_target_zip = zip_path
-                if zip_size_mb > 13.0:
-                    log(f"Warning: ZIP size ({zip_size_mb:.2f} MB) exceeds safe limit (~12MB). Creating compact ZIP with master CSV only...")
-                    compact_zip_path = chunks_dir / f"bingx_1h_master_{s_tag}_{e_tag}.zip"
-                    with zipfile.ZipFile(compact_zip_path, "w", zipfile.ZIP_DEFLATED, compresslevel=9) as zf:
-                        zf.writestr(f"all_symbols_1h_{s_tag}_{e_tag}.csv", merged_csv_str)
-                    send_target_zip = compact_zip_path
-                    log(f"Compact ZIP created: {compact_zip_path.name} ({compact_zip_path.stat().st_size / (1024*1024):.2f} MB)")
-
-                # Discordへ送信（未送信またはデータ更新があった場合のみ）
-                if discord:
-                    if should_upload_file(send_target_zip):
-                        log(f"📤 [Discord送信中] {send_target_zip.name} (新規またはデータ変更あり)...")
-                        desc = (
-                            f"📦 **【BingX 1時間足 全銘柄データ (小分け {chunk_idx}/{len(chunks)})】**\n"
-                            f"• 期間: `{s_tag}` ～ `{e_tag}` ({chunk_days}日間)\n"
-                            f"• 取得銘柄数: `{valid_count}` / `{len(all_symbols)}` 銘柄\n"
-                            f"• 総レコード数: `{len(df_chunk_all):,}` 行\n"
-                            f"• ファイルサイズ: `{send_target_zip.stat().st_size / (1024*1024):.2f} MB`"
-                        )
-                        sent = discord.send_file(send_target_zip, desc)
-                        if sent:
-                            record_file_uploaded(send_target_zip, rows=len(df_chunk_all))
-                        await asyncio.sleep(4.0)
-                    else:
-                        log(f"📦 [アップロード不要] {send_target_zip.name} はすでにDiscord送信完了済み（変更なし）のため送信をスキップしました。")
-    else:
-        log("Skip download flag is set. Loading existing candles from local cache for charts...")
-        for sym in top10_volume_symbols + FIXED_SYMBOLS:
-            f = candles_dir / f"{sym}_1h.csv"
-            if f.exists():
+        chart_dfs = {}
+        for sym in chart_symbols:
+            csv_path = candles_dir / f"{sym}_1h.csv"
+            if csv_path.exists():
                 try:
-                    d = pd.read_csv(f)
-                    d["dt_jst"] = pd.to_datetime(d["timestamp"], unit="ms").dt.tz_localize("UTC").dt.tz_convert(JST)
-                    latest_symbols_df[sym] = d
+                    df = pd.read_csv(csv_path)
+                    df['timestamp'] = pd.to_datetime(df['timestamp'])
+                    chart_dfs[sym] = df
                 except Exception:
                     pass
 
-    # 4. ノーマライズチャート生成 & Discord送信
-    if not skip_charts and latest_symbols_df:
-        log("\n=================================================================")
-        log(" Generating Normalized Charts (Top 10 Volume & Fixed Symbols)")
-        log("=================================================================")
+        chart_paths = generate_normalized_charts(chart_dfs, chart_symbols, plots_dir, timestamp_tag=now_jst)
+        for cp in chart_paths:
+            if not skip_upload:
+                desc = f"📈 **[Bitbank 主要銘柄 リターン比較]** `{cp.name}`"
+                if discord.send_file(cp, description=desc):
+                    record_file_uploaded(cp)
+                    log(f"   ✅ チャート Discord 送信完了: {cp.name}")
+            else:
+                log(f"   チャート生成完了: {cp.name}")
 
-        # ① 取引高上位 10 銘柄のノーマライズチャート (30D, 10D, 5D)
-        log("\n[Chart 1] Generating Top 10 Volume Normalized Charts (30D, 10D, 5D)...")
-        for win_label, win_hours in CHART_WINDOWS:
-            chart_file = charts_dir / f"normalized_top10_volume_{win_label}.png"
-            res = generate_normalized_chart(
-                symbols_data=latest_symbols_df,
-                target_symbols=top10_volume_symbols,
-                window_name=win_label,
-                hours=win_hours,
-                title=f"BingX Top 10 Volume Normalized Performance",
-                out_path=chart_file,
-                benchmark_symbol="BTC-USDT"
-            )
-            if res and discord:
-                discord.send_file(res, f"📊 **【BingX 取引高上位10銘柄 ノーマライズチャート [{win_label.upper()}]】**")
-
-        # ② 銘柄選定固定のノーマライズチャート (HYPE, NEAR, ZEC, ARB, UNI + BTC)
-        log("\n[Chart 2] Generating Fixed Selection Normalized Charts (30D, 10D, 5D)...")
-        fixed_target_list = list(FIXED_SYMBOLS)
-        if "BTC-USDT" not in fixed_target_list:
-            fixed_target_list.append("BTC-USDT")
-
-        for win_label, win_hours in CHART_WINDOWS:
-            chart_file = charts_dir / f"normalized_fixed_symbols_{win_label}.png"
-            res = generate_normalized_chart(
-                symbols_data=latest_symbols_df,
-                target_symbols=fixed_target_list,
-                window_name=win_label,
-                hours=win_hours,
-                title=f"BingX Fixed Selection (HYPE, NEAR, ZEC, ARB, UNI) Normalized",
-                out_path=chart_file,
-                benchmark_symbol="BTC-USDT"
-            )
-            if res and discord:
-                discord.send_file(res, f"🎯 **【固定選定銘柄 (HYPE, NEAR, ZEC, ARB, UNI) ノーマライズチャート [{win_label.upper()}]】**")
-
-    log("\n=================================================================")
-    log(" Historical Pipeline Completed Successfully!")
-    log("=================================================================")
+    log("\n🎉 [Bitbank 5.46] 全銘柄1年分データ取得＆統合CSV保存・送信パイプラインが完了しました！")
 
 
 def main():
-    parser = argparse.ArgumentParser(description="BingX All-Symbols 1H Historical Download & Normalized Charts")
-    parser.add_argument("--days", type=int, default=730, help="Total days to fetch backward (default: 730 = 2 years)")
-    parser.add_argument("--chunk-days", type=int, default=30, help="Days per chunk/zip (default: 30 days)")
-    parser.add_argument("--test", action="store_true", help="Run test mode (20 symbols, 5 days)")
-    parser.add_argument("--skip-download", action="store_true", help="Skip downloading data, only generate charts from local cache")
-    parser.add_argument("--skip-charts", action="store_true", help="Skip generating charts, only download data")
-    parser.add_argument("--no-discord", action="store_true", help="Do not send files/messages to Discord")
+    parser = argparse.ArgumentParser(description="Bitbank 全銘柄1年分1時間足データ取得＆日時付き統合CSV送信")
+    parser.add_argument("--days", type=int, default=365, help="取得日数 (デフォルト: 365日)")
+    parser.add_argument("--top-n", type=int, default=0, help="出来高上位取得数 (0 = 全JPY銘柄47ペア)")
+    parser.add_argument("--symbols", type=str, default="", help="カンマ区切り銘柄指定 (例: btc_jpy,xrp_jpy)")
+    parser.add_argument("--force", action="store_true", help="既存キャッシュを無視して全日を再取得")
+    parser.add_argument("--force-upload", action="store_true", help="レジストリ判定を無視して強制Discordアップロード")
+    parser.add_argument("--skip-charts", action="store_true", help="チャート生成をスキップ")
+    parser.add_argument("--skip-upload", action="store_true", help="Discord送信をスキップ")
     args = parser.parse_args()
 
-    asyncio.run(run_pipeline(
-        total_days=args.days,
-        chunk_days=args.chunk_days,
-        test_mode=args.test,
-        skip_download=args.skip_download,
-        skip_charts=args.skip_charts,
-        no_discord=args.no_discord
-    ))
+    symbols_override = [s.strip() for s in args.symbols.split(",") if s.strip()] if args.symbols else None
+
+    asyncio.run(
+        run_pipeline(
+            days=args.days,
+            top_n=args.top_n,
+            force=args.force,
+            force_upload=args.force_upload,
+            skip_charts=args.skip_charts,
+            skip_upload=args.skip_upload,
+            symbols_override=symbols_override
+        )
+    )
 
 
 if __name__ == "__main__":

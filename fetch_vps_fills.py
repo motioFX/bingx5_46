@@ -8,7 +8,7 @@ import requests
 BASE_DIR = Path(__file__).resolve().parent
 sys.path.append(str(BASE_DIR))
 
-from bingx5_46_2api import api_bingx
+from bitbank5_46_2api import api_bingx
 
 async def main():
     print("=== BingX 実運用（アカウント）約定履歴 & 実績データ取得 ===")
@@ -24,8 +24,8 @@ async def main():
 
     # 3. BingXの約定履歴
     try:
-        from bingx5_46_3logic import PnLCalculator
-        from bingx5_46_2api import apis
+        from bitbank5_46_3logic import PnLCalculator
+        from bitbank5_46_2api import apis
         pnl_calc = PnLCalculator(apis_config=apis, mode="demo")
         orders = await pnl_calc.get_bingx_trade_history(apis)
         print(f"[約定履歴] 全約定件数: {len(orders)} 件")

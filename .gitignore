@@ -1,4 +1,6 @@
 # Credentials and Secrets (Security)
+bitbank_credentials.json
+bitbank_credentials_*.json
 bingx_credentials.json
 bingx_credentials_*.json
 hyperliquid_credentials.json
