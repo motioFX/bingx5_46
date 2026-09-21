@@ -86,11 +86,12 @@ WEBHOOK_ALIASES = {
     "bingx": "real3_bngx",
     "real3_bngx": "real3_bngx",
 
-    "test4": "test4_backtest",
-    "test": "test4_backtest",
-    "backtest": "test4_backtest",
-    "win32": "test4_backtest",
-    "test4_backtest": "test4_backtest",
+    "test4": "test4_test",
+    "test": "test4_test",
+    "test4_test": "test4_test",
+    "test4_backtest": "test4_test",
+    "backtest": "test4_test",
+    "win32": "test4_test",
 }
 
 
@@ -114,5 +115,10 @@ def get_webhook_url(name: Optional[str] = None, config: Optional[Dict[str, Any]]
             return str(webhooks[name])
         return ""
 
-    # 未指定の場合: bitbank本番チャンネル (#real1_bitbank) を最優先、次いで #test4_backtest
-    return str(webhooks.get("real1_bitbank") or webhooks.get("test4_backtest") or webhooks.get("win32") or "")
+    # 未指定の場合:
+    # Windows (win32) でのテスト実行時は test4_test を最優先
+    # VPS (Linux等) での本番実行時は real1_bitbank を最優先
+    if sys.platform == "win32":
+        return str(webhooks.get("test4_test") or webhooks.get("test4_backtest") or webhooks.get("real1_bitbank") or "")
+    else:
+        return str(webhooks.get("real1_bitbank") or webhooks.get("test4_test") or webhooks.get("test4_backtest") or "")

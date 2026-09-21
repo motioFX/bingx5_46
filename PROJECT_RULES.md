@@ -14,8 +14,11 @@
        - 日時付き統合CSV: `Data/bitbank_all_symbols_1h_YYYYMMDD_HHMMSS.csv`
        - Discord送信ZIP: `Data/bitbank_all_symbols_1h_YYYYMMDD_HHMMSS.zip`
        - ノーマライズ比較チャート: `Data/plots/bitbank_normalized_{30d|10d|5d}_YYYYMMDD_HHMMSS.png`
-  3. **Discord送信仕様（1個の統合ファイル）**:
-     * 小分け送信ではなく、**全データが入った1個のファイル** として Discord（`#real1_bitbank`）へ送信すること。
+  3. **Discord送信仕様（環境別自動切替 ＆ 1個の統合ファイル）**:
+     * 小分け送信ではなく、**全データが入った1個のファイル** として送信すること。
+     * **送信先チャンネルの環境自動判別**:
+       - **VPS（Linux環境）での本番稼働時**: **`real1_bitbank`** チャンネルへ自動出力
+       - **Windows（win32環境）でのテスト運用時**: **`test4_test`**（旧 win32 / test4_backtest）チャンネルへ自動出力
      * Discord Webhook の容量制限（通常10MB〜25MB）を超える場合（1年分データは約26MB）、自動的に同名の日時付きZIP（約6MB）に圧縮して確実に送信すること。
   4. **スマート差分キャッシュ ＆ 重複送信防止**:
      * 個別銘柄CSV（`Data/historical_candles/{symbol}_1h.csv`）に蓄積し、未取得日のみを並行取得（`Semaphore(12)`）して高速化すること。

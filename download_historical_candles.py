@@ -94,11 +94,29 @@ def normalize_symbol(symbol: str) -> str:
 class send_discord:
     def __init__(self) -> None:
         self.real1_webhook = get_webhook_url("real1_bitbank")
-        self.test4_webhook = get_webhook_url("test4_backtest")
-        self.webhook_url = self.real1_webhook or self.test4_webhook
+        self.test4_webhook = get_webhook_url("test4_test")
+
+        # デフォルト出力先: Windows実行時は test4_test、VPS(Linux)実行時は real1_bitbank
+        if sys.platform == "win32":
+            self.webhook_url = self.test4_webhook or self.real1_webhook
+        else:
+            self.webhook_url = self.real1_webhook or self.test4_webhook
 
     def _get_target_webhooks(self) -> list[str]:
-        target = self.real1_webhook or self.test4_webhook
+        # 引数 --channel で明示指定された場合
+        for idx, arg in enumerate(sys.argv):
+            if arg in ("--channel", "--webhook") and idx + 1 < len(sys.argv):
+                val = sys.argv[idx + 1].strip().lower()
+                if "real" in val or "bitbank" in val:
+                    return [self.real1_webhook] if self.real1_webhook else []
+                elif "test" in val or "win" in val:
+                    return [self.test4_webhook] if self.test4_webhook else []
+
+        # 環境自動判別: Windows (win32) は #test4_test、VPS (Linux等) は #real1_bitbank
+        if sys.platform == "win32":
+            target = self.test4_webhook or self.real1_webhook
+        else:
+            target = self.real1_webhook or self.test4_webhook
         return [target] if target else []
 
     def send_message(self, content: str) -> bool:

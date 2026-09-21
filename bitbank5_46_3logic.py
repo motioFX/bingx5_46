@@ -381,18 +381,18 @@ class send_discord:
 
     def __init__(self):
         self.real1_webhook = get_webhook_url("real1_bitbank")
+        self.test4_webhook = get_webhook_url("test4_test")
         self.real2_webhook = get_webhook_url("real2_hype")
         self.real3_webhook = get_webhook_url("real3_bngx")
-        self.test4_webhook = get_webhook_url("test4_backtest")
 
-        # 互換用エイリアス（BingX関連はすべて #real3_bngx へ全集約）
-        self.bingx_webhook = self.real3_webhook
-        self.win32_webhook = self.real3_webhook
-        self.default_webhook = self.real3_webhook
-        self.webhook_url = self.real3_webhook or self.test4_webhook
+        # デフォルト出力先: Windows実行時は test4_test、VPS(Linux)実行時は real1_bitbank
+        if sys.platform == "win32":
+            self.webhook_url = self.test4_webhook or self.real1_webhook
+        else:
+            self.webhook_url = self.real1_webhook or self.test4_webhook
 
-        if not self.real3_webhook and not self.test4_webhook:
-            print("[WARN] Discord webhook for BingX (real3_bngx / test4_backtest) is not configured.")
+        if not self.webhook_url:
+            print("[WARN] Discord webhook (real1_bitbank / test4_test) is not configured.")
         
         from rich.console import Console
         self.console = Console(color_system="standard", force_terminal=True, highlight=False)
@@ -402,8 +402,20 @@ class send_discord:
         self.timers = send_discord._shared_timers
 
     def _get_target_webhooks(self, text: str = "") -> list[str]:
-        # BingX関連の全通知（バックテスト・最適化・ログ・チャート含む）を #real3_bngx へ全集約
-        target = self.real3_webhook or self.test4_webhook
+        # 引数 --channel で明示指定された場合
+        for idx, arg in enumerate(sys.argv):
+            if arg in ("--channel", "--webhook") and idx + 1 < len(sys.argv):
+                val = sys.argv[idx + 1].strip().lower()
+                if "real" in val or "bitbank" in val:
+                    return [self.real1_webhook] if self.real1_webhook else []
+                elif "test" in val or "win" in val:
+                    return [self.test4_webhook] if self.test4_webhook else []
+
+        # 環境自動判別: Windows (win32) は #test4_test、VPS (Linux等) は #real1_bitbank
+        if sys.platform == "win32":
+            target = self.test4_webhook or self.real1_webhook
+        else:
+            target = self.real1_webhook or self.test4_webhook
         return [target] if target else []
 
     def flush_buffer(self, url):
@@ -498,6 +510,22 @@ class send_discord:
                 timer = threading.Timer(1.2, self.flush_buffer, args=[url])
                 self.timers[url] = timer
                 timer.start()
+
+    def send_message(self, content: str) -> bool:
+        webhooks = self._get_target_webhooks(content)
+        if not webhooks:
+            return False
+        success = True
+        for url in webhooks:
+            self.flush_buffer(url)
+            try:
+                payload = {"content": content}
+                response = requests.post(url, json=payload, timeout=15)
+                response.raise_for_status()
+            except Exception as e:
+                print(f"Failed to send direct message to {url}: {e}")
+                success = False
+        return success
 
     def _send_file(self, content_text, file_path, file_name, mime_type) -> bool:
         webhooks = self._get_target_webhooks(content_text)
