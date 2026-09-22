@@ -1685,6 +1685,7 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                             )
                             closed = False
                     else:
+                        closed = False
                         # 1. バックテスト整合の最大固定ストップロス判定 (3.0% SL)
                         if entry_px > 0 and (current_price < entry_px * 0.97):
                             exit_reason = "Fixed_SL_3.0%"
