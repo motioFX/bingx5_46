@@ -1509,7 +1509,7 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                     env_len=cand_p.get("length", 15),
                     env_lower_pct=cand_p.get("lower_pct", 2.0),
                     env_upper_pct=cand_p.get("upper_pct", 2.0),
-                    env_malen=cand_p.get("malen", 200),
+                    env_malen=cand_p.get("malen", 100),
                     rsi_len=cand_p.get("rsi_len", 9),
                     lma_len=cand_p.get("lma_len", 7),
                     lEp=cand_p.get("lEp", 40.0),
@@ -1685,13 +1685,25 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                             )
                             closed = False
                     else:
-                        # 利確シグナル未到達時は通常の Volume Profile SL (損切り/撤退) を判定
-                        closed = await api.long_close(
-                            df, position, commission=0.0,
-                            sl_margin_pct=sym_params.get("margin", 2.0),
-                            strategy_type=cand_strat,
-                        )
-                        exit_reason = "VP_Trailing"
+                        # 1. バックテスト整合の最大固定ストップロス判定 (3.0% SL)
+                        if entry_px > 0 and (current_price < entry_px * 0.97):
+                            exit_reason = "Fixed_SL_3.0%"
+                            discord.print_log(
+                                f"[{sym}] [STOP LOSS TRIGGERED] 🛑 最大ストップロス (3.0%) 成立!\n"
+                                f"   └ 現在値: ${current_price:,.4f} < SLライン: ${entry_px * 0.97:,.4f} (建値: ${entry_px:,.4f}) ➔ 成行損切り決済"
+                            )
+                            from bingx5_46_2api import flatten_current_position_bingx
+                            await flatten_current_position_bingx(sym, "USDT", mode, exit_reason, force_market=True)
+                            closed = True
+
+                        if not closed:
+                            # 2. 利確シグナル未到達時は通常の Volume Profile SL (損切り/撤退) を判定
+                            closed = await api.long_close(
+                                df, position, commission=0.0,
+                                sl_margin_pct=sym_params.get("margin", 2.0),
+                                strategy_type=cand_strat,
+                            )
+                            exit_reason = "VP_Trailing"
 
                     if closed:
                         trailing_tp_states.pop(sym, None)

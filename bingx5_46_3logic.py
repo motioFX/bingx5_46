@@ -305,14 +305,15 @@ class logicinstance:
         env_l = int(kwargs.get('env_len', 15))
         env_lp = float(kwargs.get('env_lower_pct', 2.0))
         env_up = float(kwargs.get('env_upper_pct', 2.0))
-        env_ml = int(kwargs.get('env_malen', 200))
+        env_ml = int(kwargs.get('env_malen', 100))
         basis = calc_ema(df['close'], env_l)
         mabasis = calc_ema(df['close'], env_ml) if len(df) >= env_ml else basis
         df['basis'] = basis
         df['mabasis'] = mabasis
         df['env_lower'] = basis * (1.0 - env_lp / 100.0)
         df['env_upper'] = basis * (1.0 + env_up / 100.0)
-        df['long_envelope'] = df['close'] < df['env_lower']
+        # トレンドフィルター（長期EMAより上）かつ下限バンド割れ
+        df['long_envelope'] = (df['close'] < df['env_lower']) & (df['close'] > df['mabasis'])
         df['longclose_envelope'] = df['close'] > df['basis']
         
         # --- RSI MA (RSIMA3) 戦略シグナル ---
@@ -587,7 +588,7 @@ class send_discord:
 
         self._send_file(f"{symbol} klines with Market Profile", "backtest_data/kline_img.jpg", "kline_img.jpg", "image/jpeg")
 
-    def plot_backtest(self, label="MP", csv_file="backtest_data/klines100.csv", img_file=None, symbol=""):
+    def plot_backtest(self, label="MP", csv_file="backtest_data/klines100.csv", img_file=None, symbol="", strategy_type=None):
         if symbol and not str(label).startswith(symbol):
             display_label = f"{symbol}_{label}"
             title_prefix = f"{symbol} | "
@@ -609,12 +610,69 @@ class send_discord:
             df["dt"] = df["dt"].dt.tz_convert("Asia/Tokyo")
 
         matplotlib.rcParams["timezone"] = "Asia/Tokyo"
-        fig = plt.figure(figsize=(9, 4), dpi=120)
-        fig.subplots_adjust(left=0.1, bottom=0.18, right=0.9, top=0.88)
-        ax1 = fig.add_subplot(1, 1, 1)
+        plt.rcParams['font.sans-serif'] = ['Meiryo', 'Yu Gothic', 'MS Gothic', 'DejaVu Sans']
+        plt.rcParams['axes.unicode_minus'] = False
 
-        x_indices = np.arange(len(df))
+        # 戦略タイプの自動判定
+        strat = (strategy_type or (df["strategy_name"].iloc[0] if "strategy_name" in df.columns else "") or "").upper()
+        if not strat:
+            if "ENVELOPE" in str(label).upper():
+                strat = "ENVELOPE"
+            elif "RSIMA" in str(label).upper():
+                strat = "RSIMA"
+
+        # インジケーター列の自動補完 (CSVにない場合)
+        if strat == "ENVELOPE" and "env_lower" not in df.columns:
+            b_s = calc_ema(df['close'], 10)
+            mb_s = calc_ema(df['close'], 100) if len(df) >= 100 else b_s
+            df['basis'] = b_s
+            df['mabasis'] = mb_s
+            df['env_lower'] = b_s * 0.985
+            df['env_upper'] = b_s * 1.015
+        elif strat == "RSIMA" and "rsi" not in df.columns:
+            r_s = calc_rsi(df['close'], 14)
+            lr_s = calc_ema(r_s, 5)
+            df['rsi'] = r_s
+            df['lrsiMA'] = lr_s
+            df['lEp'] = 45.0
+            df['lCp'] = 65.0
+
+        n = len(df)
+        x_indices = np.arange(n)
         width = 0.6
+
+        # --- プロット構成の分岐 ---
+        if strat == "RSIMA":
+            # 3段構成: 上段=価格&売買, 中段=RSI/lrsiMA, 下段=累積PnL
+            fig, (ax1, ax_rsi, ax_pnl) = plt.subplots(
+                3, 1, figsize=(11, 7.5), dpi=120,
+                gridspec_kw={'height_ratios': [2.3, 1.2, 1.0]},
+                sharex=True
+            )
+            fig.patch.set_facecolor('#131722')
+            ax1.set_facecolor('#1e222d')
+            ax_rsi.set_facecolor('#1e222d')
+            ax_pnl.set_facecolor('#1e222d')
+            plt.subplots_adjust(left=0.08, bottom=0.12, right=0.92, top=0.91, hspace=0.15)
+        elif strat == "ENVELOPE":
+            # 2段構成: 上段=価格&エンベロープ, 下段=累積PnL
+            fig, (ax1, ax_pnl) = plt.subplots(
+                2, 1, figsize=(11, 6.5), dpi=120,
+                gridspec_kw={'height_ratios': [2.6, 1.0]},
+                sharex=True
+            )
+            fig.patch.set_facecolor('#131722')
+            ax1.set_facecolor('#1e222d')
+            ax_pnl.set_facecolor('#1e222d')
+            plt.subplots_adjust(left=0.08, bottom=0.12, right=0.92, top=0.91, hspace=0.15)
+        else:
+            # 従来型: 1段 + twinx
+            fig = plt.figure(figsize=(10, 4.5), dpi=120)
+            fig.subplots_adjust(left=0.08, bottom=0.18, right=0.92, top=0.88)
+            ax1 = fig.add_subplot(1, 1, 1)
+            fig.patch.set_facecolor('#131722')
+            ax1.set_facecolor('#1e222d')
+            ax_pnl = ax1.twinx()
 
         # 1. 日付区切り垂直線
         try:
@@ -629,104 +687,146 @@ class send_discord:
                 match_indices = np.where(d_series.dt.floor("D") == day_start)[0]
                 if len(match_indices) > 0:
                     first_idx = match_indices[0]
-                    ax1.axvline(first_idx, color="gray", linestyle=":", linewidth=0.8, alpha=0.4, zorder=1)
+                    ax1.axvline(first_idx, color="#555555", linestyle=":", linewidth=0.7, alpha=0.5, zorder=1)
+                    if strat == "RSIMA":
+                        ax_rsi.axvline(first_idx, color="#555555", linestyle=":", linewidth=0.7, alpha=0.5, zorder=1)
+                    if strat in ("ENVELOPE", "RSIMA"):
+                        ax_pnl.axvline(first_idx, color="#555555", linestyle=":", linewidth=0.7, alpha=0.5, zorder=1)
         except Exception:
             pass
 
-        # 2. Market Profile (Volume Profile)
-        has_market_profile = all(col in df.columns for col in ['POC', 'VAH', 'VAL'])
-        if has_market_profile:
-            poc_plot = df['POC'].values
-            vah_plot = df['VAH'].values
-            val_plot = df['VAL'].values
-            
-            ax1.plot(x_indices, poc_plot, color='red', linestyle='-', linewidth=1.4, label='POC', alpha=0.75, zorder=2)
-            ax1.plot(x_indices, vah_plot, color='green', linestyle='--', linewidth=1.1, label='VAH', alpha=0.7, zorder=2)
-            ax1.plot(x_indices, val_plot, color='blue', linestyle='--', linewidth=1.1, label='VAL', alpha=0.7, zorder=2)
-            ax1.fill_between(x_indices, val_plot, vah_plot, alpha=0.08, color='purple', zorder=1)
-
-        # 3. ローソク足の描画
+        # 2. ローソク足描画 (ax1)
         has_ohlc = all(col in df.columns for col in ['open', 'high', 'low', 'close'])
         if has_ohlc:
             for i, row in df.iterrows():
-                op = float(row["open"])
-                hi = float(row["high"])
-                lo = float(row["low"])
-                cl = float(row["close"])
-                color = "#2e7d32" if cl >= op else "#c62828"  # 陽線: 緑, 陰線: 赤
-
-                # ヒゲ
-                ax1.plot([i, i], [lo, hi], color=color, linewidth=1.0, zorder=3)
-                # 実体
-                body_bottom = min(op, cl)
-                body_height = abs(cl - op)
-                if body_height == 0:
-                    body_height = (hi - lo) * 0.01 if hi != lo else 0.0001
-                rect = plt.Rectangle((i - width / 2, body_bottom), width, body_height,
-                                     facecolor=color, edgecolor=color, zorder=4)
+                op, hi, lo, cl = float(row["open"]), float(row["high"]), float(row["low"]), float(row["close"])
+                color = "#00c076" if cl >= op else "#ff3355"
+                ax1.plot([i, i], [lo, hi], color=color, linewidth=0.8, zorder=3)
+                b_bot = min(op, cl)
+                b_h = max(abs(cl - op), (hi - lo) * 0.01 if hi != lo else 0.0001)
+                rect = plt.Rectangle((i - width / 2, b_bot), width, b_h, facecolor=color, edgecolor=color, zorder=4)
                 ax1.add_patch(rect)
         else:
-            ax1.plot(x_indices, df['close'], "C0", label="close", linewidth=1.5, zorder=3)
+            ax1.plot(x_indices, df['close'], "#00c076", label="close", linewidth=1.5, zorder=3)
 
-        # 4. 売買マーカー (exec buy: 鮮やかブルー / exec sell: 鮮やかマゼンタ、黒フチ付き)
+        # 3. インジケーター描画 (Envelope / RSIMA / Volume Profile)
+        if strat == "ENVELOPE":
+            if 'basis' in df.columns:
+                ax1.plot(x_indices, df['basis'], color='#ffbb00', label='Basis EMA', linewidth=1.2, alpha=0.9, zorder=5)
+            if 'env_lower' in df.columns:
+                ax1.plot(x_indices, df['env_lower'], color='#00d084', linestyle='--', label='Lower Band (Buy)', linewidth=1.2, zorder=5)
+            if 'env_upper' in df.columns:
+                ax1.plot(x_indices, df['env_upper'], color='#ff4d4d', linestyle='--', label='Upper Band', linewidth=1.0, zorder=5)
+            if 'mabasis' in df.columns:
+                ax1.plot(x_indices, df['mabasis'], color='#3b82f6', label='Trend EMA', linewidth=1.4, alpha=0.85, zorder=5)
+            if 'env_lower' in df.columns and 'env_upper' in df.columns:
+                ax1.fill_between(x_indices, df['env_lower'], df['env_upper'], color='#ffbb00', alpha=0.04, zorder=2)
+        elif strat == "RSIMA":
+            # 中段 ax_rsi に描画
+            if 'rsi' in df.columns and 'lrsiMA' in df.columns:
+                ax_rsi.plot(x_indices, df['rsi'], color='#ff00aa', label='RSI', linewidth=1.4, zorder=4)
+                ax_rsi.plot(x_indices, df['lrsiMA'], color='#00e5ff', label='RSI EMA', linewidth=1.2, zorder=4)
+                lep = float(df['lEp'].iloc[0]) if 'lEp' in df.columns else 40.0
+                lcp = float(df['lCp'].iloc[0]) if 'lCp' in df.columns else 60.0
+                ax_rsi.axhline(lcp, color='#ff5555', linestyle='--', linewidth=0.9, label=f'Exit (lCp={lcp:.0f})')
+                ax_rsi.axhline(lep, color='#00ff88', linestyle='--', linewidth=0.9, label=f'Entry (lEp={lep:.0f})')
+                ax_rsi.axhline(50, color='#666666', linestyle=':', linewidth=0.7)
+                
+                # GCかつ < lEp のポイント
+                r_s = df['rsi']
+                ma_s = df['lrsiMA']
+                gc_cond = (r_s > ma_s) & (r_s.shift(1) <= ma_s.shift(1)) & (ma_s < lep) & (r_s < lcp)
+                if gc_cond.any():
+                    gc_x = x_indices[gc_cond]
+                    gc_y = r_s[gc_cond]
+                    ax_rsi.scatter(gc_x, gc_y, color='#00ff88', s=50, marker='o', edgecolors='black', label='Entry GC', zorder=6)
+                
+                ax_rsi.set_ylim(0, 100)
+                ax_rsi.set_ylabel("RSI (0-100)", color='white', fontsize=8)
+                ax_rsi.tick_params(colors='#888888', labelsize=8)
+                ax_rsi.grid(True, linestyle=':', alpha=0.25, color='#444444')
+                ax_rsi.legend(loc='upper left', facecolor='#2a2e39', edgecolor='#444444', labelcolor='white', fontsize=7, ncol=3)
+        else:
+            # Volume Profile
+            if all(c in df.columns for c in ['POC', 'VAH', 'VAL']):
+                ax1.plot(x_indices, df['POC'], color='red', linestyle='-', linewidth=1.4, label='POC', alpha=0.75, zorder=2)
+                ax1.plot(x_indices, df['VAH'], color='green', linestyle='--', linewidth=1.1, label='VAH', alpha=0.7, zorder=2)
+                ax1.plot(x_indices, df['VAL'], color='blue', linestyle='--', linewidth=1.1, label='VAL', alpha=0.7, zorder=2)
+                ax1.fill_between(x_indices, df['VAL'], df['VAH'], alpha=0.08, color='purple', zorder=1)
+
+        # 4. 売買マーカー
         if 'exec_buy_price' in df.columns:
             buy_mask = df['exec_buy_price'].notna()
             if buy_mask.any():
-                ax1.scatter(
-                    x_indices[buy_mask],
-                    df.loc[buy_mask, 'exec_buy_price'],
-                    marker='^',
-                    color='#0091ea',  # エレクトリックブルー (ローソク足の緑/赤と完全差別化)
-                    edgecolors='black',
-                    linewidths=1.0,
-                    label='exec buy',
-                    zorder=6,
-                    s=70,
-                )
+                ax1.scatter(x_indices[buy_mask], df.loc[buy_mask, 'exec_buy_price'],
+                            marker='^', color='#00e676', edgecolors='black', linewidths=1.0,
+                            label='BUY Entry', zorder=7, s=80)
         if 'exec_sell_price' in df.columns:
             sell_mask = df['exec_sell_price'].notna()
             if sell_mask.any():
-                ax1.scatter(
-                    x_indices[sell_mask],
-                    df.loc[sell_mask, 'exec_sell_price'],
-                    marker='v',
-                    color='#d500f9',  # ネオンマゼンタ (ローソク足の緑/赤と完全差別化)
-                    edgecolors='black',
-                    linewidths=1.0,
-                    label='exec sell',
-                    zorder=6,
-                    s=70,
-                )
+                ax1.scatter(x_indices[sell_mask], df.loc[sell_mask, 'exec_sell_price'],
+                            marker='v', color='#ff1744', edgecolors='black', linewidths=1.0,
+                            label='SELL Exit', zorder=7, s=80)
 
-        ax1.set_ylabel("close [USDT]", fontsize=9)
-        ax1.grid(True, axis='y', linestyle=':', alpha=0.3)
+        ax1.set_ylabel("Price [USDT]", color='white', fontsize=9)
+        ax1.tick_params(colors='#888888', labelsize=8)
+        ax1.grid(True, axis='y', linestyle=':', alpha=0.25, color='#444444')
 
-        # 5. 右軸 (twinx): 累積 PnL
-        ax2 = ax1.twinx()
-        b_plot = df['pnl'] if 'pnl' in df.columns else np.zeros(len(df))
-        ax2.plot(x_indices, b_plot, "C1", label="pl", linewidth=1.5)
-        ax2.set_ylabel("pnl [USDT]", fontsize=9)
-        ax2.grid(False)
+        # 5. PnL 描画
+        pnl_series = df['pnl'] if 'pnl' in df.columns else np.zeros(len(df))
+        final_pnl = pnl_series.iloc[-1] if not pnl_series.empty else 0.0
+        
+        if strat in ("ENVELOPE", "RSIMA"):
+            # 独立サブプロット
+            pnl_vals = pnl_series.values - 100.0 if (len(pnl_series) > 0 and pnl_series.iloc[0] >= 90.0) else pnl_series.values
+            ax_pnl.plot(x_indices, pnl_vals, color='#00d084' if pnl_vals[-1] >= 0 else '#ff4d4d', linewidth=1.6, label='PnL [USDT]')
+            ax_pnl.fill_between(x_indices, 0, pnl_vals, where=(pnl_vals >= 0), color='#00d084', alpha=0.15)
+            ax_pnl.fill_between(x_indices, 0, pnl_vals, where=(pnl_vals < 0), color='#ff4d4d', alpha=0.15)
+            ax_pnl.axhline(0, color='#888888', linestyle='--', linewidth=0.7)
+            
+            # ドローダウン
+            peak_val = np.maximum.accumulate(pnl_vals)
+            dd_val = peak_val - pnl_vals
+            ax_pnl_dd = ax_pnl.twinx()
+            ax_pnl_dd.fill_between(x_indices, -dd_val, 0, color='#ff3355', alpha=0.2, label='Drawdown')
+            ax_pnl_dd.set_ylabel("DD", color='#ff8888', fontsize=8)
+            ax_pnl_dd.tick_params(colors='#ff8888', labelsize=7)
+            ax_pnl_dd.set_ylim(-max(15, float(dd_val.max()) * 1.4), 0)
+            
+            ax_pnl.set_ylabel("PnL [USDT]", color='white', fontsize=8)
+            ax_pnl.tick_params(colors='#888888', labelsize=8)
+            ax_pnl.grid(True, linestyle=':', alpha=0.25, color='#444444')
+            ax_pnl.legend(loc='upper left', facecolor='#2a2e39', edgecolor='#444444', labelcolor='white', fontsize=7)
+            
+            # X軸目盛り
+            step = max(1, len(df) // 6)
+            tick_idx = list(range(0, len(df), step))
+            if len(tick_idx) > 1 and ((len(df) - 1) - tick_idx[-1] < step * 0.5):
+                tick_idx[-1] = len(df) - 1
+            elif (len(df) - 1) not in tick_idx:
+                tick_idx.append(len(df) - 1)
+            tick_lbl = [df.iloc[i]["dt"].strftime("%m/%d %H:%M") for i in tick_idx]
+            ax_pnl.set_xticks(tick_idx)
+            ax_pnl.set_xticklabels(tick_lbl, rotation=15, ha="right", fontsize=8, color='#888888')
+        else:
+            ax_pnl.plot(x_indices, pnl_series, "#ff9800", label="PnL", linewidth=1.5)
+            ax_pnl.set_ylabel("pnl [USDT]", fontsize=9, color='#ff9800')
+            ax_pnl.tick_params(colors='#ff9800', labelsize=8)
+            step = max(1, len(df) // 6)
+            tick_idx = list(range(0, len(df), step))
+            if len(tick_idx) > 1 and ((len(df) - 1) - tick_idx[-1] < step * 0.5):
+                tick_idx[-1] = len(df) - 1
+            elif (len(df) - 1) not in tick_idx:
+                tick_idx.append(len(df) - 1)
+            tick_lbl = [df.iloc[i]["dt"].strftime("%m/%d %H:%M") for i in tick_idx]
+            ax1.set_xticks(tick_idx)
+            ax1.set_xticklabels(tick_lbl, rotation=15, ha="right", fontsize=8, color='#888888')
 
-        # 6. X軸目盛り設定 (日付表示)
-        step = max(1, len(df) // 8)
-        tick_indices = list(range(0, len(df), step))
-        if (len(df) - 1) not in tick_indices:
-            tick_indices.append(len(df) - 1)
-        tick_labels = [df.iloc[idx]["dt"].strftime("%Y-%m-%d %H:%M") for idx in tick_indices]
-        ax1.set_xticks(tick_indices)
-        ax1.set_xticklabels(tick_labels, rotation=15, ha="right", fontsize=8)
-
-        final_pnl = df['pnl'].iloc[-1] if 'pnl' in df.columns else 0.0
-        ax1.set_title(f"{title_prefix}{label} | Final PnL: {final_pnl:.4f} USDT", fontsize=10, pad=10)
-
-        # 7. 凡例統合
-        h1, l1 = ax1.get_legend_handles_labels()
-        h2, l2 = ax2.get_legend_handles_labels()
-        ax1.legend(h1 + h2, l1 + l2, loc='lower left', fontsize=8)
+        ax1.set_title(f"{title_prefix}{display_label} | Final PnL: {final_pnl:+.2f} USDT", fontsize=11, color='white', pad=8, fontweight='bold')
+        ax1.legend(loc='upper left', facecolor='#2a2e39', edgecolor='#444444', labelcolor='white', fontsize=8)
 
         os.makedirs(os.path.dirname(img_file) if os.path.dirname(img_file) else "backtest_data", exist_ok=True)
-        plt.savefig(img_file, format='jpg', dpi=100)
+        plt.savefig(img_file, format='jpg', dpi=110, facecolor=fig.get_facecolor(), bbox_inches='tight')
         plt.close(fig)
         plt.close('all')
         import gc
@@ -1371,14 +1471,17 @@ def simulate_envelope_strategy(
     length: int = 15,
     lower_pct: float = 2.0,
     upper_pct: float = 2.0,
-    malen: int = 200,
+    malen: int = 100,
     max_trades: int = 1,
     initial_equity: float = 100.0,
     fee_rate: float = 0.0006,
-    callback_pct: float = 0.008
+    callback_pct: float = 0.008,
+    sl_pct: float = 0.03,
+    use_trend_filter: bool = True
 ) -> dict:
     closes = df["close"].values
     highs = df["high"].values if "high" in df.columns else closes
+    lows = df["low"].values if "low" in df.columns else closes
     n = len(closes)
     if n < max(length, 10):
         return {"final_pnl": 0.0, "trade_count": 0, "win_rate": 0.0, "DD_max": 0.0, "max_unrealized_loss": 0.0}
@@ -1410,46 +1513,67 @@ def simulate_envelope_strategy(
     for i in range(1, n):
         c = closes[i]
         h = highs[i]
+        l = lows[i]
         b = basis[i]
         low_band = lower[i]
         ts = df["timestamp"].iloc[i] if "timestamp" in df.columns else i
         
-        # 決済チェック (Trailing Take-Profit: close > basis かつ avg_price 以上で利確モード突入後、最高値から反落で成行利確)
+        # 決済チェック
         if pos_qty > 0:
-            if not trailing_tp_active:
-                if c > b and c > avg_price:
-                    trailing_tp_active = True
-                    trail_peak = max(c, h)
-            
-            if trailing_tp_active:
-                trail_peak = max(trail_peak, h)
-                trail_stop = max(trail_peak * (1.0 - callback_pct), avg_price * (1.0 + fee_rate))
-                if c < trail_stop:
-                    sell_val = pos_qty * c
-                    fee = sell_val * fee_rate
-                    pnl = sell_val - pos_cost - fee
-                    cum_realized_pnl += pnl
-                    cum_fees += fee
-                    trades.append(pnl)
-                    exec_history.append({"timestamp": ts, "price": c, "size": -pos_qty, "type": "SELL"})
-                    pos_qty = 0.0
-                    pos_cost = 0.0
-                    avg_price = 0.0
-                    pos_count = 0
-                    trailing_tp_active = False
-                    trail_peak = 0.0
+            # 1. 損切り (Stop Loss) チェック
+            if sl_pct > 0 and l < avg_price * (1.0 - sl_pct):
+                sl_price = avg_price * (1.0 - sl_pct)
+                sell_val = pos_qty * sl_price
+                fee = sell_val * fee_rate
+                pnl = sell_val - pos_cost - fee
+                cum_realized_pnl += pnl
+                cum_fees += fee
+                trades.append(pnl)
+                exec_history.append({"timestamp": ts, "price": sl_price, "size": -pos_qty, "type": "STOP_LOSS"})
+                pos_qty = 0.0
+                pos_cost = 0.0
+                avg_price = 0.0
+                pos_count = 0
+                trailing_tp_active = False
+                trail_peak = 0.0
+            else:
+                # 2. 利確 (Trailing Take-Profit) チェック
+                if not trailing_tp_active:
+                    if c > b and c > avg_price:
+                        trailing_tp_active = True
+                        trail_peak = max(c, h)
                 
-        # エントリーチェック (close < lower)
+                if trailing_tp_active:
+                    trail_peak = max(trail_peak, h)
+                    trail_stop = max(trail_peak * (1.0 - callback_pct), avg_price * (1.0 + fee_rate))
+                    if c < trail_stop:
+                        sell_val = pos_qty * c
+                        fee = sell_val * fee_rate
+                        pnl = sell_val - pos_cost - fee
+                        cum_realized_pnl += pnl
+                        cum_fees += fee
+                        trades.append(pnl)
+                        exec_history.append({"timestamp": ts, "price": c, "size": -pos_qty, "type": "SELL"})
+                        pos_qty = 0.0
+                        pos_cost = 0.0
+                        avg_price = 0.0
+                        pos_count = 0
+                        trailing_tp_active = False
+                        trail_peak = 0.0
+                
+        # エントリーチェック (close < lower かつ トレンドフィルター)
         if pos_count < max_trades:
             can_enter = False
-            if pos_count == 0:
-                if c < low_band:
-                    can_enter = True
-            else:
-                add_pct = calc_add_pct(pos_count)
-                if c < low_band and c < avg_price * (1.0 - add_pct):
-                    can_enter = True
-                    
+            trend_ok = (c > mabasis[i]) if use_trend_filter else True
+            if trend_ok:
+                if pos_count == 0:
+                    if c < low_band:
+                        can_enter = True
+                else:
+                    add_pct = calc_add_pct(pos_count)
+                    if c < low_band and c < avg_price * (1.0 - add_pct):
+                        can_enter = True
+                        
             if can_enter:
                 buy_val = trade_size_usdt
                 qty = buy_val / c
@@ -1491,7 +1615,8 @@ def simulate_envelope_strategy(
             "lower_pct": lower_pct,
             "upper_pct": upper_pct,
             "malen": malen,
-            "max_trades": max_trades
+            "max_trades": max_trades,
+            "sl_pct": sl_pct
         }
     }
 
@@ -1505,10 +1630,12 @@ def simulate_rsima_strategy(
     max_trades: int = 1,
     initial_equity: float = 100.0,
     fee_rate: float = 0.0006,
-    callback_pct: float = 0.008
+    callback_pct: float = 0.008,
+    sl_pct: float = 0.03
 ) -> dict:
     closes = df["close"].values
     highs = df["high"].values if "high" in df.columns else closes
+    lows = df["low"].values if "low" in df.columns else closes
     n = len(closes)
     if n < max(rsi_len, lma_len) + 5:
         return {"final_pnl": 0.0, "trade_count": 0, "win_rate": 0.0, "DD_max": 0.0, "max_unrealized_loss": 0.0}
@@ -1540,6 +1667,7 @@ def simulate_rsima_strategy(
     for i in range(1, n):
         c = closes[i]
         h = highs[i]
+        l = lows[i]
         r = rsi[i]
         r_prev = rsi[i-1]
         ma_val = lrsiMA[i]
@@ -1549,30 +1677,48 @@ def simulate_rsima_strategy(
         # ゴールデンクロス判定: rsi > lrsiMA かつ 前足では rsi <= lrsiMA
         gc = (r > ma_val) and (r_prev <= ma_prev)
         
-        # 決済チェック (Trailing Take-Profit: rsi > lCp かつ avg_price 以上で利確モード突入後、最高値から反落で成行利確)
+        # 決済チェック
         if pos_qty > 0:
-            if not trailing_tp_active:
-                if r > lCp and c > avg_price:
-                    trailing_tp_active = True
-                    trail_peak = max(c, h)
-            
-            if trailing_tp_active:
-                trail_peak = max(trail_peak, h)
-                trail_stop = max(trail_peak * (1.0 - callback_pct), avg_price * (1.0 + fee_rate))
-                if c < trail_stop:
-                    sell_val = pos_qty * c
-                    fee = sell_val * fee_rate
-                    pnl = sell_val - pos_cost - fee
-                    cum_realized_pnl += pnl
-                    cum_fees += fee
-                    trades.append(pnl)
-                    exec_history.append({"timestamp": ts, "price": c, "size": -pos_qty, "type": "SELL"})
-                    pos_qty = 0.0
-                    pos_cost = 0.0
-                    avg_price = 0.0
-                    pos_count = 0
-                    trailing_tp_active = False
-                    trail_peak = 0.0
+            # 1. 損切り (Stop Loss) チェック
+            if sl_pct > 0 and l < avg_price * (1.0 - sl_pct):
+                sl_price = avg_price * (1.0 - sl_pct)
+                sell_val = pos_qty * sl_price
+                fee = sell_val * fee_rate
+                pnl = sell_val - pos_cost - fee
+                cum_realized_pnl += pnl
+                cum_fees += fee
+                trades.append(pnl)
+                exec_history.append({"timestamp": ts, "price": sl_price, "size": -pos_qty, "type": "STOP_LOSS"})
+                pos_qty = 0.0
+                pos_cost = 0.0
+                avg_price = 0.0
+                pos_count = 0
+                trailing_tp_active = False
+                trail_peak = 0.0
+            else:
+                # 2. 利確 (Trailing Take-Profit) チェック
+                if not trailing_tp_active:
+                    if r > lCp and c > avg_price:
+                        trailing_tp_active = True
+                        trail_peak = max(c, h)
+                
+                if trailing_tp_active:
+                    trail_peak = max(trail_peak, h)
+                    trail_stop = max(trail_peak * (1.0 - callback_pct), avg_price * (1.0 + fee_rate))
+                    if c < trail_stop:
+                        sell_val = pos_qty * c
+                        fee = sell_val * fee_rate
+                        pnl = sell_val - pos_cost - fee
+                        cum_realized_pnl += pnl
+                        cum_fees += fee
+                        trades.append(pnl)
+                        exec_history.append({"timestamp": ts, "price": c, "size": -pos_qty, "type": "SELL"})
+                        pos_qty = 0.0
+                        pos_cost = 0.0
+                        avg_price = 0.0
+                        pos_count = 0
+                        trailing_tp_active = False
+                        trail_peak = 0.0
                 
         # エントリーチェック: lrsiMA < lEp and rsi < lCp
         if pos_count < max_trades and gc:
@@ -1626,7 +1772,8 @@ def simulate_rsima_strategy(
             "lma_len": lma_len,
             "lEp": lEp,
             "lCp": lCp,
-            "max_trades": max_trades
+            "max_trades": max_trades,
+            "sl_pct": sl_pct
         }
     }
 
@@ -1655,7 +1802,8 @@ def optimize_symbol_strategy(
                 for ml in env_malens:
                     res = simulate_envelope_strategy(
                         df, length=l, lower_pct=lp, upper_pct=lp, malen=ml,
-                        max_trades=max_trades, initial_equity=initial_equity
+                        max_trades=max_trades, initial_equity=initial_equity,
+                        sl_pct=0.03, use_trend_filter=True
                     )
                     label = f"Envelope_L{l}_P{lp}_MA{ml}"
                     results[label] = res
@@ -1673,7 +1821,8 @@ def optimize_symbol_strategy(
                     for cp in lCps:
                         res = simulate_rsima_strategy(
                             df, rsi_len=rl, lma_len=ml, lEp=ep, lCp=cp,
-                            max_trades=max_trades, initial_equity=initial_equity
+                            max_trades=max_trades, initial_equity=initial_equity,
+                            sl_pct=0.03
                         )
                         label = f"RSIMA_R{rl}_M{ml}_Ep{ep}_Cp{cp}"
                         results[label] = res
@@ -1776,11 +1925,37 @@ def run_interval_comparison(df_60m, lot=1.0, data_equity=100.0, side_mode="long"
                 else:
                     df_chart.loc[mask, 'exec_sell_price'] = ex['price']
                     
+        # 戦略別インジケーター列の付与
+        if best_strat == "envelope":
+            el = int(best_params.get("length", 15))
+            elp = float(best_params.get("lower_pct", 2.0))
+            eup = float(best_params.get("upper_pct", 2.0))
+            eml = int(best_params.get("malen", 100))
+            b_series = calc_ema(df_chart['close'], el)
+            mb_series = calc_ema(df_chart['close'], eml) if len(df_chart) >= eml else b_series
+            df_chart['basis'] = b_series
+            df_chart['mabasis'] = mb_series
+            df_chart['env_lower'] = b_series * (1.0 - elp / 100.0)
+            df_chart['env_upper'] = b_series * (1.0 + eup / 100.0)
+            df_chart['strategy_name'] = "ENVELOPE"
+        elif best_strat == "rsima":
+            rl = int(best_params.get("rsi_len", 9))
+            ll = int(best_params.get("lma_len", 7))
+            lep = float(best_params.get("lEp", 40.0))
+            lcp = float(best_params.get("lCp", 60.0))
+            r_s = calc_rsi(df_chart['close'], rl)
+            lr_s = calc_ema(r_s, ll)
+            df_chart['rsi'] = r_s
+            df_chart['lrsiMA'] = lr_s
+            df_chart['lEp'] = lep
+            df_chart['lCp'] = lcp
+            df_chart['strategy_name'] = "RSIMA"
+
         eval_bars_10d = min(len(df_chart), 240)
         chart_10d_df = df_chart.tail(eval_bars_10d).reset_index(drop=True)
         bg_csv = f"backtest_data/klines100_{symbol}_bingx.csv"
         chart_10d_df.to_csv(bg_csv, index=False)
-        discord.plot_backtest(label=f"BingX_{symbol}_{best_strat.upper()}", csv_file=bg_csv, symbol=symbol)
+        discord.plot_backtest(label=f"BingX_{symbol}_{best_strat.upper()}", csv_file=bg_csv, symbol=symbol, strategy_type=best_strat)
     except Exception as ch_err:
         print(f"[Chart Error] {symbol}: {ch_err}")
 
