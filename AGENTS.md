@@ -2,6 +2,13 @@
 
 ## 1. Deployment & Code Synchronization Rule
 - **Never directly overwrite/SCP code files (.py) from Windows to VPS.**
+- **Designated Production VPS (Oracle No.2)**:
+  - Host: `158.101.157.117`
+  - User: `ubuntu`
+  - SSH Key: `C:\Users\user\OneDrive\Desktop\OracleVPS\id_rsa.oracle2`
+  - Command: `ssh -i "C:\Users\user\OneDrive\Desktop\OracleVPS\id_rsa.oracle2" ubuntu@158.101.157.117`
+  - Directory: `/home/ubuntu/bingx5_46`
+  - Venv: `/home/ubuntu/pybot-env`
 - Always follow the Git-based deployment workflow:
   1. Make and test code changes locally on Windows.
   2. Commit and push to GitHub (`git add`, `git commit`, `git push origin main`).

@@ -76,6 +76,16 @@ BINGX_IS_AIR = True
 
 ## 6. VPS常駐・プロセス管理規約
 
+* **指定運用VPS（オラクルナンバー2）接続情報**:
+  * **ホスト**: `158.101.157.117`
+  * **ユーザー**: `ubuntu`
+  * **秘密鍵**: `C:\Users\user\OneDrive\Desktop\OracleVPS\id_rsa.oracle2`
+  * **SSH接続コマンド**:
+    ```bash
+    ssh -i "C:\Users\user\OneDrive\Desktop\OracleVPS\id_rsa.oracle2" ubuntu@158.101.157.117
+    ```
+  * **VPSプロジェクトパス**: `/home/ubuntu/bingx5_46`
+  * **仮想環境パス**: `/home/ubuntu/pybot-env`
 * **自動死活監視（Cron）**:
   * `/etc/crontab` または `crontab -l` にて `check_and_restart.sh` を5分間隔（`*/5 * * * *`）で実行し、プロセスダウン時は自動再起動する。
 * **Python実行時アンバッファ**:
@@ -89,10 +99,13 @@ BINGX_IS_AIR = True
   * Windowsローカル環境から VPS へプログラムコード（`.py` ファイル等）を SCP で直接上書きアップロードしてはならない（Git競合の原因となるため）。
 * **標準デプロイワークフロー**:
   1. **ローカル**: コード修正 ➔ 構文・動作確認 ➔ `git add` ➔ `git commit` ➔ `git push origin main`
-  2. **VPS側**: SSH接続 ➔ `git pull origin main` で変更を取得・同期
-  3. **再起動**: VPS側でボットプロセスを安全に再起動（`pkill` ➔ `check_and_restart.sh` または `nohup` 起動）
+  2. **VPS側**: SSH接続 (`ssh -i "C:\Users\user\OneDrive\Desktop\OracleVPS\id_rsa.oracle2" ubuntu@158.101.157.117`) ➔ `cd /home/ubuntu/bingx5_46 && git pull origin main` で変更を取得・同期
+  3. **再起動**: VPS側でボットプロセスを安全に再起動（`pkill` ➔ `nohup` または `check_and_restart.sh` 起動）
 * **データファイル（ログ・CSV等）の取得**:
   * VPSからローカルへログファイルやCSV・画像をダウンロードする目的の SCP は許可される。
+    ```bash
+    scp -i "C:\Users\user\OneDrive\Desktop\OracleVPS\id_rsa.oracle2" ubuntu@158.101.157.117:/home/ubuntu/bingx5_46/bot_output.log ./scratch/
+    ```
 
 ---
 
