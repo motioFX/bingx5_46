@@ -1647,14 +1647,17 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                         ttp["peak_price"] = cur_high
                         ttp["entry_price"] = entry_px
                         ttp["strategy"] = cand_strat
-                        callback_pct = 0.008  # 0.8%
+                        callback_pct = 0.015  # 1.5% に適正化 (大相場追従)
                         min_guarantee = entry_px * 1.001  # 建値+手数料0.1%保証
-                        ttp["trail_stop"] = max(cur_high * (1.0 - callback_pct), min_guarantee)
+                        vah_val = float(df["VAH"].iloc[-1]) if ("VAH" in df.columns and not pd.isna(df["VAH"].iloc[-1])) else 0.0
+                        vah_guard = vah_val if (vah_val > 0 and cur_high > vah_val) else 0.0
+                        ttp["trail_stop"] = max(cur_high * (1.0 - callback_pct), vah_guard, min_guarantee)
                         trailing_tp_states[sym] = ttp
                         save_trailing_tp_states(trailing_tp_states)
+                        vah_tag = f" | VAH防護: ${vah_guard:,.4f}" if vah_guard > 0 else ""
                         discord.print_log(
                             f"[{sym}] [TRAILING TP ACTIVATED] 🔥 利益確定トレーリング開始!\n"
-                            f"   └ 現在値: ${current_price:,.4f} (建値: ${entry_px:,.4f}) | 高値: ${ttp['peak_price']:,.4f} | 利確ライン: ${ttp['trail_stop']:,.4f} (-0.8%)"
+                            f"   └ 現在値: ${current_price:,.4f} (建値: ${entry_px:,.4f}) | 高値: ${ttp['peak_price']:,.4f} | 利確ライン: ${ttp['trail_stop']:,.4f} (-1.5%{vah_tag})"
                         )
 
                     # トレーリング利確モード中の判定
@@ -1662,11 +1665,14 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                         cur_high = max(current_price, float(df["high"].iloc[-1]) if "high" in df.columns else current_price)
                         if cur_high > ttp["peak_price"]:
                             ttp["peak_price"] = cur_high
-                        callback_pct = 0.008
+                        callback_pct = 0.015
                         min_guarantee = entry_px * 1.001
-                        ttp["trail_stop"] = max(ttp["peak_price"] * (1.0 - callback_pct), min_guarantee)
+                        vah_val = float(df["VAH"].iloc[-1]) if ("VAH" in df.columns and not pd.isna(df["VAH"].iloc[-1])) else 0.0
+                        vah_guard = vah_val if (vah_val > 0 and ttp["peak_price"] > vah_val) else 0.0
+                        ttp["trail_stop"] = max(ttp["peak_price"] * (1.0 - callback_pct), vah_guard, min_guarantee)
                         trailing_tp_states[sym] = ttp
                         save_trailing_tp_states(trailing_tp_states)
+
 
                         if current_price < ttp["trail_stop"]:
                             exit_reason = f"TrailingTP_{cand_strat.upper()}"

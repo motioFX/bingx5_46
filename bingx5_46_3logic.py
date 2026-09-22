@@ -1476,13 +1476,14 @@ def simulate_envelope_strategy(
     max_trades: int = 1,
     initial_equity: float = 100.0,
     fee_rate: float = 0.0006,
-    callback_pct: float = 0.008,
+    callback_pct: float = 0.015,
     sl_pct: float = 0.03,
     use_trend_filter: bool = False
 ) -> dict:
     closes = df["close"].values
     highs = df["high"].values if "high" in df.columns else closes
     lows = df["low"].values if "low" in df.columns else closes
+    vahs = df["VAH"].values if "VAH" in df.columns else None
     n = len(closes)
     if n < max(length, 10):
         return {"final_pnl": 0.0, "trade_count": 0, "win_rate": 0.0, "DD_max": 0.0, "max_unrealized_loss": 0.0}
@@ -1546,7 +1547,9 @@ def simulate_envelope_strategy(
                 
                 if trailing_tp_active:
                     trail_peak = max(trail_peak, h)
-                    trail_stop = max(trail_peak * (1.0 - callback_pct), avg_price * (1.0 + fee_rate))
+                    vah_val = float(vahs[i]) if (vahs is not None and i < len(vahs) and not np.isnan(vahs[i])) else 0.0
+                    vah_guard = vah_val if (vah_val > 0 and trail_peak > vah_val) else 0.0
+                    trail_stop = max(trail_peak * (1.0 - callback_pct), vah_guard, avg_price * (1.0 + fee_rate))
                     if c < trail_stop:
                         sell_val = pos_qty * c
                         fee = sell_val * fee_rate
@@ -1561,6 +1564,7 @@ def simulate_envelope_strategy(
                         pos_count = 0
                         trailing_tp_active = False
                         trail_peak = 0.0
+
                 
         # エントリーチェック (戻りエントリー: 前足がバンド以下で今足終値がバンド内に復帰)
         if pos_count < max_trades:
@@ -1633,12 +1637,13 @@ def simulate_rsima_strategy(
     max_trades: int = 1,
     initial_equity: float = 100.0,
     fee_rate: float = 0.0006,
-    callback_pct: float = 0.008,
+    callback_pct: float = 0.015,
     sl_pct: float = 0.03
 ) -> dict:
     closes = df["close"].values
     highs = df["high"].values if "high" in df.columns else closes
     lows = df["low"].values if "low" in df.columns else closes
+    vahs = df["VAH"].values if "VAH" in df.columns else None
     n = len(closes)
     if n < max(rsi_len, lma_len) + 5:
         return {"final_pnl": 0.0, "trade_count": 0, "win_rate": 0.0, "DD_max": 0.0, "max_unrealized_loss": 0.0}
@@ -1707,7 +1712,9 @@ def simulate_rsima_strategy(
                 
                 if trailing_tp_active:
                     trail_peak = max(trail_peak, h)
-                    trail_stop = max(trail_peak * (1.0 - callback_pct), avg_price * (1.0 + fee_rate))
+                    vah_val = float(vahs[i]) if (vahs is not None and i < len(vahs) and not np.isnan(vahs[i])) else 0.0
+                    vah_guard = vah_val if (vah_val > 0 and trail_peak > vah_val) else 0.0
+                    trail_stop = max(trail_peak * (1.0 - callback_pct), vah_guard, avg_price * (1.0 + fee_rate))
                     if c < trail_stop:
                         sell_val = pos_qty * c
                         fee = sell_val * fee_rate
@@ -1722,6 +1729,7 @@ def simulate_rsima_strategy(
                         pos_count = 0
                         trailing_tp_active = False
                         trail_peak = 0.0
+
                 
         # エントリーチェック: lrsiMA < lEp and rsi < lCp
         if pos_count < max_trades and gc:
