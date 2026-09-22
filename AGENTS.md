@@ -23,3 +23,8 @@
 
 ## 3. Implementation Plan & Walkthrough Rule
 - ALWAYS write the Implementation Plan and Walkthrough artifacts entirely in Japanese.
+
+## 4. Project Rules & Living Documentation Policy
+- **Primary Specification Source**: Always consult and strictly adhere to the trading logic, risk management, and operational rules defined in `PROJECT_RULES.md`.
+- **Incremental Rule Refinement**: Whenever the user provides new rules, constraints, or operational requirements during conversations, immediately document and organize them into `PROJECT_RULES.md` (in Japanese).
+- **Consistency**: Before implementing or modifying code, verify that all changes are fully consistent with `PROJECT_RULES.md`.
