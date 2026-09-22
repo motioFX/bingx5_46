@@ -312,8 +312,9 @@ class logicinstance:
         df['mabasis'] = mabasis
         df['env_lower'] = basis * (1.0 - env_lp / 100.0)
         df['env_upper'] = basis * (1.0 + env_up / 100.0)
-        # トレンドフィルター（長期EMAより上）かつ下限バンド割れ
-        df['long_envelope'] = (df['close'] < df['env_lower']) & (df['close'] > df['mabasis'])
+        # 戻りエントリー: 1本前が下限バンド以下、かつ当足終値が下限バンドを上抜け復帰
+        # （反発初動確認＋3%固定SLにより、長期MAフィルターは解除して自律反発を広く捕捉）
+        df['long_envelope'] = (df['close'].shift(1) <= df['env_lower'].shift(1)) & (df['close'] > df['env_lower'])
         df['longclose_envelope'] = df['close'] > df['basis']
         
         # --- RSI MA (RSIMA3) 戦略シグナル ---
@@ -1477,7 +1478,7 @@ def simulate_envelope_strategy(
     fee_rate: float = 0.0006,
     callback_pct: float = 0.008,
     sl_pct: float = 0.03,
-    use_trend_filter: bool = True
+    use_trend_filter: bool = False
 ) -> dict:
     closes = df["close"].values
     highs = df["high"].values if "high" in df.columns else closes
@@ -1561,18 +1562,20 @@ def simulate_envelope_strategy(
                         trailing_tp_active = False
                         trail_peak = 0.0
                 
-        # エントリーチェック (close < lower かつ トレンドフィルター)
+        # エントリーチェック (戻りエントリー: 前足がバンド以下で今足終値がバンド内に復帰)
         if pos_count < max_trades:
             can_enter = False
             trend_ok = (c > mabasis[i]) if use_trend_filter else True
             if trend_ok:
+                rebound_condition = (closes[i-1] <= lower[i-1]) and (c > low_band)
                 if pos_count == 0:
-                    if c < low_band:
+                    if rebound_condition:
                         can_enter = True
                 else:
                     add_pct = calc_add_pct(pos_count)
-                    if c < low_band and c < avg_price * (1.0 - add_pct):
+                    if rebound_condition and c < avg_price * (1.0 - add_pct):
                         can_enter = True
+
                         
             if can_enter:
                 buy_val = trade_size_usdt
@@ -1795,7 +1798,7 @@ def optimize_symbol_strategy(
     if force_strategy is None or force_strategy.lower() == "envelope":
         env_lengths = [10, 15, 20, 25]
         env_lower_pcts = [1.5, 2.0, 2.5, 3.0]
-        env_malens = [100, 200]
+        env_malens = [100]
         
         for l in env_lengths:
             for lp in env_lower_pcts:
@@ -1803,10 +1806,11 @@ def optimize_symbol_strategy(
                     res = simulate_envelope_strategy(
                         df, length=l, lower_pct=lp, upper_pct=lp, malen=ml,
                         max_trades=max_trades, initial_equity=initial_equity,
-                        sl_pct=0.03, use_trend_filter=True
+                        sl_pct=0.03, use_trend_filter=False
                     )
-                    label = f"Envelope_L{l}_P{lp}_MA{ml}"
+                    label = f"Envelope_L{l}_P{lp}"
                     results[label] = res
+
 
     # 2. RSIMA 戦略グリッドサーチ
     if force_strategy is None or force_strategy.lower() == "rsima":
