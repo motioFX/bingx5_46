@@ -13,6 +13,10 @@
      - 📦 マスターZIP（`Data/historical_all_symbols_merged.zip`）の更新
   3. 作成されたZIPファイルを、**Discordへ自動アップロード（`discord.send_file(zip_path, ...)`）** して手元でバックテスト・検証用データとして保存・利用可能とすること。
   4. 今後スクリーニングロジックやブレイクアウト判定の仕様変更を行う場合でも、**この「32日分データ取得 ➔ ZIP化 ➔ Discord送信」のパイプラインは絶対に削除・省略してはならない**。
+5. **Funding Rate & Open Interest 取得・マージ規約**:
+   - **Funding Rate（FR）**: `/openApi/swap/v2/quote/fundingRate` より指定期間（`startTime` / `endTime` / `limit=1000`）の履歴リストを取得し、1時間足データ（整時境界）へ `merge` および `ffill()` で前方補間結合する。
+   - **Open Interest（OI）**: `/openApi/swap/v2/quote/openInterest` より銘柄ごとのリアルタイム建玉を取得し、時系列データおよび毎時サイクルログで建玉変化率（`OIΔ`）を記録・算出可能とする。
+   - **標準データセット保存カラム**: `timestamp`, `symbol`, `open`, `high`, `low`, `close`, `volume`, `fundingRate`, `openInterest` を標準形式として出力・保存する。
 
 ---
 

@@ -167,6 +167,21 @@ def fetch_bingx_tickers(product_type: str = "SWAP", mode: str = "demo", max_retr
             data = resp.json()
             if data.get("code") == 0:
                 ticker_list = data.get("data", [])
+
+                # premiumIndex から全銘柄のリアルタイム FR を取得
+                fr_map = {}
+                try:
+                    url_prem = f"{base_url}/openApi/swap/v2/quote/premiumIndex"
+                    resp_prem = requests.get(url_prem, timeout=10)
+                    if resp_prem.status_code == 200:
+                        data_prem = resp_prem.json()
+                        for p_item in data_prem.get("data", []):
+                            p_sym = normalize_symbol(p_item.get("symbol", ""))
+                            fr_val = float(p_item.get("lastFundingRate") or 0.0)
+                            fr_map[p_sym] = fr_val
+                except Exception:
+                    pass
+
                 result = []
                 for item in ticker_list:
                     sym = normalize_symbol(item.get("symbol", ""))
@@ -194,6 +209,7 @@ def fetch_bingx_tickers(product_type: str = "SWAP", mode: str = "demo", max_retr
                             pass
 
                     whale_impact_ratio = (whale_net_usd / vol * 100.0) if vol > 0 else 0.0
+                    fr = fr_map.get(sym, 0.0)
 
                     result.append({
                         "symbol": sym,
@@ -203,9 +219,9 @@ def fetch_bingx_tickers(product_type: str = "SWAP", mode: str = "demo", max_retr
                         "usdtVolume": vol,
                         "openInterestCoins": 0.0,
                         "openInterestVal": 0.0,
-                        "funding": 0.0,
-                        "funding_rate_pct": 0.0,
-                        "funding_annual_pct": 0.0,
+                        "funding": fr,
+                        "funding_rate_pct": fr * 100.0,
+                        "funding_annual_pct": fr * 3.0 * 365.0 * 100.0,
                         "premium": 0.0,
                         "whale_net_val_usd": whale_net_usd,
                         "whale_long_ratio": whale_long_r,
@@ -354,26 +370,61 @@ async def fetch_bingx_funding_history(
     url = f"{base_url}/openApi/swap/v2/quote/fundingRate"
     clean_sym = normalize_symbol(symbol)
     results = []
-    try:
-        resp = requests.get(f"{url}?symbol={clean_sym}", timeout=10)
-        if resp.status_code == 200:
-            data = resp.json()
-            if data.get("code") == 0:
-                fr_info = data.get("data", {})
-                if isinstance(fr_info, dict):
-                    fr = float(fr_info.get("fundingRate") or 0.0)
-                    t_ms = int(fr_info.get("fundingTime") or time.time() * 1000)
-                    dt_jst = from_ms_jst(t_ms).replace(minute=0, second=0, microsecond=0)
-                    results.append({
-                        "timestamp": dt_jst,
-                        "fundingRate": fr,
-                        "fundingRate_1h_pct": fr * 100.0,
-                        "fundingRate_annual_pct": fr * 3.0 * 365.0 * 100.0,
-                        "premium": 0.0,
-                    })
-    except Exception as e:
-        log(f"BingX funding rate fetch error for {clean_sym}: {e}")
+    params = {
+        "symbol": clean_sym,
+        "startTime": str(start_ms),
+        "endTime": str(end_ms),
+        "limit": "1000",
+    }
+    for attempt in range(3):
+        try:
+            resp = requests.get(url, params=params, timeout=10)
+            if resp.status_code == 200:
+                data = resp.json()
+                if data.get("code") == 0:
+                    fr_items = data.get("data", [])
+                    if isinstance(fr_items, list):
+                        for fr_info in fr_items:
+                            fr = float(fr_info.get("fundingRate") or 0.0)
+                            t_ms = int(fr_info.get("fundingTime") or time.time() * 1000)
+                            t_hour_ms = (t_ms // 3600000) * 3600000
+                            dt_jst = from_ms_jst(t_hour_ms)
+                            results.append({
+                                "timestamp": dt_jst,
+                                "fundingRate": fr,
+                                "fundingRate_1h_pct": fr * 100.0,
+                                "fundingRate_annual_pct": fr * 3.0 * 365.0 * 100.0,
+                                "premium": 0.0,
+                            })
+                        break
+            time.sleep(0.5)
+        except Exception as e:
+            log(f"BingX funding rate fetch error for {clean_sym} (attempt {attempt+1}): {e}")
+            time.sleep(1.0)
     return results
+
+
+async def fetch_bingx_open_interest(
+    symbol: str,
+    mode: str = "demo",
+) -> float:
+    """BingXから銘柄のリアルタイム建玉(OI)を取得"""
+    base_url = REST_API_URL["bingx_demo"] if mode in ("paper", "demo", "testnet") else REST_API_URL["bingx"]
+    url = f"{base_url}/openApi/swap/v2/quote/openInterest"
+    clean_sym = normalize_symbol(symbol)
+    for attempt in range(3):
+        try:
+            resp = requests.get(url, params={"symbol": clean_sym}, timeout=10)
+            if resp.status_code == 200:
+                data = resp.json()
+                if data.get("code") == 0:
+                    oi_val = float(data.get("data", {}).get("openInterest") or 0.0)
+                    return oi_val
+            time.sleep(0.5)
+        except Exception as e:
+            log(f"BingX open interest fetch error for {clean_sym} (attempt {attempt+1}): {e}")
+            time.sleep(1.0)
+    return 0.0
 
 
 async def build_merged_dataset(
@@ -446,6 +497,8 @@ async def build_merged_dataset(
 
     # 3. Open Interest (建玉)
     oi_coins = float(ticker_info.get("openInterestCoins", 0.0)) if ticker_info else 0.0
+    if oi_coins <= 0.0:
+        oi_coins = await fetch_bingx_open_interest(symbol, mode="live")
     df["openInterest"] = oi_coins
     df["openInterestVal"] = df["openInterest"] * df["close"]
     df["symbol"] = symbol

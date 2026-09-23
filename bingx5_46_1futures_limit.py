@@ -591,8 +591,8 @@ def load_traded_symbols() -> List[str]:
     return []
 
 
-async def fetch_all_asset_contexts(mode: str = 'demo') -> Dict[str, Dict[str, Any]]:
-    """BingX Swap API から全銘柄のリアルタイム FR / 価格 / 出来高を取得"""
+async def fetch_all_asset_contexts(mode: str = 'demo', target_symbols: Optional[List[str]] = None) -> Dict[str, Dict[str, Any]]:
+    """BingX Swap API から全銘柄のリアルタイム FR / 価格 / 出来高 / OI を取得"""
     res: Dict[str, Dict[str, Any]] = {}
     cred_key = 'bingx_demo' if mode in ('paper', 'demo', 'testnet') else 'bingx'
     base_url = RestAPI_url.get(cred_key, 'https://open-api-vst.bingx.com' if mode in ('paper', 'demo', 'testnet') else 'https://open-api.bingx.com')
@@ -641,6 +641,25 @@ async def fetch_all_asset_contexts(mode: str = 'demo') -> Dict[str, Dict[str, An
                         res[k]["prevDayPx"] = open_px
                         if res[k]["markPx"] == 0.0:
                             res[k]["markPx"] = last_px
+
+        # 3. 指定銘柄のリアルタイム建玉 (openInterest) を取得
+        if target_symbols:
+            oi_syms = set(normalize_symbol(s) for s in target_symbols)
+            for s in oi_syms:
+                try:
+                    url_oi = f"{base_url}/openApi/swap/v2/quote/openInterest"
+                    resp_oi = requests.get(url_oi, params={"symbol": s}, timeout=5)
+                    if resp_oi.status_code == 200:
+                        oi_data = resp_oi.json()
+                        if oi_data.get("code") == 0:
+                            oi_val = float(oi_data.get("data", {}).get("openInterest") or 0.0)
+                            coin = s.replace("-USDT", "")
+                            if s in res:
+                                res[s]["openInterest"] = oi_val
+                            if coin in res:
+                                res[coin]["openInterest"] = oi_val
+                except Exception:
+                    pass
     except Exception as e:
         print(f"[Warning] fetch_all_asset_contexts (BingX) error: {e}")
     return res
@@ -1456,7 +1475,7 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
             freed_symbols = []
 
             # 1. 全銘柄のリアルタイム資金調達率(FR)と建玉(OI)を一括取得
-            all_asset_ctxs = await fetch_all_asset_contexts(mode=mode)
+            all_asset_ctxs = await fetch_all_asset_contexts(mode=mode, target_symbols=list(symbol_apis.keys()))
 
             # 口座総残高をサイクル開始時に1回取得
             first_api = next(iter(symbol_apis.values())) if symbol_apis else None

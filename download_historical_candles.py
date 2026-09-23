@@ -229,6 +229,107 @@ async def fetch_symbol_klines(
     return symbol, []
 
 
+async def fetch_symbol_funding_history(
+    session: aiohttp.ClientSession,
+    symbol: str,
+    start_ms: int,
+    end_ms: int,
+    sem: asyncio.Semaphore,
+    limit: int = 1000
+) -> Tuple[str, List[Dict[str, Any]]]:
+    """1銘柄の指定期間のファンディングレート(FR)履歴を取得"""
+    url = f"{REST_API_URL['bingx']}/openApi/swap/v2/quote/fundingRate"
+    params = {
+        "symbol": symbol,
+        "startTime": str(start_ms),
+        "endTime": str(end_ms),
+        "limit": str(limit),
+    }
+    async with sem:
+        for attempt in range(5):
+            try:
+                async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=12)) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        if data.get("code") == 0:
+                            items = data.get("data", [])
+                            if isinstance(items, list):
+                                rows = []
+                                for it in items:
+                                    t = int(it.get("fundingTime") or 0)
+                                    t_hour = (t // 3600000) * 3600000
+                                    fr = float(it.get("fundingRate") or 0.0)
+                                    rows.append({
+                                        "timestamp": t_hour,
+                                        "fundingRate": fr,
+                                    })
+                                return symbol, rows
+                        elif data.get("code") == 100410:
+                            await asyncio.sleep(3.0 * (attempt + 1))
+                            continue
+                    await asyncio.sleep(0.08)
+            except Exception:
+                await asyncio.sleep(1.0 * (attempt + 1))
+    return symbol, []
+
+
+async def fetch_symbol_open_interest(
+    session: aiohttp.ClientSession,
+    symbol: str,
+    sem: asyncio.Semaphore,
+) -> Tuple[str, float]:
+    """1銘柄の現在の建玉(OI)を取得"""
+    url = f"{REST_API_URL['bingx']}/openApi/swap/v2/quote/openInterest"
+    params = {"symbol": symbol}
+    async with sem:
+        for attempt in range(4):
+            try:
+                async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        if data.get("code") == 0:
+                            oi_val = float(data.get("data", {}).get("openInterest") or 0.0)
+                            return symbol, oi_val
+                        elif data.get("code") == 100410:
+                            await asyncio.sleep(2.0 * (attempt + 1))
+                            continue
+                    await asyncio.sleep(0.05)
+            except Exception:
+                await asyncio.sleep(1.0 * (attempt + 1))
+    return symbol, 0.0
+
+
+async def fetch_symbol_bundle(
+    session: aiohttp.ClientSession,
+    symbol: str,
+    start_ms: int,
+    end_ms: int,
+    sem: asyncio.Semaphore,
+    limit: int = 1000,
+    curr_oi: float = 0.0,
+) -> Tuple[str, List[Dict[str, Any]]]:
+    """1銘柄のOHLCV、FR履歴、OIを統合して取得"""
+    _, kline_rows = await fetch_symbol_klines(session, symbol, start_ms, end_ms, sem, limit=limit)
+    if not kline_rows:
+        return symbol, []
+
+    _, fr_rows = await fetch_symbol_funding_history(session, symbol, start_ms, end_ms, sem, limit=limit)
+
+    df_k = pd.DataFrame(kline_rows).drop_duplicates(subset=["timestamp"]).sort_values("timestamp").reset_index(drop=True)
+
+    if fr_rows:
+        df_fr = pd.DataFrame(fr_rows).drop_duplicates(subset=["timestamp"]).sort_values("timestamp").reset_index(drop=True)
+        df_merged = pd.merge(df_k, df_fr, on="timestamp", how="left")
+        df_merged["fundingRate"] = df_merged["fundingRate"].ffill().bfill().fillna(0.0)
+    else:
+        df_merged = df_k
+        df_merged["fundingRate"] = 0.0
+
+    df_merged["openInterest"] = curr_oi
+    return symbol, df_merged.to_dict(orient="records")
+
+
+
 def generate_normalized_chart(
     symbols_data: Dict[str, pd.DataFrame],
     target_symbols: List[str],
@@ -398,7 +499,17 @@ async def run_pipeline(
         timeout = aiohttp.ClientTimeout(total=15)
         connector = aiohttp.TCPConnector(limit=20)
 
+        cols_to_save = ["timestamp", "symbol", "open", "high", "low", "close", "volume", "fundingRate", "openInterest"]
+
         async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
+            # 0. 全銘柄のリアルタイム建玉(OI)を事前取得
+            log(f"Fetching real-time Open Interest for {len(all_symbols)} symbols...")
+            oi_tasks = [fetch_symbol_open_interest(session, sym, sem) for sym in all_symbols]
+            oi_results = await asyncio.gather(*oi_tasks)
+            symbol_oi_map = {sym: val for sym, val in oi_results}
+            nonzero_oi = sum(1 for v in symbol_oi_map.values() if v > 0)
+            log(f"Fetched Open Interest for {len(symbol_oi_map)} symbols ({nonzero_oi} symbols with active OI)")
+
             for chunk_idx, (chunk_start, chunk_end) in enumerate(chunks, 1):
                 start_ms = int(chunk_start.timestamp() * 1000)
                 end_ms = int(chunk_end.timestamp() * 1000)
@@ -417,11 +528,11 @@ async def run_pipeline(
                     log(f"⚡ [{chunk_label}] {target_existing.name} はすでにDiscord送信完了済み（データ変更なし）のためスキップします。")
                     continue
 
-                log(f"\n--- Fetching {chunk_label} for {len(all_symbols)} symbols ---")
+                log(f"\n--- Fetching {chunk_label} (OHLCV + FR + OI) for {len(all_symbols)} symbols ---")
                 t0 = time.time()
 
                 tasks = [
-                    fetch_symbol_klines(session, sym, start_ms, end_ms, sem, limit=chunk_days * 24 + 10)
+                    fetch_symbol_bundle(session, sym, start_ms, end_ms, sem, limit=chunk_days * 24 + 10, curr_oi=symbol_oi_map.get(sym, 0.0))
                     for sym in all_symbols
                 ]
                 results = await asyncio.gather(*tasks)
@@ -445,20 +556,23 @@ async def run_pipeline(
                     if chunk_idx == len(chunks):
                         latest_symbols_df[sym] = df_sym
 
+                    # 保存対象カラムの抽出（存在するもの）
+                    avail_save_cols = [c for c in cols_to_save if c in df_sym.columns]
+
                     # ローカル累積CSVに追記保存
                     sym_csv = candles_dir / f"{sym}_1h.csv"
                     if sym_csv.exists():
                         try:
                             old_df = pd.read_csv(sym_csv)
-                            comb_df = pd.concat([old_df, df_sym[["timestamp", "open", "high", "low", "close", "volume", "symbol"]]], ignore_index=True)
+                            comb_df = pd.concat([old_df, df_sym[avail_save_cols]], ignore_index=True)
                             comb_df = comb_df.drop_duplicates(subset=["timestamp"]).sort_values("timestamp").reset_index(drop=True)
                             comb_df.to_csv(sym_csv, index=False, encoding="utf-8")
                         except Exception:
-                            df_sym[["timestamp", "open", "high", "low", "close", "volume", "symbol"]].to_csv(sym_csv, index=False, encoding="utf-8")
+                            df_sym[avail_save_cols].to_csv(sym_csv, index=False, encoding="utf-8")
                     else:
-                        df_sym[["timestamp", "open", "high", "low", "close", "volume", "symbol"]].to_csv(sym_csv, index=False, encoding="utf-8")
+                        df_sym[avail_save_cols].to_csv(sym_csv, index=False, encoding="utf-8")
 
-                log(f"Fetched {valid_count}/{len(all_symbols)} symbols with valid data in {t1 - t0:.1f}s")
+                log(f"Fetched {valid_count}/{len(all_symbols)} symbols with valid OHLCV+FR+OI data in {t1 - t0:.1f}s")
 
                 if not all_chunk_rows:
                     log(f"No historical data returned for {chunk_label}.")
@@ -467,9 +581,12 @@ async def run_pipeline(
                 # ZIPアーカイブ作成 (全銘柄統合CSV + 主要銘柄個別CSV -> 8~10MBに最適化)
                 log(f"Creating ZIP archive: {zip_filename}...")
                 df_chunk_all = pd.DataFrame(all_chunk_rows).drop_duplicates(subset=["timestamp", "symbol"]).sort_values(by=["timestamp", "symbol"]).reset_index(drop=True)
+                avail_all_cols = [c for c in cols_to_save if c in df_chunk_all.columns]
+                other_all_cols = [c for c in df_chunk_all.columns if c not in cols_to_save]
+                df_chunk_all = df_chunk_all[avail_all_cols + other_all_cols]
 
                 with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
-                    # 1. 全銘柄統合CSV (全銘柄590+網羅)
+                    # 1. 全銘柄統合CSV (全銘柄590+網羅, OHLCV + FR + OI)
                     merged_csv_str = df_chunk_all.to_csv(index=False)
                     zf.writestr(f"all_symbols_1h_{s_tag}_{e_tag}.csv", merged_csv_str)
                     
@@ -477,7 +594,8 @@ async def run_pipeline(
                     for sym in key_individual_symbols:
                         df_s = ind_dfs.get(sym)
                         if df_s is not None and not df_s.empty:
-                            s_csv = df_s[["timestamp", "open", "high", "low", "close", "volume", "symbol"]].to_csv(index=False)
+                            s_save_cols = [c for c in cols_to_save if c in df_s.columns]
+                            s_csv = df_s[s_save_cols].to_csv(index=False)
                             zf.writestr(f"individual/{sym}_1h.csv", s_csv)
 
                 zip_size_mb = zip_path.stat().st_size / (1024 * 1024)
