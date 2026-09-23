@@ -20,6 +20,7 @@ import numpy as np
 import pandas as pd
 import pybotters
 import requests
+import aiohttp
 from config_loader import get_webhook_url
 from upload_registry import should_upload_file, record_file_uploaded
 
@@ -376,31 +377,35 @@ async def fetch_bingx_funding_history(
         "endTime": str(end_ms),
         "limit": "1000",
     }
-    for attempt in range(3):
-        try:
-            resp = requests.get(url, params=params, timeout=10)
-            if resp.status_code == 200:
-                data = resp.json()
-                if data.get("code") == 0:
-                    fr_items = data.get("data", [])
-                    if isinstance(fr_items, list):
-                        for fr_info in fr_items:
-                            fr = float(fr_info.get("fundingRate") or 0.0)
-                            t_ms = int(fr_info.get("fundingTime") or time.time() * 1000)
-                            t_hour_ms = (t_ms // 3600000) * 3600000
-                            dt_jst = from_ms_jst(t_hour_ms)
-                            results.append({
-                                "timestamp": dt_jst,
-                                "fundingRate": fr,
-                                "fundingRate_1h_pct": fr * 100.0,
-                                "fundingRate_annual_pct": fr * 3.0 * 365.0 * 100.0,
-                                "premium": 0.0,
-                            })
-                        break
-            time.sleep(0.5)
-        except Exception as e:
-            log(f"BingX funding rate fetch error for {clean_sym} (attempt {attempt+1}): {e}")
-            time.sleep(1.0)
+    timeout = aiohttp.ClientTimeout(total=12)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        for attempt in range(4):
+            try:
+                async with session.get(url, params=params) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        if data.get("code") == 0:
+                            fr_items = data.get("data", [])
+                            if isinstance(fr_items, list) and fr_items:
+                                for fr_info in fr_items:
+                                    fr = float(fr_info.get("fundingRate") or 0.0)
+                                    t_ms = int(fr_info.get("fundingTime") or time.time() * 1000)
+                                    t_hour_ms = (t_ms // 3600000) * 3600000
+                                    dt_jst = from_ms_jst(t_hour_ms)
+                                    results.append({
+                                        "timestamp": dt_jst,
+                                        "fundingRate": fr,
+                                        "fundingRate_1h_pct": fr * 100.0,
+                                        "fundingRate_annual_pct": fr * 3.0 * 365.0 * 100.0,
+                                        "premium": 0.0,
+                                    })
+                                return results
+                    elif resp.status == 429 or (resp.status == 200 and (await resp.json()).get("code") == 100410):
+                        await asyncio.sleep(2.0 * (attempt + 1))
+                        continue
+                await asyncio.sleep(0.1)
+            except Exception as e:
+                await asyncio.sleep(1.0 * (attempt + 1))
     return results
 
 
@@ -412,18 +417,19 @@ async def fetch_bingx_open_interest(
     base_url = REST_API_URL["bingx_demo"] if mode in ("paper", "demo", "testnet") else REST_API_URL["bingx"]
     url = f"{base_url}/openApi/swap/v2/quote/openInterest"
     clean_sym = normalize_symbol(symbol)
-    for attempt in range(3):
-        try:
-            resp = requests.get(url, params={"symbol": clean_sym}, timeout=10)
-            if resp.status_code == 200:
-                data = resp.json()
-                if data.get("code") == 0:
-                    oi_val = float(data.get("data", {}).get("openInterest") or 0.0)
-                    return oi_val
-            time.sleep(0.5)
-        except Exception as e:
-            log(f"BingX open interest fetch error for {clean_sym} (attempt {attempt+1}): {e}")
-            time.sleep(1.0)
+    timeout = aiohttp.ClientTimeout(total=10)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        for attempt in range(4):
+            try:
+                async with session.get(url, params={"symbol": clean_sym}) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        if data.get("code") == 0:
+                            oi_val = float(data.get("data", {}).get("openInterest") or 0.0)
+                            return oi_val
+                    await asyncio.sleep(0.08)
+            except Exception:
+                await asyncio.sleep(0.5 * (attempt + 1))
     return 0.0
 
 
@@ -475,6 +481,8 @@ async def build_merged_dataset(
 
     # 2. Funding History (FR & Premium) フェッチ & マージ
     funding_rows = await fetch_bingx_funding_history(symbol, start_ms, end_ms)
+    fallback_fr = float(ticker_info.get("funding", 0.0)) if ticker_info else 0.0
+
     if funding_rows:
         df_funding = (
             pd.DataFrame(funding_rows)
@@ -485,12 +493,13 @@ async def build_merged_dataset(
         df_funding["timestamp"] = pd.to_datetime(df_funding["timestamp"])
         df = pd.merge(df, df_funding, on="timestamp", how="left")
     else:
-        df["fundingRate"] = 0.0
-        df["fundingRate_1h_pct"] = 0.0
-        df["fundingRate_annual_pct"] = 0.0
+        df["fundingRate"] = fallback_fr
+        df["fundingRate_1h_pct"] = fallback_fr * 100.0
+        df["fundingRate_annual_pct"] = fallback_fr * 24.0 * 365.0 * 100.0
         df["premium"] = 0.0
 
-    df["fundingRate"] = df["fundingRate"].ffill().bfill().fillna(0.0)
+    # 欠損値を前後補間、それでも残ればフォールバックFRで補完
+    df["fundingRate"] = df["fundingRate"].ffill().bfill().fillna(fallback_fr)
     df["fundingRate_1h_pct"] = df["fundingRate"] * 100.0
     df["fundingRate_annual_pct"] = df["fundingRate"] * 24.0 * 365.0 * 100.0
     df["premium"] = df.get("premium", pd.Series(0.0, index=df.index)).ffill().bfill().fillna(0.0)
