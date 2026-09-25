@@ -2,17 +2,17 @@
 
 ## 1. 銘柄選定・マージドデータダウンロード必須ルール（candle_merged_alt10）
 
-### 【規約】正規化（normalize）処理前の32日分データダウンロード＆完全ZIP化
+### 【規約】正規化（normalize）処理前の2ヶ月分（60日）データダウンロード＆完全ZIP化
 * **対象スクリプト**: `bingx5_46_4mix_candle_Merged_Alt10.py`
 * **実行タイミング**: 8時間ごと（01:00, 09:00, 17:00 JST）の銘柄スクリーニング時
 * **必須要件**:
-  1. 正規化比較チャート（`generate_normalized_charts`）の作成処理に入る前に、選定された全銘柄（Top 10）および BTC の **過去32日分（`timedelta(days=32)`）の1時間足データ（OHLCV、出来高、Funding Rate、Open Interest）を1回すべてダウンロード完了** すること。
-  2. ダウンロード完了後、直ちに以下のファイルを **ZIPアーカイブ（`YYYYMMDD_YYYYMMDD_all_symbols_merged.zip`）** にまとめること：
-     - 📄 全銘柄統合マージドCSV（`YYYYMMDD_YYYYMMDD_all_symbols_merged.csv`）
-     - 📁 個別銘柄の32日分マージドCSV（`individual/merged_{SYMBOL}.csv`）
-     - 📦 マスターZIP（`Data/historical_all_symbols_merged.zip`）の更新
+  1. 正規化比較チャート（`generate_normalized_charts`）の作成処理に入る前に、選定された全銘柄（Top 10）および BTC の **過去2ヶ月分（60日間: `timedelta(days=60)`）の1時間足データ（OHLCV、出来高、Funding Rate、Open Interest）を1回すべてダウンロード完了** すること。
+  2. ダウンロード完了後、直ちに以下のファイルを **ZIPアーカイブ（`bingx_all_markets_1h_YYYYMMDD_HHh.zip`）** にまとめること：
+     - 📄 全銘柄統合マージドCSV（`bingx_all_markets_1h_YYYYMMDD_HHh.csv` 例: `bingx_all_markets_1h_20260925_17h.csv`）
+     - 📁 個別銘柄の2ヶ月分マージドCSV（`individual/merged_{SYMBOL}.csv`）
+     - 📦 マスターCSV・ZIP（`Data/historical_all_symbols_merged.csv` / `.zip`）の更新（互換性維持）
   3. 作成されたZIPファイルを、**Discordへ自動アップロード（`discord.send_file(zip_path, ...)`）** して手元でバックテスト・検証用データとして保存・利用可能とすること。
-  4. 今後スクリーニングロジックやブレイクアウト判定の仕様変更を行う場合でも、**この「32日分データ取得 ➔ ZIP化 ➔ Discord送信」のパイプラインは絶対に削除・省略してはならない**。
+  4. 今後スクリーニングロジックやブレイクアウト判定の仕様変更を行う場合でも、**この「2ヶ月分データ取得 ➔ ZIP化 ➔ Discord送信」のパイプラインは絶対に削除・省略してはならない**。
 5. **Funding Rate & Open Interest 取得・マージ規約**:
    - **Funding Rate（FR）**: `/openApi/swap/v2/quote/fundingRate` より指定期間（`startTime` / `endTime` / `limit=1000`）の履歴リストを取得し、1時間足データ（整時境界）へ `merge` および `ffill()` で前方補間結合する。
    - **Open Interest（OI）**: `/openApi/swap/v2/quote/openInterest` より銘柄ごとのリアルタイム建玉を取得し、時系列データおよび毎時サイクルログで建玉変化率（`OIΔ`）を記録・算出可能とする。

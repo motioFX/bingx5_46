@@ -1284,7 +1284,7 @@ async def main():
     parser.add_argument("--start", type=str, default=DEFAULT_START_STR, help="ISO start timestamp")
     parser.add_argument("--top-n", type=int, default=15, help="Number of alt symbols to select")
     parser.add_argument("--no-chart-send", action="store_true", help="Do not send charts to Discord")
-    parser.add_argument("--skip-zip", action="store_true", help="Skip sending 32d zip (e.g. after 1-year download)")
+    parser.add_argument("--skip-zip", action="store_true", help="Skip sending 2-month zip (e.g. after 1-year download)")
     args = parser.parse_args()
 
     # 0. クジラ分析スクリプトを自動更新実行
@@ -1336,9 +1336,9 @@ async def main():
     tier3_cnt = sum(1 for c in prioritized_candidates if c.get("tier") == 3)
     log(f"Saved precursor selection scores to {scores_path} (Top: {', '.join([c['symbol'] for c in prioritized_candidates[:5]])} | Tier1: {tier1_cnt}, Tier2: {tier2_cnt}, Tier3: {tier3_cnt})")
 
-    # 4. 選定候補 Top 10 銘柄の OHLCV & Funding データ取得 (過去30日分+アルファ: 32日間)・ファイル保存
+    # 4. 選定候補 Top 10 銘柄の OHLCV & Funding データ取得 (過去2ヶ月分: 60日間)・ファイル保存
     end_utc = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0)
-    start_utc = end_utc - timedelta(days=32)
+    start_utc = end_utc - timedelta(days=60)
     # 暗号資産取引高上位10銘柄
     crypto_tickers = [
         t for t in tickers 
@@ -1355,7 +1355,7 @@ async def main():
 
     ticker_map = {t.get("symbol"): t for t in tickers}
 
-    print(f"\n[Download Engine] Downloading 30-day+ OHLCV, Funding Rate & OI for ALL {len(target_symbols)} symbols in parallel...")
+    print(f"\n[Download Engine] Downloading 60-day (2 months) OHLCV, Funding Rate & OI for ALL {len(target_symbols)} symbols in parallel...")
 
     sem = asyncio.Semaphore(12)
     async def fetch_one(rank, sym):
@@ -1385,22 +1385,21 @@ async def main():
         df_merged_all = pd.concat(all_dfs, ignore_index=True)
         merged_all_path = out_dir / "historical_all_symbols_merged.csv"
         df_merged_all.to_csv(merged_all_path, index=False, encoding="utf-8-sig")
-        print(f"\n[Success] Merged 30-day dataset successfully saved to: {merged_all_path} ({len(df_merged_all)} rows)")
+        print(f"\n[Success] Merged 60-day (2 months) dataset successfully saved to: {merged_all_path} ({len(df_merged_all)} rows)")
 
         # 日付スタンプ付きCSVおよびZIPアーカイブの作成
-        start_tag = start_utc.strftime("%Y%m%d")
-        end_tag = end_utc.strftime("%Y%m%d")
         now_jst = datetime.now(JST)
+        today_tag = now_jst.strftime("%Y%m%d")
         acq_tag = f"{now_jst.strftime('%H')}h"
-        dated_csv_name = f"bingx_all_symbols_1h_{start_tag}_to_{end_tag}_{acq_tag}.csv"
+        dated_csv_name = f"bingx_all_markets_1h_{today_tag}_{acq_tag}.csv"
         dated_csv_path = out_dir / dated_csv_name
         df_merged_all.to_csv(dated_csv_path, index=False, encoding="utf-8-sig")
 
         # ==============================================================================
-        # 【必須ルール】正規化（normalize）処理の前に、選定全銘柄+BTCの過去32日分データを
+        # 【必須ルール】正規化（normalize）処理の前に、選定全銘柄+BTCの過去2ヶ月分（60日）データを
         # 1回すべてダウンロード完了し、必ずまとめてZIPファイル化してDiscordへ送信する
         # ==============================================================================
-        zip_name = f"bingx_all_symbols_1h_{start_tag}_to_{end_tag}_{acq_tag}.zip"
+        zip_name = f"bingx_all_markets_1h_{today_tag}_{acq_tag}.zip"
         zip_path = out_dir / zip_name
         
         with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED, compresslevel=9) as zf:
@@ -1419,8 +1418,9 @@ async def main():
             if should_upload_file(send_target_zip):
                 log(f"📤 [Discord送信中] {send_target_zip.name} (新規またはデータ更新あり)...")
                 zip_desc = (
-                    f"📦 **【BingX全銘柄 32日分1HマージドデータZIP】** ({start_tag} ～ {end_tag} / {acq_tag})\n"
+                    f"📦 **【BingX全銘柄 2ヶ月分1HマージドデータZIP】** ({today_tag}_{acq_tag})\n"
                     f"• 取得日時: `{now_jst.strftime('%Y/%m/%d %H:%M JST')}` ({acq_tag})\n"
+                    f"• 対象期間: 過去60日間（2ヶ月分 / 約1,440時間足）\n"
                     f"• 収録銘柄数: 全 `{len(all_dfs)}` 銘柄 (全データ行数: `{len(df_merged_all):,}` 行)\n"
                     f"• ファイル名: `{send_target_zip.name}`\n"
                     f"• ファイルサイズ: `{zip_size_mb:.2f} MB` (Discord最適化)\n"

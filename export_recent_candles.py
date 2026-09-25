@@ -115,18 +115,19 @@ def export_recent_candles(days: int = 60, send_discord_flag: bool = True, all_sy
 
     # 取得時刻（何時取得か）のタグを生成（英数字表記: 例 "15h", "17h"）
     now_jst = datetime.now(JST)
+    today_tag = now_jst.strftime("%Y%m%d")
     acq_tag = f"{now_jst.strftime('%H')}h"
     acq_fmt = now_jst.strftime("%Y/%m/%d %H:%M JST")
 
-    # ZIPファイル名設定（何日から何日までのデータか、何時取得かを明確に命名: 'master' は含めない）
-    mode_prefix = "all_symbols" if all_symbols else "fixed5"
-    zip_name = f"bingx_{mode_prefix}_1h_{start_tag}_to_{end_tag}_{acq_tag}.zip"
+    # ZIPファイル名設定（例: bingx_all_markets_1h_20260925_17h.zip）
+    mode_prefix = "all_markets" if all_symbols else "fixed5"
+    zip_name = f"bingx_{mode_prefix}_1h_{today_tag}_{acq_tag}.zip"
     zip_path = out_dir / zip_name
 
-    print(f"📦 ZIPアーカイブ作成中: {zip_path.name} (期間: {start_tag} ～ {end_tag}, 取得: {acq_tag}) ...")
+    print(f"📦 ZIPアーカイブ作成中: {zip_path.name} (取得: {acq_fmt}) ...")
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED, compresslevel=9) as zf:
         # 全銘柄統合CSV 1ファイルのみをZIPに格納（個別CSVは含めず軽量化）
-        all_csv_name = f"bingx_{mode_prefix}_1h_{start_tag}_to_{end_tag}_{acq_tag}.csv"
+        all_csv_name = f"bingx_{mode_prefix}_1h_{today_tag}_{acq_tag}.csv"
         all_csv_str = df_all.to_csv(index=False)
         zf.writestr(all_csv_name, all_csv_str)
 
