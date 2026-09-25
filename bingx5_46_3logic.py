@@ -508,10 +508,10 @@ class send_discord:
         for url in webhooks:
             self.flush_buffer(url)
             try:
-                payload = {"content": content_text}
+                data = {"payload_json": json.dumps({"content": content_text})} if content_text else {}
                 with open(file_path, "rb") as f:
                     files = {"file": (file_name, f, mime_type)}
-                    response = requests.post(url, data=payload, files=files, timeout=90)
+                    response = requests.post(url, data=data, files=files, timeout=90)
                     response.raise_for_status()
             except requests.exceptions.RequestException as e:
                 print(f"Failed to send file {file_name} to {url}:", e)

@@ -100,7 +100,7 @@ class send_discord:
                     continue
                 with file_path.open("rb") as fh:
                     files = {"file": (file_path.name, fh)}
-                    data = {"content": description} if description else {}
+                    data = {"payload_json": json.dumps({"content": description})} if description else {}
                     requests.post(url, data=data, files=files, timeout=120).raise_for_status()
             except requests.RequestException as e:
                 print(f"[Discord Error] Failed to send file {file_path.name}: {e}")
