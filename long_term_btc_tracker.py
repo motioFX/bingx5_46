@@ -16,7 +16,11 @@ from bitbank5_46_2api import api_bitbank
 from bitbank5_46_3logic import discord
 
 # 長期保有 BTC の保護数量（この数量はボットの売買から隔離）
-LONG_TERM_PROTECTED_BTC: float = 0.2434
+LONG_TERM_PROTECTED_BTC: float = 0.1434
+
+# 長期保有 BTC の基準取得単価（1,279万円・1,300万弱）
+# ※ 過去の売買・利確履歴を踏まえたユーザー確定簿価
+KNOWN_ENTRY_PRICE: float = 12794387.0
 
 
 async def get_long_term_btc_status(mode: str = "live") -> Dict[str, Any]:
@@ -28,11 +32,9 @@ async def get_long_term_btc_status(mode: str = "live") -> Dict[str, Any]:
     # 1. JPY 現金残高 (onhand_amount)
     jpy_total = await api.get_account()
 
-    # 2. 口座内全体の BTC 保有数量と平均取得単価
+    # 2. 口座内全体の BTC 保有数量
     # raw asset から実際の BTC onhand を直接取得
     btc_size = 0.0
-    entry_px = 0.0
-
     try:
         helper = api.bitbank
         res = await helper._request_private("GET", "/v1/user/assets")
@@ -41,32 +43,15 @@ async def get_long_term_btc_status(mode: str = "live") -> Dict[str, Any]:
                 if asset_info.get("asset", "").lower() == "btc":
                     btc_size = float(asset_info.get("onhand_amount", 0.0))
                     break
-
-        if btc_size > 0:
-            hist = await helper._request_private("GET", "/v1/user/spot/trade_history", {"pair": "btc_jpy", "count": 100})
-            if hist.get("success") == 1 and "data" in hist and "trades" in hist["data"]:
-                trades = hist["data"]["trades"]
-                buy_trades = [t for t in trades if t.get("side") == "buy"]
-                if buy_trades:
-                    cum_amount = 0.0
-                    weighted_sum = 0.0
-                    for t in buy_trades:
-                        amount = float(t.get("amount", 0))
-                        price = float(t.get("price", 0))
-                        remaining = btc_size - cum_amount
-                        take = min(amount, remaining)
-                        weighted_sum += take * price
-                        cum_amount += take
-                        if cum_amount >= btc_size:
-                            break
-                    if cum_amount > 0:
-                        entry_px = float(np.round(weighted_sum / cum_amount, 2))
     except Exception as e:
         discord.print_log(f"[LongTermBTC] 残高取得エラー: {e}")
 
-    # もし履歴から取得単価が取得できなかった場合のフォールバック（既知の取得単価）
-    if entry_px <= 0 and btc_size > 0:
-        entry_px = 12794387.0
+    # 保有数量が0の場合はデフォルト保護数量にフォールバック
+    if btc_size <= 0:
+        btc_size = LONG_TERM_PROTECTED_BTC
+
+    # 平均取得単価: ユーザー確定簿価を採用（1,300万弱 / 12,794,387円）
+    entry_px = KNOWN_ENTRY_PRICE
 
     # 3. BTC 現在価格
     last_price = 0.0
@@ -97,7 +82,7 @@ async def get_long_term_btc_status(mode: str = "live") -> Dict[str, Any]:
 
 def format_long_term_btc_report(status: Dict[str, Any]) -> str:
     """
-    指定フォーマットでレポート文字列を生成する。
+    起動時・8時間定期選定時用の詳細枠線ブロックレポート文字列を生成する。
     """
     jpy_total = status["jpy_total"]
     btc_size = status["btc_size"]
@@ -128,12 +113,38 @@ def format_long_term_btc_report(status: Dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-async def report_long_term_btc(mode: str = "live", to_discord: bool = True) -> str:
+def format_compact_btc_report(status: Dict[str, Any]) -> str:
+    """
+    毎時サイクル用の1行コンパクトサマリー文字列を生成する。
+    """
+    btc_size = status["btc_size"]
+    entry_px = status["entry_px"]
+    last_price = status["last_price"]
+    eval_value = status["eval_value"]
+    pnl_jpy = status["pnl_jpy"]
+    pnl_pct = status["pnl_pct"]
+    total_equity = status["total_equity"]
+    sign = "+" if pnl_jpy >= 0 else ""
+
+    return (
+        f"💎 [長期BTC] {btc_size:.4f} BTC @ {entry_px:,.0f}円 | "
+        f"現在: {last_price:,.0f}円 | 評価額: {eval_value:,.0f}円 | "
+        f"含み損益: {sign}{pnl_jpy:,.0f}円 ({sign}{pnl_pct:.2f}%) | "
+        f"口座総資産: {total_equity:,.0f}円"
+    )
+
+
+async def report_long_term_btc(mode: str = "live", to_discord: bool = True, compact: bool = False) -> str:
     """
     長期運用 BTC/JPY の状況を取得し、ターミナル出力および Discord 送信を行う。
+    - compact=False: 起動時・定期選定時用の詳細枠線ブロック
+    - compact=True: 毎時サイクル用の1行コンパクトサマリー
     """
     status = await get_long_term_btc_status(mode=mode)
-    report_text = format_long_term_btc_report(status)
+    if compact:
+        report_text = format_compact_btc_report(status)
+    else:
+        report_text = format_long_term_btc_report(status)
 
     # ターミナルログ出力
     print(report_text)
@@ -151,4 +162,7 @@ async def report_long_term_btc(mode: str = "live", to_discord: bool = True) -> s
 
 
 if __name__ == "__main__":
-    asyncio.run(report_long_term_btc(mode="live", to_discord=True))
+    print("\n--- [1] 枠線付き詳細レポート (起動時 & 8時間選定時 / Discord送信) ---")
+    asyncio.run(report_long_term_btc(mode="live", to_discord=False, compact=False))
+    print("\n--- [2] 1行コンパクト要約 (毎時サイクル時 / ターミナル出力) ---")
+    asyncio.run(report_long_term_btc(mode="live", to_discord=False, compact=True))

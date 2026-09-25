@@ -1312,6 +1312,13 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
         # ========== 各銘柄のトレード判定 (LONG ONLY) ==========
         discord.print_log(f"\n[Cycle #{cycle_count}] {now_jst.strftime('%Y-%m-%d %H:%M')} JST | 対象: {', '.join(symbol_apis.keys())}", level="debug")
 
+        # 💎 毎時サイクル開始時: 長期運用 BTC/JPY 状況の1行コンパクト表示 (ターミナル出力)
+        try:
+            from long_term_btc_tracker import report_long_term_btc
+            await report_long_term_btc(mode=mode, to_discord=False, compact=True)
+        except Exception:
+            pass
+
         try:
             active_positions = {}
             valid_entry_candidates = []
