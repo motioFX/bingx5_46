@@ -436,7 +436,7 @@ async def run_pipeline(
 
     log(f"\n✅ 全 {len(target_symbols)} 銘柄のローカルCSV保存が完了しました (新規DL日次ブロック: {total_downloaded_days:,} 件)")
 
-    # 3. 日時付き統合CSVファイルの作成 (Data/bitbank_all_symbols_1h_{YYYYMMDD_HHMMSS}.csv)
+    # 3. 日時付き統合データおよび期間2分割アーカイブの作成 (hyper-rigid-bot準拠)
     merged_rows = []
     for sym in target_symbols:
         csv_path = candles_dir / f"{sym}_1h.csv"
@@ -453,38 +453,80 @@ async def run_pipeline(
         return
 
     master_df = pd.concat(merged_rows, ignore_index=True)
-    # タイムスタンプ順にソート
     master_df['timestamp'] = pd.to_datetime(master_df['timestamp'])
+
+    # 指定日数 (days=120日 / 約4ヶ月分) の期間に正確にフィルタ
+    if all_dates:
+        cutoff_dt = pd.to_datetime(all_dates[0])
+        master_df = master_df[master_df['timestamp'] >= cutoff_dt].copy()
+
     master_df = master_df.sort_values(by=['timestamp', 'symbol']).reset_index(drop=True)
 
-    # ① 日時付き統合CSV（被らないように保存）
-    dated_csv_name = f"bitbank_all_symbols_1h_{now_jst}.csv"
-    dated_csv_path = data_dir / dated_csv_name
-    master_df.to_csv(dated_csv_path, index=False, encoding="utf-8")
-    dated_csv_size_mb = dated_csv_path.stat().st_size / (1024 * 1024)
-    log(f"\n📄 日時付き統合CSVを保存しました: {dated_csv_name} ({len(master_df):,} 行 / {dated_csv_size_mb:.2f} MB)")
-
-    # ② 固定名マスターCSVも最新化
+    # ① 固定名マスターCSVを最新化 (全期間)
     fixed_master_csv = data_dir / "historical_all_symbols_merged.csv"
     master_df.to_csv(fixed_master_csv, index=False, encoding="utf-8")
-    log(f"📄 固定マスターCSVも更新しました: {fixed_master_csv.name}")
+    log(f"\n📄 固定マスターCSVを更新しました: {fixed_master_csv.name} ({len(master_df):,} 行)")
 
-    # 4. Discord へ全データ入りの1個のファイルを送信
-    if not skip_upload:
-        log("\n📤 Discord へ全銘柄統合データを送信中...")
-        desc = (
-            f"📊 **[Bitbank 5.46 全銘柄1年分データ]**\n"
-            f"• 銘柄数: `{len(target_symbols)}` 銘柄 (JPY現物全銘柄)\n"
-            f"• 期間: 過去 `{days}` 日分 (〜{all_dates[-1]})\n"
-            f"• 総レコード数: `{len(master_df):,}` 行 ({dated_csv_size_mb:.2f} MB)\n"
-            f"• ファイル名: `{dated_csv_name}`"
-        )
-        send_ok = discord.send_file(dated_csv_path, description=desc)
-        if send_ok:
-            record_file_uploaded(dated_csv_path)
-            log(f"   ✅ Discord 送信完了: {dated_csv_name}")
-        else:
-            log(f"   ⚠️ Discord 送信に失敗しました。")
+    # ② 期間で2分割: 過去（前半期間）と直近（後半期間）
+    unique_ts = sorted(master_df["timestamp"].unique())
+    mid_idx = len(unique_ts) // 2
+    split_ts = unique_ts[mid_idx]
+
+    df_past = master_df[master_df["timestamp"] < split_ts].copy()
+    df_recent = master_df[master_df["timestamp"] >= split_ts].copy()
+
+    past_start = str(df_past["timestamp"].min())[:10]
+    past_end = str(df_past["timestamp"].max())[:10]
+    recent_start = str(df_recent["timestamp"].min())[:10]
+    recent_end = str(df_recent["timestamp"].max())[:10]
+
+    ts_jst_str = datetime.now(JST).strftime("%Y-%m-%d %H:%M JST")
+
+    parts = [
+        (
+            "Part 1/2 【過去データ (前半)】",
+            f"{past_start} 〜 {past_end}",
+            df_past,
+            data_dir / f"bitbank_all_symbols_past_{now_jst}.zip",
+            f"bitbank_all_symbols_past_{now_jst}.csv",
+            "過去ヒストリー検証・長期バックテスト用"
+        ),
+        (
+            "Part 2/2 【直近データ (後半)】",
+            f"{recent_start} 〜 {recent_end}",
+            df_recent,
+            data_dir / f"bitbank_all_symbols_recent_{now_jst}.zip",
+            f"bitbank_all_symbols_recent_{now_jst}.csv",
+            "直近相場分析・スマホGemini Pro丸ごと投入用 (約95万トークン)"
+        ),
+    ]
+
+    # 4. 2分割ZIPファイルの作成とDiscord送信
+    for part_name, period_str, sub_df, zip_path, inner_csv_name, usage_hint in parts:
+        csv_buf = sub_df.to_csv(index=False).encode("utf-8")
+        with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as zf:
+            zf.writestr(inner_csv_name, csv_buf)
+
+        part_size_mb = zip_path.stat().st_size / (1024 * 1024)
+        n_syms = len(sub_df["symbol"].unique())
+        log(f"📦 {part_name} ZIP作成完了: {zip_path.name} ({len(sub_df):,} 行 / {part_size_mb:.2f} MB / 全{n_syms}銘柄)")
+
+        if not skip_upload:
+            desc = (
+                f"📦 **[Bitbank 全銘柄ヒストリー統合データ (1H)] {part_name}** ({ts_jst_str})\n"
+                f"• ファイル名: `{zip_path.name}`\n"
+                f"• 期間: `{period_str}` (全{len(master_df):,}行中 {len(sub_df):,}行)\n"
+                f"• 対象: `全 {n_syms} 銘柄` (JPY現物全銘柄収録)\n"
+                f"• ファイルサイズ: `{part_size_mb:.2f} MB`\n"
+                f"• 用途: {usage_hint}"
+            )
+            log(f"📤 Discord へ送信中: {zip_path.name} ...")
+            if discord.send_file(zip_path, description=desc):
+                record_file_uploaded(zip_path)
+                log(f"   ✅ Discord 送信完了: {zip_path.name}")
+            else:
+                log(f"   ⚠️ Discord 送信に失敗しました: {zip_path.name}")
+            time.sleep(2.0)
 
     # 5. ノーマライズ比較チャート生成 & 送信
     if not skip_charts:
@@ -517,8 +559,8 @@ async def run_pipeline(
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Bitbank 全銘柄1年分1時間足データ取得＆日時付き統合CSV送信")
-    parser.add_argument("--days", type=int, default=365, help="取得日数 (デフォルト: 365日)")
+    parser = argparse.ArgumentParser(description="Bitbank 全銘柄4ヶ月分1時間足データ取得＆期間2分割ZIP送信 (hyper-rigid-bot準拠)")
+    parser.add_argument("--days", type=int, default=120, help="取得日数 (デフォルト: 120日 / 約4ヶ月)")
     parser.add_argument("--top-n", type=int, default=0, help="出来高上位取得数 (0 = 全JPY銘柄47ペア)")
     parser.add_argument("--symbols", type=str, default="", help="カンマ区切り銘柄指定 (例: btc_jpy,xrp_jpy)")
     parser.add_argument("--force", action="store_true", help="既存キャッシュを無視して全日を再取得")

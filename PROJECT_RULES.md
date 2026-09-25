@@ -1,27 +1,32 @@
 # bitbank5_46 プロジェクト運用ルール & 開発規約
 
-## 1. 全銘柄データダウンロード規約（ヒストリカルデータ）
+## 1. 全銘柄データダウンロード規約（ヒストリカルデータ / hyper-rigid-bot準拠）
 
-### 【規約】2〜4ヶ月分（または1年分）データ取得・日時付き統合ファイル保存＆Discord送信
+### 【規約】4ヶ月分（120日）データ取得・期間2分割アーカイブ保存＆Discord 2回送信
 * **対象スクリプト**: `download_historical_candles.py`
-* **実行タイミング**: ボット起動時（ステップ2）または日次定期データ更新時
+* **実行タイミング**: ボット起動時（ステップ2）または定期データ更新時
 * **必須要件**:
-  1. **全銘柄2ヶ月（60日）〜推奨4ヶ月（120日、または1年365日）分の完全取得**:
-     - Bitbank 現物 JPY 全銘柄（`btc_jpy`, `eth_jpy`, `xrp_jpy`, `sol_jpy` ... 全ペア）の過去2ヶ月（最低60日分、推奨4ヶ月・120日分、または1年分）の1時間足OHLCVデータを網羅取得すること。
-  2. **日時命名規約（重複・上書き防止）**:
-     - 何回取得してもファイル名が被らないよう、生成するファイル名には **取得日付と時間（`YYYYMMDD_HHMMSS`）** を必ず付与すること。
-     - ファイル命名例:
-       - 日時付き統合CSV: `Data/bitbank_all_symbols_1h_YYYYMMDD_HHMMSS.csv`
-       - Discord送信ZIP: `Data/bitbank_all_symbols_1h_YYYYMMDD_HHMMSS.zip`
-       - ノーマライズ比較チャート: `Data/plots/bitbank_normalized_{30d|10d|5d}_YYYYMMDD_HHMMSS.png`
-  3. **Discord送信仕様（環境別自動切替 ＆ 1個の統合ファイル）**:
-     - 小分け送信ではなく、**全データが入った1個のファイル** として送信すること。
+  1. **全銘柄4ヶ月分（120日分）の完全取得**:
+     - Bitbank 現物 JPY 全47銘柄（`btc_jpy`, `eth_jpy`, `xrp_jpy`, `sol_jpy` ... 全ペア）の過去120日分の1時間足OHLCVデータを網羅取得すること。
+     - すでに取得済みのローカルCSV（`Data/historical_candles/{symbol}_1h.csv`）に差分蓄積し、未取得日のみを並行取得（`Semaphore(12)`）して高速同期すること。
+  2. **期間別2分割アーカイブ生成（全47銘柄 100%完全収録）**:
+     - タイムスタンプの中間点でデータを2分割し、全銘柄を網羅した2本の独立ZIPアーカイブを生成すること：
+       - **Part 1/2 【過去データ (前半60日)】**:
+         - ZIP名: `Data/bitbank_all_symbols_past_{YYYYMMDD_HHMMSS}.zip`
+         - 内部CSV名: `bitbank_all_symbols_past_{YYYYMMDD_HHMMSS}.csv`
+         - 用途: 過去ヒストリー検証・長期バックテスト用
+       - **Part 2/2 【直近データ (後半60日)】**:
+         - ZIP名: `Data/bitbank_all_symbols_recent_{YYYYMMDD_HHMMSS}.zip`
+         - 内部CSV名: `bitbank_all_symbols_recent_{YYYYMMDD_HHMMSS}.csv`
+         - 用途: 直近相場分析・**スマホGemini Pro（Google AI Pro）丸ごと投入用（全47銘柄入り・約95万トークンで超快適・高精度動作）**
+     - 全期間マスターCSV（`Data/historical_all_symbols_merged.csv`）もローカル検証用に最新化保存すること。
+  3. **Discord送信仕様（2回送信シーケンス ＆ 環境自動判別）**:
      - **送信先チャンネルの環境自動判別**:
-       - **VPS（Linux環境）での本番稼働時**: **`real1_bitbank`** チャンネルへ自動出力
-       - **Windows（win32環境）でのテスト運用時**: **`test4_test`**（旧 win32 / test4_backtest）チャンネルへ自動出力
-     - Discord Webhook の容量制限（通常10MB〜25MB）を超える場合、自動的に同名の日時付きZIPに圧縮して確実に送信すること。
-  4. **スマート差分キャッシュ ＆ 重複送信防止**:
-     - 個別銘柄CSV（`Data/historical_candles/{symbol}_1h.csv`）に蓄積し、未取得日のみを並行取得（`Semaphore(12)`）して高速化すること。
+       - VPS（Linux環境）での本番稼働時: **`real1_bitbank`** チャンネルへ自動出力
+       - Windows（win32環境）でのテスト運用時: **`test4_test`**（旧 win32 / test4_backtest）チャンネルへ自動出力
+     - **2回送信シーケンス**:
+       - Part 1（過去データZIP 約1.1MB）を送信 ➔ レートリミット対策インターバル（`time.sleep(2.0)`） ➔ Part 2（直近データZIP 約1.1MB）を送信。
+       - 各メッセージに対象銘柄数（全47銘柄）、期間、行数、ファイルサイズ、用途を明記。
      - `upload_registry.py` と連携し、同一データ（MD5ハッシュ一致）の二重送信を防止すること。
 
 ---
