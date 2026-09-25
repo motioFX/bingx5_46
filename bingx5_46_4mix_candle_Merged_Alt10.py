@@ -101,7 +101,7 @@ class send_discord:
                 with file_path.open("rb") as fh:
                     files = {"file": (file_path.name, fh)}
                     data = {"content": description} if description else {}
-                    requests.post(url, data=data, files=files, timeout=30).raise_for_status()
+                    requests.post(url, data=data, files=files, timeout=120).raise_for_status()
             except requests.RequestException as e:
                 print(f"[Discord Error] Failed to send file {file_path.name}: {e}")
 
@@ -1393,7 +1393,7 @@ async def main():
         acq_tag = f"{now_jst.strftime('%H')}h"
         dated_csv_name = f"bingx_all_markets_1h_{today_tag}_{acq_tag}.csv"
         dated_csv_path = out_dir / dated_csv_name
-        df_merged_all.to_csv(dated_csv_path, index=False, encoding="utf-8-sig")
+        df_merged_all.to_csv(dated_csv_path, index=False, float_format="%.6g", encoding="utf-8-sig")
 
         # ==============================================================================
         # 【必須ルール】正規化（normalize）処理の前に、選定全銘柄+BTCの過去2ヶ月分（60日）データを

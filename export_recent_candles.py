@@ -128,7 +128,7 @@ def export_recent_candles(days: int = 60, send_discord_flag: bool = True, all_sy
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED, compresslevel=9) as zf:
         # 全銘柄統合CSV 1ファイルのみをZIPに格納（個別CSVは含めず軽量化）
         all_csv_name = f"bingx_{mode_prefix}_1h_{today_tag}_{acq_tag}.csv"
-        all_csv_str = df_all.to_csv(index=False)
+        all_csv_str = df_all.to_csv(index=False, float_format="%.6g")
         zf.writestr(all_csv_name, all_csv_str)
 
     zip_size_mb = zip_path.stat().st_size / (1024 * 1024)
