@@ -16,3 +16,9 @@
 
 ## 3. Implementation Plan & Walkthrough Rule
 - ALWAYS write the Implementation Plan and Walkthrough artifacts entirely in Japanese.
+
+## 4. Data Retention & Disk Capacity Management Rule
+- **Always keep only the latest data files and auto-cleanup old files.**
+- Historical ZIP archives (`Data/*.zip`) and plot charts (`Data/plots/*.png`) must be automatically pruned after 24 hours of retention (max 1 day) while keeping the latest 1 set safe.
+- Single master CSV (`historical_all_symbols_merged.csv`) and candle caches (`historical_candles/*.csv`) must always be cleanly updated in place without accumulating dated redundant CSV files.
+- Execution logs (`bot_output.log`) must be rotated with a 15MB cap to permanently prevent VPS disk space exhaustion.
