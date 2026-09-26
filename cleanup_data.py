@@ -47,6 +47,9 @@ def cleanup_data_dir(data_dir: Path) -> None:
         elif "_all_symbols_merged." in name and not name.startswith("historical_"):
             shutil.move(str(item), str(archives_dir / name))
             moved_archives += 1
+        elif name.startswith("bingx_all_markets_") or name.startswith("bingx_all_symbols_"):
+            shutil.move(str(item), str(archives_dir / name))
+            moved_archives += 1
         elif name.startswith("historical_selection_scores"):
             shutil.move(str(item), str(archives_dir / name))
             moved_archives += 1
