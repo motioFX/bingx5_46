@@ -514,8 +514,9 @@ async def build_merged_dataset(
 
     df = df.sort_values("timestamp").reset_index(drop=True)
 
-    out_dir.mkdir(parents=True, exist_ok=True)
-    out_file = out_dir / f"merged_{symbol}.csv"
+    ind_dir = out_dir / "individual" if out_dir.name != "individual" else out_dir
+    ind_dir.mkdir(parents=True, exist_ok=True)
+    out_file = ind_dir / f"merged_{symbol}.csv"
     df.to_csv(out_file, index=False, encoding="utf-8-sig")
     log(f"Saved merged dataset for {symbol} to {out_file} ({len(df)} rows)")
 
@@ -641,7 +642,9 @@ def generate_normalized_charts(all_dfs: List[pd.DataFrame], out_dir: Path, windo
     ax.grid(True, linestyle=':', alpha=0.4)
     plt.tight_layout()
 
-    out_file = out_dir / f"normalized_chart_{window_name}.png"
+    charts_dir = out_dir / "charts" if out_dir.name != "charts" else out_dir
+    charts_dir.mkdir(parents=True, exist_ok=True)
+    out_file = charts_dir / f"normalized_chart_{window_name}.png"
     plt.savefig(out_file, dpi=150, bbox_inches='tight')
     plt.close(fig)
 
@@ -732,7 +735,9 @@ def generate_custom_normalized_charts(
     ax.grid(True, linestyle="--", alpha=0.35)
     plt.tight_layout()
 
-    out_file = out_dir / f"{file_prefix}_{window_name}.png"
+    charts_dir = out_dir / "charts" if out_dir.name != "charts" else out_dir
+    charts_dir.mkdir(parents=True, exist_ok=True)
+    out_file = charts_dir / f"{file_prefix}_{window_name}.png"
     plt.savefig(out_file, bbox_inches="tight")
     plt.close(fig)
     log(f"Custom normalized chart saved to {out_file}")
@@ -1548,6 +1553,10 @@ async def main():
             df_sym = df_map_all.get(clean_sym)
             if df_sym is None or df_sym.empty:
                 cand_file = out_dir / f"historical_candles/{clean_sym}_1h.csv"
+                if not cand_file.exists():
+                    cand_file = out_dir / "individual" / f"merged_{clean_sym}.csv"
+                if not cand_file.exists():
+                    cand_file = out_dir / f"merged_{clean_sym}.csv"
                 if not cand_file.exists():
                     cand_file = out_dir / f"merged_{clean_sym.replace('-USDT','')}.csv"
                 if cand_file.exists():

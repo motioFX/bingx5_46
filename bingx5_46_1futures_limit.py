@@ -785,8 +785,10 @@ async def load_local_or_api_candles(symbol: str, limit: int = 1440) -> pd.DataFr
             except Exception:
                 pass
 
-    # 2. 32日分マージドデータ (Data/merged_{clean_sym}.csv)
-    cand_csv = data_dir / f"merged_{clean_sym}.csv"
+    # 2. 32日分マージドデータ (Data/individual/merged_{clean_sym}.csv または Data/merged_{clean_sym}.csv)
+    cand_csv = data_dir / "individual" / f"merged_{clean_sym}.csv"
+    if not cand_csv.exists():
+        cand_csv = data_dir / f"merged_{clean_sym}.csv"
     if cand_csv.exists():
         try:
             df = pd.read_csv(cand_csv)

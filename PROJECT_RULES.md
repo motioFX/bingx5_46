@@ -20,6 +20,11 @@
      - **2回送信シーケンス**:
        - Part 1（過去データZIP）を送信 ➔ レートリミット回避インターバル（`time.sleep(2.0)`） ➔ Part 2（直近データZIP）を送信。
      - `upload_registry.py` と連携し、同一データ（MD5ハッシュ一致）の二重送信を防止すること。
+  4. **Data/ ディレクトリ構成と整理規約**:
+     - `Data/individual/`: 個別銘柄の32日分マージドCSV（`merged_{SYMBOL}.csv`）を集約・格納。
+     - `Data/charts/`: ノーマライズ比較チャート等の画像（`*.png`）を集約・格納。
+     - `Data/historical_archives/`: 過去の確定バックナンバー（`*_all_symbols_merged.*`, `*_Merged_All_Data_Bitget.csv` 等）をアーカイブ格納。
+     - `Data/` 直下: 最新マスターデータ（`historical_all_symbols_merged.csv / .zip`）、稼働用JSON（`market_state.json` 等）、実行ログ（`bot_output.log`）のみを保持し、常に10〜15件程度のクリーンな状態を維持する。
 
 ---
 
