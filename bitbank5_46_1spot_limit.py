@@ -12,6 +12,7 @@ if hasattr(sys.stdout, "reconfigure"):
         pass
 
 import re
+import subprocess
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 # Automatic Dual Logging: Output to both Terminal and Data/bot_output.log
@@ -1088,6 +1089,31 @@ async def audit_and_retain_positions(
 
     return symbol_apis, symbol_params_map
 
+async def sync_historical_and_charts(days: int = 120) -> None:
+    """Bitbank 全銘柄ヒストリカルデータ (2ヶ月×2分割ZIP) ＆ 30d/10d/5d ノーマライズチャート同期・Discord送信"""
+    discord.print_log(f"\n📦 【全銘柄データ同期＆チャート送信】 Bitbank 全銘柄ヒストリカルデータ ({days}日分 / 2分割ZIP) ＆ ノーマライズチャート同期中...")
+    download_script = Path(__file__).resolve().parent / "download_historical_candles.py"
+    if download_script.exists():
+        try:
+            cmd_hist = [
+                sys.executable, str(download_script),
+                "--days", str(days),
+            ]
+            loop = asyncio.get_running_loop()
+            ret = await loop.run_in_executor(
+                None, lambda: subprocess.run(cmd_hist, timeout=360, capture_output=True, text=True, encoding="utf-8")
+            )
+            if ret.returncode == 0:
+                discord.print_log("✅ 【データ同期完了】 全47銘柄 2分割ZIPアーカイブ送信 ＆ ノーマライズチャート送信が完了しました。")
+            else:
+                err_snippet = (ret.stderr or ret.stdout or "")[-300:]
+                discord.print_log(f"⚠️ 【データ同期注意】 終了コード: {ret.returncode}\n{err_snippet}")
+        except subprocess.TimeoutExpired:
+            discord.print_log("⚠️ 【データ同期注意】 データ取得がタイムアウト（360秒）しました。バックグラウンド処理を継続します。")
+        except Exception as e:
+            discord.print_log(f"⚠️ 【データ同期例外】 エラーが発生しました: {e}")
+
+
 async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60'):
     from bitbank5_46_2api import (
         api_bitbank,
@@ -1097,7 +1123,7 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
     from bitbank5_46_3logic import PnLCalculator
 
     account_mode_str = "[LIVE Account] (Bitbank 本番口座 接続中)" if BITBANK_IS_LIVE else "[OFFLINE/MOCK]"
-    air_mode_str = "[AIR TRADE ON] (本番リアルタイム監視 ＆ ペーパートレード発注)" if BITBANK_IS_AIR else "[REAL ORDER ON] (実際にBitbank取引所へ発注)"
+    air_mode_str = "エアトレード (本番リアルタイム監視 ＆ ペーパートレード発注)" if BITBANK_IS_AIR else "リアル発注 (実際にBitbank取引所へ発注)"
 
     hours_str = ", ".join([f"{h:02d}:00" for h in sorted(ANALYSIS_HOURS)])
     start_msg = (
@@ -1126,29 +1152,10 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
     else:
         print("[Banner Skipped by --no-banner]")
 
-    # ========== 【トレード前準備 ステップ2】: 全銘柄1時間足データ（1年分）取得＆日時付き統合CSV送信 ==========
+    # ========== 【トレード前準備 ステップ2】: 全銘柄ヒストリカルデータ (2ヶ月×2分割ZIP) ＆ 30d/10d/5d ノーマライズチャート ==========
     skip_history = ("--skip-history" in sys.argv or "--no-history" in sys.argv)
     if not skip_history:
-        discord.print_log("\n📦 【トレード前準備: ステップ2】 Bitbank 全銘柄1年分1時間足データ同期・送信確認中...")
-        download_script = Path(__file__).resolve().parent / "download_historical_candles.py"
-        if download_script.exists():
-            try:
-                cmd_hist = [
-                    sys.executable, str(download_script),
-                    "--days", "365",
-                ]
-                ret = subprocess.run(cmd_hist, timeout=300, capture_output=True, text=True, encoding="utf-8")
-                if ret.returncode == 0:
-                    discord.print_log("✅ 【ステップ2完了】 Bitbank 全銘柄1年分データの同期・送信が完了しました。")
-                else:
-                    err_snippet = (ret.stderr or ret.stdout or "")[-300:]
-                    discord.print_log(f"⚠️ 【ステップ2注意】 データ取得終了コード: {ret.returncode}\n{err_snippet}")
-            except subprocess.TimeoutExpired:
-                discord.print_log("⚠️ 【ステップ2注意】 データ取得がタイムアウト（300秒）しました。バックグラウンド処理を継続します。")
-            except Exception as e:
-                discord.print_log(f"⚠️ 【ステップ2例外】 データ取得処理中にエラーが発生しました: {e}")
-
-
+        await sync_historical_and_charts(days=120)
 
     # ========== 【トレード前準備 ステップ3 & 4 & 5】: 指定11銘柄設定 ==========
     selected_symbols = [normalize_symbol(s) for s in FIXED_SYMBOLS][:MAX_SELECTED_SYMBOLS]
@@ -1184,6 +1191,14 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
         await report_long_term_btc(mode=mode, to_discord=True)
     except Exception as btc_err:
         discord.print_log(f"⚠️ 長期BTC状況取得エラー: {btc_err}")
+
+    # 📋 起動時: 今指値を出しているレンダーや未約定注文の状況表示＆通知
+    try:
+        from active_orders_tracker import report_active_orders
+        discord.print_log("\n📋 【ボット起動時 初期状態: 配置中 指値・未約定注文 状況】")
+        await report_active_orders(mode=mode, to_discord=True)
+    except Exception as ord_err:
+        discord.print_log(f"⚠️ 指値状況取得エラー: {ord_err}")
 
     logic = logicinstance()
     last_screening_slot = (datetime.now(JST).date(), datetime.now(JST).hour)
@@ -1224,12 +1239,15 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
             and current_slot != last_screening_slot
         )
         if is_periodic_reset_time:
-            discord.print_log(f"[Phase C] 定期銘柄選定時刻 ({now_jst.hour:02d}:00 JST) 到達。スクリーニング＆最適化を実行します。")
+            discord.print_log(f"[Phase C] 定期銘柄選定時刻 ({now_jst.hour:02d}:00 JST / 8時間ごと) 到達。")
 
-            # 1. 定期フルスクリーニング＆最適化（チャート送信付き）
+            # 1. 全銘柄ヒストリカルデータ同期 (2ヶ月×2分割ZIP) ＆ 30d/10d/5d ノーマライズチャート送信 (アスキーアートなし)
+            await sync_historical_and_charts(days=120)
+
+            # 2. 定期フルスクリーニング＆最適化
             trade_side, new_symbol_params_map, best_params, selected_symbols = await run_screening_and_optimization(mode, send_charts=True)
 
-            # 2. 旧インスタンスの引き継ぎと新選定銘柄の symbol_apis 構築
+            # 3. 旧インスタンスの引き継ぎと新選定銘柄の symbol_apis 構築
             old_apis = symbol_apis
             old_params = symbol_params_map
             symbol_apis = {}
@@ -1239,18 +1257,18 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                 if sym in old_apis and old_apis[sym] is not None:
                     symbol_apis[sym] = old_apis[sym]
                 else:
-                    api = api_bingx(symbol=sym, mode=mode)
-                    spec = fetch_instrument_spec_bingx(sym, mode)
+                    api = api_bitbank(symbol=sym, mode=mode)
+                    spec = fetch_instrument_spec_bitbank(sym, mode)
                     if spec:
                         api.update_instrument_spec(spec)
                     symbol_apis[sym] = api
 
-            # 3. 口座全体の全ポジションをスキャンし、選定外でも保有中の銘柄はGraceful Exitとして引き継ぐ（強制成行決済は廃止）
+            # 4. 口座全体の全ポジションをスキャンし、選定外でも保有中の銘柄はGraceful Exitとして引き継ぐ（強制成行決済は廃止）
             symbol_apis, symbol_params_map = await audit_and_retain_positions(
                 selected_symbols, symbol_apis, symbol_params_map, best_params, mode, old_apis=old_apis, old_params=old_params
             )
 
-            # 4. ポジションのない旧選定銘柄のインスタンスをメモリ破棄
+            # ポジションのない旧選定銘柄のインスタンスをメモリ破棄
             for old_sym in list(old_apis.keys()):
                 if old_sym not in symbol_apis:
                     old_apis[old_sym] = None
@@ -1260,13 +1278,21 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
             logic = logicinstance()
             discord.print_log(f"[Periodic Reset Complete] 新しい選定銘柄 (LONG ONLY): {', '.join(selected_symbols)} | 現在の全監視対象: {', '.join(symbol_apis.keys())}")
 
-            # 💎 1日3回選定時: 長期運用 BTC/JPY 状況の表示＆通知 (JST 1:00, 9:00, 17:00)
+            # 5. 長期運用 BTC/JPY 状況の表示＆通知
             try:
                 from long_term_btc_tracker import report_long_term_btc
                 discord.print_log(f"\n💎 【定期銘柄選定時 ({now_jst.hour:02d}:00 JST) 長期運用 BTC/JPY 状況】")
                 await report_long_term_btc(mode=mode, to_discord=True)
             except Exception as btc_err:
                 discord.print_log(f"⚠️ 長期BTC状況取得エラー: {btc_err}")
+
+            # 6. 今指値を出しているレンダーや未約定注文の状況表示＆通知
+            try:
+                from active_orders_tracker import report_active_orders
+                discord.print_log(f"\n📋 【定期銘柄選定時 ({now_jst.hour:02d}:00 JST) 配置中 指値・未約定注文 状況】")
+                await report_active_orders(mode=mode, to_discord=True)
+            except Exception as ord_err:
+                discord.print_log(f"⚠️ 指値状況取得エラー: {ord_err}")
 
             continue
 
