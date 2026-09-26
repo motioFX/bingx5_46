@@ -1306,6 +1306,13 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                     except Exception:
                         pass
 
+                # 古いZIP・チャート画像の自動クリーンアップ (24時間超過ファイルを毎時クリーンアップ)
+                try:
+                    from download_historical_candles import cleanup_data_dir
+                    cleanup_data_dir(max_age_hours=24.0)
+                except Exception:
+                    pass
+
                 # 保有中ポジションの確認
                 held_symbols = set()
                 for sym, api in symbol_apis.items():

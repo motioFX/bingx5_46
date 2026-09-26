@@ -326,6 +326,111 @@ def generate_normalized_charts(
     return created_charts
 
 
+# ==================== 古いデータ・ZIPの自動クリーンアップ ====================
+def cleanup_data_dir(
+    data_dir: Optional[Path] = None,
+    max_age_hours: float = 24.0,
+    keep_latest_n: int = 1
+) -> Dict[str, Any]:
+    """直近指定時間（デフォルト24時間＝1日分）を超えた古いZIPファイルおよびチャート画像を自動削除する。
+
+    安全保護仕様:
+    - historical_candles/ ディレクトリ配下の最新CSVは保護
+    - historical_all_symbols_merged.csv は保護
+    - uploaded_files_registry.json は保護
+    - bot_output.log は保護
+    - past/recent ZIP、各種チャート画像は、最新 keep_latest_n 個は24時間以上経過しても必ず保持
+    """
+    if data_dir is None:
+        data_dir = Path(__file__).resolve().parent / "Data"
+
+    now_ts = time.time()
+    cutoff_ts = now_ts - (max_age_hours * 3600.0)
+
+    deleted_files = []
+    total_freed_bytes = 0
+
+    if not data_dir.exists():
+        return {"deleted_files": [], "freed_mb": 0.0}
+
+    log(f"🧹 [Cleanup] 古い一時ファイル・ZIPの整理を開始します (保持期間: {max_age_hours:.1f} 時間)...")
+
+    # 1. ZIPファイルのクリーンアップ
+    zip_categories = {
+        "past": list(data_dir.glob("bitbank_all_symbols_past_*.zip")),
+        "recent": list(data_dir.glob("bitbank_all_symbols_recent_*.zip")),
+        "other_zip": [
+            p for p in data_dir.glob("*.zip")
+            if not p.name.startswith("bitbank_all_symbols_past_") and not p.name.startswith("bitbank_all_symbols_recent_")
+        ]
+    }
+
+    for cat_name, files in zip_categories.items():
+        # 更新日時降順（新しい順）にソート
+        files_sorted = sorted(files, key=lambda f: f.stat().st_mtime, reverse=True)
+        # 最新 keep_latest_n 本は保護（other_zip は無条件チェック）
+        to_check = files_sorted[keep_latest_n:] if cat_name != "other_zip" else files_sorted
+        for f in to_check:
+            try:
+                stat = f.stat()
+                if stat.st_mtime < cutoff_ts:
+                    size = stat.st_size
+                    f.unlink()
+                    deleted_files.append(f.name)
+                    total_freed_bytes += size
+                    log(f"   🗑️ 古いZIP削除: {f.name} ({size / (1024 * 1024):.2f} MB)")
+            except Exception as e:
+                log(f"   ⚠️ 削除失敗 ({f.name}): {e}")
+
+    # 2. 古い一時CSVファイルのクリーンアップ (Data/ 直下の日時付きCSV等)
+    for f in data_dir.glob("bitbank_all_symbols_1h_*.csv"):
+        try:
+            stat = f.stat()
+            if stat.st_mtime < cutoff_ts:
+                size = stat.st_size
+                f.unlink()
+                deleted_files.append(f.name)
+                total_freed_bytes += size
+                log(f"   🗑️ 古い一時CSV削除: {f.name} ({size / (1024 * 1024):.2f} MB)")
+        except Exception as e:
+            log(f"   ⚠️ 削除失敗 ({f.name}): {e}")
+
+    # 3. plots ディレクトリ配下の古いチャート画像のクリーンアップ
+    plots_dir = data_dir / "plots"
+    if plots_dir.exists():
+        chart_files = list(plots_dir.glob("*.png"))
+        from collections import defaultdict
+        chart_groups = defaultdict(list)
+        for cf in chart_files:
+            # プレフィックス判別 (例: bitbank_normalized_10d, btc_long_term_weekly, backtest_vp_btc_jpy など)
+            parts = cf.stem.rsplit("_", 2)
+            group_key = parts[0] if len(parts) > 1 else cf.stem
+            chart_groups[group_key].append(cf)
+
+        for g_key, g_files in chart_groups.items():
+            g_sorted = sorted(g_files, key=lambda f: f.stat().st_mtime, reverse=True)
+            # 各プレフィックスごとに最新 keep_latest_n 本は保護
+            for cf in g_sorted[keep_latest_n:]:
+                try:
+                    stat = cf.stat()
+                    if stat.st_mtime < cutoff_ts:
+                        size = stat.st_size
+                        cf.unlink()
+                        deleted_files.append(cf.name)
+                        total_freed_bytes += size
+                        log(f"   🗑️ 古いチャート削除: {cf.name} ({size / 1024:.1f} KB)")
+                except Exception as e:
+                    log(f"   ⚠️ 削除失敗 ({cf.name}): {e}")
+
+    freed_mb = total_freed_bytes / (1024 * 1024)
+    if deleted_files:
+        log(f"✨ [Cleanup] 完了: 計 {len(deleted_files)} ファイル削除, 約 {freed_mb:.2f} MB 解放")
+    else:
+        log(f"✨ [Cleanup] 完了: 削除対象の古いファイル（>{max_age_hours:.1f}時間経過）はありませんでした。")
+
+    return {"deleted_files": deleted_files, "freed_mb": freed_mb}
+
+
 # ==================== メイン実行パイプライン ====================
 async def run_pipeline(
     days: int = 365,
@@ -555,7 +660,11 @@ async def run_pipeline(
             else:
                 log(f"   チャート生成完了: {cp.name}")
 
-    log("\n🎉 [Bitbank 5.46] 全銘柄1年分データ取得＆統合CSV保存・送信パイプラインが完了しました！")
+    # 6. 古いZIP・チャート画像のクリーンアップ (直近24時間分のみ保持)
+    log("\n🧹 不要な古いZIPファイルおよびチャート画像の自動クリーンアップを実行中 (24時間保持)...")
+    cleanup_data_dir(data_dir=data_dir, max_age_hours=24.0)
+
+    log("\n🎉 [Bitbank 5.46] 全銘柄データ取得＆統合CSV保存・送信パイプラインが完了しました！")
 
 
 def main():
@@ -567,7 +676,13 @@ def main():
     parser.add_argument("--force-upload", action="store_true", help="レジストリ判定を無視して強制Discordアップロード")
     parser.add_argument("--skip-charts", action="store_true", help="チャート生成をスキップ")
     parser.add_argument("--skip-upload", action="store_true", help="Discord送信をスキップ")
+    parser.add_argument("--cleanup", action="store_true", help="古いZIP・チャート画像のクリーンアップのみを実行して終了")
+    parser.add_argument("--max-age-hours", type=float, default=24.0, help="クリーンアップ対象の経過時間 (デフォルト: 24.0時間)")
     args = parser.parse_args()
+
+    if args.cleanup:
+        cleanup_data_dir(max_age_hours=args.max_age_hours)
+        return
 
     symbols_override = [s.strip() for s in args.symbols.split(",") if s.strip()] if args.symbols else None
 
