@@ -22,6 +22,7 @@ if hasattr(sys.stdout, "reconfigure"):
 
 from bitbank5_46_5backtest_mm import make_mm_pl, Backtest, AirExchange
 from config_loader import get_webhook_url
+from real_trade_tracker import compute_volume_profile_bands
 
 
 def calc_add_pct(n: int) -> float:
@@ -1400,69 +1401,148 @@ def simulate_envelope_strategy(
     length: int = 15,
     lower_pct: float = 2.0,
     upper_pct: float = 2.0,
-    malen: int = 200,
+    malen: int = 100,
     max_trades: int = 1,
     initial_equity: float = 100.0,
-    fee_rate: float = 0.0006
+    fee_rate: float = 0.0012,
+    use_vp_trailing: bool = False,
+    val_alpha_pct: float = 0.8,
+    callback_pct: float = 0.015,
+    sl_pct: float = 0.03,
 ) -> dict:
     closes = df["close"].values
+    highs = df["high"].values if "high" in df.columns else closes
+    lows = df["low"].values if "low" in df.columns else closes
     n = len(closes)
     if n < max(length, 10):
         return {"final_pnl": 0.0, "trade_count": 0, "win_rate": 0.0, "DD_max": 0.0, "max_unrealized_loss": 0.0}
 
+    # Volume Profile バンドの準備 (VPトレーリング有効時)
+    vahs = df["VAH"].values if "VAH" in df.columns else None
+    vals = df["VAL"].values if "VAL" in df.columns else None
+    pocs = df["POC"].values if "POC" in df.columns else None
+    if use_vp_trailing and (vahs is None or vals is None or pocs is None):
+        df_vp = compute_volume_profile_bands(df)
+        vahs = df_vp["VAH"].values
+        vals = df_vp["VAL"].values
+        pocs = df_vp["POC"].values
+
     close_s = pd.Series(closes)
     basis = calc_ema(close_s, length).values
-    mabasis = calc_ema(close_s, malen).values if malen <= n else basis
-    
+
     lower = basis * (1.0 - lower_pct / 100.0)
     upper = basis * (1.0 + upper_pct / 100.0)
-    
+
     pos_qty = 0.0
     pos_cost = 0.0
     avg_price = 0.0
     pos_count = 0
-    
+
+    trailing_tp_active = False
+    trail_peak = 0.0
+
     cum_realized_pnl = 0.0
     cum_fees = 0.0
     trades = []
     equity_curve = [initial_equity]
     unrealized_list = [0.0]
     exec_history = []
-    
+
     trade_size_usdt = initial_equity / max_trades
-    
+
     for i in range(1, n):
         c = closes[i]
+        h = highs[i]
+        l = lows[i]
         b = basis[i]
         low_band = lower[i]
         ts = df["timestamp"].iloc[i] if "timestamp" in df.columns else i
-        
-        # 決済チェック (close > basis かつ avg_price 以上で利確)
+
+        # 決済チェック
         if pos_qty > 0:
-            if c > b and c > avg_price:
-                sell_val = pos_qty * c
-                fee = sell_val * fee_rate
-                pnl = sell_val - pos_cost - fee
-                cum_realized_pnl += pnl
-                cum_fees += fee
-                trades.append(pnl)
-                exec_history.append({"timestamp": ts, "price": c, "size": -pos_qty, "type": "SELL"})
-                pos_qty = 0.0
-                pos_cost = 0.0
-                avg_price = 0.0
-                pos_count = 0
-                
-        # エントリーチェック (close < lower)
+            if not use_vp_trailing:
+                # 【第1段階: 基礎ルール】固定SL ＆ 中心線EMA上抜け利確
+                if sl_pct > 0 and l < avg_price * (1.0 - sl_pct):
+                    sell_px = avg_price * (1.0 - sl_pct)
+                    sell_val = pos_qty * sell_px
+                    fee = sell_val * fee_rate
+                    pnl = sell_val - pos_cost - fee
+                    cum_realized_pnl += pnl
+                    cum_fees += fee
+                    trades.append(pnl)
+                    exec_history.append({"timestamp": ts, "price": sell_px, "size": -pos_qty, "type": "STOP_LOSS"})
+                    pos_qty, pos_cost, avg_price, pos_count = 0.0, 0.0, 0.0, 0
+                elif c > b and c > avg_price:
+                    sell_val = pos_qty * c
+                    fee = sell_val * fee_rate
+                    pnl = sell_val - pos_cost - fee
+                    cum_realized_pnl += pnl
+                    cum_fees += fee
+                    trades.append(pnl)
+                    exec_history.append({"timestamp": ts, "price": c, "size": -pos_qty, "type": "SELL"})
+                    pos_qty, pos_cost, avg_price, pos_count = 0.0, 0.0, 0.0, 0
+            else:
+                # 【第2段階: ボリュームプロファイルトレーリング (VPトレーリング)】
+                val_i = float(vals[i]) if (vals is not None and i < len(vals) and not np.isnan(vals[i])) else avg_price * (1.0 - sl_pct)
+                poc_i = float(pocs[i]) if (pocs is not None and i < len(pocs) and not np.isnan(pocs[i])) else avg_price
+                vah_i = float(vahs[i]) if (vahs is not None and i < len(vahs) and not np.isnan(vahs[i])) else avg_price * 1.02
+
+                # 1. 損切りチェック (含み損時: VAL - α% を維持、建値以上の場合は固定SL)
+                if val_i > 0 and val_i < avg_price:
+                    sl_line = max(val_i * (1.0 - val_alpha_pct / 100.0), avg_price * (1.0 - sl_pct))
+                else:
+                    sl_line = avg_price * (1.0 - sl_pct)
+
+                if c < sl_line:
+                    sell_px = max(c, sl_line)
+                    sell_val = pos_qty * sell_px
+                    fee = sell_val * fee_rate
+                    pnl = sell_val - pos_cost - fee
+                    cum_realized_pnl += pnl
+                    cum_fees += fee
+                    trades.append(pnl)
+                    exec_history.append({"timestamp": ts, "price": sell_px, "size": -pos_qty, "type": "VP_STOP_LOSS"})
+                    pos_qty, pos_cost, avg_price, pos_count = 0.0, 0.0, 0.0, 0
+                    trailing_tp_active = False
+                    trail_peak = 0.0
+                else:
+                    # 2. トレーリング利確チェック (中心線上抜け、またはVAH到達、または+1%含み益で起動)
+                    if not trailing_tp_active:
+                        if (c > b or (vah_i > 0 and c >= vah_i) or c >= avg_price * 1.01) and c > avg_price:
+                            trailing_tp_active = True
+                            trail_peak = max(c, h)
+
+                    if trailing_tp_active:
+                        trail_peak = max(trail_peak, h)
+                        poc_guard = poc_i * 0.998 if (poc_i > 0 and trail_peak > poc_i) else 0.0
+                        vah_guard = vah_i * 0.998 if (vah_i > 0 and trail_peak > vah_i) else 0.0
+                        trail_stop = max(trail_peak * (1.0 - callback_pct), poc_guard, vah_guard, avg_price * (1.0 + fee_rate))
+
+                        if c < trail_stop:
+                            sell_px = max(c, trail_stop)
+                            sell_val = pos_qty * sell_px
+                            fee = sell_val * fee_rate
+                            pnl = sell_val - pos_cost - fee
+                            cum_realized_pnl += pnl
+                            cum_fees += fee
+                            trades.append(pnl)
+                            exec_history.append({"timestamp": ts, "price": sell_px, "size": -pos_qty, "type": "VP_TRAIL_TP"})
+                            pos_qty, pos_cost, avg_price, pos_count = 0.0, 0.0, 0.0, 0
+                            trailing_tp_active = False
+                            trail_peak = 0.0
+
+        # エントリーチェック (戻りエントリー: 1足前終値がバンド以下で今足終値がバンド内に復帰)
         if pos_count < max_trades:
+            rebound_condition = (closes[i-1] <= lower[i-1]) and (c > low_band)
             can_enter = False
             if pos_count == 0:
-                if c < low_band:
+                if rebound_condition:
                     can_enter = True
             else:
                 add_pct = calc_add_pct(pos_count)
-                if c < low_band and c < avg_price * (1.0 - add_pct):
+                if rebound_condition and c < avg_price * (1.0 - add_pct):
                     can_enter = True
-                    
+
             if can_enter:
                 buy_val = trade_size_usdt
                 qty = buy_val / c
@@ -1472,24 +1552,25 @@ def simulate_envelope_strategy(
                 pos_qty += qty
                 avg_price = pos_cost / pos_qty
                 pos_count += 1
+                trail_peak = c
                 exec_history.append({"timestamp": ts, "price": c, "size": qty, "type": "BUY"})
-                
+
         unrealized = (pos_qty * c - pos_cost) if pos_qty > 0 else 0.0
         unrealized_list.append(unrealized)
         current_eq = initial_equity + cum_realized_pnl + unrealized - cum_fees
         equity_curve.append(current_eq)
-        
+
     eq_series = pd.Series(equity_curve)
     peak = eq_series.cummax()
     dd = peak - eq_series
     dd_max = float(dd.max()) if not dd.empty else 0.0
-    
+
     trade_cnt = len(trades)
     win_cnt = sum(1 for t in trades if t > 0)
     win_rate = (win_cnt / trade_cnt * 100.0) if trade_cnt > 0 else 0.0
     final_pnl = float(equity_curve[-1]) - initial_equity
     min_unrealized = float(min(unrealized_list)) if unrealized_list else 0.0
-    
+
     return {
         "final_pnl": final_pnl,
         "trade_count": trade_cnt,
@@ -1497,6 +1578,7 @@ def simulate_envelope_strategy(
         "DD_max": dd_max,
         "max_unrealized_loss": min_unrealized,
         "strategy": "envelope",
+        "use_vp_trailing": use_vp_trailing,
         "equity_curve": equity_curve,
         "exec_history": exec_history,
         "params": {
@@ -1504,7 +1586,8 @@ def simulate_envelope_strategy(
             "lower_pct": lower_pct,
             "upper_pct": upper_pct,
             "malen": malen,
-            "max_trades": max_trades
+            "max_trades": max_trades,
+            "use_vp_trailing": use_vp_trailing
         }
     }
 
@@ -1517,61 +1600,140 @@ def simulate_rsima_strategy(
     lCp: float = 60.0,
     max_trades: int = 1,
     initial_equity: float = 100.0,
-    fee_rate: float = 0.0006
+    fee_rate: float = 0.0012,
+    use_vp_trailing: bool = False,
+    val_alpha_pct: float = 0.8,
+    callback_pct: float = 0.015,
+    sl_pct: float = 0.03,
 ) -> dict:
     closes = df["close"].values
+    highs = df["high"].values if "high" in df.columns else closes
+    lows = df["low"].values if "low" in df.columns else closes
     n = len(closes)
     if n < max(rsi_len, lma_len) + 5:
         return {"final_pnl": 0.0, "trade_count": 0, "win_rate": 0.0, "DD_max": 0.0, "max_unrealized_loss": 0.0}
 
+    # Volume Profile バンドの準備 (VPトレーリング有効時)
+    vahs = df["VAH"].values if "VAH" in df.columns else None
+    vals = df["VAL"].values if "VAL" in df.columns else None
+    pocs = df["POC"].values if "POC" in df.columns else None
+    if use_vp_trailing and (vahs is None or vals is None or pocs is None):
+        df_vp = compute_volume_profile_bands(df)
+        vahs = df_vp["VAH"].values
+        vals = df_vp["VAL"].values
+        pocs = df_vp["POC"].values
+
     close_s = pd.Series(closes)
     rsi_s = calc_rsi(close_s, rsi_len)
     lrsiMA_s = calc_ema(rsi_s, lma_len)
-    
+
     rsi = rsi_s.values
     lrsiMA = lrsiMA_s.values
-    
+
     pos_qty = 0.0
     pos_cost = 0.0
     avg_price = 0.0
     pos_count = 0
-    
+
+    trailing_tp_active = False
+    trail_peak = 0.0
+
     cum_realized_pnl = 0.0
     cum_fees = 0.0
     trades = []
     equity_curve = [initial_equity]
     unrealized_list = [0.0]
     exec_history = []
-    
+
     trade_size_usdt = initial_equity / max_trades
-    
+
     for i in range(1, n):
         c = closes[i]
+        h = highs[i]
+        l = lows[i]
         r = rsi[i]
         r_prev = rsi[i-1]
         ma_val = lrsiMA[i]
         ma_prev = lrsiMA[i-1]
         ts = df["timestamp"].iloc[i] if "timestamp" in df.columns else i
-        
+
         # ゴールデンクロス判定: rsi > lrsiMA かつ 前足では rsi <= lrsiMA
         gc = (r > ma_val) and (r_prev <= ma_prev)
-        
-        # 決済チェック: rsi > lCp かつ c > avg_price で利確
+
+        # 決済チェック
         if pos_qty > 0:
-            if r > lCp and c > avg_price:
-                sell_val = pos_qty * c
-                fee = sell_val * fee_rate
-                pnl = sell_val - pos_cost - fee
-                cum_realized_pnl += pnl
-                cum_fees += fee
-                trades.append(pnl)
-                exec_history.append({"timestamp": ts, "price": c, "size": -pos_qty, "type": "SELL"})
-                pos_qty = 0.0
-                pos_cost = 0.0
-                avg_price = 0.0
-                pos_count = 0
-                
-        # エントリーチェック: lrsiMA < lEp and rsi < lCp
+            if not use_vp_trailing:
+                # 【第1段階: 基礎ルール】固定SL ＆ rsi > lCp 利確
+                if sl_pct > 0 and l < avg_price * (1.0 - sl_pct):
+                    sell_px = avg_price * (1.0 - sl_pct)
+                    sell_val = pos_qty * sell_px
+                    fee = sell_val * fee_rate
+                    pnl = sell_val - pos_cost - fee
+                    cum_realized_pnl += pnl
+                    cum_fees += fee
+                    trades.append(pnl)
+                    exec_history.append({"timestamp": ts, "price": sell_px, "size": -pos_qty, "type": "STOP_LOSS"})
+                    pos_qty, pos_cost, avg_price, pos_count = 0.0, 0.0, 0.0, 0
+                elif r > lCp and c > avg_price:
+                    sell_val = pos_qty * c
+                    fee = sell_val * fee_rate
+                    pnl = sell_val - pos_cost - fee
+                    cum_realized_pnl += pnl
+                    cum_fees += fee
+                    trades.append(pnl)
+                    exec_history.append({"timestamp": ts, "price": c, "size": -pos_qty, "type": "SELL"})
+                    pos_qty, pos_cost, avg_price, pos_count = 0.0, 0.0, 0.0, 0
+            else:
+                # 【第2段階: ボリュームプロファイルトレーリング (VPトレーリング)】
+                val_i = float(vals[i]) if (vals is not None and i < len(vals) and not np.isnan(vals[i])) else avg_price * (1.0 - sl_pct)
+                poc_i = float(pocs[i]) if (pocs is not None and i < len(pocs) and not np.isnan(pocs[i])) else avg_price
+                vah_i = float(vahs[i]) if (vahs is not None and i < len(vahs) and not np.isnan(vahs[i])) else avg_price * 1.02
+
+                # 1. 損切りチェック (含み損時: VAL - α% を維持、建値以上の場合は固定SL)
+                if val_i > 0 and val_i < avg_price:
+                    sl_line = max(val_i * (1.0 - val_alpha_pct / 100.0), avg_price * (1.0 - sl_pct))
+                else:
+                    sl_line = avg_price * (1.0 - sl_pct)
+
+                if c < sl_line:
+                    sell_px = max(c, sl_line)
+                    sell_val = pos_qty * sell_px
+                    fee = sell_val * fee_rate
+                    pnl = sell_val - pos_cost - fee
+                    cum_realized_pnl += pnl
+                    cum_fees += fee
+                    trades.append(pnl)
+                    exec_history.append({"timestamp": ts, "price": sell_px, "size": -pos_qty, "type": "VP_STOP_LOSS"})
+                    pos_qty, pos_cost, avg_price, pos_count = 0.0, 0.0, 0.0, 0
+                    trailing_tp_active = False
+                    trail_peak = 0.0
+                else:
+                    # 2. トレーリング利確チェック (RSI到達、またはVAH到達、または+1%含み益で起動)
+                    if not trailing_tp_active:
+                        if (r > lCp or (vah_i > 0 and c >= vah_i) or c >= avg_price * 1.01) and c > avg_price:
+                            trailing_tp_active = True
+                            trail_peak = max(c, h)
+
+                    if trailing_tp_active:
+                        trail_peak = max(trail_peak, h)
+                        poc_guard = poc_i * 0.998 if (poc_i > 0 and trail_peak > poc_i) else 0.0
+                        vah_guard = vah_i * 0.998 if (vah_i > 0 and trail_peak > vah_i) else 0.0
+                        trail_stop = max(trail_peak * (1.0 - callback_pct), poc_guard, vah_guard, avg_price * (1.0 + fee_rate))
+
+                        if c < trail_stop:
+                            sell_px = max(c, trail_stop)
+                            sell_val = pos_qty * sell_px
+                            fee = sell_val * fee_rate
+                            pnl = sell_val - pos_cost - fee
+                            cum_realized_pnl += pnl
+                            cum_fees += fee
+                            trades.append(pnl)
+                            exec_history.append({"timestamp": ts, "price": sell_px, "size": -pos_qty, "type": "VP_TRAIL_TP"})
+                            pos_qty, pos_cost, avg_price, pos_count = 0.0, 0.0, 0.0, 0
+                            trailing_tp_active = False
+                            trail_peak = 0.0
+
+        # エントリーチェック: lrsiMA < lEp and rsi < lCp かつ ゴールデンクロス
         if pos_count < max_trades and gc:
             if ma_val < lEp and r < lCp:
                 can_enter = False
@@ -1581,7 +1743,7 @@ def simulate_rsima_strategy(
                     add_pct = calc_add_pct(pos_count)
                     if c < avg_price * (1.0 - add_pct):
                         can_enter = True
-                        
+
                 if can_enter:
                     buy_val = trade_size_usdt
                     qty = buy_val / c
@@ -1591,24 +1753,25 @@ def simulate_rsima_strategy(
                     pos_qty += qty
                     avg_price = pos_cost / pos_qty
                     pos_count += 1
+                    trail_peak = c
                     exec_history.append({"timestamp": ts, "price": c, "size": qty, "type": "BUY"})
-                    
+
         unrealized = (pos_qty * c - pos_cost) if pos_qty > 0 else 0.0
         unrealized_list.append(unrealized)
         current_eq = initial_equity + cum_realized_pnl + unrealized - cum_fees
         equity_curve.append(current_eq)
-        
+
     eq_series = pd.Series(equity_curve)
     peak = eq_series.cummax()
     dd = peak - eq_series
     dd_max = float(dd.max()) if not dd.empty else 0.0
-    
+
     trade_cnt = len(trades)
     win_cnt = sum(1 for t in trades if t > 0)
     win_rate = (win_cnt / trade_cnt * 100.0) if trade_cnt > 0 else 0.0
     final_pnl = float(equity_curve[-1]) - initial_equity
     min_unrealized = float(min(unrealized_list)) if unrealized_list else 0.0
-    
+
     return {
         "final_pnl": final_pnl,
         "trade_count": trade_cnt,
@@ -1616,6 +1779,7 @@ def simulate_rsima_strategy(
         "DD_max": dd_max,
         "max_unrealized_loss": min_unrealized,
         "strategy": "rsima",
+        "use_vp_trailing": use_vp_trailing,
         "equity_curve": equity_curve,
         "exec_history": exec_history,
         "params": {
@@ -1623,7 +1787,8 @@ def simulate_rsima_strategy(
             "lma_len": lma_len,
             "lEp": lEp,
             "lCp": lCp,
-            "max_trades": max_trades
+            "max_trades": max_trades,
+            "use_vp_trailing": use_vp_trailing
         }
     }
 
@@ -1636,41 +1801,49 @@ def optimize_symbol_strategy(
     force_strategy: Optional[str] = None
 ) -> Tuple[str, Dict[str, Any], Dict[str, Any], list]:
     """
-    対象銘柄に対して Envelope 戦略と RSI MA 戦略のグリッドサーチを実行し、
-    PnLが最大となる戦略と最適パラメータを決定する。
+    対象銘柄に対して 2段階最適化プロセスを実行：
+    1. 第1段階: Envelope戻り戦略 と RSIMA戦略 のグリッドサーチを実行し、基礎ベストPnLパラメータを決定。
+    2. 第2段階: 決定したベスト設定に対して ボリュームプロファイルトレーリング (VPトレーリング) を適用。
     """
+    # 事前にVPバンドを算出
+    df_work = df.copy()
+    if not all(col in df_work.columns for col in ["VAH", "VAL", "POC"]):
+        df_work = compute_volume_profile_bands(df_work)
+
     results = {}
-    
-    # 1. Envelope 戦略グリッドサーチ
+
+    # 1. Envelope 戦略グリッドサーチ (第1段階: 基礎PnL探索)
     if force_strategy is None or force_strategy.lower() == "envelope":
         env_lengths = [10, 15, 20, 25]
         env_lower_pcts = [1.5, 2.0, 2.5, 3.0]
         env_malens = [100, 200]
-        
+
         for l in env_lengths:
             for lp in env_lower_pcts:
                 for ml in env_malens:
                     res = simulate_envelope_strategy(
-                        df, length=l, lower_pct=lp, upper_pct=lp, malen=ml,
-                        max_trades=max_trades, initial_equity=initial_equity
+                        df_work, length=l, lower_pct=lp, upper_pct=lp, malen=ml,
+                        max_trades=max_trades, initial_equity=initial_equity,
+                        use_vp_trailing=False
                     )
                     label = f"Envelope_L{l}_P{lp}_MA{ml}"
                     results[label] = res
 
-    # 2. RSIMA 戦略グリッドサーチ
+    # 2. RSIMA 戦略グリッドサーチ (第1段階: 基礎PnL探索)
     if force_strategy is None or force_strategy.lower() == "rsima":
         rsi_lengths = [7, 9, 14]
         lma_lengths = [5, 7, 10]
         lEps = [30, 35, 40, 45]
         lCps = [55, 60, 65, 70]
-        
+
         for rl in rsi_lengths:
             for ml in lma_lengths:
                 for ep in lEps:
                     for cp in lCps:
                         res = simulate_rsima_strategy(
-                            df, rsi_len=rl, lma_len=ml, lEp=ep, lCp=cp,
-                            max_trades=max_trades, initial_equity=initial_equity
+                            df_work, rsi_len=rl, lma_len=ml, lEp=ep, lCp=cp,
+                            max_trades=max_trades, initial_equity=initial_equity,
+                            use_vp_trailing=False
                         )
                         label = f"RSIMA_R{rl}_M{ml}_Ep{ep}_Cp{cp}"
                         results[label] = res
@@ -1683,7 +1856,7 @@ def optimize_symbol_strategy(
             "win_rate": 0.0,
             "DD_max": 0.0,
             "max_unrealized_loss": 0.0,
-            "params": {"length": 15, "lower_pct": 2.0, "upper_pct": 2.0, "malen": 200, "max_trades": max_trades}
+            "params": {"length": 15, "lower_pct": 2.0, "upper_pct": 2.0, "malen": 200, "max_trades": max_trades, "use_vp_trailing": True}
         }
         return "envelope", default_res["params"], default_res, []
 
@@ -1691,14 +1864,43 @@ def optimize_symbol_strategy(
     eval_pool = active_results if active_results else results
 
     best_key = max(eval_pool.keys(), key=lambda k: eval_pool[k]["final_pnl"])
-    best_res = eval_pool[best_key]
-    best_strat = best_res["strategy"]
-    best_params = best_res["params"]
+    base_best_res = eval_pool[best_key]
+    best_strat = base_best_res["strategy"]
+    base_params = base_best_res["params"]
+
+    # 【第2段階】ベスト設定に対してボリュームプロファイルトレーリング (VPトレーリング) を適用
+    if best_strat == "envelope":
+        vp_res = simulate_envelope_strategy(
+            df_work,
+            length=base_params.get("length", 15),
+            lower_pct=base_params.get("lower_pct", 2.0),
+            upper_pct=base_params.get("upper_pct", 2.0),
+            malen=base_params.get("malen", 100),
+            max_trades=max_trades,
+            initial_equity=initial_equity,
+            use_vp_trailing=True
+        )
+    else:
+        vp_res = simulate_rsima_strategy(
+            df_work,
+            rsi_len=base_params.get("rsi_len", 9),
+            lma_len=base_params.get("lma_len", 7),
+            lEp=base_params.get("lEp", 40.0),
+            lCp=base_params.get("lCp", 60.0),
+            max_trades=max_trades,
+            initial_equity=initial_equity,
+            use_vp_trailing=True
+        )
+
+    # 基礎結果とVPトレーリング結果の比較情報を格納
+    vp_res["base_pnl"] = base_best_res["final_pnl"]
+    vp_res["base_win_rate"] = base_best_res["win_rate"]
+    vp_res["base_dd"] = base_best_res["DD_max"]
 
     sorted_results = sorted(results.items(), key=lambda x: x[1]["final_pnl"], reverse=True)
     top10 = sorted_results[:10]
 
-    return best_strat, best_params, best_res, top10
+    return best_strat, vp_res["params"], vp_res, top10
 
 
 def run_interval_comparison(df_60m, lot=1.0, data_equity=100.0, side_mode="long", symbol="", force_strategy=None, prefer_breakout=False, max_trades=1):
