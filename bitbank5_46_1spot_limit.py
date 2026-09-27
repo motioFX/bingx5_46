@@ -265,9 +265,9 @@ def format_state_message(symbol: str, position: Dict[str, Any], open_orders_coun
     fee_info = f" (価格差: {raw_pnl:+.2f}, 手数料: -{total_fee:.2f})" if total_fee > 0 else ""
 
     if buy_qty > 0:
-        pos_str = f"🟢 保有: LONG {buy_qty} | 実質含み損益: {pnl:+.2f} USDT{fee_info}"
+        pos_str = f"🟢 保有: LONG {buy_qty} | 実質含み損益: {pnl:+.2f} 円{fee_info}"
     elif sell_qty > 0:
-        pos_str = f"🔴 保有: SHORT {sell_qty} | 実質含み損益: {pnl:+.2f} USDT{fee_info}"
+        pos_str = f"🔴 保有: SHORT {sell_qty} | 実質含み損益: {pnl:+.2f} 円{fee_info}"
     else:
         pos_str = f"⚪ 保有: なし (ノーポジ) | 方向: {trade_side.upper()}"
 
@@ -840,11 +840,11 @@ async def validate_profitable_candidates(trade_side: str, mode: str, base_symbol
                 if cand_pnl > 0 and trade_cnt > 0:
                     discord.print_log(
                         f"   [合格 🟢] {cand}: 戦略={cand_strat.upper()} | "
-                        f"純利益: +${cand_pnl:.2f} USDT (取引: {trade_cnt}回, 勝率: {win_rt:.1f}%, DD: {max_dd:.2f})"
+                        f"純利益: +{cand_pnl:+.2f} 円 (取引: {trade_cnt}回, 勝率: {win_rt:.1f}%, DD: {max_dd:.2f})"
                     )
                     profitable_cands.append(cand)
                 else:
-                    discord.print_log(f"   [不合格 🔴] {cand}: PnL = ${cand_pnl:.2f} (取引: {trade_cnt}回)")
+                    discord.print_log(f"   [不合格 🔴] {cand}: PnL = {cand_pnl:+.2f} 円 (取引: {trade_cnt}回)")
 
             except Exception as opt_err:
                 discord.print_log(f"   [最適化エラー] {cand}: {opt_err}")
@@ -996,7 +996,7 @@ async def run_screening_and_optimization(mode: str, send_charts: bool = False, s
 
         discord.print_log(
             f"   📌 [{sym}] 戦略={strat} (ナンピン数:{MAX_TRADES_COUNT}) | {param_str} | "
-            f"純利益: {pnl_val:+.4f} USDT (取引: {tc_val}回, 勝率: {wr_val:.1f}%, DD: {dd_val:.4f})"
+            f"純利益: {pnl_val:+.2f} 円 (取引: {tc_val}回, 勝率: {wr_val:.1f}%, DD: {dd_val:.2f})"
         )
 
     global current_strategy_type
@@ -1060,12 +1060,12 @@ async def audit_and_retain_positions(
             if sym in selected_set:
                 discord.print_log(
                     f"💎 [Position Retained] 【{sym}】新監視銘柄リストに選定されたためポジションを継続保有します。"
-                    f" (方向: {side}, 数量: {current_qty}, 含み損益: {pnl:+.2f} USDT)"
+                    f" (方向: {side}, 数量: {current_qty}, 含み損益: {pnl:+.2f} 円)"
                 )
             else:
                 discord.print_log(
                     f"🛡️ [Graceful Exit] 【{sym}】新選定リスト外ですがポジション保有中です。"
-                    f" (方向: {side}, 数量: {current_qty}, 損益: {pnl:+.2f} USDT)"
+                    f" (方向: {side}, 数量: {current_qty}, 損益: {pnl:+.2f} 円)"
                     f" → 強制決済せず、通常のエグジット判定完了まで独立監視を継続します。"
                 )
                 # symbol_apis に登録（既存のインスタンスがあれば引き継ぎ、なければ新設）
@@ -1564,20 +1564,21 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                         )
                     if closed:
                         record_real_trade(sym, "LONG", "CLOSE", current_price, float(position.get("buy", 0)), pnl_current, f"実運用決済 ({exit_reason})")
-                        discord.print_log(f"[{sym}] [CLOSE] 🟢 ロングポジション決済完了 (PnL: {pnl_current:+.2f} USDT, 理由: {exit_reason})")
+                        discord.print_log(f"[{sym}] [CLOSE] 🟢 ロングポジション決済完了 (PnL: {pnl_current:+.2f} 円, 理由: {exit_reason})")
                         
+                        sym_exch = "Binance Japan" if (str(sym).upper().endswith("JPY") and "_" not in str(sym)) else "Bitbank"
                         # 1. 決済トレードチャート画像の生成 & 送信
                         exit_chart_file = plot_exit_chart(
                             symbol=sym, df=df, exit_price=current_price, entry_price=entry_px,
                             pnl=pnl_current, exit_reason="VP_Trailing/Exit_Rule", side="LONG", whale_signal=whale_sig
                         )
                         if exit_chart_file and exit_chart_file.exists():
-                            discord.send_file(exit_chart_file, f"📊 【決済チャート】{sym} LONG 決済完了 (PnL: {pnl_current:+.2f} USDT)")
+                            discord.send_file(exit_chart_file, f"📊 【{sym_exch} 決済チャート】{sym.upper()} LONG 決済完了 (PnL: {pnl_current:+.2f} 円)")
 
                         # 2. 累積 PnL パフォーマンスチャートの生成 & 送信
                         chart_file = plot_real_trading_performance()
                         if chart_file and chart_file.exists():
-                            discord.send_file(chart_file, f"📈 【実運用実績】累積損益パフォーマンス更新 (PnL: {pnl_current:+.2f} USDT)")
+                            discord.send_file(chart_file, f"📈 【{sym_exch} 実運用実績】累積損益パフォーマンス更新 (PnL: {pnl_current:+.2f} 円)")
                         del active_positions[sym]
 
                         # 旧選定銘柄の決済完了時は監視リストから解放
@@ -1590,7 +1591,7 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                     else:
                         pnl_icon = "🟢" if pnl_current >= 0 else "🔴"
                         discord.print_log(f"──────────────────────────────────────────────────────────")
-                        discord.print_log(f"💰 【{sym} 現在の含み損益】: {pnl_current:+.2f} USDT {pnl_icon} (ロング継続保有中)")
+                        discord.print_log(f"💰 【{sym} 現在の含み損益】: {pnl_current:+.2f} 円 {pnl_icon} (ロング継続保有中)")
                         discord.print_log(f"──────────────────────────────────────────────────────────")
 
             # 3. 新規エントリー実行 (最大同時保有ポジション数制限: MAX_ACTIVE_POSITIONS)
@@ -1687,18 +1688,24 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                                 whale_flow=whale_flow_val
                             )
                             
+                            best_exch = "Binance Japan" if (str(best_sym).upper().endswith("JPY") and "_" not in str(best_sym)) else "Bitbank"
+                            px_fmt = f"{current_price:,.0f} 円" if current_price >= 100 else (f"{current_price:,.2f} 円" if current_price >= 1 else f"{current_price:.4f} 円")
+                            vah_fmt = f"{vah_val:,.0f} 円" if vah_val >= 100 else (f"{vah_val:,.2f} 円" if vah_val >= 1 else f"{vah_val:.4f} 円")
+                            poc_fmt = f"{poc_val:,.0f} 円" if poc_val >= 100 else (f"{poc_val:,.2f} 円" if poc_val >= 1 else f"{poc_val:.4f} 円")
+                            val_fmt = f"{val_val:,.0f} 円" if val_val >= 100 else (f"{val_val:,.2f} 円" if val_val >= 1 else f"{val_val:.4f} 円")
+                            
                             entry_msg = (
-                                f"🚀🚀🚀 **【新規ロングエントリー約定】** 🚀🚀🚀\n"
+                                f"🚀🚀🚀 **【{best_exch} 新規ロングエントリー約定】** 🚀🚀🚀\n"
                                 f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                                f"📌 **銘柄 / 方向**: `{best_sym}` (LONG 🟢)\n"
-                                f"💰 **約定価格**: `${current_price:.6f}`\n"
-                                f"📦 **発注数量**: `{lot_size:,.2f} {best_sym}` (約 `${entry_notional:,.2f} USDT`)\n"
+                                f"📌 **取引所 / 銘柄**: `【{best_exch}】 {best_sym.upper()}` (LONG 🟢)\n"
+                                f"💰 **約定価格**: `{px_fmt}`\n"
+                                f"📦 **発注数量**: `{lot_size:,.4f} {best_sym.upper()}` (約 `{entry_notional:,.0f} 円`)\n"
                                 f"⚙️ **適用戦略**: `{strat_desc}`\n"
-                                f"🐋 **クジラ判定**: `{whale_sig}` (流入: `${whale_flow_val:+,.0f}`)\n"
+                                f"🐋 **クジラ判定**: `{whale_sig}` (流入: `{whale_flow_val:+,.0f} 円`)\n"
                                 f"📐 **Volume Profile 指標**:\n"
-                                f"  - **VAH (上値抵抗)**: `${vah_val:.6f}`\n"
-                                f"  - **POC (中心値)**  : `${poc_val:.6f}`\n"
-                                f"  - **VAL (初期SL)** : `${val_val:.6f}`\n"
+                                f"  - **VAH (上値抵抗)**: `{vah_fmt}`\n"
+                                f"  - **POC (中心値)**  : `{poc_fmt}`\n"
+                                f"  - **VAL (初期SL)** : `{val_fmt}`\n"
                                 f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
                             )
                             

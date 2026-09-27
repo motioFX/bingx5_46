@@ -45,9 +45,23 @@ def record_real_trade(symbol: str, side: str, action: str, price: float, qty: fl
     with open(TRADES_FILE, "w", encoding="utf-8") as f:
         json.dump(trades, f, indent=2)
         
-    print(f"[Real Trade Tracker] 記録完了: {symbol} {action} {side} @ ${price:.4f} (PnL: ${pnl:+.2f})")
+    print(f"[Real Trade Tracker] 記録完了: {symbol} {action} {side} @ {price:,.2f} JPY (PnL: {pnl:+,.2f} JPY)")
     plot_real_trading_performance()
     return trade_entry
+
+
+def format_jpy_price(price: float) -> str:
+    """日本円建て価格のフォーマッター"""
+    try:
+        p = float(price)
+        if p >= 100:
+            return f"{p:,.0f} JPY"
+        elif p >= 1:
+            return f"{p:,.2f} JPY"
+        else:
+            return f"{p:.4f} JPY"
+    except Exception:
+        return f"{price} JPY"
 
 
 def plot_real_trading_performance():
@@ -72,7 +86,7 @@ def plot_real_trading_performance():
     else:
         df["dt_jst"] = df["timestamp"].dt.tz_convert("Asia/Tokyo")
 
-    ax.plot(df["dt_jst"], df["cum_pnl"], marker='o', markersize=6, color='#29b6f6', linewidth=2.2, label="Cumulative Real PnL (USDT)", zorder=3)
+    ax.plot(df["dt_jst"], df["cum_pnl"], marker='o', markersize=6, color='#29b6f6', linewidth=2.2, label="Cumulative Real PnL (JPY)", zorder=3)
     
     # 0ライン
     ax.axhline(0, color="#787b86", linestyle="--", alpha=0.5, zorder=2)
@@ -153,9 +167,9 @@ def plot_real_trading_performance():
     ax.set_ylim(min_pnl - pnl_range * 0.22, max_pnl + pnl_range * 0.25)
     ax.margins(x=0.10)
 
-    ax.set_title("BingX Real Trading Performance (Cumulative Realized PnL)", fontsize=12, color="#ffffff", pad=15, weight="bold")
+    ax.set_title("Bitbank Real Trading Performance (Cumulative Realized PnL)", fontsize=12, color="#ffffff", pad=15, weight="bold")
     ax.set_xlabel("Time (JST)", fontsize=10, color="#b2b5be")
-    ax.set_ylabel("Realized Cumulative PnL (USDT)", fontsize=10, color="#b2b5be")
+    ax.set_ylabel("Realized Cumulative PnL (JPY)", fontsize=10, color="#b2b5be")
     ax.tick_params(colors="#b2b5be", labelsize=9)
     ax.grid(True, linestyle=':', color="#363c4e", alpha=0.7)
     ax.legend(loc="upper left", facecolor="#1e222d", edgecolor="#363c4e", fontsize=9, labelcolor="#ffffff")
@@ -390,14 +404,18 @@ def plot_entry_chart(
 
     x_indices = _draw_candles_and_vp(ax, plot_df)
 
+    sym_str = str(symbol).strip()
+    is_binance = "binance" in sym_str.lower() or (sym_str.upper().endswith("JPY") and "_" not in sym_str)
+    exchange_name = "Binance Japan" if is_binance else "Bitbank"
+    title_price_str = format_jpy_price(entry_price)
+
     # エントリーポイントの描画（最新バー）
     last_idx = len(plot_df) - 1
-    ax.scatter([last_idx], [entry_price], color="#00e676", s=180, marker="^", edgecolors="#ffffff", linewidths=1.5, zorder=6, label=f"Entry Point @ ${entry_price:.4f}")
+    ax.scatter([last_idx], [entry_price], color="#00e676", s=180, marker="^", edgecolors="#ffffff", linewidths=1.5, zorder=6, label=f"Entry Point @ {title_price_str}")
 
     # 吹き出しアノテーション（右側余白スペースに配置してローソク足を一切隠さない）
-    price_str = f"${entry_price:.6f}" if entry_price < 1 else f"${entry_price:.4f}"
     ax.annotate(
-        f" ▲ LONG ENTRY\n {price_str}",
+        f" ▲ LONG ENTRY\n {title_price_str}",
         xy=(last_idx, entry_price),
         xytext=(last_idx + 1.2, entry_price),
         arrowprops=dict(
@@ -419,18 +437,18 @@ def plot_entry_chart(
     _setup_time_axis(ax, plot_df, x_indices, right_margin_bars=8)
 
     # タイトル
-    whale_str = f" | Whale: {whale_signal} ({whale_flow:+,.0f} USD)" if whale_signal else ""
+    whale_str = f" | Whale: {whale_signal} ({whale_flow:+,.0f} JPY)" if whale_signal else ""
     strat_str = f" | Strat: {strategy_name}" if strategy_name else ""
-    title_price_str = f"{entry_price:.6f} USD" if entry_price < 1 else f"{entry_price:.4f} USD"
     
     ax.set_title(
-        f"[NEW ENTRY] {symbol} (LONG) - Execution & Volume Profile Bands\nEntry Price: {title_price_str}{strat_str}{whale_str}",
+        f"[{exchange_name}] [NEW ENTRY] {symbol.upper()} (LONG) - Execution & Volume Profile Bands\nEntry Price: {title_price_str}{strat_str}{whale_str}",
         fontsize=11,
         color="#ffffff",
         weight="bold",
         pad=15
     )
 
+    ax.set_ylabel("Price [JPY]", fontsize=10, color="#b2b5be")
     # Y軸マージンを少し確保
     ax.margins(y=0.08)
     ax.legend(loc="upper left", facecolor="#1e222d", edgecolor="#363c4e", fontsize=8, labelcolor="#ffffff", framealpha=0.75)
@@ -534,11 +552,17 @@ def plot_exit_chart(
 
     x_indices = _draw_candles_and_vp(ax, plot_df)
 
+    sym_str = str(symbol).strip()
+    is_binance = "binance" in sym_str.lower() or (sym_str.upper().endswith("JPY") and "_" not in sym_str)
+    exchange_name = "Binance Japan" if is_binance else "Bitbank"
+    title_entry_str = format_jpy_price(entry_price)
+    title_exit_str = format_jpy_price(exit_price)
+
     # エントリーマーカー
-    ax.scatter([entry_idx], [entry_price], color="#00e676", s=160, marker="^", edgecolors="#ffffff", linewidths=1.5, zorder=6, label=f"Entry @ ${entry_price:.4f}")
+    ax.scatter([entry_idx], [entry_price], color="#00e676", s=160, marker="^", edgecolors="#ffffff", linewidths=1.5, zorder=6, label=f"Entry @ {title_entry_str}")
     # エグジットマーカー
     exit_marker_color = "#26a69a" if pnl >= 0 else "#ef5350"
-    ax.scatter([exit_idx], [exit_price], color=exit_marker_color, s=160, marker="v", edgecolors="#ffffff", linewidths=1.5, zorder=6, label=f"Exit @ ${exit_price:.4f}")
+    ax.scatter([exit_idx], [exit_price], color=exit_marker_color, s=160, marker="v", edgecolors="#ffffff", linewidths=1.5, zorder=6, label=f"Exit @ {title_exit_str}")
 
     # トレード軌跡（破線ライン）
     line_color = "#26a69a" if pnl >= 0 else "#ef5350"
@@ -546,7 +570,7 @@ def plot_exit_chart(
 
     # 決済吹き出しアノテーション（右側余白スペースに配置し、過去のローソク足を一切隠さない）
     pnl_sign = "+" if pnl > 0 else ""
-    pnl_str = f"PnL: {pnl_sign}${pnl:.2f} ({pnl_pct:+.2f}%)" if pnl_pct is not None else f"PnL: {pnl_sign}${pnl:.2f}"
+    pnl_str = f"PnL: {pnl_sign}{pnl:,.0f} JPY ({pnl_pct:+.2f}%)" if pnl_pct is not None else f"PnL: {pnl_sign}{pnl:,.0f} JPY"
     reason_str = f"\nReason: {exit_reason}" if exit_reason else ""
     
     bg_color = "#1b5e20" if pnl >= 0 else "#b71c1c"
@@ -574,18 +598,17 @@ def plot_exit_chart(
     _setup_time_axis(ax, plot_df, x_indices, right_margin_bars=8)
 
     # タイトル
-    title_exit_str = f"${exit_price:.6f}" if exit_price < 1 else f"${exit_price:.4f}"
-    title_entry_str = f"${entry_price:.6f}" if entry_price < 1 else f"${entry_price:.4f}"
     result_tag = "PROFIT" if pnl >= 0 else "LOSS CUT"
     
     ax.set_title(
-        f"[{result_tag}] {symbol} ({side} CLOSE) - Trade Execution Chart\nEntry: {title_entry_str} -> Exit: {title_exit_str} | Realized PnL: {pnl_sign}${pnl:.2f} ({pnl_pct:+.2f}%)",
+        f"[{exchange_name}] [{result_tag}] {symbol.upper()} ({side} CLOSE) - Trade Execution Chart\nEntry: {title_entry_str} -> Exit: {title_exit_str} | Realized PnL: {pnl_sign}{pnl:,.0f} JPY ({pnl_pct:+.2f}%)",
         fontsize=11,
         color="#ffffff",
         weight="bold",
         pad=15
     )
 
+    ax.set_ylabel("Price [JPY]", fontsize=10, color="#b2b5be")
     # Y軸マージンを少し確保
     ax.margins(y=0.08)
     ax.legend(loc="upper left", facecolor="#1e222d", edgecolor="#363c4e", fontsize=8, labelcolor="#ffffff", framealpha=0.75)

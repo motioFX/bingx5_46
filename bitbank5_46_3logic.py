@@ -606,7 +606,11 @@ class send_discord:
             ax1.annotate(f'VAL: {latest_val:.2f}', xy=(1.01, latest_val), xycoords=('axes fraction', 'data'), fontsize=8, color='blue', va='center')
         
         ax1.legend(loc='upper left', fontsize=8)
-        ax1.set_ylabel("Price [USDT]")
+        sym_str = str(symbol).strip()
+        exchange_name = "Binance Japan" if ("binance" in sym_str.lower() or (sym_str.upper().endswith("JPY") and "_" not in sym_str)) else "Bitbank"
+        cur_unit = "JPY" if "_jpy" in sym_str.lower() or sym_str.upper().endswith("JPY") else "JPY"
+        ax1.set_title(f"[{exchange_name}] {symbol.upper()} Market Profile (1H)", fontsize=10, weight="bold")
+        ax1.set_ylabel(f"Price [{cur_unit}]")
         ax1.grid(True, alpha=0.3)
         ax1.xaxis.set_major_formatter(md.DateFormatter("%m/%d %H:%M"))
         fig.autofmt_xdate(rotation=10)
@@ -615,15 +619,22 @@ class send_discord:
         os.makedirs("backtest_data", exist_ok=True)
         fig.savefig("backtest_data/kline_img.jpg", format='jpg', dpi=80)
 
-        self._send_file(f"{symbol} klines with Market Profile", "backtest_data/kline_img.jpg", "kline_img.jpg", "image/jpeg")
+        self._send_file(f"📈 【{exchange_name}】{symbol.upper()} ローソク足＆マーケットプロファイル", "backtest_data/kline_img.jpg", "kline_img.jpg", "image/jpeg")
 
     def plot_backtest(self, label="MP", csv_file="backtest_data/klines100.csv", img_file=None, symbol=""):
-        if symbol and not str(label).startswith(symbol):
-            display_label = f"{symbol}_{label}"
-            title_prefix = f"{symbol} | "
+        # 取引所の判別: symbol または label から判定
+        sym_str = str(symbol).strip()
+        lbl_str = str(label).strip()
+        if "binance" in lbl_str.lower() or (sym_str.upper().endswith("JPY") and "_" not in sym_str):
+            exchange_name = "Binance Japan"
         else:
-            display_label = label
-            title_prefix = f"{symbol} | " if symbol else ""
+            exchange_name = "Bitbank"
+
+        # ラベル内の不要な BingX を除去し、取引所名を正規化
+        cleaned_label = lbl_str.replace("BingX_", "").replace("bingx_", "")
+        display_label = f"{exchange_name.replace(' ', '_')}_{cleaned_label}" if not cleaned_label.startswith(exchange_name.replace(' ', '_')) else cleaned_label
+
+        currency_unit = "JPY" if "_jpy" in sym_str.lower() or sym_str.upper().endswith("JPY") else "USDT"
 
         if img_file is None:
             img_file = f"backtest_data/backtest_{display_label}_img.jpg"
@@ -728,14 +739,14 @@ class send_discord:
                     s=70,
                 )
 
-        ax1.set_ylabel("close [USDT]", fontsize=9)
+        ax1.set_ylabel(f"Close Price [{currency_unit}]", fontsize=9)
         ax1.grid(True, axis='y', linestyle=':', alpha=0.3)
 
         # 5. 右軸 (twinx): 累積 PnL
         ax2 = ax1.twinx()
         b_plot = df['pnl'] if 'pnl' in df.columns else np.zeros(len(df))
         ax2.plot(x_indices, b_plot, "C1", label="pl", linewidth=1.5)
-        ax2.set_ylabel("pnl [USDT]", fontsize=9)
+        ax2.set_ylabel(f"Cumulative PnL [{currency_unit}]", fontsize=9)
         ax2.grid(False)
 
         # 6. X軸目盛り設定 (日付表示)
@@ -748,7 +759,7 @@ class send_discord:
         ax1.set_xticklabels(tick_labels, rotation=15, ha="right", fontsize=8)
 
         final_pnl = df['pnl'].iloc[-1] if 'pnl' in df.columns else 0.0
-        ax1.set_title(f"{title_prefix}{label} | Final PnL: {final_pnl:.4f} USDT", fontsize=10, pad=10)
+        ax1.set_title(f"[{exchange_name}] {symbol.upper()} | {cleaned_label} | Final PnL: {final_pnl:+,.2f} {currency_unit}", fontsize=10, pad=10)
 
         # 7. 凡例統合
         h1, l1 = ax1.get_legend_handles_labels()
@@ -762,7 +773,7 @@ class send_discord:
         import gc
         gc.collect()
 
-        self._send_file(f"backtest pnl ({display_label})", img_file, f"backtest_{display_label}.jpg", "image/jpeg")
+        self._send_file(f"📊 【{exchange_name}】バックテスト推移チャート: {symbol.upper()} ({cleaned_label})", img_file, f"backtest_{display_label}.jpg", "image/jpeg")
         return img_file
 
     def print_logs(self, df, jpy_onhand_amount, onhand_amount, max_lot, target_position_value=None, trade_side="long"):
@@ -791,7 +802,7 @@ class send_discord:
             optimal_lot_usdt = optimal_lot * price
 
         onhand_amount_usdt = onhand_amount * price
-        self.print_log(f"best lot : {optimal_lot_usdt:.2f} USDT, onhand_amount : {onhand_amount_usdt:.2f} USDT")
+        self.print_log(f"best lot : {optimal_lot_usdt:,.0f} JPY, onhand_amount : {onhand_amount_usdt:,.0f} JPY")
         time.sleep(1)
         self.print_log("-----------------------------------------")
         time.sleep(1)
@@ -1940,17 +1951,17 @@ def run_interval_comparison(df_60m, lot=1.0, data_equity=100.0, side_mode="long"
         }
     
     discord.print_log("【個別最適化バックテスト結果 (Top 10)】")
-    header = f"{'設定':<35} {'PnL [USDT]':>12} {'DD_max':>8} {'勝率':>7} {'取引':>6}"
+    header = f"{'設定':<35} {'PnL [JPY]':>12} {'DD_max':>8} {'勝率':>7} {'取引':>6}"
     separator = "-" * 73
     all_rows = []
     for label, data in top10:
         row_disp = f"{symbol}_{label}" if (symbol and not str(label).startswith(symbol)) else label
-        all_rows.append(f"{row_disp:<35} {data['final_pnl']:>+12.4f} {data['DD_max']:>8.4f} {data['win_rate']:>6.1f}% {data['trade_count']:>6}")
+        all_rows.append(f"{row_disp:<35} {data['final_pnl']:>+12.2f} {data['DD_max']:>8.4f} {data['win_rate']:>6.1f}% {data['trade_count']:>6}")
     table_lines = ["```", header, separator] + all_rows + ["```"]
     discord.print_log("\n".join(table_lines))
     
     best_disp = f"{symbol}_{best_strat.upper()}"
-    discord.print_log(f"★ PnL最大選定: {best_disp} -> 純利益: {best_res['final_pnl']:+.4f} USDT (勝率: {best_res['win_rate']:.1f}%, 取引: {best_res['trade_count']}回, 最大DD: {best_res['DD_max']:.4f})")
+    discord.print_log(f"★ PnL最大選定: {best_disp} -> 純利益: {best_res['final_pnl']:+.2f} JPY (勝率: {best_res['win_rate']:.1f}%, 取引: {best_res['trade_count']}回, 最大DD: {best_res['DD_max']:.4f})")
     discord.print_log(f"   └ 採用パラメータ: {best_params}")
 
     # バックテストチャートの生成
@@ -1977,9 +1988,10 @@ def run_interval_comparison(df_60m, lot=1.0, data_equity=100.0, side_mode="long"
                     
         eval_bars_10d = min(len(df_chart), 240)
         chart_10d_df = df_chart.tail(eval_bars_10d).reset_index(drop=True)
-        bg_csv = f"backtest_data/klines100_{symbol}_bingx.csv"
+        exchange_tag = "Binance_Japan" if (str(symbol).upper().endswith("JPY") and "_" not in str(symbol)) else "Bitbank"
+        bg_csv = f"backtest_data/klines100_{symbol}_{exchange_tag.lower()}.csv"
         chart_10d_df.to_csv(bg_csv, index=False)
-        discord.plot_backtest(label=f"BingX_{symbol}_{best_strat.upper()}", csv_file=bg_csv, symbol=symbol)
+        discord.plot_backtest(label=f"{exchange_tag}_{symbol}_{best_strat.upper()}", csv_file=bg_csv, symbol=symbol)
     except Exception as ch_err:
         print(f"[Chart Error] {symbol}: {ch_err}")
 
