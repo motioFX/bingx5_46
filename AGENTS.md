@@ -60,19 +60,21 @@
 
 ---
 
-## 4. Air Mode (安全監視) / 口座管理 & 資産保護規約
+## 4. デモ口座 (VST) フル活用 & API取引検証スタイル規約 (Account & Verification Mode)
 
+* **VSTデモ口座のフル活用による実API取引検証**:
+  - BingX公式のVSTデモ取引所（`https://open-api-vst.bingx.com`）をフル活用する。
+  - **デモ口座でAPI取引（発注・未約定キャンセル・約定照会・レバレッジ設定・ポジション管理）を実際に実行し、リアルタイムで検証していくスタイル** を標準とする。
+  - ペーパートレード上の計算にとどまらず、実際のAPI通信レイテンシや取引所での未約定キャンセル再配置ロジックを本番さながらの環境で徹底検証する。
 * **口座切替フラグの明確化**:
   - `bingx5_46_1futures_limit.py` 冒頭にて以下を厳密に管理する：
     ```python
-    BINGX_IS_LIVE = False  # True: 本番口座, False: デモ口座 (VST)
-    BINGX_IS_AIR  = True   # True: AIRモード (シミュレーション), False: 取引所発注
+    ALLOW_LIVE_TRADING = False  # 本番リアル口座への発注APIを物理的に完全遮断
+    BINGX_IS_LIVE = False       # True: 本番口座, False: デモ口座 (VST: Virtual Simulation Trading)
+    BINGX_IS_AIR = ("--air" in sys.argv or "--mock" in sys.argv)  # True: 仮想AIRシミュレーション, False: 取引所API発注
     ```
 * **誤発注防止二重ロック**:
-  - 本番リアル発注へ切り替える際は、コード内フラグ（`ALLOW_LIVE_TRADING = True`）および起動時引数の両方が揃う二重ロック構造を維持する。
-* **長期保有資産の隔離・保護**:
-  - 取引口座内に存在する長期保有資産（現物BTC等）は、ボットの自動売買・自動決済対象から完全に隔離・保護する。
-  - 定期サイクルログおよび Discord 通知にて、保有数量・平均建値・評価額・含み損益を明示する。
+  - 本番リアル発注へ切り替える際は、コード内安全ロック（`ALLOW_LIVE_TRADING = True` かつ `BINGX_IS_LIVE = True`）および起動時引数の両方が揃う二重ロック構造を維持する。
 
 ---
 
@@ -98,12 +100,15 @@
 ## 6. 全銘柄データ取得・アーカイブ & Discord 送信規約 (Data Pipeline)
 
 * **データ取得期間 & 命名規則**:
-  - **期間**: 過去 2 ヶ月分（60 日間 / 約 1,440 時間足）〜 4 ヶ月分（120 日間）。
-  - **ファイル命名規則**:
-    - CSV: `bingx_all_markets_1h_YYYYMMDD_HHh.csv`
-    - ZIP: `bingx_all_markets_1h_YYYYMMDD_HHh.zip`
+  - **期間**: 4 ヶ月分（120 日間 / 約 2,880 時間足）。
+  - **【厳格ファイル命名規則】必ず「日付」と「撮った時間（時間帯タグ）」を追記すること**:
+    - 全銘柄統合CSV: **`bingx_all_markets_1h_YYYYMMDD_HHh.csv`**（例: `bingx_all_markets_1h_20260927_09h.csv`）
+    - 期間別2分割ZIPアーカイブ:
+      - **Part 1/2 【前半（過去60日）】**: **`bingx_all_markets_1h_YYYYMMDD_HHh_part1.zip`**
+      - **Part 2/2 【後半（直近60日）】**: **`bingx_all_markets_1h_YYYYMMDD_HHh_part2.zip`**
+      - （全期間最新マスターZIP: `bingx_all_markets_1h_YYYYMMDD_HHh.zip`）
 * **Discord 25MB ファイルサイズ制限の厳格遵守**:
-  - 全 600 銘柄以上のデータを ZIP 圧縮する際、Discord の Webhook 上限（25MB）を超過しないよう、浮動小数点精度を最適化（`float_format="%.6g"`）して出力すること。
+  - 全 600 銘柄以上のデータを ZIP 圧縮する際、Discord の Webhook 上限（25MB）を超過しないよう、浮動小数点精度を最適化（`float_format="%.6g"`）して出力し、最高圧縮（`compresslevel=9`）でアーカイブ化すること。
 * **文字化け完全防止 (payload_json 規約)**:
   - Discord Webhook へのマルチパートファイル送信時は、必ず `payload_json` パラメータ（`json.dumps({"content": description}, ensure_ascii=False)`）を使用し、日本語や絵文字が `?` に化ける問題を永久に防止すること。
 * **重複送信防止 (`upload_registry.py`)**:
