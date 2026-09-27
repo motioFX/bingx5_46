@@ -135,6 +135,7 @@ for _idx, _arg in enumerate(sys.argv):
             ANALYSIS_HOURS = [int(_arg.split("=")[1])]
         except ValueError:
             pass
+
 # ========================================================================
 
 import bitbank5_46_2api
@@ -1090,8 +1091,10 @@ async def audit_and_retain_positions(
     return symbol_apis, symbol_params_map
 
 async def sync_historical_and_charts(days: int = 120) -> None:
-    """Bitbank 全銘柄ヒストリカルデータ (2ヶ月×2分割ZIP) ＆ 30d/10d/5d ノーマライズチャート同期・Discord送信"""
-    discord.print_log(f"\n📦 【全銘柄データ同期＆チャート送信】 Bitbank 全銘柄ヒストリカルデータ ({days}日分 / 2分割ZIP) ＆ ノーマライズチャート同期中...")
+    """Bitbank ＆ Binance Japan 全銘柄ヒストリカルデータ (4ヶ月分 / 2分割ZIP) ＆ ノーマライズチャート同期・Discord送信"""
+    discord.print_log(f"\n📦 【全銘柄データ同期＆チャート送信】 Bitbank ＆ Binance Japan 全銘柄ヒストリカルデータ ({days}日分 / 2分割ZIP) 同期中...")
+    
+    # 1. Bitbank 47銘柄データ同期 & チャート
     download_script = Path(__file__).resolve().parent / "download_historical_candles.py"
     if download_script.exists():
         try:
@@ -1104,14 +1107,24 @@ async def sync_historical_and_charts(days: int = 120) -> None:
                 None, lambda: subprocess.run(cmd_hist, timeout=360, capture_output=True, text=True, encoding="utf-8")
             )
             if ret.returncode == 0:
-                discord.print_log("✅ 【データ同期完了】 全47銘柄 2分割ZIPアーカイブ送信 ＆ ノーマライズチャート送信が完了しました。")
+                discord.print_log("✅ 【Bitbank データ同期完了】 全47銘柄 2分割ZIPアーカイブ送信 ＆ ノーマライズチャート送信が完了しました。")
             else:
                 err_snippet = (ret.stderr or ret.stdout or "")[-300:]
-                discord.print_log(f"⚠️ 【データ同期注意】 終了コード: {ret.returncode}\n{err_snippet}")
+                discord.print_log(f"⚠️ 【Bitbank データ同期注意】 終了コード: {ret.returncode}\n{err_snippet}")
         except subprocess.TimeoutExpired:
-            discord.print_log("⚠️ 【データ同期注意】 データ取得がタイムアウト（360秒）しました。バックグラウンド処理を継続します。")
+            discord.print_log("⚠️ 【Bitbank データ同期注意】 データ取得がタイムアウト（360秒）しました。バックグラウンド処理を継続します。")
         except Exception as e:
-            discord.print_log(f"⚠️ 【データ同期例外】 エラーが発生しました: {e}")
+            discord.print_log(f"⚠️ 【Bitbank データ同期例外】 エラーが発生しました: {e}")
+
+    # 2. Binance Japan 全銘柄データ同期 (4ヶ月分 / 2分割ZIP)
+    binance_script = Path(__file__).resolve().parent / "download_binance_candles.py"
+    if binance_script.exists():
+        try:
+            from download_binance_candles import run_binance_pipeline
+            await run_binance_pipeline(days=days, to_discord=True)
+            discord.print_log("✅ 【Binance Japan データ同期完了】 全JPY現物銘柄 2分割ZIPアーカイブ送信が完了しました。")
+        except Exception as b_err:
+            discord.print_log(f"⚠️ 【Binance Japan データ同期注意】 エラーが発生しました: {b_err}")
 
 
 async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60'):
@@ -1184,21 +1197,12 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
         selected_symbols, symbol_apis, symbol_params_map, best_params, mode
     )
 
-    # 💎 起動時: 長期運用 BTC/JPY 状況の表示＆通知
+    # 💎 起動時: Bitbank ＆ Binance Japan 全保有暗号資産・損益・未約定指値 総合ポジション監査
     try:
-        from long_term_btc_tracker import report_long_term_btc
-        discord.print_log("\n💎 【ボット起動時 初期状態: 長期運用 BTC/JPY 状況】")
-        await report_long_term_btc(mode=mode, to_discord=True)
-    except Exception as btc_err:
-        discord.print_log(f"⚠️ 長期BTC状況取得エラー: {btc_err}")
-
-    # 📋 起動時: 今指値を出しているレンダーや未約定注文の状況表示＆通知
-    try:
-        from active_orders_tracker import report_active_orders
-        discord.print_log("\n📋 【ボット起動時 初期状態: 配置中 指値・未約定注文 状況】")
-        await report_active_orders(mode=mode, to_discord=True)
-    except Exception as ord_err:
-        discord.print_log(f"⚠️ 指値状況取得エラー: {ord_err}")
+        from portfolio_tracker import report_all_positions
+        await report_all_positions(mode=mode, to_discord=True, header_title="🏦 【ボット起動時 初期状態: 全保有暗号資産 総合ポジション監査】")
+    except Exception as port_err:
+        discord.print_log(f"⚠️ 総合ポジション監査エラー: {port_err}")
 
     logic = logicinstance()
     last_screening_slot = (datetime.now(JST).date(), datetime.now(JST).hour)
@@ -1278,21 +1282,12 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
             logic = logicinstance()
             discord.print_log(f"[Periodic Reset Complete] 新しい選定銘柄 (LONG ONLY): {', '.join(selected_symbols)} | 現在の全監視対象: {', '.join(symbol_apis.keys())}")
 
-            # 5. 長期運用 BTC/JPY 状況の表示＆通知
+            # 5. Bitbank ＆ Binance Japan 全保有暗号資産・損益・未約定指値 総合ポジション監査
             try:
-                from long_term_btc_tracker import report_long_term_btc
-                discord.print_log(f"\n💎 【定期銘柄選定時 ({now_jst.hour:02d}:00 JST) 長期運用 BTC/JPY 状況】")
-                await report_long_term_btc(mode=mode, to_discord=True)
-            except Exception as btc_err:
-                discord.print_log(f"⚠️ 長期BTC状況取得エラー: {btc_err}")
-
-            # 6. 今指値を出しているレンダーや未約定注文の状況表示＆通知
-            try:
-                from active_orders_tracker import report_active_orders
-                discord.print_log(f"\n📋 【定期銘柄選定時 ({now_jst.hour:02d}:00 JST) 配置中 指値・未約定注文 状況】")
-                await report_active_orders(mode=mode, to_discord=True)
-            except Exception as ord_err:
-                discord.print_log(f"⚠️ 指値状況取得エラー: {ord_err}")
+                from portfolio_tracker import report_all_positions
+                await report_all_positions(mode=mode, to_discord=True, header_title=f"🏦 【定期選定時 ({now_jst.hour:02d}:00 JST) 全保有暗号資産 総合ポジション監査】")
+            except Exception as port_err:
+                discord.print_log(f"⚠️ 総合ポジション監査エラー: {port_err}")
 
             continue
 
@@ -1345,12 +1340,17 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
         # ========== 各銘柄のトレード判定 (LONG ONLY) ==========
         discord.print_log(f"\n[Cycle #{cycle_count}] {now_jst.strftime('%Y-%m-%d %H:%M')} JST | 対象: {', '.join(symbol_apis.keys())}", level="debug")
 
-        # 💎 毎時サイクル開始時: 長期運用 BTC/JPY 状況の1行コンパクト表示 (ターミナル出力)
-        try:
-            from long_term_btc_tracker import report_long_term_btc
-            await report_long_term_btc(mode=mode, to_discord=False, compact=True)
-        except Exception:
-            pass
+        # 💎 毎時サイクル開始時: Bitbank ＆ Binance Japan 全保有暗号資産・損益・未約定指値 総合監査 (毎時間チェック)
+        if cycle_count > 1 or "--loop" in sys.argv:
+            try:
+                from portfolio_tracker import report_all_positions
+                await report_all_positions(
+                    mode=mode,
+                    to_discord=True,
+                    header_title=f"🏦 【毎時ポジション監査 (Cycle #{cycle_count} / {now_jst.strftime('%H:%M')} JST)】"
+                )
+            except Exception as port_err:
+                discord.print_log(f"⚠️ 毎時ポジション監査エラー: {port_err}")
 
         try:
             active_positions = {}
@@ -1540,6 +1540,19 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
 
                     if is_take_profit:
                         discord.print_log(f"[{sym}] [TAKE PROFIT] 🎯 新戦略利確シグナル点灯 (現在値: {current_price:,.0f}円 > 建値: {entry_px:,.0f}円, 戦略: {cand_strat.upper()})")
+                        try:
+                            discord.send(
+                                f"📢 **【シグナル通知: LONG CLOSE】**\n"
+                                f"🎯 **{sym.upper()}** にロング利確・クローズシグナルが点灯しました！\n"
+                                f"・現在値: `{current_price:,.1f}円`\n"
+                                f"・建値: `{entry_px:,.1f}円`\n"
+                                f"・含み損益: `{pnl_current:+,.0f}円`\n"
+                                f"・理由: `{exit_reason}` (戦略: `{cand_strat.upper()}`)\n"
+                                f"*(※エアトレード決済シグナル)*"
+                            )
+                        except Exception:
+                            pass
+
                         from bitbank5_46_2api import flatten_current_position_bitbank
                         await flatten_current_position_bitbank(sym, "JPY", mode, exit_reason, force_market=True)
                         closed = True
@@ -1617,6 +1630,26 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                         lot_size = best_cand["lot_size"]
                         current_price = best_cand["current_price"]
                         whale_sig = best_cand["whale_sig"]
+
+                        px_fmt = f"{current_price:,.3f}円" if current_price < 1000 else f"{current_price:,.0f}円"
+                        best_sym_params = symbol_params_map.get(best_sym, best_params)
+                        strat_desc = f"{best_sym_params.get('strategy', 'BREAKOUT').upper()} (MP={best_sym_params.get('mp', '-')}, ER={best_sym_params.get('er', '-')})"
+
+                        discord.print_log(
+                            f"📢 【シグナル通知: LONG ENTRY】🚀 {best_sym.upper()} にロングエントリーシグナル点灯！\n"
+                            f"   ・現在値: {px_fmt} | クジラ判定: {whale_sig} | 戦略: {strat_desc}"
+                        )
+                        try:
+                            discord.send(
+                                f"📢 **【シグナル通知: LONG ENTRY】**\n"
+                                f"🚀 **{best_sym.upper()}** にロングエントリーシグナルが点灯しました！\n"
+                                f"・現在値: `{px_fmt}`\n"
+                                f"・クジラ判定: `{whale_sig}`\n"
+                                f"・戦略: `{strat_desc}`\n"
+                                f"*(※エアトレードエントリー)*"
+                            )
+                        except Exception:
+                            pass
 
                         discord.print_log(f"[{best_sym}] [ENTRY>>] ロングエントリー試行 ({cand_idx+1}/{len(candidates_to_enter)}) (クジラ判定: {whale_sig})")
                         entered = await api.long_entry(df, position, balance, lot_size, max_lot)

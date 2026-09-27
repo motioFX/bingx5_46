@@ -1,7 +1,7 @@
 import json
 import sys
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 # 設定ファイルの探索優先度: bitbank_credentials.json -> bingx_credentials.json
 _PARENT_DIR = Path(__file__).resolve().parent
@@ -68,6 +68,28 @@ def load_api_keys(platform: Optional[str] = None, config: Optional[Dict[str, Any
         else:
             formatted[k] = v
     return formatted
+
+
+def load_binance_api_keys(platform: Optional[str] = None, config: Optional[Dict[str, Any]] = None) -> List[str]:
+    """
+    Binance APIキー [api_key, secret_key] を返します。
+    """
+    cfg = config if config is not None else load_config()
+    apis = cfg.get("apis", {})
+    if not isinstance(apis, dict):
+        return ["", ""]
+    
+    # 1. apis 直下の binance
+    if "binance" in apis and isinstance(apis["binance"], list):
+        return apis["binance"]
+    
+    # 2. プラットフォームごとの階層 (win32 / linux / default)
+    platform_key = platform or sys.platform
+    p_apis = apis.get(platform_key, {}) or apis.get("default", {})
+    if isinstance(p_apis, dict) and "binance" in p_apis and isinstance(p_apis["binance"], list):
+        return p_apis["binance"]
+        
+    return ["", ""]
 
 
 # Webhook チャンネル名正規化エイリアスマップ

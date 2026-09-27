@@ -359,9 +359,11 @@ def cleanup_data_dir(
     zip_categories = {
         "past": list(data_dir.glob("bitbank_all_symbols_past_*.zip")),
         "recent": list(data_dir.glob("bitbank_all_symbols_recent_*.zip")),
+        "binance_past": list(data_dir.glob("binance_japan_all_symbols_past_*.zip")),
+        "binance_recent": list(data_dir.glob("binance_japan_all_symbols_recent_*.zip")),
         "other_zip": [
             p for p in data_dir.glob("*.zip")
-            if not p.name.startswith("bitbank_all_symbols_past_") and not p.name.startswith("bitbank_all_symbols_recent_")
+            if not p.name.startswith("bitbank_all_symbols_") and not p.name.startswith("binance_japan_all_symbols_")
         ]
     }
 
