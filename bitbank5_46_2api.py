@@ -20,6 +20,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 import numpy as np
 import pandas as pd
 import pybotters
+import aiohttp
 import requests
 
 from bitbank5_46_3logic import send_discord, backtester, PositionSizer, calc_add_pct, VPTrailingManager
@@ -153,6 +154,9 @@ def sign_bitbank_query(secret_key: str, message: str) -> str:
     ).hexdigest()
 
 
+_LAST_BITBANK_NONCE: int = 0
+
+
 # ==================== Bitbank API Helper クラス ====================
 class api_bitbank_helper:
     def __init__(self, symbol='btc_jpy', coin='JPY', mode='demo', instrument_spec=None):
@@ -214,21 +218,54 @@ class api_bitbank_helper:
             return float(round(price, 2))
 
     async def _request_private(self, method: str, path: str, data: Optional[dict] = None) -> dict:
+        global _LAST_BITBANK_NONCE
         if not self.api_key or not self.secret_key or self.api_key.startswith("YOUR_"):
             return {"success": 0, "error": "NO_API_KEY"}
         
-        async with pybotters.Client(apis={"bitbank": [self.api_key, self.secret_key]}) as client:
+        now_ms = int(time.time() * 1000)
+        if now_ms <= _LAST_BITBANK_NONCE:
+            now_ms = _LAST_BITBANK_NONCE + 1
+        _LAST_BITBANK_NONCE = now_ms
+        nonce_str = str(now_ms)
+
+        url = f"{self.rest_url}{path}"
+        query_str = ""
+        body_str = ""
+        if method.upper() == "GET":
+            if data:
+                query_str = "?" + urllib.parse.urlencode(data)
+            auth_payload = f"{nonce_str}{path}{query_str}"
+        else:
+            body_str = json.dumps(data) if data else ""
+            auth_payload = f"{nonce_str}{body_str}"
+
+        signature = hmac.new(
+            self.secret_key.encode("utf-8"),
+            auth_payload.encode("utf-8"),
+            hashlib.sha256
+        ).hexdigest()
+
+        headers = {
+            "ACCESS-KEY": self.api_key,
+            "ACCESS-NONCE": nonce_str,
+            "ACCESS-SIGNATURE": signature,
+            "Content-Type": "application/json"
+        }
+
+        async with aiohttp.ClientSession() as session:
             try:
-                url = f"{self.rest_url}{path}"
+                full_url = f"{url}{query_str}" if query_str else url
                 if method.upper() == "GET":
-                    res = await client.get(url, params=data or {})
+                    async with session.get(full_url, headers=headers, timeout=10) as resp:
+                        return await resp.json()
                 elif method.upper() == "POST":
-                    res = await client.post(url, data=data or {})
+                    async with session.post(full_url, headers=headers, data=body_str, timeout=10) as resp:
+                        return await resp.json()
                 elif method.upper() == "DELETE":
-                    res = await client.delete(url, data=data or {})
+                    async with session.delete(full_url, headers=headers, data=body_str, timeout=10) as resp:
+                        return await resp.json()
                 else:
                     return {"success": 0, "error": f"UNSUPPORTED_METHOD_{method}"}
-                return await res.json()
             except Exception as e:
                 return {"success": 0, "error": str(e)}
 

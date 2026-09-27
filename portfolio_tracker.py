@@ -186,6 +186,10 @@ def fetch_binance_portfolio() -> Dict[str, Any]:
                 "warnOnFetchOpenOrdersWithoutSymbol": False,
             }
         })
+        try:
+            exchange.load_time_difference()
+        except Exception:
+            pass
         balance = exchange.fetch_balance()
     except Exception as e:
         discord.print_log(f"[Binance Portfolio Error] 残高取得失敗: {e}", level="debug")
@@ -360,8 +364,9 @@ async def report_all_positions(
             pnl_icon = "🟢" if a["pnl"] >= 0 else "🔴"
             px_fmt = f"{a['current_price']:,.3f}円" if a['current_price'] < 1000 else f"{a['current_price']:,.0f}円"
             entry_fmt = f"{a['avg_entry']:,.3f}円" if a['avg_entry'] < 1000 else f"{a['avg_entry']:,.0f}円"
+            asset_label = f"{a['asset']} (💎長期保有)" if a['asset'] == "BTC" else a['asset']
             lines.append(
-                f"  ・{a['asset']}: {a['amount']:,.4f} 枚 | 建値: {entry_fmt} -> 現値: {px_fmt} | 評価額: {a['valuation']:,.0f}円 | 損益: {a['pnl']:+,.0f}円 ({a['pnl_pct']:+.2f}%) {pnl_icon}"
+                f"  ・{asset_label}: {a['amount']:,.4f} 枚 | 建値: {entry_fmt} -> 現値: {px_fmt} | 評価額: {a['valuation']:,.0f}円 | 損益: {a['pnl']:+,.0f}円 ({a['pnl_pct']:+.2f}%) {pnl_icon}"
             )
     else:
         lines.append("  ・保有暗号資産なし")
