@@ -975,12 +975,13 @@ async def select_top_bingx_symbols(top_n: int = 10, mode: str = 'demo') -> List[
         print("[Symbol Selection] 銘柄情報の取得に失敗。デフォルト銘柄を使用します。")
         return [{"symbol": "ETH-USDT", "lastPr": 2500.0, "usdtVolume": 1e8}, {"symbol": "SOL-USDT", "lastPr": 105.0, "usdtVolume": 1e8}]
     
-    # BTCを除外して優先順序通りに抽出
+    # BTCおよび非暗号資産（為替FX・株・コモディティ等）を除外して優先順序通りに抽出
+    from bingx5_46_4mix_candle_Merged_Alt10 import is_crypto_symbol
     def _is_btc_sym(s: str) -> bool:
         clean = str(s).upper().replace("-", "").replace("_", "").replace("USDT", "").replace("USDC", "")
         return clean == "BTC"
 
-    sorted_tickers = [t for t in tickers if not _is_btc_sym(t.get("symbol", ""))]
+    sorted_tickers = [t for t in tickers if not _is_btc_sym(t.get("symbol", "")) and is_crypto_symbol(t.get("symbol", ""))]
 
     # 取引所の universe に存在する銘柄のみにフィルタリング
     try:

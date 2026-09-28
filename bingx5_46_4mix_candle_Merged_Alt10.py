@@ -156,6 +156,25 @@ def normalize_symbol(symbol: str) -> str:
     return sym
 
 
+def is_crypto_symbol(symbol: str) -> bool:
+    """BingXの非暗号資産（TradFi: 為替FX、コモディティ、株価指数、個別株等）を除外し、純粋な暗号資産のみを判定"""
+    sym = normalize_symbol(symbol).upper()
+    base = sym.replace("-USDT", "").replace("-USDC", "")
+    # BingXのTradFiは全てNCプレフィックス（NCFX: 為替FX, NCCO: コモディティ, NCSI: 指数, NCSK: 個別株）
+    if base.startswith("NC"):
+        return False
+    # その他TradFiキーワードおよび為替通貨ペアの除外
+    tradfi_keywords = (
+        "2USD", "2EUR", "2GBP", "2JPY", "EUR2", "GBP2", "USD2", "JPY2",
+        "AUD2", "CAD2", "CHF2", "NZD2", "GOLD", "SILVER", "XAU", "XAG",
+        "OIL", "WTI", "SP500", "SPX", "NASDAQ", "NIKKEI", "US30", "DJI",
+        "FOREX", "INDEX"
+    )
+    if any(k in base for k in tradfi_keywords):
+        return False
+    return True
+
+
 def fetch_bingx_tickers(product_type: str = "SWAP", mode: str = "demo", max_retries: int = 5) -> List[dict]:
     base_url = REST_API_URL["bingx_demo"] if mode in ("paper", "demo", "testnet") else REST_API_URL["bingx"]
     url = f"{base_url}/openApi/swap/v2/quote/ticker"
@@ -187,6 +206,8 @@ def fetch_bingx_tickers(product_type: str = "SWAP", mode: str = "demo", max_retr
                 for item in ticker_list:
                     sym = normalize_symbol(item.get("symbol", ""))
                     if not sym.endswith("-USDT"):
+                        continue
+                    if not is_crypto_symbol(sym):
                         continue
                     last_pr = float(item.get("lastPrice") or 0.0)
                     open_pr = float(item.get("openPrice") or 0.0)
@@ -580,8 +601,8 @@ def check_normalized_peak_timing(df: pd.DataFrame) -> Tuple[bool, List[str]]:
     return is_bad, reasons
 
 
-def generate_normalized_charts(all_dfs: List[pd.DataFrame], out_dir: Path, window_name: str, hours_limit: int) -> Tuple[Optional[Path], float, str]:
-    """指定期間 (30d / 10d / 5d) の上位10銘柄の正規化比較チャートを作成し、地合い（Market State）を判定 (パフォーマンス順ランキング凡例)"""
+def generate_normalized_charts(all_dfs: List[pd.DataFrame], out_dir: Path, window_name: str, hours_limit: int, save_chart: bool = False) -> Tuple[Optional[Path], float, str]:
+    """指定期間 (30d / 10d / 5d) の上位10銘柄の正規化比較を行い、地合い（Market State）を判定 (save_chart=False時は描画スキップ)"""
     if not all_dfs:
         return None, 1.0, "NEUTRAL"
 
@@ -622,6 +643,9 @@ def generate_normalized_charts(all_dfs: List[pd.DataFrame], out_dir: Path, windo
     norm_performances = [item["final_norm"] for item in plot_items]
     mean_norm = float(np.mean(norm_performances)) if norm_performances else 1.0
     market_state = "LONG" if mean_norm >= 1.0 else "SHORT"
+
+    if not save_chart:
+        return None, mean_norm, market_state
 
     fig, ax = plt.subplots(figsize=(10.5, 5.2))
     
@@ -1344,10 +1368,10 @@ async def main():
     # 4. 選定候補 Top 10 銘柄の OHLCV & Funding データ取得 (過去2ヶ月分: 60日間)・ファイル保存
     end_utc = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0)
     start_utc = end_utc - timedelta(days=60)
-    # 暗号資産取引高上位10銘柄
+    # 暗号資産取引高上位10銘柄 (FX・TradFiを除外)
     crypto_tickers = [
         t for t in tickers 
-        if not any(x in t.get("symbol", "").upper() for x in ["NCSK", "2USD", "GOLD"])
+        if is_crypto_symbol(t.get("symbol", ""))
     ]
     top10_vol_symbols = [t["symbol"] for t in crypto_tickers[:10]]
     if "BTC-USDT" not in top10_vol_symbols:
@@ -1521,18 +1545,15 @@ async def main():
             if not args.no_chart_send and fixed_chart and fixed_chart.exists():
                 discord.send_file(fixed_chart, f"🎯 **【固定選定銘柄 (HYPE, NEAR, ZEC, ARB, UNI) ノーマライズチャート [{win_label.upper()}]】**")
 
-        # ③ 30d, 10d, 5d のマルチタイムフレーム乖離判定 & 地合い判定
-        print("\n[MTF Divergence Analysis] Analyzing 30d, 10d, 5d Market Divergence & States...")
+        # ③ 30d, 10d, 5d のマルチタイムフレーム地合い判定 (チャート生成・Discord送信は廃止、地合い計算のみ維持)
+        print("\n[MTF Market State Analysis] Analyzing 30d, 10d, 5d Market States...")
         for win_label, win_hours in windows:
-            chart_file, mean_norm, market_state = generate_normalized_charts(plot_dfs, out_dir, win_label, win_hours)
+            _, mean_norm, market_state = generate_normalized_charts(plot_dfs, out_dir, win_label, win_hours, save_chart=False)
             final_st = "long_only" if market_state == "LONG" else "short_only"
             state_icon = "🟢" if market_state == "LONG" else "🔴"
             print(f"   └ [{win_label} Window] Mean Norm: {mean_norm:.4f} -> Market State: {market_state} ({final_st})")
             summary_text += f"• **[{win_label.upper()}]**: {state_icon} `{market_state}` (平均騰落: `{mean_norm:.4f}`)\n"
             window_states.append((win_label, market_state, mean_norm))
-
-            if not args.no_chart_send and chart_file and chart_file.exists():
-                discord.send_file(chart_file, f"📈 **【マルチタイムフレーム乖離判定 [{win_label.upper()}]】** 地合い: `{market_state}` (平均: `{mean_norm:.4f}`)")
 
         # ④ 固定5銘柄 MTF完全ロング判定レポート (HYPE, NEAR, ZEC, ARB, UNI)
         print("\n==================================================================================")
