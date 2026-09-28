@@ -570,10 +570,14 @@ async def run_pipeline(
 
     master_df = master_df.sort_values(by=['timestamp', 'symbol']).reset_index(drop=True)
 
-    # ① 固定名マスターCSVを最新化 (全期間)
+    # ① 固定名マスターCSVを最新化 (全期間) - Bitbank専用明示名 & 互換名
+    bitbank_master_csv = data_dir / "bitbank_all_symbols_merged.csv"
+    master_df.to_csv(bitbank_master_csv, index=False, encoding="utf-8")
+    log(f"\n📄 [Bitbank] 取引所別マスターCSVを更新しました: {bitbank_master_csv.name} ({len(master_df):,} 行)")
+
     fixed_master_csv = data_dir / "historical_all_symbols_merged.csv"
     master_df.to_csv(fixed_master_csv, index=False, encoding="utf-8")
-    log(f"\n📄 固定マスターCSVを更新しました: {fixed_master_csv.name} ({len(master_df):,} 行)")
+    log(f"📄 [Bitbank] 互換マスターCSVを更新しました: {fixed_master_csv.name} ({len(master_df):,} 行)")
 
     # ② 期間で2分割: 過去（前半期間）と直近（後半期間）
     unique_ts = sorted(master_df["timestamp"].unique())
@@ -636,6 +640,22 @@ async def run_pipeline(
                 log(f"   ✅ Discord 送信完了: {zip_path.name}")
             else:
                 log(f"   ⚠️ Discord 送信に失敗しました: {zip_path.name}")
+            time.sleep(2.0)
+
+    # ③ 取引所別 単体統合マスターCSVもDiscordへ送信 (20MB未満)
+    if not skip_upload and bitbank_master_csv.exists():
+        csv_size_mb = bitbank_master_csv.stat().st_size / (1024 * 1024)
+        if csv_size_mb < 20.0:
+            csv_desc = (
+                f"📄 **[Bitbank 全47銘柄 統合マスターCSV]** ({ts_jst_str})\n"
+                f"• ファイル名: `{bitbank_master_csv.name}`\n"
+                f"• 期間: 過去{days}日分 (全{len(master_df):,}行 / 全{len(target_symbols)}銘柄)\n"
+                f"• ファイルサイズ: `{csv_size_mb:.2f} MB`\n"
+                f"• 用途: 取引所別 単一CSV分析・スプレッドシート・Python一括読み込み用"
+            )
+            log(f"📤 Discord へ送信中: {bitbank_master_csv.name} ...")
+            if discord.send_file(bitbank_master_csv, description=csv_desc):
+                log(f"   ✅ Discord 送信完了: {bitbank_master_csv.name}")
             time.sleep(2.0)
 
     # 5. ノーマライズ比較チャート生成 & 送信

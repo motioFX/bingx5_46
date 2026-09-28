@@ -346,8 +346,25 @@ async def run_binance_pipeline(days: int = 120, to_discord: bool = True) -> None
             )
             log(f"   🚀 Discordへ送信中: {zip_path.name} ...")
             discord.send_file(zip_path, desc)
+            await asyncio.sleep(2.0)
+
+    # 4-2. 取引所別 単体統合マスターCSVもDiscordへ送信 (20MB未満)
+    if to_discord and fixed_master_csv.exists():
+        csv_size_mb = fixed_master_csv.stat().st_size / (1024 * 1024)
+        if csv_size_mb < 20.0:
+            csv_desc = (
+                f"📄 **[Binance Japan 全27銘柄 統合マスターCSV]** ({ts_jst_str})\n"
+                f"• ファイル名: `{fixed_master_csv.name}`\n"
+                f"• 期間: 過去{days}日分 (全{len(master_df):,}行 / 全{len(symbols)}銘柄)\n"
+                f"• ファイルサイズ: `{csv_size_mb:.2f} MB`\n"
+                f"• 用途: 取引所別 単一CSV分析・スプレッドシート・Python一括読み込み用"
+            )
+            log(f"   🚀 Discordへ送信中: {fixed_master_csv.name} ...")
+            discord.send_file(fixed_master_csv, csv_desc)
+            await asyncio.sleep(2.0)
 
     # 5. クリーンアップ実行
+
     cleanup_binance_data_dir(data_dir, max_age_hours=24.0)
     log("\n✨ [Binance Japan] 全銘柄4ヶ月分データ取得＆2分割ZIP配信完了！")
 
