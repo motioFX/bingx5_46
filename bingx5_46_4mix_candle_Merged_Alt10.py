@@ -156,23 +156,19 @@ def normalize_symbol(symbol: str) -> str:
     return sym
 
 
-def is_crypto_symbol(symbol: str) -> bool:
-    """BingXの非暗号資産（TradFi: 為替FX、コモディティ、株価指数、個別株等）を除外し、純粋な暗号資産のみを判定"""
+def is_forex_symbol(symbol: str) -> bool:
+    """BingXの外国為替（FOREX）ペアを判定 (FOREXのみ除外対象、コモディティ・株価指数・個別株は許可)"""
     sym = normalize_symbol(symbol).upper()
     base = sym.replace("-USDT", "").replace("-USDC", "")
-    # BingXのTradFiは全てNCプレフィックス（NCFX: 為替FX, NCCO: コモディティ, NCSI: 指数, NCSK: 個別株）
-    if base.startswith("NC"):
-        return False
-    # その他TradFiキーワードおよび為替通貨ペアの除外
-    tradfi_keywords = (
-        "2USD", "2EUR", "2GBP", "2JPY", "EUR2", "GBP2", "USD2", "JPY2",
-        "AUD2", "CAD2", "CHF2", "NZD2", "GOLD", "SILVER", "XAU", "XAG",
-        "OIL", "WTI", "SP500", "SPX", "NASDAQ", "NIKKEI", "US30", "DJI",
-        "FOREX", "INDEX"
-    )
-    if any(k in base for k in tradfi_keywords):
-        return False
-    return True
+    # BingXの外国為替(FX)は全て NCFX プレフィックス
+    if base.startswith("NCFX") or "FOREX" in base:
+        return True
+    return False
+
+
+def is_crypto_symbol(symbol: str) -> bool:
+    """FOREX以外の取引対象銘柄（暗号資産、コモディティ、株価指数、個別株を含む）の判定"""
+    return not is_forex_symbol(symbol)
 
 
 def fetch_bingx_tickers(product_type: str = "SWAP", mode: str = "demo", max_retries: int = 5) -> List[dict]:
@@ -207,7 +203,7 @@ def fetch_bingx_tickers(product_type: str = "SWAP", mode: str = "demo", max_retr
                     sym = normalize_symbol(item.get("symbol", ""))
                     if not sym.endswith("-USDT"):
                         continue
-                    if not is_crypto_symbol(sym):
+                    if is_forex_symbol(sym):
                         continue
                     last_pr = float(item.get("lastPrice") or 0.0)
                     open_pr = float(item.get("openPrice") or 0.0)
@@ -1368,10 +1364,10 @@ async def main():
     # 4. 選定候補 Top 10 銘柄の OHLCV & Funding データ取得 (過去2ヶ月分: 60日間)・ファイル保存
     end_utc = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0)
     start_utc = end_utc - timedelta(days=60)
-    # 暗号資産取引高上位10銘柄 (FX・TradFiを除外)
+    # 取引高上位10銘柄 (FOREXのみ除外、コモディティ・株・指数は許容)
     crypto_tickers = [
         t for t in tickers 
-        if is_crypto_symbol(t.get("symbol", ""))
+        if not is_forex_symbol(t.get("symbol", ""))
     ]
     top10_vol_symbols = [t["symbol"] for t in crypto_tickers[:10]]
     if "BTC-USDT" not in top10_vol_symbols:

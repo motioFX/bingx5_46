@@ -92,23 +92,19 @@ def normalize_symbol(symbol: str) -> str:
     return sym
 
 
-def is_crypto_symbol(symbol: str) -> bool:
-    """BingXの非暗号資産（TradFi: 為替FX、コモディティ、株価指数、個別株等）を除外し、純粋な暗号資産のみを判定"""
+def is_forex_symbol(symbol: str) -> bool:
+    """BingXの外国為替（FOREX）ペアを判定 (FOREXのみ除外対象、コモディティ・株価指数・個別株は許可)"""
     sym = normalize_symbol(symbol).upper()
     base = sym.replace("-USDT", "").replace("-USDC", "")
-    # BingXのTradFiは全てNCプレフィックス（NCFX: 為替FX, NCCO: コモディティ, NCSI: 指数, NCSK: 個別株）
-    if base.startswith("NC"):
-        return False
-    # その他TradFiキーワードおよび為替通貨ペアの除外
-    tradfi_keywords = (
-        "2USD", "2EUR", "2GBP", "2JPY", "EUR2", "GBP2", "USD2", "JPY2",
-        "AUD2", "CAD2", "CHF2", "NZD2", "GOLD", "SILVER", "XAU", "XAG",
-        "OIL", "WTI", "SP500", "SPX", "NASDAQ", "NIKKEI", "US30", "DJI",
-        "FOREX", "INDEX"
-    )
-    if any(k in base for k in tradfi_keywords):
-        return False
-    return True
+    # BingXの外国為替(FX)は全て NCFX プレフィックス
+    if base.startswith("NCFX") or "FOREX" in base:
+        return True
+    return False
+
+
+def is_crypto_symbol(symbol: str) -> bool:
+    """FOREX以外の取引対象銘柄（暗号資産、コモディティ、株価指数、個別株を含む）の判定"""
+    return not is_forex_symbol(symbol)
 
 
 class send_discord:
@@ -176,8 +172,8 @@ def fetch_bingx_tickers(filter_non_crypto: bool = True) -> List[Dict[str, Any]]:
                         sym = normalize_symbol(it.get("symbol", ""))
                         if not sym.endswith("-USDT"):
                             continue
-                        # 非暗号資産（為替FX・株・コモディティ・インデックス等）の除外
-                        if filter_non_crypto and not is_crypto_symbol(sym):
+                        # 外国為替（FOREX）のみ除外（コモディティ・株・指数は許容）
+                        if filter_non_crypto and is_forex_symbol(sym):
                             continue
                         vol = float(it.get("quoteVolume") or 0.0)
                         last_px = float(it.get("lastPrice") or 0.0)
