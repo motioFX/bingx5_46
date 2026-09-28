@@ -23,6 +23,7 @@ import shutil
 import sys
 import time
 import zipfile
+import gc
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
