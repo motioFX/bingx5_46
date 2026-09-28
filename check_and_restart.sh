@@ -2,20 +2,24 @@
 
 # 監視対象のプロセス名
 PROCESS_NAME="bitbank5_46_1spot_limit.py"
+PYTHON_BIN="/home/ubuntu/pybot-env310/bin/python"
+BOT_DIR="/home/ubuntu/bitbank5_46"
 
 # プロセスが実行中かチェック
 if ! pgrep -f "$PROCESS_NAME" >/dev/null; then
     echo "$(date) - $PROCESS_NAME が停止していたため再起動します..."
-    nohup nice -n 10 python3 -u "$HOME/bitbank5_46/bitbank5_46_1spot_limit.py" --air --loop --skip-history > "$HOME/bitbank5_46/bot_output.log" 2>&1 &
+    cd "$BOT_DIR" || exit 1
+    nohup "$PYTHON_BIN" -u "$BOT_DIR/$PROCESS_NAME" --loop > "$BOT_DIR/bot_output.log" 2>&1 &
     
-    echo "30分間待機して起動後の生存判定を行います..."
-    sleep 1800
+    sleep 3
     if pgrep -f "$PROCESS_NAME" >/dev/null; then
-        echo "✅ [30分後判定: 成功] $PROCESS_NAME は30分後も正常に常駐稼働を継続しています。"
+        echo "✅ [自動復旧成功] $PROCESS_NAME を再起動しました。(PID: $(pgrep -f "$PROCESS_NAME" | tr '\n' ' '))"
     else
-        echo "❌ [30分後判定: 失敗] $PROCESS_NAME は起動後30分以内に異常終了しました。ログ末尾:"
-        tail -n 25 "$HOME/bitbank5_46/bot_output.log"
+        echo "❌ [自動復旧失敗] $PROCESS_NAME の再起動に失敗しました。ログ末尾:"
+        tail -n 25 "$BOT_DIR/bot_output.log"
     fi
 else
-    echo "🟢 [稼働中] $PROCESS_NAME は正常に実行されています。"
+    # 正常稼働中
+    exit 0
 fi
+

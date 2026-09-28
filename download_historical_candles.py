@@ -611,8 +611,10 @@ async def run_pipeline(
     # 4. 2分割ZIPファイルの作成とDiscord送信
     for part_name, period_str, sub_df, zip_path, inner_csv_name, usage_hint in parts:
         csv_buf = sub_df.to_csv(index=False).encode("utf-8")
-        with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as zf:
+        with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=1) as zf:
             zf.writestr(inner_csv_name, csv_buf)
+        del csv_buf
+        gc.collect()
 
         part_size_mb = zip_path.stat().st_size / (1024 * 1024)
         n_syms = len(sub_df["symbol"].unique())
