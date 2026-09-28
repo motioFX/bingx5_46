@@ -229,7 +229,22 @@ def cleanup_binance_data_dir(data_dir: Path, max_age_hours: float = 24.0, keep_l
             except Exception as e:
                 log(f"   ⚠️ 削除失敗 ({f.name}): {e}")
 
+    # 古い日時付きCSVのクリーンアップ
+    tagged_csvs = sorted(list(data_dir.glob("binance_japan_all_symbols_merged_*.csv")), key=lambda f: f.stat().st_mtime, reverse=True)
+    for f in tagged_csvs[keep_latest_n:]:
+        try:
+            stat = f.stat()
+            if stat.st_mtime < cutoff_ts:
+                size = stat.st_size
+                f.unlink()
+                deleted_files.append(f.name)
+                total_freed_bytes += size
+                log(f"   🗑️ 古いBinance日時付きCSV削除: {f.name} ({size / (1024 * 1024):.2f} MB)")
+        except Exception as e:
+            log(f"   ⚠️ 削除失敗 ({f.name}): {e}")
+
     freed_mb = total_freed_bytes / (1024 * 1024)
+
     return {"deleted_files": deleted_files, "freed_mb": freed_mb}
 
 
@@ -284,6 +299,11 @@ async def run_binance_pipeline(days: int = 120, to_discord: bool = True) -> None
     fixed_master_csv = data_dir / "binance_japan_all_symbols_merged.csv"
     master_df.to_csv(fixed_master_csv, index=False, encoding="utf-8")
     log(f"\n📄 Binance Japan 固定マスターCSV更新: {fixed_master_csv.name} ({len(master_df):,} 行)")
+
+    binance_tagged_csv = data_dir / f"binance_japan_all_symbols_merged_{now_jst}.csv"
+    master_df.to_csv(binance_tagged_csv, index=False, encoding="utf-8")
+    log(f"📄 Binance Japan 日時付き統合CSV保存: {binance_tagged_csv.name}")
+
 
     # 4. 期間2分割（前半・後半）
     unique_ts = sorted(master_df["timestamp"].unique())

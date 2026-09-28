@@ -386,17 +386,26 @@ def cleanup_data_dir(
                 log(f"   ⚠️ 削除失敗 ({f.name}): {e}")
 
     # 2. 古い一時CSVファイルのクリーンアップ (Data/ 直下の日時付きCSV等)
-    for f in data_dir.glob("bitbank_all_symbols_1h_*.csv"):
-        try:
-            stat = f.stat()
-            if stat.st_mtime < cutoff_ts:
-                size = stat.st_size
-                f.unlink()
-                deleted_files.append(f.name)
-                total_freed_bytes += size
-                log(f"   🗑️ 古い一時CSV削除: {f.name} ({size / (1024 * 1024):.2f} MB)")
-        except Exception as e:
-            log(f"   ⚠️ 削除失敗 ({f.name}): {e}")
+    csv_globs = [
+        "bitbank_all_symbols_1h_*.csv",
+        "bitbank_all_symbols_merged_*.csv",
+        "binance_japan_all_symbols_merged_*.csv"
+    ]
+    for pattern in csv_globs:
+        matched_csvs = sorted(list(data_dir.glob(pattern)), key=lambda f: f.stat().st_mtime, reverse=True)
+        # 最新1本は保護、2本目以降で24時間経過したものを削除
+        for f in matched_csvs[keep_latest_n:]:
+            try:
+                stat = f.stat()
+                if stat.st_mtime < cutoff_ts:
+                    size = stat.st_size
+                    f.unlink()
+                    deleted_files.append(f.name)
+                    total_freed_bytes += size
+                    log(f"   🗑️ 古い日時付きCSV削除: {f.name} ({size / (1024 * 1024):.2f} MB)")
+            except Exception as e:
+                log(f"   ⚠️ 削除失敗 ({f.name}): {e}")
+
 
     # 3. plots ディレクトリ配下の古いチャート画像のクリーンアップ
     plots_dir = data_dir / "plots"
@@ -570,10 +579,14 @@ async def run_pipeline(
 
     master_df = master_df.sort_values(by=['timestamp', 'symbol']).reset_index(drop=True)
 
-    # ① 固定名マスターCSVを最新化 (全期間) - Bitbank専用明示名 & 互換名
+    # ① 固定名マスターCSVを最新化 (全期間) - Bitbank専用明示名 & 日時付き & 互換名
     bitbank_master_csv = data_dir / "bitbank_all_symbols_merged.csv"
     master_df.to_csv(bitbank_master_csv, index=False, encoding="utf-8")
     log(f"\n📄 [Bitbank] 取引所別マスターCSVを更新しました: {bitbank_master_csv.name} ({len(master_df):,} 行)")
+
+    bitbank_tagged_csv = data_dir / f"bitbank_all_symbols_merged_{now_jst}.csv"
+    master_df.to_csv(bitbank_tagged_csv, index=False, encoding="utf-8")
+    log(f"📄 [Bitbank] 日時付き統合CSVを保存しました: {bitbank_tagged_csv.name}")
 
     fixed_master_csv = data_dir / "historical_all_symbols_merged.csv"
     master_df.to_csv(fixed_master_csv, index=False, encoding="utf-8")
