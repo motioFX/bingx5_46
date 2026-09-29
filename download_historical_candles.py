@@ -658,9 +658,11 @@ async def run_pipeline(
         n_syms = len(sub_df["symbol"].unique())
         log(f"📦 {part_name} ZIP作成完了: {zip_path.name} ({len(sub_df):,} 行 / {part_size_mb:.2f} MB / 全{n_syms}銘柄)")
 
-        if not skip_upload:
+        # 直近データ (recent) のみ Discord 送信 (past はローカル作成のみ、素のCSVは送信しない)
+        is_recent_part = "recent" in zip_path.name.lower()
+        if not skip_upload and is_recent_part:
             desc = (
-                f"📦 **[Bitbank 全銘柄ヒストリー統合データ (1H)] {part_name}** ({ts_jst_str})\n"
+                f"📦 **[Bitbank 全銘柄ヒストリー統合データ (1H)] 直近データ** ({ts_jst_str})\n"
                 f"• ファイル名: `{zip_path.name}`\n"
                 f"• 期間: `{period_str}` (全{len(master_df):,}行中 {len(sub_df):,}行)\n"
                 f"• 対象: `全 {n_syms} 銘柄` (JPY現物全銘柄収録)\n"
@@ -675,70 +677,67 @@ async def run_pipeline(
                 log(f"   ⚠️ Discord 送信に失敗しました: {zip_path.name}")
             time.sleep(2.0)
 
-    # ③ 取引所別 単体統合マスターCSVもDiscordへ送信 (20MB未満)
-    if not skip_upload and bitbank_master_csv.exists():
-        csv_size_mb = bitbank_master_csv.stat().st_size / (1024 * 1024)
-        if csv_size_mb < 20.0:
-            csv_desc = (
-                f"📄 **[Bitbank 全47銘柄 統合マスターCSV]** ({ts_jst_str})\n"
-                f"• ファイル名: `{bitbank_master_csv.name}`\n"
-                f"• 期間: 過去{days}日分 (全{len(master_df):,}行 / 全{len(target_symbols)}銘柄)\n"
-                f"• ファイルサイズ: `{csv_size_mb:.2f} MB`\n"
-                f"• 用途: 取引所別 単一CSV分析・スプレッドシート・Python一括読み込み用"
-            )
-            log(f"📤 Discord へ送信中: {bitbank_master_csv.name} ...")
-            if discord.send_file(bitbank_master_csv, description=csv_desc):
-                log(f"   ✅ Discord 送信完了: {bitbank_master_csv.name}")
-            time.sleep(2.0)
-
     # 5. ノーマライズ比較チャート生成 & 送信
     if not skip_charts:
-        log("\n📊 ノーマライズ比較チャートを生成中 (Bitbank 11銘柄 ＋ Binance NEAR)...")
-        chart_symbols = list(CHART_SYMBOLS)
-
-        chart_dfs = {}
-        for sym in chart_symbols:
-            csv_path = candles_dir / f"{sym}_1h.csv"
-            # NEAR の場合は Binance Japan ディレクトリまたは API を参照
-            if sym in ("near_jpy", "nearjpy"):
-                binance_dir = data_dir / "historical_candles_binance"
-                alt_path = binance_dir / "nearjpy_1h.csv"
-                if alt_path.exists():
-                    csv_path = alt_path
-                else:
-                    try:
-                        from download_binance_candles import fetch_symbol_klines
-                        df_near = fetch_symbol_klines("NEARJPY", days=35)
-                        if not df_near.empty:
-                            binance_dir.mkdir(parents=True, exist_ok=True)
-                            df_near.to_csv(alt_path, index=False, encoding="utf-8")
-                            csv_path = alt_path
-                    except Exception as e:
-                        log(f"   ⚠️ NEAR データ取得エラー: {e}")
-
-            if csv_path.exists():
-                try:
-                    df = pd.read_csv(csv_path)
-                    df['timestamp'] = pd.to_datetime(df['timestamp'])
-                    chart_dfs[sym] = df
-                except Exception:
-                    pass
-
-        chart_paths = generate_normalized_charts(chart_dfs, chart_symbols, plots_dir, timestamp_tag=now_jst)
-        for cp in chart_paths:
-            if not skip_upload:
-                desc = f"📈 **[主要銘柄 リターン比較 (Bitbank + Binance NEAR)]** `{cp.name}`"
-                if discord.send_file(cp, description=desc):
-                    record_file_uploaded(cp)
-                    log(f"   ✅ チャート Discord 送信完了: {cp.name}")
-            else:
-                log(f"   チャート生成完了: {cp.name}")
+        await create_and_send_normalized_charts(skip_upload=skip_upload, timestamp_tag=now_jst)
 
     # 6. 古いZIP・チャート画像のクリーンアップ (直近24時間分のみ保持)
     log("\n🧹 不要な古いZIPファイルおよびチャート画像の自動クリーンアップを実行中 (24時間保持)...")
     cleanup_data_dir(data_dir=data_dir, max_age_hours=24.0)
 
     log("\n🎉 [Bitbank 5.46] 全銘柄データ取得＆統合CSV保存・送信パイプラインが完了しました！")
+
+
+async def create_and_send_normalized_charts(skip_upload: bool = False, timestamp_tag: Optional[str] = None) -> List[Path]:
+    """主要銘柄 (Bitbank 11銘柄 ＋ Binance NEAR) のノーマライズ比較チャートを生成・Discord送信"""
+    data_dir = Path(__file__).resolve().parent / "Data"
+    candles_dir = data_dir / "historical_candles"
+    plots_dir = data_dir / "plots"
+    now_tag = timestamp_tag or datetime.now(JST).strftime("%Y%m%d_%H%M%S")
+    discord = send_discord()
+
+    log("\n📊 ノーマライズ比較チャートを生成中 (Bitbank 11銘柄 ＋ Binance NEAR)...")
+    chart_symbols = list(CHART_SYMBOLS)
+
+    chart_dfs = {}
+    for sym in chart_symbols:
+        csv_path = candles_dir / f"{sym}_1h.csv"
+        # NEAR の場合は Binance Japan ディレクトリまたは API を参照
+        if sym in ("near_jpy", "nearjpy"):
+            binance_dir = data_dir / "historical_candles_binance"
+            alt_path = binance_dir / "nearjpy_1h.csv"
+            if alt_path.exists():
+                csv_path = alt_path
+            else:
+                try:
+                    from download_binance_candles import fetch_symbol_klines
+                    df_near = fetch_symbol_klines("NEARJPY", days=35)
+                    if not df_near.empty:
+                        binance_dir.mkdir(parents=True, exist_ok=True)
+                        df_near.to_csv(alt_path, index=False, encoding="utf-8")
+                        csv_path = alt_path
+                except Exception as e:
+                    log(f"   ⚠️ NEAR データ取得エラー: {e}")
+
+        if csv_path.exists():
+            try:
+                df = pd.read_csv(csv_path)
+                df['timestamp'] = pd.to_datetime(df['timestamp'])
+                chart_dfs[sym] = df
+            except Exception:
+                pass
+
+    chart_paths = generate_normalized_charts(chart_dfs, chart_symbols, plots_dir, timestamp_tag=now_tag)
+    for cp in chart_paths:
+        if not skip_upload:
+            desc = f"📈 **[主要銘柄 リターン比較 (Bitbank + Binance NEAR)]** `{cp.name}`"
+            if discord.send_file(cp, description=desc):
+                record_file_uploaded(cp)
+                log(f"   ✅ チャート Discord 送信完了: {cp.name}")
+        else:
+            log(f"   チャート生成完了: {cp.name}")
+
+    return chart_paths
 
 
 def main():

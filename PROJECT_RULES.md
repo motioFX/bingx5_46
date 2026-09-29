@@ -2,7 +2,7 @@
 
 ## 1. 全銘柄データダウンロード規約（ヒストリカルデータ / hyper-rigid-bot準拠）
 
-### 【規約】4ヶ月分（120日）データ取得・期間2分割アーカイブ保存＆Discord送信（2取引所対応）
+### 【規約】4ヶ月分（120日）データ取得・直近ZIPアーカイブ保存＆Discord送信（2取引所対応）
 * **対象スクリプト**: 
   - Bitbank: `download_historical_candles.py`
   - Binance Japan: `download_binance_candles.py`
@@ -11,27 +11,33 @@
   1. **全銘柄4ヶ月分（120日分）の完全取得**:
      - **Bitbank**: 現物 JPY 全47銘柄（`btc_jpy`, `eth_jpy`, `xrp_jpy`, `sol_jpy` ... 全ペア）の過去120日分の1時間足OHLCVデータを取得。ローカルCSV（`Data/historical_candles/{symbol}_1h.csv`）に差分蓄積。
      - **Binance Japan**: 現物 JPY 全27銘柄（`ADAJPY`, `BTCJPY`, `ETHJPY`, `NEARJPY`, `SOLJPY` ... 全現物JPYペア）の過去120日分の1時間足OHLCVデータを取得。ローカルCSV（`Data/historical_candles_binance/{symbol}_1h.csv`）に蓄積。
-  2. **期間別2分割アーカイブ生成（100%完全収録）**:
-     - タイムスタンプの中間点でデータを2分割し、全銘柄を網羅した2本の独立ZIPアーカイブを生成すること：
+  2. **期間別2分割アーカイブ生成（直近ZIPのみDiscord送信・素のCSV廃止）**:
+     - タイムスタンプの中間点でデータを2分割し、全銘柄を網羅した2本の独立ZIPアーカイブを生成：
        - **Part 1/2 【過去データ (前半60日)】**:
          - Bitbank: `Data/bitbank_all_symbols_past_{YYYYMMDD_HHMMSS}.zip`
          - Binance Japan: `Data/binance_japan_all_symbols_past_{YYYYMMDD_HHMMSS}.zip`
-         - 用途: 過去ヒストリー検証・長期バックテスト用
+         - 用途: 過去ヒストリー検証・長期バックテスト用（※ローカル作成・保管のみ）
        - **Part 2/2 【直近データ (後半60日)】**:
          - Bitbank: `Data/bitbank_all_symbols_recent_{YYYYMMDD_HHMMSS}.zip`
          - Binance Japan: `Data/binance_japan_all_symbols_recent_{YYYYMMDD_HHMMSS}.zip`
          - 用途: 直近相場分析・**スマホGemini Pro（Google AI Pro）丸ごと投入用（全銘柄入り・約95万トークンで超快適・高精度動作）**
-     - 全期間マスターCSV（`Data/historical_all_symbols_merged.csv`, `Data/binance_japan_all_symbols_merged.csv`）もローカル検証用に最新化保存すること。
+     - 全期間マスターCSV（`Data/historical_all_symbols_merged.csv`, `Data/binance_japan_all_symbols_merged.csv`）はローカル検証用に最新化保存。
+     - **Discord送信は直近ZIP（Part 2/2）のみを送信し、素のCSVファイルは送信しない（ZIP内にCSV収録のため）**。
   3. **レートリミット対策 ＆ CPU負荷極小化設計**:
      - Binance Japan のデータ取得時は、各銘柄間に `0.3秒`、ページネーション間に `0.05秒` のウェイトを挿入し、逐次（シングルスレッド）で丁寧に取得する。
      - ZIP圧縮は超高速・低負荷圧縮（圧縮レベル最軽量）を採用し、VPSのCPUクレジット消費やCPUスパイクを恒久的に防ぐ。
-  4. **Discord送信仕様（環境自動判別）**:
+  4. **Discord送信仕様 ＆ 厳格な送信順序**:
+     - 送信順序:
+       1. **Bitbank 全銘柄 直近ZIP** (`bitbank_all_symbols_recent_*.zip`)
+       2. **Binance Japan 全銘柄 直近ZIP** (`binance_japan_all_symbols_recent_*.zip`)
+       3. **ノーマライズ比較チャート** (30d / 10d / 5d 主要12銘柄)
+       4. **口座状況** (全保有暗号資産 総合ポジション監査)
      - VPS（Linux環境）稼働時: **`real1_bitbank`** チャンネルへ自動出力
      - Windows（win32環境）テスト時: **`test4_test`** チャンネルへ自動出力
   5. **データファイルの最新保持・自動クリーンアップ規約**:
-     - 生成されたZIPファイル（BitbankおよびBinance Japanの `past`, `recent`）およびチャート画像は**「常に最新のものだけを維持する」**ことを厳守する。
+     - 生成されたZIPファイルおよびチャート画像は**「常に最新のものだけを維持する」**ことを厳守する。
      - Discord送信完了後の保管期間は **直近24時間（最大1日分）** とし、24時間を超過した古いZIPアーカイブおよび画像ファイルは自動削除（クリーンアップ）する。
-     - 最新の1セット分（past/recent各1本）は経過時間に関わらず常時保護する。
+     - 最新の1セット分（recent各1本等）は経過時間に関わらず常時保護する。
 
 ---
 
@@ -69,7 +75,7 @@
   - **Bitbank**: 保有中の全暗号資産（現物 RENDER, BTC 等）の残高、約定履歴からの加重平均建値、現在価格、評価額、含み損益、未約定指値（拘束JPY）。
   - **Binance Japan**: 保有中の全暗号資産（現物 NEAR 等）の残高、約定履歴からの加重平均建値、現在価格、評価額、含み損益、未約定指値（拘束JPY）。
 * **通知仕様**:
-  - 取引所ごとのJPY現金残高、保有暗号資産の建値/現値/損益、未約定指値の内訳、および全口座の純資産総額（現金＋現物評価額）を美しくフォーマットしてターミナルログおよびDiscordへ自動報告する。
+  - 縦揃えの美しい箇条書きスタイル（緑色 / ANSI Green）で、各銘柄の保有数量、平均取得単価、現在価格、評価額、投資元本、含み損益を美しくフォーマットしてターミナルログおよびDiscordへ自動報告する。
 * **現物長期保有BTCの隔離・保護**:
   - 口座内の長期保有現物BTC（0.1434 BTC等、基準建値 1,279万円）は、ボットの売買から完全に隔離・保護する。
 
