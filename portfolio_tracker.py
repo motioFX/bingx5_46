@@ -356,68 +356,79 @@ async def report_all_positions(
     grand_total_equity = total_jpy_equity + total_crypto_val
 
     # ---------- A. Bitbank セクション ----------
-    lines.append("\n🔶 [Bitbank 口座]")
+    lines.append("\n◆ [Bitbank 口座]")
     bb_jpy = bb_res["jpy"]
-    lines.append(f"  ・JPY残高: {bb_jpy['total']:,.0f} 円 (利用可能: {bb_jpy['free']:,.0f} 円 | 指値拘束: {bb_jpy['locked']:,.0f} 円)")
+    lines.append(f"  JPY 現金残高 : {bb_jpy['total']:,.0f} 円 (利用可能: {bb_jpy['free']:,.0f} 円 | 指値拘束: {bb_jpy['locked']:,.0f} 円)")
     if bb_res["assets"]:
         for a in bb_res["assets"]:
             pnl_icon = "🟢" if a["pnl"] >= 0 else "🔴"
-            px_fmt = f"{a['current_price']:,.3f}円" if a['current_price'] < 1000 else f"{a['current_price']:,.0f}円"
-            entry_fmt = f"{a['avg_entry']:,.3f}円" if a['avg_entry'] < 1000 else f"{a['avg_entry']:,.0f}円"
+            sign = "+" if a["pnl"] >= 0 else ""
+            px_fmt = f"{a['current_price']:,.3f} 円" if a['current_price'] < 1000 else f"{a['current_price']:,.0f} 円"
+            entry_fmt = f"{a['avg_entry']:,.3f} 円" if a['avg_entry'] < 1000 else f"{a['avg_entry']:,.0f} 円"
             asset_label = f"{a['asset']} (💎長期保有)" if a['asset'] == "BTC" else a['asset']
-            lines.append(
-                f"  ・{asset_label}: {a['amount']:,.4f} 枚 | 建値: {entry_fmt} -> 現値: {px_fmt} | 評価額: {a['valuation']:,.0f}円 | 損益: {a['pnl']:+,.0f}円 ({a['pnl_pct']:+.2f}%) {pnl_icon}"
-            )
+            unit_str = "BTC" if a['asset'] == "BTC" else "枚"
+            cost_val = a.get("cost", a["amount"] * a["avg_entry"])
+
+            lines.append(f"\n  【{asset_label}】")
+            lines.append(f"    保有数量     : {a['amount']:,.4f} {unit_str}")
+            lines.append(f"    平均取得単価 : {entry_fmt}")
+            lines.append(f"    現在価格     : {px_fmt}")
+            lines.append(f"    評価額       : {a['valuation']:,.0f} 円")
+            lines.append(f"    投資元本     : {cost_val:,.0f} 円")
+            lines.append(f"    含み損益     : {sign}{a['pnl']:,.0f} 円 ({sign}{a['pnl_pct']:.2f}%) {pnl_icon}")
     else:
-        lines.append("  ・保有暗号資産なし")
+        lines.append("  保有暗号資産 : なし")
 
     if bb_res["orders"]:
-        lines.append(f"  ・未約定指値: {len(bb_res['orders'])} 件")
+        lines.append(f"\n  未約定指値   : {len(bb_res['orders'])} 件")
         for o in bb_res["orders"]:
             val = o["price"] * o["remaining_amount"]
-            lines.append(f"     └ {o['pair'].upper()} {o['side']} 指値: {o['price']:,.1f}円 | 数量: {o['remaining_amount']:,.1f} | 拘束: {val:,.0f}円")
+            lines.append(f"    └ {o['pair'].upper()} {o['side']} 指値: {o['price']:,.1f} 円 | 数量: {o['remaining_amount']:,.4f} | 拘束: {val:,.0f} 円")
     else:
-        lines.append("  ・未約定指値なし")
+        lines.append("\n  未約定指値   : なし")
 
     # ---------- B. Binance Japan セクション ----------
-    lines.append("\n🔶 [Binance Japan 口座]")
+    lines.append("\n◆ [Binance Japan 口座]")
     bin_jpy = binance_res["jpy"]
-    lines.append(f"  ・JPY残高: {bin_jpy['total']:,.0f} 円 (利用可能: {bin_jpy['free']:,.0f} 円 | 指値拘束: {bin_jpy['locked']:,.0f} 円)")
+    lines.append(f"  JPY 現金残高 : {bin_jpy['total']:,.0f} 円 (利用可能: {bin_jpy['free']:,.0f} 円 | 指値拘束: {bin_jpy['locked']:,.0f} 円)")
     if binance_res["assets"]:
         for a in binance_res["assets"]:
             pnl_icon = "🟢" if a["pnl"] >= 0 else "🔴"
-            px_fmt = f"{a['current_price']:,.2f}円" if a['current_price'] < 1000 else f"{a['current_price']:,.0f}円"
-            entry_fmt = f"{a['avg_entry']:,.2f}円" if a['avg_entry'] < 1000 else f"{a['avg_entry']:,.0f}円"
-            lines.append(
-                f"  ・{a['asset']}: {a['amount']:,.4f} 枚 | 建値: {entry_fmt} -> 現値: {px_fmt} | 評価額: {a['valuation']:,.0f}円 | 損益: {a['pnl']:+,.0f}円 ({a['pnl_pct']:+.2f}%) {pnl_icon}"
-            )
+            sign = "+" if a["pnl"] >= 0 else ""
+            px_fmt = f"{a['current_price']:,.2f} 円" if a['current_price'] < 1000 else f"{a['current_price']:,.0f} 円"
+            entry_fmt = f"{a['avg_entry']:,.2f} 円" if a['avg_entry'] < 1000 else f"{a['avg_entry']:,.0f} 円"
+            cost_val = a.get("cost", a["amount"] * a["avg_entry"])
+            unit_str = a['asset']
+
+            lines.append(f"\n  【{a['asset']}】")
+            lines.append(f"    保有数量     : {a['amount']:,.4f} {unit_str}")
+            lines.append(f"    平均取得単価 : {entry_fmt}")
+            lines.append(f"    現在価格     : {px_fmt}")
+            lines.append(f"    評価額       : {a['valuation']:,.0f} 円")
+            lines.append(f"    投資元本     : {cost_val:,.0f} 円")
+            lines.append(f"    含み損益     : {sign}{a['pnl']:,.0f} 円 ({sign}{a['pnl_pct']:.2f}%) {pnl_icon}")
     else:
-        lines.append("  ・保有暗号資産なし")
+        lines.append("  保有暗号資産 : なし")
 
     if binance_res["orders"]:
-        lines.append(f"  ・未約定指値: {len(binance_res['orders'])} 件")
+        lines.append(f"\n  未約定指値   : {len(binance_res['orders'])} 件")
         for o in binance_res["orders"]:
             val = o["price"] * o["remaining"]
-            lines.append(f"     └ {o['symbol']} {o['side']} 指値: {o['price']:,.1f}円 | 数量: {o['remaining']:,.1f} | 拘束: {val:,.0f}円")
+            lines.append(f"    └ {o['symbol']} {o['side']} 指値: {o['price']:,.1f} 円 | 数量: {o['remaining']:,.4f} | 拘束: {val:,.0f} 円")
     else:
-        lines.append("  ・未約定指値なし")
+        lines.append("\n  未約定指値   : なし")
 
     # ---------- C. 総合総括 ----------
     pnl_overall_icon = "🟢" if total_crypto_pnl >= 0 else "🔴"
-    lines.append("--------------------------------------------------")
-    lines.append(f"💰 暗号資産 評価総額: 約 {total_crypto_val:,.0f} 円")
-    lines.append(f"📊 暗号資産 含み損益計: 約 {total_crypto_pnl:+,.0f} 円 {pnl_overall_icon}")
-    lines.append(f"🏦 全口座 純資産総額 (現金+現物): 約 {grand_total_equity:,.0f} 円")
+    overall_sign = "+" if total_crypto_pnl >= 0 else ""
+    lines.append("\n--------------------------------------------------")
+    lines.append(f"💰 暗号資産 評価総額 : 約 {total_crypto_val:,.0f} 円")
+    lines.append(f"📊 暗号資産 含み損益 : 約 {overall_sign}{total_crypto_pnl:,.0f} 円 {pnl_overall_icon}")
+    lines.append(f"🏦 全口座 純資産総額 : 約 {grand_total_equity:,.0f} 円 (現金 + 現物)")
     lines.append("==================================================")
 
     report_text = "\n".join(lines)
     discord.print_log(report_text)
-
-    if to_discord:
-        try:
-            discord.send(report_text)
-        except Exception:
-            pass
 
     return report_text
 

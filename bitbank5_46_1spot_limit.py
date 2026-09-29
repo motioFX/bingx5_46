@@ -1232,13 +1232,6 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
     except Exception as port_err:
         discord.print_log(f"⚠️ 総合ポジション監査エラー: {port_err}")
 
-    # 💎 起動時: 長期保有BTCの取得単価・現在価格・含み損益レポート
-    try:
-        from long_term_btc_tracker import report_long_term_btc
-        await report_long_term_btc(mode=mode, to_discord=True, compact=False)
-    except Exception as btc_err:
-        discord.print_log(f"⚠️ 長期BTCレポートエラー: {btc_err}")
-
     logic = logicinstance()
     last_screening_slot = (datetime.now(JST).date(), datetime.now(JST).hour)
     cycle_count = 0
@@ -1323,12 +1316,6 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                 await report_all_positions(mode=mode, to_discord=True, header_title=f"🏦 【定期選定時 ({now_jst.hour:02d}:00 JST) 全保有暗号資産 総合ポジション監査】")
             except Exception as port_err:
                 discord.print_log(f"⚠️ 総合ポジション監査エラー: {port_err}")
-
-            try:
-                from long_term_btc_tracker import report_long_term_btc
-                await report_long_term_btc(mode=mode, to_discord=True, compact=False)
-            except Exception as btc_err:
-                discord.print_log(f"⚠️ 長期BTCレポートエラー: {btc_err}")
 
             continue
 
