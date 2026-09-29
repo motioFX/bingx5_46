@@ -310,6 +310,7 @@ class api_bitbank_helper:
             'buy_count': 0,
             'sell_count': 0,
             'margin_mode': 'spot',
+            'entry_time': None,
         }
 
         if not self.api_key or self.api_key.startswith("YOUR_"):
@@ -351,6 +352,14 @@ class api_bitbank_helper:
                                 break
                         if cum_amount > 0:
                             position['buy_pos'] = float(np.round(weighted_sum / cum_amount, 2))
+                        
+                        # 最新の買い約定時刻を保持
+                        latest_exec = buy_trades[0].get("executed_at")
+                        if latest_exec:
+                            try:
+                                position['entry_time'] = datetime.fromtimestamp(float(latest_exec) / 1000.0, tz=timezone.utc).isoformat()
+                            except Exception:
+                                position['entry_time'] = str(latest_exec)
 
                 # ステージ / ピラミッディング計算
                 if lot_size and lot_size > 0:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 import json
 import os
+from typing import Optional, Union, List, Dict, Any
 from datetime import datetime, timezone
 from pathlib import Path
 import numpy as np
@@ -475,6 +476,7 @@ def plot_exit_chart(
     side: str = "LONG",
     whale_signal: str = "",
     lookback_bars: int = 48,
+    entry_time: Optional[Union[datetime, str, pd.Timestamp]] = None,
 ) -> Path:
     """決済(Exit/Close)時点のローソク足、Volume Profile履歴バンド、エントリー＆エグジット軌跡を描画して保存する"""
     if df is None or df.empty:
@@ -483,33 +485,28 @@ def plot_exit_chart(
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     out_file = DATA_DIR / f"exit_chart_{symbol}.png"
 
-    # Volume Profile カラムがなければ計算付与
     work_df = df.copy()
-    if not all(col in work_df.columns for col in ['VAH', 'VAL', 'POC']):
-        work_df = compute_volume_profile_bands(work_df, period=lookback_bars)
 
-    plot_df = work_df.tail(lookback_bars).reset_index(drop=True)
-    if len(plot_df) == 0:
-        return None
-
-    # 日時処理
-    if "timestamp" in plot_df.columns:
-        plot_df["dt"] = pd.to_datetime(plot_df["timestamp"])
-    elif "date" in plot_df.columns:
-        plot_df["dt"] = pd.to_datetime(plot_df["date"])
+    # 全期間の日時処理
+    if "timestamp" in work_df.columns:
+        work_df["dt"] = pd.to_datetime(work_df["timestamp"])
+    elif "date" in work_df.columns:
+        work_df["dt"] = pd.to_datetime(work_df["date"])
     else:
-        plot_df["dt"] = pd.date_range(end=pd.Timestamp.now(), periods=len(plot_df), freq="1h")
+        work_df["dt"] = pd.date_range(end=pd.Timestamp.now(), periods=len(work_df), freq="1h")
 
-    if plot_df["dt"].dt.tz is None:
-        plot_df["dt"] = plot_df["dt"].dt.tz_localize("UTC").dt.tz_convert("Asia/Tokyo")
+    if work_df["dt"].dt.tz is None:
+        work_df["dt"] = work_df["dt"].dt.tz_localize("UTC").dt.tz_convert("Asia/Tokyo")
     else:
-        plot_df["dt"] = plot_df["dt"].dt.tz_convert("Asia/Tokyo")
+        work_df["dt"] = work_df["dt"].dt.tz_convert("Asia/Tokyo")
 
-    # エントリー価格と正確なエントリー日時の検索 (指定されていない場合、または正確なバー位置特定)
+    # 1. エントリートレード情報の検索（シンボル正規化照合）
+    norm_sym = str(symbol).lower().replace("_", "").replace("jpy", "")
     trades = load_real_trades()
     entry_trade = None
     for t in reversed(trades):
-        if t.get("symbol") == symbol and t.get("action") == "ENTRY":
+        t_sym = str(t.get("symbol", "")).lower().replace("_", "").replace("jpy", "")
+        if (t_sym == norm_sym or t.get("symbol") == symbol) and t.get("action") == "ENTRY":
             entry_trade = t
             break
 
@@ -517,27 +514,94 @@ def plot_exit_chart(
         entry_price = float(entry_trade.get("price", 0))
 
     if entry_price is None or entry_price <= 0:
-        entry_price = float(plot_df["open"].iloc[max(0, len(plot_df) - 5)])
+        entry_price = float(work_df["close"].iloc[max(0, len(work_df) - 5)])
 
-    # 正確なエントリーバーインデックスの特定
-    exit_idx = len(plot_df) - 1
-    entry_idx = max(0, exit_idx - 4)  # デフォルトフォールバック
+    # 2. 正確なエントリー足（グローバルインデックス）の多段階特定
+    total_bars = len(work_df)
+    exit_global_idx = total_bars - 1
+    matched_entry_global_idx = None
 
-    if entry_trade and "timestamp" in entry_trade:
+    # Step A: 明示的な日時 (entry_time または entry_trade['timestamp']) からの特定
+    target_dt = None
+    if entry_time is not None:
+        target_dt = pd.to_datetime(entry_time)
+    elif entry_trade and "timestamp" in entry_trade:
+        target_dt = pd.to_datetime(entry_trade["timestamp"])
+
+    if target_dt is not None:
         try:
-            entry_dt = pd.to_datetime(entry_trade["timestamp"])
-            if entry_dt.tzinfo is None:
-                entry_dt = entry_dt.tz_localize("UTC").tz_convert("Asia/Tokyo")
+            if target_dt.tzinfo is None:
+                target_dt = target_dt.tz_localize("UTC").tz_convert("Asia/Tokyo")
             else:
-                entry_dt = entry_dt.tz_convert("Asia/Tokyo")
-            
-            # 最も時刻が近いバーを検索
-            time_diffs = (plot_df["dt"] - entry_dt).abs()
+                target_dt = target_dt.tz_convert("Asia/Tokyo")
+            time_diffs = (work_df["dt"] - target_dt).abs()
             nearest_idx = int(time_diffs.argmin())
-            if nearest_idx < exit_idx:
-                entry_idx = nearest_idx
+            if nearest_idx < exit_global_idx:
+                matched_entry_global_idx = nearest_idx
         except Exception:
             pass
+
+    # Step B: 日時で特定できなかった場合、または価格が大きく乖離している場合、
+    # 過去のローソク足から entry_price を含んでいた足（low <= entry_price <= high）を直近から遡って探索
+    need_price_matching = (matched_entry_global_idx is None)
+    if matched_entry_global_idx is not None:
+        cand_row = work_df.iloc[matched_entry_global_idx]
+        cand_lo = float(cand_row.get("low", 0.0))
+        cand_hi = float(cand_row.get("high", 0.0))
+        if cand_lo > 0 and cand_hi > 0:
+            # もしエントリー足と判定された足の価格帯から 3% 以上外れている場合は価格探索にフォールバック
+            if entry_price < cand_lo * 0.97 or entry_price > cand_hi * 1.03:
+                need_price_matching = True
+
+    if need_price_matching and entry_price > 0:
+        # 直近の1本前（exit_global_idx - 1）から過去最大120本を遡って探索
+        search_start = max(0, exit_global_idx - 120)
+        found_idx = None
+        for idx in range(exit_global_idx - 1, search_start - 1, -1):
+            row = work_df.iloc[idx]
+            lo = float(row.get("low", 0.0))
+            hi = float(row.get("high", 0.0))
+            if lo <= entry_price <= hi:
+                found_idx = idx
+                break
+
+        if found_idx is not None:
+            matched_entry_global_idx = found_idx
+        else:
+            # 完全一致のヒゲ範囲がない場合、entry_price に最も近い過去バーを選択
+            sub_df = work_df.iloc[search_start:exit_global_idx]
+            if not sub_df.empty:
+                dist = ((sub_df["high"] + sub_df["low"]) / 2.0 - entry_price).abs()
+                matched_entry_global_idx = int(dist.idxmin())
+
+    # 最終フォールバック
+    if matched_entry_global_idx is None or matched_entry_global_idx >= exit_global_idx:
+        matched_entry_global_idx = max(0, exit_global_idx - 4)
+
+    # 3. エントリー足からエグジット足までが綺麗に収まるよう表示バー数を動的拡張
+    bars_ago = exit_global_idx - matched_entry_global_idx
+    actual_lookback = max(lookback_bars, min(total_bars, bars_ago + 16))
+    actual_lookback = min(120, actual_lookback)  # チャートの可読性維持のため最大120本
+
+    # Volume Profile カラムの計算（動的表示期間対応）
+    if not all(col in work_df.columns for col in ['VAH', 'VAL', 'POC']):
+        work_df = compute_volume_profile_bands(work_df, period=actual_lookback)
+
+    plot_df = work_df.tail(actual_lookback).reset_index(drop=True)
+    if len(plot_df) == 0:
+        return None
+
+    # ローカルプロット用インデックス
+    exit_idx = len(plot_df) - 1
+    entry_idx = max(0, exit_idx - bars_ago)
+
+    # 4. エントリープロット価格の吸着調整（ローソク足の実体・ヒゲに美しくフィット）
+    entry_bar = plot_df.iloc[entry_idx]
+    entry_bar_lo = float(entry_bar["low"])
+    entry_bar_hi = float(entry_bar["high"])
+    
+    # マーカー表示用のY座標（ローソク足の範囲内に確実に乗るよう微調整）
+    clamped_entry_price = min(max(entry_price, entry_bar_lo), entry_bar_hi) if (entry_bar_lo > 0 and entry_bar_hi > 0) else entry_price
 
     # 収益率の計算
     if pnl_pct is None and entry_price > 0:
@@ -558,15 +622,15 @@ def plot_exit_chart(
     title_entry_str = format_jpy_price(entry_price)
     title_exit_str = format_jpy_price(exit_price)
 
-    # エントリーマーカー
-    ax.scatter([entry_idx], [entry_price], color="#00e676", s=160, marker="^", edgecolors="#ffffff", linewidths=1.5, zorder=6, label=f"Entry @ {title_entry_str}")
+    # エントリーマーカー（ローソク足上に確実に吸着）
+    ax.scatter([entry_idx], [clamped_entry_price], color="#00e676", s=160, marker="^", edgecolors="#ffffff", linewidths=1.5, zorder=6, label=f"Entry @ {title_entry_str}")
     # エグジットマーカー
     exit_marker_color = "#26a69a" if pnl >= 0 else "#ef5350"
     ax.scatter([exit_idx], [exit_price], color=exit_marker_color, s=160, marker="v", edgecolors="#ffffff", linewidths=1.5, zorder=6, label=f"Exit @ {title_exit_str}")
 
     # トレード軌跡（破線ライン）
     line_color = "#26a69a" if pnl >= 0 else "#ef5350"
-    ax.plot([entry_idx, exit_idx], [entry_price, exit_price], color=line_color, linestyle=":", linewidth=2.0, alpha=0.9, zorder=5)
+    ax.plot([entry_idx, exit_idx], [clamped_entry_price, exit_price], color=line_color, linestyle=":", linewidth=2.0, alpha=0.9, zorder=5)
 
     # 決済吹き出しアノテーション（右側余白スペースに配置し、過去のローソク足を一切隠さない）
     pnl_sign = "+" if pnl > 0 else ""
@@ -608,10 +672,27 @@ def plot_exit_chart(
         pad=15
     )
 
-    ax.set_ylabel("Price [JPY]", fontsize=10, color="#b2b5be")
-    # Y軸マージンを少し確保
-    ax.margins(y=0.08)
-    ax.legend(loc="upper left", facecolor="#1e222d", edgecolor="#363c4e", fontsize=8, labelcolor="#ffffff", framealpha=0.75)
+    # エントリー吹き出しアノテーション（ローソク足の上に綺麗に注記）
+    y_range = ax.get_ylim()[1] - ax.get_ylim()[0]
+    ax.annotate(
+        f"▲ ENTRY\n{title_entry_str}",
+        xy=(entry_idx, clamped_entry_price),
+        xytext=(entry_idx, clamped_entry_price + y_range * 0.045),
+        ha="center",
+        va="bottom",
+        fontsize=8,
+        color="#ffffff",
+        weight="bold",
+        bbox=dict(boxstyle="round,pad=0.3", facecolor="#1b5e20", edgecolor="#00e676", alpha=0.9),
+        arrowprops=dict(arrowstyle="->", color="#00e676", lw=1.3),
+        zorder=7
+    )
+
+    # 凡例の位置をスマート判定（左上にエントリーマーカーがある場合は右上に逃がす）
+    legend_loc = "upper left"
+    if entry_idx < len(plot_df) * 0.35 and clamped_entry_price >= (ax.get_ylim()[0] + ax.get_ylim()[1]) * 0.5:
+        legend_loc = "upper right"
+    ax.legend(loc=legend_loc, facecolor="#1e222d", edgecolor="#363c4e", fontsize=8, labelcolor="#ffffff", framealpha=0.8)
     plt.tight_layout()
 
     plt.savefig(out_file, dpi=150, facecolor=fig.get_facecolor(), edgecolor="none")

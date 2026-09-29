@@ -1580,6 +1580,7 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
             for sym, (has_long, df, position, current_price, pnl_current) in list(active_positions.items()):
                 api = symbol_apis[sym]
                 entry_px = float(position.get("buy_pos", 0)) or current_price
+                entry_time = position.get("entry_time")
                 sym_params = symbol_params_map.get(sym, best_params)
                 whale_sig = get_whale_sentiment_info(sym).get("signal", "NEUTRAL")
 
@@ -1621,7 +1622,8 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                         # 1. 決済トレードチャート画像の生成 & 送信
                         exit_chart_file = plot_exit_chart(
                             symbol=sym, df=df, exit_price=current_price, entry_price=entry_px,
-                            pnl=pnl_current, exit_reason="VP_Trailing/Exit_Rule", side="LONG", whale_signal=whale_sig
+                            pnl=pnl_current, exit_reason="VP_Trailing/Exit_Rule", side="LONG", whale_signal=whale_sig,
+                            entry_time=entry_time
                         )
                         if exit_chart_file and exit_chart_file.exists():
                             discord.send_file(exit_chart_file, f"📊 【{sym_exch} 決済チャート】{sym.upper()} LONG 決済完了 (PnL: {pnl_current:+.2f} 円)")
@@ -1701,6 +1703,10 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                         discord.print_log(f"[{best_sym}] [ENTRY>>] ロングエントリー試行 ({cand_idx+1}/{len(candidates_to_enter)}) (クジラ判定: {whale_sig})")
                         entered = await api.long_entry(df, position, balance, lot_size, max_lot)
                         if entered:
+                            now_iso = datetime.now(timezone.utc).isoformat()
+                            if isinstance(position, dict):
+                                position['entry_time'] = now_iso
+                                position['buy_pos'] = current_price
                             active_positions[best_sym] = (True, df, position, current_price, 0.0)
                             # 1. 実運用トレード履歴の記録
                             record_real_trade(best_sym, "LONG", "ENTRY", current_price, lot_size, 0.0, "実運用新規エントリー")
