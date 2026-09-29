@@ -59,6 +59,13 @@ FIXED_SYMBOLS = [
     "bnb_jpy", "arb_jpy", "sui_jpy", "avax_jpy", "render_jpy", "link_jpy"
 ]
 
+# ノーマライズ比較チャート対象銘柄 (Bitbank主要11銘柄 ＋ Binance Japan保有のNEAR)
+CHART_SYMBOLS = [
+    "btc_jpy", "eth_jpy", "xrp_jpy", "sol_jpy", "doge_jpy",
+    "bnb_jpy", "arb_jpy", "sui_jpy", "avax_jpy", "render_jpy", "link_jpy",
+    "near_jpy"
+]
+
 # チャート期間設定 (ラベル, 時間数)
 CHART_WINDOWS = [
     ("30d", 30 * 24),   # 720h
@@ -298,19 +305,32 @@ def generate_normalized_charts(
             df = df_dict[sym].copy()
             if len(df) < 5:
                 continue
+            # タイムゾーンを tz-naive (UTC/JST一貫) に統一
+            ts_series = pd.to_datetime(df["timestamp"])
+            if hasattr(ts_series.dt, "tz") and ts_series.dt.tz is not None:
+                ts_series = ts_series.dt.tz_convert(None)
+            df["timestamp"] = ts_series
+
             df = df.tail(hours)
             base_price = df["close"].iloc[0]
             if base_price <= 0:
                 continue
             norm_series = (df["close"] / base_price - 1.0) * 100.0
-            plt.plot(df["timestamp"], norm_series, label=sym.upper(), linewidth=1.5)
+
+            # 凡例ラベルの装飾
+            if sym in ("near_jpy", "nearjpy"):
+                plot_label = "NEAR (Binance)"
+                plt.plot(df["timestamp"], norm_series, label=plot_label, linewidth=2.0, linestyle="--")
+            else:
+                plot_label = sym.upper()
+                plt.plot(df["timestamp"], norm_series, label=plot_label, linewidth=1.5)
             plotted_any = True
 
         if not plotted_any:
             plt.close()
             continue
 
-        plt.title(f"Bitbank Top Assets Normalized Return ({label.upper()})", fontsize=14, fontweight="bold")
+        plt.title(f"Bitbank & Binance (NEAR) Normalized Return ({label.upper()})", fontsize=14, fontweight="bold")
         plt.xlabel("Date (JST)", fontsize=10)
         plt.ylabel("Return (%)", fontsize=10)
         plt.grid(True, linestyle="--", alpha=0.5)
@@ -673,13 +693,29 @@ async def run_pipeline(
 
     # 5. ノーマライズ比較チャート生成 & 送信
     if not skip_charts:
-        log("\n📊 ノーマライズ比較チャートを生成中...")
-        chart_symbols = list(FIXED_SYMBOLS)
-
+        log("\n📊 ノーマライズ比較チャートを生成中 (Bitbank 11銘柄 ＋ Binance NEAR)...")
+        chart_symbols = list(CHART_SYMBOLS)
 
         chart_dfs = {}
         for sym in chart_symbols:
             csv_path = candles_dir / f"{sym}_1h.csv"
+            # NEAR の場合は Binance Japan ディレクトリまたは API を参照
+            if sym in ("near_jpy", "nearjpy"):
+                binance_dir = data_dir / "historical_candles_binance"
+                alt_path = binance_dir / "nearjpy_1h.csv"
+                if alt_path.exists():
+                    csv_path = alt_path
+                else:
+                    try:
+                        from download_binance_candles import fetch_symbol_klines
+                        df_near = fetch_symbol_klines("NEARJPY", days=35)
+                        if not df_near.empty:
+                            binance_dir.mkdir(parents=True, exist_ok=True)
+                            df_near.to_csv(alt_path, index=False, encoding="utf-8")
+                            csv_path = alt_path
+                    except Exception as e:
+                        log(f"   ⚠️ NEAR データ取得エラー: {e}")
+
             if csv_path.exists():
                 try:
                     df = pd.read_csv(csv_path)
@@ -691,7 +727,7 @@ async def run_pipeline(
         chart_paths = generate_normalized_charts(chart_dfs, chart_symbols, plots_dir, timestamp_tag=now_jst)
         for cp in chart_paths:
             if not skip_upload:
-                desc = f"📈 **[Bitbank 主要銘柄 リターン比較]** `{cp.name}`"
+                desc = f"📈 **[主要銘柄 リターン比較 (Bitbank + Binance NEAR)]** `{cp.name}`"
                 if discord.send_file(cp, description=desc):
                     record_file_uploaded(cp)
                     log(f"   ✅ チャート Discord 送信完了: {cp.name}")

@@ -86,7 +86,7 @@
 * **ロット・価格の丸め込み（Quantization）**:
   - 各通貨ペアの最小発注数量（Bitbank 現物は基本 `0.0001` 等）および価格小数点桁数（`sz_decimals: 4.0`, 各ペアの `price_place`）を `BITBANK_SPECS` に基づき厳格に適用する。
 * **主要銘柄**:
-  - 対象銘柄例: `BTC`, `ETH`, `XRP`, `SOL`, `DOGE`, `BNB`, `ARB`, `SUI`, `AVAX`, `RNDR（render_jpy）`, `LINK` 等
+  - 対象銘柄例: `BTC`, `ETH`, `XRP`, `SOL`, `DOGE`, `BNB`, `ARB`, `SUI`, `AVAX`, `RNDR（render_jpy）`, `LINK`, `NEAR（Binance Japan現物連携）` 等
 
 ---
 

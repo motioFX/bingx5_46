@@ -106,6 +106,7 @@ BITBANK_SPECS: Dict[str, Dict[str, float]] = {
     "trx_jpy": {"sz_decimals": 4.0, "qty_step": 0.0001, "min_qty": 0.0001, "price_place": 3.0},
     "chz_jpy": {"sz_decimals": 4.0, "qty_step": 0.0001, "min_qty": 0.0001, "price_place": 3.0},
     "ada_jpy": {"sz_decimals": 4.0, "qty_step": 0.0001, "min_qty": 0.0001, "price_place": 3.0},
+    "near_jpy": {"sz_decimals": 2.0, "qty_step": 0.01, "min_qty": 0.01, "price_place": 1.0},
 }
 
 # ==================== 長期保有BTC保護枠 ====================
@@ -404,6 +405,19 @@ class api_bitbank_helper:
 
     async def get_orderbook(self) -> Tuple[Optional[float], Optional[float]]:
         """Ticker / Depth から best_bid, best_ask を取得"""
+        clean_sym = normalize_symbol(self.symbol)
+        if clean_sym in ("near_jpy", "nearjpy"):
+            try:
+                resp = requests.get("https://api.binance.com/api/v3/ticker/bookTicker", params={"symbol": "NEARJPY"}, timeout=5)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    best_bid = float(data.get("bidPrice") or 0.0) or None
+                    best_ask = float(data.get("askPrice") or 0.0) or None
+                    return best_bid, best_ask
+            except Exception as e:
+                print(f"Binance NEARJPY bookTicker fetch failed: {e}")
+            return None, None
+
         try:
             async with pybotters.Client() as client:
                 res = await client.get(f"{self.public_url}/{self.symbol}/ticker")
@@ -422,6 +436,30 @@ class api_bitbank_helper:
         Bitbank Public API から Candlestick (OHLCV) データを取得
         対応インターバル: '1hour' / '1h' -> '1hour', '1day' / '1d' -> '1day', '15m' -> '15min' 等
         """
+        clean_sym = normalize_symbol(self.symbol)
+        if clean_sym in ("near_jpy", "nearjpy"):
+            try:
+                binance_interval = "1h" if interval in ("1h", "60", "1hour") else ("1d" if "d" in str(interval) else "15m")
+                url = "https://api.binance.com/api/v3/klines"
+                params = {"symbol": "NEARJPY", "interval": binance_interval, "limit": min(max_len, 1000)}
+                res = requests.get(url, params=params, timeout=10).json()
+                if isinstance(res, list) and res:
+                    rows = []
+                    for k in res:
+                        ts = pd.to_datetime(k[0], unit="ms")  # tz-naive UTC
+                        rows.append({
+                            "timestamp": ts,
+                            "open": float(k[1]),
+                            "high": float(k[2]),
+                            "low": float(k[3]),
+                            "close": float(k[4]),
+                            "volume": float(k[5]),
+                        })
+                    df_res = pd.DataFrame(rows).drop_duplicates(subset=["timestamp"]).sort_values("timestamp").reset_index(drop=True)
+                    return df_res
+            except Exception as e:
+                print(f"Binance NEARJPY klines error: {e}")
+            return pd.DataFrame()
         candletype = "1hour"
         interval_str = str(interval).lower()
         if "d" in interval_str or interval_str == "1day":
@@ -534,6 +572,9 @@ class api_bitbank:
 
     async def get_open_orders(self, include_stop: bool = True) -> list[dict]:
         return await self.bitbank.get_open_orders()
+
+    async def get_orderbook(self) -> Tuple[Optional[float], Optional[float]]:
+        return await self.bitbank.get_orderbook()
 
     async def long_entry(self, df, position, jpy_onhand_amount, lot_size, max_lot):
         """

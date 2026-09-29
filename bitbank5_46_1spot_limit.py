@@ -85,15 +85,16 @@ TARGET_POSITION_VALUE_JPY = BITBANK_TARGET_POSITION_VALUE_JPY
 TARGET_POSITION_VALUE_USDT = TARGET_POSITION_VALUE_JPY
 LEVERAGE_FACTOR = 1.0  # 現物取引のため 1.0 倍
 MAX_ACTIVE_POSITIONS: int = 2  # 最大同時保有ポジション数
-MAX_SELECTED_SYMBOLS: int = 11  # 最大監視銘柄数 (Bitbank指定11銘柄)
+MAX_SELECTED_SYMBOLS: int = 12  # 最大監視銘柄数 (Bitbank指定11銘柄 ＋ Binance Japan NEAR)
 
 # [ 4 ] ナンピン数設定 (初期値: 1)
 MAX_TRADES_COUNT: int = 1
 
-# [ 5 ] 固定選定銘柄 (Bitbank指定11銘柄: BTC, ETH, XRP, SOL, DOGE, BNB, ARB, SUI, AVAX, RNDR/RENDER, LINK)
+# [ 5 ] 固定選定銘柄 (主要12銘柄: BTC, ETH, XRP, SOL, DOGE, BNB, ARB, SUI, AVAX, RNDR/RENDER, LINK, NEAR)
 FIXED_SYMBOLS: List[str] = [
     "btc_jpy", "eth_jpy", "xrp_jpy", "sol_jpy", "doge_jpy",
-    "bnb_jpy", "arb_jpy", "sui_jpy", "avax_jpy", "render_jpy", "link_jpy"
+    "bnb_jpy", "arb_jpy", "sui_jpy", "avax_jpy", "render_jpy", "link_jpy",
+    "near_jpy"
 ]
 
 # [ 6 ] 定期銘柄選定・リセット時刻（JST時間: 0〜23時）
@@ -600,11 +601,28 @@ def load_traded_symbols() -> List[str]:
 
 
 async def fetch_all_asset_contexts(mode: str = 'demo') -> Dict[str, Dict[str, Any]]:
-    """Bitbank Public Ticker から各銘柄の最新価格・出来高を取得"""
+    """Bitbank / Binance Public Ticker から各銘柄の最新価格・出来高を取得"""
     res: Dict[str, Dict[str, Any]] = {}
     for sym in FIXED_SYMBOLS:
         try:
             norm_sym = normalize_symbol(sym)
+            if norm_sym in ("near_jpy", "nearjpy"):
+                b_resp = requests.get("https://api.binance.com/api/v3/ticker/24hr", params={"symbol": "NEARJPY"}, timeout=5)
+                if b_resp.status_code == 200:
+                    b_data = b_resp.json()
+                    last_px = float(b_data.get("lastPrice", 0.0))
+                    vol = float(b_data.get("volume", 0.0))
+                    info = {
+                        "funding": 0.0,
+                        "openInterest": 0.0,
+                        "dayNtlVlm": vol,
+                        "markPx": last_px,
+                        "prevDayPx": last_px,
+                    }
+                    res[norm_sym] = info
+                    res[norm_sym.split('_')[0]] = info
+                continue
+
             resp = requests.get(f"{BITBANK_PUBLIC_URL}/{norm_sym}/ticker", timeout=5)
             if resp.status_code == 200:
                 data = resp.json()
@@ -692,24 +710,34 @@ async def load_local_or_api_candles(symbol: str, limit: int = 1440) -> pd.DataFr
     data_dir = Path(__file__).resolve().parent / "Data"
     target_cols = ["timestamp", "open", "high", "low", "close", "volume", "fundingRate", "openInterest", "funding", "oi"]
 
-    # 1. 過去1年分蓄積ローソク足CSV (historical_candles/{symbol}_1h.csv) を最優先探索
-    candles_dir = data_dir / "historical_candles"
-    for cand_name in [f"{symbol}_1h.csv", f"{clean_sym}-USDT_1h.csv", f"{clean_sym}_1h.csv"]:
-        cand_path = candles_dir / cand_name
-        if cand_path.exists():
-            try:
-                df = pd.read_csv(cand_path)
-                if not df.empty and "close" in df.columns:
-                    df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms" if pd.to_numeric(df["timestamp"], errors="coerce").notna().all() else None)
-                    df = df.sort_values("timestamp").reset_index(drop=True)
-                    available_cols = [c for c in target_cols if c in df.columns]
-                    df = df[available_cols].copy()
-                    if limit and len(df) > limit:
-                        df = df.tail(limit).reset_index(drop=True)
-                    if len(df) >= 20:
-                        return df
-            except Exception:
-                pass
+    # 1. 過去蓄積ローソク足CSV (historical_candles または historical_candles_binance) を最優先探索
+    candles_dirs = [data_dir / "historical_candles", data_dir / "historical_candles_binance"]
+    possible_names = [
+        f"{symbol}_1h.csv", f"{clean_sym.lower()}_1h.csv", f"{clean_sym}_1h.csv",
+        f"{clean_sym}-USDT_1h.csv", f"{clean_sym.lower()}jpy_1h.csv", f"{clean_sym}JPY_1h.csv"
+    ]
+    for c_dir in candles_dirs:
+        if not c_dir.exists():
+            continue
+        for cand_name in possible_names:
+            cand_path = c_dir / cand_name
+            if cand_path.exists():
+                try:
+                    df = pd.read_csv(cand_path)
+                    if not df.empty and "close" in df.columns:
+                        ts_val = pd.to_datetime(df["timestamp"])
+                        if hasattr(ts_val.dt, "tz") and ts_val.dt.tz is not None:
+                            ts_val = ts_val.dt.tz_convert(None)
+                        df["timestamp"] = ts_val
+                        df = df.sort_values("timestamp").reset_index(drop=True)
+                        available_cols = [c for c in target_cols if c in df.columns]
+                        df = df[available_cols].copy()
+                        if limit and len(df) > limit:
+                            df = df.tail(limit).reset_index(drop=True)
+                        if len(df) >= 20:
+                            return df
+                except Exception:
+                    pass
 
     # 2. 32日分マージドデータ (Data/merged_{clean_sym}.csv)
     cand_csv = data_dir / f"merged_{clean_sym}.csv"
