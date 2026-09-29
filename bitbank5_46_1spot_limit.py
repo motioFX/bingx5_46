@@ -1643,11 +1643,6 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                                 del symbol_apis[sym]
                             if sym in symbol_params_map:
                                 del symbol_params_map[sym]
-                    else:
-                        pnl_icon = "🟢" if pnl_current >= 0 else "🔴"
-                        discord.print_log(f"──────────────────────────────────────────────────────────")
-                        discord.print_log(f"💰 【{sym} 現在の含み損益】: {pnl_current:+.2f} 円 {pnl_icon} (ロング継続保有中)")
-                        discord.print_log(f"──────────────────────────────────────────────────────────")
 
             # 3. 新規エントリー実行 (最大同時保有ポジション数制限: MAX_ACTIVE_POSITIONS)
             current_pos_count = len(active_positions)
