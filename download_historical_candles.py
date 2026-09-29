@@ -658,11 +658,10 @@ async def run_pipeline(
         n_syms = len(sub_df["symbol"].unique())
         log(f"📦 {part_name} ZIP作成完了: {zip_path.name} ({len(sub_df):,} 行 / {part_size_mb:.2f} MB / 全{n_syms}銘柄)")
 
-        # 直近データ (recent) のみ Discord 送信 (past はローカル作成のみ、素のCSVは送信しない)
-        is_recent_part = "recent" in zip_path.name.lower()
-        if not skip_upload and is_recent_part:
+        # 2分割ZIP (past / recent) を Discord 送信 (素のCSVは送信しない)
+        if not skip_upload:
             desc = (
-                f"📦 **[Bitbank 全銘柄ヒストリー統合データ (1H)] 直近データ** ({ts_jst_str})\n"
+                f"📦 **[Bitbank 全銘柄ヒストリー統合データ (1H)] {part_name}** ({ts_jst_str})\n"
                 f"• ファイル名: `{zip_path.name}`\n"
                 f"• 期間: `{period_str}` (全{len(master_df):,}行中 {len(sub_df):,}行)\n"
                 f"• 対象: `全 {n_syms} 銘柄` (JPY現物全銘柄収録)\n"

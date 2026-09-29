@@ -1119,10 +1119,10 @@ async def audit_and_retain_positions(
     return symbol_apis, symbol_params_map
 
 async def sync_historical_and_charts(days: int = 120) -> None:
-    """Bitbank ＆ Binance Japan 直近ZIP同期 ＆ ノーマライズ比較チャート送信"""
-    discord.print_log(f"\n📦 【全銘柄データ同期＆チャート送信】 Bitbank ＆ Binance Japan 直近ZIPアーカイブ同期中...")
+    """Bitbank ＆ Binance Japan 全銘柄2分割ZIP同期 ＆ ノーマライズ比較チャート送信"""
+    discord.print_log(f"\n📦 【全銘柄データ同期＆チャート送信】 Bitbank ＆ Binance Japan 全銘柄2分割ZIPアーカイブ同期中...")
     
-    # 1. Bitbank 47銘柄データ同期 (直近ZIPのみ送信。チャートはBinance直近ZIPの後に送信)
+    # 1. Bitbank 47銘柄データ同期 (2分割ZIP送信。チャートはBinance 2分割ZIPの後に送信)
     download_script = Path(__file__).resolve().parent / "download_historical_candles.py"
     if download_script.exists():
         try:
@@ -1136,7 +1136,7 @@ async def sync_historical_and_charts(days: int = 120) -> None:
                 None, lambda: subprocess.run(cmd_hist, timeout=360, capture_output=True, text=True, encoding="utf-8")
             )
             if ret.returncode == 0:
-                discord.print_log("✅ 【Bitbank データ同期完了】 直近ZIPアーカイブ送信が完了しました。")
+                discord.print_log("✅ 【Bitbank データ同期完了】 全47銘柄 2分割ZIPアーカイブ送信が完了しました。")
             else:
                 err_snippet = (ret.stderr or ret.stdout or "")[-300:]
                 discord.print_log(f"⚠️ 【Bitbank データ同期注意】 終了コード: {ret.returncode}\n{err_snippet}")
@@ -1145,13 +1145,13 @@ async def sync_historical_and_charts(days: int = 120) -> None:
         except Exception as e:
             discord.print_log(f"⚠️ 【Bitbank データ同期例外】 エラーが発生しました: {e}")
 
-    # 2. Binance Japan 全銘柄データ同期 (直近ZIPのみ送信)
+    # 2. Binance Japan 全銘柄データ同期 (2分割ZIP送信)
     binance_script = Path(__file__).resolve().parent / "download_binance_candles.py"
     if binance_script.exists():
         try:
             from download_binance_candles import run_binance_pipeline
             await run_binance_pipeline(days=days, to_discord=True)
-            discord.print_log("✅ 【Binance Japan データ同期完了】 直近ZIPアーカイブ送信が完了しました。")
+            discord.print_log("✅ 【Binance Japan データ同期完了】 全JPY現物銘柄 2分割ZIPアーカイブ送信が完了しました。")
         except Exception as b_err:
             discord.print_log(f"⚠️ 【Binance Japan データ同期注意】 エラーが発生しました: {b_err}")
 

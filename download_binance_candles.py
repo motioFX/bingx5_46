@@ -352,11 +352,11 @@ async def run_binance_pipeline(days: int = 120, to_discord: bool = True) -> None
 
         zip_size_mb = zip_path.stat().st_size / (1024 * 1024)
         compression_ratio = (1.0 - (zip_size_mb / csv_size_mb)) * 100.0 if csv_size_mb > 0 else 0.0
-        # Discord送信は直近データ (recent) のみ送信 (past はローカル作成のみ、素のCSVは送信しない)
-        is_recent_part = "recent" in zip_path.name.lower()
-        if to_discord and is_recent_part:
+        # 2分割ZIP (past / recent) を Discord 送信 (素のCSVは送信しない)
+        if to_discord:
             desc = (
-                f"📂 **【Binance Japan 全銘柄 1時間足データ (直近60日)】**\n"
+                f"📂 **【Binance Japan 全銘柄 1時間足データ (4ヶ月分)】**\n"
+                f"🏷️ **{part_title}**\n"
                 f"⏱️ 期間: `{period_str}` (対象: Binance Japan 全 {len(symbols)} JPY現物銘柄)\n"
                 f"📊 レコード数: `{row_count:,}` 行\n"
                 f"💡 用途: {usage_desc}\n"

@@ -16,13 +16,13 @@
        - **Part 1/2 【過去データ (前半60日)】**:
          - Bitbank: `Data/bitbank_all_symbols_past_{YYYYMMDD_HHMMSS}.zip`
          - Binance Japan: `Data/binance_japan_all_symbols_past_{YYYYMMDD_HHMMSS}.zip`
-         - 用途: 過去ヒストリー検証・長期バックテスト用（※ローカル作成・保管のみ）
+         - 用途: 過去ヒストリー検証・長期バックテスト用
        - **Part 2/2 【直近データ (後半60日)】**:
          - Bitbank: `Data/bitbank_all_symbols_recent_{YYYYMMDD_HHMMSS}.zip`
          - Binance Japan: `Data/binance_japan_all_symbols_recent_{YYYYMMDD_HHMMSS}.zip`
          - 用途: 直近相場分析・**スマホGemini Pro（Google AI Pro）丸ごと投入用（全銘柄入り・約95万トークンで超快適・高精度動作）**
      - 全期間マスターCSV（`Data/historical_all_symbols_merged.csv`, `Data/binance_japan_all_symbols_merged.csv`）はローカル検証用に最新化保存。
-     - **Discord送信は直近ZIP（Part 2/2）のみを送信し、素のCSVファイルは送信しない（ZIP内にCSV収録のため）**。
+     - **Discord送信は2分割ZIP（Part 1 past ＆ Part 2 recent）を送信し、素のCSVファイルは送信しない（ZIP内にCSV収録のため）**。
   3. **レートリミット対策 ＆ CPU負荷極小化設計**:
      - Binance Japan のデータ取得時は、各銘柄間に `0.3秒`、ページネーション間に `0.05秒` のウェイトを挿入し、逐次（シングルスレッド）で丁寧に取得する。
      - ZIP圧縮は超高速・低負荷圧縮（圧縮レベル最軽量）を採用し、VPSのCPUクレジット消費やCPUスパイクを恒久的に防ぐ。
@@ -37,7 +37,7 @@
   5. **データファイルの最新保持・自動クリーンアップ規約**:
      - 生成されたZIPファイルおよびチャート画像は**「常に最新のものだけを維持する」**ことを厳守する。
      - Discord送信完了後の保管期間は **直近24時間（最大1日分）** とし、24時間を超過した古いZIPアーカイブおよび画像ファイルは自動削除（クリーンアップ）する。
-     - 最新の1セット分（recent各1本等）は経過時間に関わらず常時保護する。
+     - 最新の1セット分（past/recent各1本等）は経過時間に関わらず常時保護する。
 
 ---
 
