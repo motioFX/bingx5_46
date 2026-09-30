@@ -1540,7 +1540,7 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
             if hourly_summary_rows:
                 next_hour_str = (now_jst.replace(minute=0, second=5, microsecond=0) + timedelta(hours=1)).strftime('%H:%M:%S')
                 summary_lines = [
-                    f"⏱ [Cycle #{cycle_count}] {now_jst.strftime('%H:%M')} JST | 口座残高: {cycle_balance:,.0f} 円",
+                    f"⏱ [Cycle #{cycle_count}] {now_jst.strftime('%H:%M')} JST (エアトレ監視)",
                     "───────────────────────────────────",
                     "銘柄       現在値    保有   シグナル  大口",
                     "───────────────────────────────────",
@@ -1550,20 +1550,6 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                     px_str = f"{px:,.3f}円" if px < 1000 else f"{px:,.0f}円"
                     summary_lines.append(f"{r['sym']:<8s} {px_str:>10s}  {r['pos']:<6s}  {r['sig']:^6s}  {r['whale']}")
                 summary_lines.append("───────────────────────────────────")
-                try:
-                    from long_term_btc_tracker import get_long_term_btc_status
-                    btc_st = await get_long_term_btc_status(mode=mode)
-                    btc_pnl = btc_st["pnl_jpy"]
-                    btc_pct = btc_st["pnl_pct"]
-                    btc_px = btc_st["last_price"]
-                    btc_sz = btc_st["btc_size"]
-                    sign = "+" if btc_pnl >= 0 else ""
-                    icon = "🟢" if btc_pnl >= 0 else "🔴"
-                    summary_lines.append(f"💎 BTC(長期) {btc_sz:.4f}枚 @ {btc_st['entry_px']:,.0f}円")
-                    summary_lines.append(f"   現値:{btc_px:,.0f}円 | 損益:{sign}{btc_pnl:,.0f}円 ({sign}{btc_pct:.2f}%) {icon}")
-                    summary_lines.append("───────────────────────────────────")
-                except Exception:
-                    pass
                 summary_lines.append(f"次回確定: {next_hour_str} JST")
                 discord.print_log("```text\n" + "\n".join(summary_lines) + "\n```")
 
