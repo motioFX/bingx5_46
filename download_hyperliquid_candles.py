@@ -1,10 +1,10 @@
-"""Binance Japan 全銘柄 マルチ時間足（1d, 1h, 15m, 5m, 1m）データ収集＆時間分割Discord配信パイプライン
+"""Hyperliquid 全銘柄 マルチ時間足（1d, 1h, 15m, 5m, 1m）データ収集＆時間分割Discord配信パイプライン
 
 仕様:
-1. Binance Japan の全JPY現物ペア（約27銘柄）を対象。
+1. Hyperliquid の全 PERP 銘柄（約230+銘柄）を対象。
 2. 5つの時間足に対応:
-   - 1d (日足): 過去4年分 (設立以降全期間、差分キャッシュ更新)
-   - 1h (1時間足): 過去4年分 (設立以降全期間、差分キャッシュ更新)
+   - 1d (日足): 過去4年分 (メインネット開始以降全期間、差分キャッシュ更新)
+   - 1h (1時間足): 過去4年分 (メインネット開始以降全期間、差分キャッシュ更新)
    - 15m (15分足): 直近180日分 (差分キャッシュ更新)
    - 5m (5分足): 直近90日分 (差分キャッシュ更新)
    - 1m (1分足): 直近30日分 (差分キャッシュ更新)
@@ -61,7 +61,7 @@ if sys.platform == "win32":
 JST = timezone(timedelta(hours=9))
 UTC = timezone.utc
 
-BINANCE_API_URL = "https://api.binance.com"
+HYPERLIQUID_API_URL = "https://api.hyperliquid.xyz/info"
 
 
 def log(message: str) -> None:
@@ -69,98 +69,100 @@ def log(message: str) -> None:
     msg_str = f"[{stamp}] {message}"
     try:
         print(msg_str)
+        sys.stdout.flush()
     except Exception:
         sys.stdout.buffer.write((msg_str + "\n").encode("utf-8", errors="replace"))
         sys.stdout.flush()
 
 
-# ==================== Binance API 銘柄取得 ====================
-def fetch_binance_jpy_symbols() -> List[str]:
-    """Binance Japan で取引可能な全現物 JPY ペアを取得"""
-    url = f"{BINANCE_API_URL}/api/v3/exchangeInfo"
+def fetch_hyperliquid_symbols() -> List[str]:
+    """Hyperliquid の全 PERP 銘柄シンボルリストを取得"""
     try:
-        resp = requests.get(url, timeout=10).json()
-        symbols = resp.get("symbols", [])
-        jpy_symbols = []
-        for s in symbols:
-            if s.get("status") == "TRADING" and s.get("isSpotTradingAllowed", False):
-                if s.get("quoteAsset") == "JPY":
-                    jpy_symbols.append(s.get("symbol"))
-        if jpy_symbols:
-            return sorted(jpy_symbols)
+        resp = requests.post(HYPERLIQUID_API_URL, json={"type": "meta"}, timeout=12).json()
+        universe = resp.get("universe", [])
+        symbols = [u["name"] for u in universe if u.get("name")]
+        if symbols:
+            return sorted(symbols)
     except Exception as e:
-        log(f"[Binance API Error] 銘柄一覧取得失敗: {e}")
+        log(f"[Hyperliquid API Error] 銘柄一覧取得失敗: {e}")
 
-    # フォールバック銘柄リスト
+    # フォールバックリスト
     return [
-        "ADAJPY", "APTJPY", "BCHJPY", "BNBJPY", "BTCJPY", "DOGEJPY", "ETHJPY",
-        "FETJPY", "GIGGLEJPY", "IOTXJPY", "LINKJPY", "LPTJPY", "LTCJPY", "MEMEJPY",
-        "NEARJPY", "PEPEJPY", "POLJPY", "SEIJPY", "SHIBJPY", "SOLJPY", "SUIJPY",
-        "TAOJPY", "TRBJPY", "TRUMPJPY", "TRXJPY", "XLMJPY", "XRPJPY"
+        "BTC", "ETH", "SOL", "HYPE", "NEAR", "ARB", "SUI", "AVAX", "LINK", "DOGE", "BNB", "XRP"
     ]
 
 
-# ==================== klines 取得 ====================
-def fetch_symbol_klines(
-    symbol: str,
+def fetch_symbol_candle_snapshot(
+    coin: str,
     interval: str,
     start_ms: int,
-    end_ms: int,
-    limit: int = 1000
+    end_ms: int
 ) -> List[List[Any]]:
-    """指定銘柄・時間足・期間の klines を取得"""
-    url = f"{BINANCE_API_URL}/api/v3/klines"
-    all_data = []
+    """Hyperliquid の candleSnapshot を安全に取得（1リクエスト最大5000本、無限ループ防止ガード付き）"""
+    all_candles = []
     curr_start = start_ms
 
+    interval_ms_map = {
+        "1m": 60 * 1000,
+        "5m": 5 * 60 * 1000,
+        "15m": 15 * 60 * 1000,
+        "1h": 60 * 60 * 1000,
+        "1d": 24 * 60 * 60 * 1000,
+    }
+    int_ms = interval_ms_map.get(interval, 60 * 1000)
+    step_limit = 4500 * int_ms
+
     while curr_start < end_ms:
-        params = {
-            "symbol": symbol,
-            "interval": interval,
-            "startTime": curr_start,
-            "endTime": end_ms,
-            "limit": limit
+        curr_end = min(curr_start + step_limit, end_ms)
+        payload = {
+            "type": "candleSnapshot",
+            "req": {
+                "coin": coin,
+                "interval": interval,
+                "startTime": curr_start,
+                "endTime": curr_end
+            }
         }
-        success = False
+        res = None
         for attempt in range(4):
             try:
-                res = requests.get(url, params=params, timeout=12).json()
-                if isinstance(res, dict) and "code" in res:
-                    time.sleep(1.0 * (attempt + 1))
-                    continue
-                if not res or not isinstance(res, list):
-                    success = True
-                    break
-
-                all_data.extend(res)
-                last_open_time = res[-1][0]
-                if last_open_time <= curr_start:
-                    success = True
-                    break
-                curr_start = last_open_time + 1
-                success = True
-                if len(res) < limit:
-                    break
-                time.sleep(0.04)
-                break
+                r = requests.post(HYPERLIQUID_API_URL, json=payload, timeout=15)
+                if r.status_code == 200:
+                    res = r.json()
+                    if isinstance(res, list):
+                        break
+                time.sleep(1.0 * (attempt + 1))
             except Exception:
                 time.sleep(1.0 * (attempt + 1))
 
-        if not success or (isinstance(res, list) and len(res) < limit):
+        if not isinstance(res, list) or len(res) == 0:
+            curr_start = curr_end + 1
+            if curr_end >= end_ms:
+                break
+            continue
+
+        all_candles.extend(res)
+        last_t = int(res[-1].get("t", 0))
+
+        # 取得件数が4500本未満、または末尾が直近近辺なら完了
+        if len(res) < 4500 or last_t >= end_ms - int_ms:
             break
 
-    return all_data
+        curr_start = max(curr_start + step_limit, last_t + int_ms)
+        time.sleep(0.04)
+
+    return all_candles
 
 
-def download_symbol_candles_binance(
-    symbol: str,
+def download_symbol_candles_hyperliquid(
+    coin: str,
     interval: str,
     days: int,
     candles_dir: Path,
     force: bool = False
 ) -> pd.DataFrame:
     """差分キャッシュを考慮して指定銘柄・時間足のデータを取得・保存"""
-    csv_path = candles_dir / f"{symbol}_{interval}.csv"
+    csv_path = candles_dir / f"{coin}_{interval}.csv"
     now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
     target_start_ms = now_ms - (days * 24 * 60 * 60 * 1000)
 
@@ -174,24 +176,27 @@ def download_symbol_candles_binance(
             if not old_df.empty:
                 max_ts = old_df["timestamp"].max()
                 latest_ms = int(max_ts.replace(tzinfo=timezone.utc).timestamp() * 1000)
-                # 最新データから直近までを取得
                 start_ms = max(target_start_ms, latest_ms + 1)
         except Exception:
             old_df = pd.DataFrame()
 
     new_rows = []
     if start_ms < now_ms:
-        raw_klines = fetch_symbol_klines(symbol, interval, start_ms, now_ms)
-        for k in raw_klines:
-            new_rows.append({
-                "timestamp": pd.to_datetime(k[0], unit="ms"),
-                "open": float(k[1]),
-                "high": float(k[2]),
-                "low": float(k[3]),
-                "close": float(k[4]),
-                "volume": float(k[5]),
-                "symbol": symbol
-            })
+        raw_candles = fetch_symbol_candle_snapshot(coin, interval, start_ms, now_ms)
+        for c in raw_candles:
+            try:
+                t_val = int(c.get("t", 0))
+                new_rows.append({
+                    "timestamp": pd.to_datetime(t_val, unit="ms"),
+                    "open": float(c.get("o", 0.0)),
+                    "high": float(c.get("h", 0.0)),
+                    "low": float(c.get("l", 0.0)),
+                    "close": float(c.get("c", 0.0)),
+                    "volume": float(c.get("v", 0.0)),
+                    "symbol": coin
+                })
+            except Exception:
+                continue
 
     df_new = pd.DataFrame(new_rows)
 
@@ -212,8 +217,8 @@ def download_symbol_candles_binance(
 
 # ==================== メイン実行パイプライン ====================
 async def run_pipeline(
-    days_1d: int = 1460,    # 4年分 (設立以降)
-    days_1h: int = 1460,    # 4年分 (設立以降)
+    days_1d: int = 1460,    # 4年分 (ローンチ以降)
+    days_1h: int = 1460,    # 4年分 (ローンチ以降)
     days_15m: int = 180,    # 180日分
     days_5m: int = 90,      # 90日分
     days_1m: int = 30,      # 30日分
@@ -224,14 +229,14 @@ async def run_pipeline(
     symbols_override: Optional[List[str]] = None
 ) -> None:
     data_dir = Path(__file__).resolve().parent / "Data"
-    candles_dir = data_dir / "historical_candles_binance"
+    candles_dir = data_dir / "historical_candles_hyperliquid"
     candles_dir.mkdir(parents=True, exist_ok=True)
 
     now_jst = datetime.now(JST).strftime("%Y%m%d_%H%M%S")
     target_intervals = list(intervals) if intervals else ["1d", "1h", "15m", "5m", "1m"]
 
     log("=" * 70)
-    log("🚀 [Binance Japan] 全銘柄マルチ時間足データ収集＆時間分割Discord配信パイプライン開始")
+    log("🚀 [Hyperliquid] 全銘柄マルチ時間足データ収集＆時間分割Discord配信パイプライン開始")
     log(f"   対象足種: {target_intervals} | 実行日時タグ: {now_jst}")
     log("=" * 70)
 
@@ -240,20 +245,20 @@ async def run_pipeline(
         target_symbols = [s.strip().upper() for s in symbols_override]
         log(f"📌 指定銘柄 ({len(target_symbols)} 銘柄): {', '.join(target_symbols)}")
     else:
-        target_symbols = fetch_binance_jpy_symbols()
-        log(f"📌 Binance Japan 対象銘柄: {len(target_symbols)} 銘柄 ({', '.join(target_symbols[:8])} ...)")
+        target_symbols = fetch_hyperliquid_symbols()
+        log(f"📌 Hyperliquid 対象銘柄: {len(target_symbols)} 銘柄 ({', '.join(target_symbols[:8])} ...)")
 
     days_map = {"1d": days_1d, "1h": days_1h, "15m": days_15m, "5m": days_5m, "1m": days_1m}
 
     for interval in target_intervals:
-        log(f"\n📂 ========== Binance Japan 【{interval.upper()}足】 収集開始 ==========")
+        log(f"\n📂 ========== Hyperliquid 【{interval.upper()}足】 収集開始 ==========")
         target_days = days_map.get(interval, 30)
 
         symbol_dfs: Dict[str, pd.DataFrame] = {}
 
         for sym_idx, sym in enumerate(target_symbols, 1):
-            df = download_symbol_candles_binance(
-                symbol=sym,
+            df = download_symbol_candles_hyperliquid(
+                coin=sym,
                 interval=interval,
                 days=target_days,
                 candles_dir=candles_dir,
@@ -262,8 +267,8 @@ async def run_pipeline(
             if not df.empty:
                 symbol_dfs[sym] = df
 
-            if sym_idx % 5 == 0 or sym_idx == len(target_symbols):
-                log(f"   [{sym_idx:2d}/{len(target_symbols)}] {sym} ({interval}) 完了 (保有レコード: {len(df):,} 行)")
+            if sym_idx % 15 == 0 or sym_idx == len(target_symbols):
+                log(f"   [{sym_idx:3d}/{len(target_symbols)}] {sym} ({interval}) 完了 (保有レコード: {len(df):,} 行)")
 
             time.sleep(0.04)
 
@@ -272,14 +277,14 @@ async def run_pipeline(
         master_df = build_full_symbol_time_grid(symbol_dfs, target_symbols)
 
         if interval == "1h":
-            fixed_csv = data_dir / "binance_japan_all_symbols_merged.csv"
+            fixed_csv = data_dir / "hyperliquid_all_symbols_merged.csv"
             master_df.to_csv(fixed_csv, index=False, encoding="utf-8")
-            log(f"📄 [Binance Japan] 1H 統合マスターCSVを更新しました: {fixed_csv.name} ({len(master_df):,} 行)")
+            log(f"📄 [Hyperliquid] 1H 統合マスターCSVを更新しました: {fixed_csv.name} ({len(master_df):,} 行)")
 
         # 3. 時間軸での N 分割 ZIP アーカイブ生成 (Part 1 最古 〜 Part N 最新)
         parts = split_and_create_time_zips(
             df=master_df,
-            exchange="binance_japan",
+            exchange="hyperliquid",
             interval=interval,
             out_dir=data_dir,
             timestamp_tag=now_jst,
@@ -291,8 +296,8 @@ async def run_pipeline(
         if not skip_upload:
             upload_time_split_zips_to_discord(
                 parts=parts,
-                webhook_name="real1_bitbank",
-                exchange_label="Binance Japan",
+                webhook_name="real2_hype",
+                exchange_label="Hyperliquid",
                 interval_label=interval,
                 interval_wait_sec=3.0,
                 force_upload=force_upload
@@ -304,13 +309,13 @@ async def run_pipeline(
 
     # 5. クリーンアップ
     log("\n🧹 不要な古いZIPファイルの自動クリーンアップを実行中...")
-    cleanup_expired_archives(data_dir=data_dir, patterns=("binance_japan_*.zip",), max_age_hours=24.0)
+    cleanup_expired_archives(data_dir=data_dir, patterns=("hyperliquid_*.zip",), max_age_hours=24.0)
 
-    log("\n🎉 [Binance Japan] 全銘柄マルチ時間足データ収集＆時間分割配信パイプラインが完了しました！")
+    log("\n🎉 [Hyperliquid] 全銘柄マルチ時間足データ収集＆時間分割配信パイプラインが完了しました！")
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Binance Japan 全銘柄マルチ時間足データ収集パイプライン")
+    parser = argparse.ArgumentParser(description="Hyperliquid 全銘柄マルチ時間足データ収集パイプライン")
     parser.add_argument("--days-1d", type=int, default=1460, help="日足取得期間（日）")
     parser.add_argument("--days-1h", type=int, default=1460, help="1時間足取得期間（日）")
     parser.add_argument("--days-15m", type=int, default=180, help="15分足取得期間（日）")

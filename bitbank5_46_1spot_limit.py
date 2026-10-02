@@ -1118,50 +1118,43 @@ async def audit_and_retain_positions(
 
     return symbol_apis, symbol_params_map
 
-async def sync_historical_and_charts(days: int = 120) -> None:
-    """Bitbank ＆ Binance Japan 全銘柄2分割ZIP同期 ＆ ノーマライズ比較チャート送信"""
-    discord.print_log(f"\n📦 【全銘柄データ同期＆チャート送信】 Bitbank ＆ Binance Japan 全銘柄2分割ZIPアーカイブ同期中...")
+async def sync_historical_and_charts(
+    days: int = 1460,
+    intervals: Optional[Sequence[str]] = None,
+    force_upload: bool = False,
+    skip_upload: bool = False
+) -> None:
+    """4大取引所（Bitbank, Binance Japan, Hyperliquid, BingX）全銘柄マルチ時間足データ収集＆時間分割Discord配信"""
+    discord.print_log(f"\n📦 【4大取引所 全銘柄データ収集＆時間分割アーカイブ同期】 開始...")
     
-    # 1. Bitbank 47銘柄データ同期 (2分割ZIP送信。チャートはBinance 2分割ZIPの後に送信)
-    download_script = Path(__file__).resolve().parent / "download_historical_candles.py"
-    if download_script.exists():
-        try:
-            cmd_hist = [
-                sys.executable, str(download_script),
-                "--days", str(days),
-                "--skip-charts",
-            ]
-            loop = asyncio.get_running_loop()
-            ret = await loop.run_in_executor(
-                None, lambda: subprocess.run(cmd_hist, timeout=360, capture_output=True, text=True, encoding="utf-8")
-            )
-            if ret.returncode == 0:
-                discord.print_log("✅ 【Bitbank データ同期完了】 全47銘柄 2分割ZIPアーカイブ送信が完了しました。")
-            else:
-                err_snippet = (ret.stderr or ret.stdout or "")[-300:]
-                discord.print_log(f"⚠️ 【Bitbank データ同期注意】 終了コード: {ret.returncode}\n{err_snippet}")
-        except subprocess.TimeoutExpired:
-            discord.print_log("⚠️ 【Bitbank データ同期注意】 データ取得がタイムアウト（360秒）しました。バックグラウンド処理を継続します。")
-        except Exception as e:
-            discord.print_log(f"⚠️ 【Bitbank データ同期例外】 エラーが発生しました: {e}")
+    # 4大取引所統合データ収集パイプライン
+    try:
+        from master_data_collector import run_all_exchanges_pipeline
+        target_intervals = list(intervals) if intervals else ["1d", "1h", "15m", "5m", "1m"]
+        await run_all_exchanges_pipeline(
+            days_1d=1460,
+            days_1h=1460,
+            days_15m=180,
+            days_5m=90,
+            days_1m=30,
+            intervals=target_intervals,
+            force=False,
+            force_upload=force_upload,
+            skip_upload=skip_upload,
+            skip_charts=False
+        )
+        discord.print_log("✅ 【4大取引所 データ同期完了】 全銘柄マルチ時間足のアーカイブ同期＆配信が完了しました。")
+    except Exception as e:
+        discord.print_log(f"⚠️ 【4大取引所 データ同期例外】 エラーが発生しました: {e}")
 
-    # 2. Binance Japan 全銘柄データ同期 (2分割ZIP送信)
-    binance_script = Path(__file__).resolve().parent / "download_binance_candles.py"
-    if binance_script.exists():
-        try:
-            from download_binance_candles import run_binance_pipeline
-            await run_binance_pipeline(days=days, to_discord=True)
-            discord.print_log("✅ 【Binance Japan データ同期完了】 全JPY現物銘柄 2分割ZIPアーカイブ送信が完了しました。")
-        except Exception as b_err:
-            discord.print_log(f"⚠️ 【Binance Japan データ同期注意】 エラーが発生しました: {b_err}")
-
-    # 3. ノーマライズ比較チャート送信 (Bitbank 11銘柄 ＋ Binance NEAR)
+    # ノーマライズ比較チャート送信 (Bitbank 11銘柄 ＋ Binance NEAR)
     try:
         from download_historical_candles import create_and_send_normalized_charts
-        await create_and_send_normalized_charts(skip_upload=False)
+        await create_and_send_normalized_charts(skip_upload=skip_upload)
         discord.print_log("✅ 【ノーマライズチャート送信完了】 主要12銘柄のリターン比較チャートを送信しました。")
     except Exception as c_err:
         discord.print_log(f"⚠️ 【ノーマライズチャート送信注意】 エラーが発生しました: {c_err}")
+
 
 
 async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60'):
