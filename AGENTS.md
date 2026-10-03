@@ -31,7 +31,7 @@
 ## 4. Execution Sequence & Periodic Timing Rule
 - **Architecture Characteristic (1H Candle & REST API Only)**:
   - 5分足の監視ループや WebSocket 常時接続は使用せず、完全な **「1時間足（1h）確定足・HTTP REST API方式」** で動作する。
-  - 毎時00分05秒に1回だけ数十秒稼働し、残りの時間はスリープ待機するため、常時接続切断トラブルがなくVPSのCPU負荷が極めて低く安定する。
+  - 毎時06分00秒（データ収集＆配信タイミングを6分シフト）に1回だけ数十秒稼働し、残りの時間はスリープ待機するため、常時接続切断トラブルがなくVPSのCPU負荷が極めて低く安定する。
 - **Startup Sequence**:
   - 1. Bitbank ASCII Art banner & account settings display (Order Mode: "エアトレード").
   - 2. 120-day historical data sync (4ヶ月分 / 2分割ZIP) ＆ 30d/10d/5d normalized return charts sent to Discord (Bitbank 47銘柄 ＆ Binance Japan 27銘柄).

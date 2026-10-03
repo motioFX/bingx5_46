@@ -99,7 +99,11 @@ FIXED_SYMBOLS: List[str] = [
 
 # [ 6 ] 定期銘柄選定・リセット時刻（JST時間: 0〜23時）
 ANALYSIS_HOURS: List[int] = [1, 9, 17]
-DAILY_ANALYSIS_MINUTE = 0
+DAILY_ANALYSIS_MINUTE: int = 6
+
+# [ 7 ] 毎時確定足サイクル＆Discord通知の実行タイミング（00分から6分シフト: 毎時06分00秒）
+HOURLY_EXECUTION_MINUTE: int = 6
+HOURLY_EXECUTION_SECOND: int = 0
 
 # コマンドライン引数からのナンピン数オーバーライド
 for _idx, _arg in enumerate(sys.argv):
@@ -529,11 +533,11 @@ def get_latest_analysis_slot_dt(now_dt: datetime, hours: List[int]) -> datetime:
     """直近の選定スロットの datetime を取得する"""
     sorted_hours = sorted(hours)
     for h in reversed(sorted_hours):
-        slot_cand = now_dt.replace(hour=h, minute=0, second=0, microsecond=0)
+        slot_cand = now_dt.replace(hour=h, minute=HOURLY_EXECUTION_MINUTE, second=HOURLY_EXECUTION_SECOND, microsecond=0)
         if now_dt >= slot_cand:
             return slot_cand
     prev_day = now_dt - timedelta(days=1)
-    return prev_day.replace(hour=sorted_hours[-1], minute=0, second=0, microsecond=0)
+    return prev_day.replace(hour=sorted_hours[-1], minute=HOURLY_EXECUTION_MINUTE, second=HOURLY_EXECUTION_SECOND, microsecond=0)
 
 
 def check_skip_mix_analysis() -> bool:
@@ -934,12 +938,14 @@ async def select_top_bingx_symbols(top_n: int = 10, mode: str = 'demo') -> List[
 
 
 async def wait_until_next_hour():
-    """毎時00分05秒まで待機する（前足確定の安全マージン5秒）"""
+    """毎時06分00秒まで待機する（データ取得・Discord配信タイミングを6分シフト）"""
     now = datetime.now(JST)
-    next_hour = now.replace(minute=0, second=5, microsecond=0) + timedelta(hours=1)
-    wait_seconds = (next_hour - now).total_seconds()
+    target = now.replace(minute=HOURLY_EXECUTION_MINUTE, second=HOURLY_EXECUTION_SECOND, microsecond=0)
+    if now >= target:
+        target += timedelta(hours=1)
+    wait_seconds = (target - now).total_seconds()
     if wait_seconds > 0:
-        discord.print_log(f"[Wait] 次の1時間足確定まで {wait_seconds/60:.1f} 分待機 (次回: {next_hour.strftime('%H:%M:%S')} JST)", level="debug")
+        discord.print_log(f"[Wait] 次の確定足サイクルまで {wait_seconds/60:.1f} 分待機 (次回: {target.strftime('%H:%M:%S')} JST)", level="debug")
         await asyncio.sleep(wait_seconds)
 
 
@@ -1246,11 +1252,11 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
         cycle_count += 1
         now_jst = datetime.now(JST)
 
-        # 初回サイクルでも、正時直後（00分00秒〜00分30秒の確定直後安全枠）でない限り、
-        # 確定足と完全に同期するため次の正時（毎時00分05秒）まで待機する
+        # 初回サイクルでも、実行時刻直後（毎時HOURLY_EXECUTION_MINUTE分00秒〜30秒の直後安全枠）でない限り、
+        # 確定足サイクルと完全に同期するため次の毎時HOURLY_EXECUTION_MINUTE分まで待機する
         if cycle_count == 1:
-            if "--loop" in sys.argv and not (now_jst.minute == 0 and now_jst.second < 30):
-                discord.print_log(f"[Sync] 初回起動時刻: {now_jst.strftime('%H:%M:%S')} JST。確定足と同期するため次の正時まで待機します。")
+            if "--loop" in sys.argv and not (now_jst.minute == HOURLY_EXECUTION_MINUTE and now_jst.second < 30):
+                discord.print_log(f"[Sync] 初回起動時刻: {now_jst.strftime('%H:%M:%S')} JST。確定サイクルと同期するため次の毎時{HOURLY_EXECUTION_MINUTE:02d}分まで待機します。")
                 await wait_until_next_hour()
                 now_jst = datetime.now(JST)
         else:
@@ -1269,11 +1275,11 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
         current_slot = (today_date, now_jst.hour)
         is_periodic_reset_time = (
             now_jst.hour in ANALYSIS_HOURS
-            and now_jst.minute < 5
+            and now_jst.minute <= 15
             and current_slot != last_screening_slot
         )
         if is_periodic_reset_time:
-            discord.print_log(f"[Phase C] 定期銘柄選定時刻 ({now_jst.hour:02d}:00 JST / 8時間ごと) 到達。")
+            discord.print_log(f"[Phase C] 定期銘柄選定時刻 ({now_jst.hour:02d}:{HOURLY_EXECUTION_MINUTE:02d} JST / 8時間ごと) 到達。")
 
             # 1. 全銘柄ヒストリカルデータ同期 (2ヶ月×2分割ZIP) ＆ 30d/10d/5d ノーマライズチャート送信 (アスキーアートなし)
             await sync_historical_and_charts(days=120)
@@ -1531,7 +1537,7 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
 
             # スマホ1画面完結サマリーのDiscord送信 (16行程度・スクロール不要)
             if hourly_summary_rows:
-                next_hour_str = (now_jst.replace(minute=0, second=5, microsecond=0) + timedelta(hours=1)).strftime('%H:%M:%S')
+                next_hour_str = (now_jst.replace(minute=HOURLY_EXECUTION_MINUTE, second=HOURLY_EXECUTION_SECOND, microsecond=0) + timedelta(hours=1)).strftime('%H:%M:%S')
                 summary_lines = [
                     f"⏱ [Cycle #{cycle_count}] {now_jst.strftime('%H:%M')} JST (エアトレ監視)",
                     "───────────────────────────────────",
