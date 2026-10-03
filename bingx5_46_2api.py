@@ -388,7 +388,7 @@ class api_bingx_helper:
                     sym = normalize_symbol(p.get("symbol", ""))
                     if sym == self.symbol:
                         amt = float(p.get("positionAmt", 0.0))
-                        entry_px = float(p.get("entryPrice", 0.0))
+                        entry_px = float(p.get("avgPrice") or p.get("entryPrice") or p.get("avgEntryPrice") or 0.0)
                         unrealized_pnl = float(p.get("unrealizedProfit", 0.0))
                         side = str(p.get("positionSide", "")).upper()
                         
@@ -604,18 +604,10 @@ class api_bingx:
         MAX_SPREAD_TOLERANCE = 0.005  # 0.5%
 
         def determine_target_price(bid: Optional[float], ask: Optional[float], ref_price: float) -> tuple[float, str]:
-            if is_testnet:
-                # Askが実勢価格に対して0.5%以内に収まる正常な板であれば、テストネット・デモの約定率確保のためAsk約定を許可
-                if ask is not None and ask <= ref_price * (1.0 + MAX_SPREAD_TOLERANCE):
-                    return ask, f"Demo Normal Ask (${ask:.4f})"
-                else:
-                    # 板飛び（スプレッド異常拡大 または Ask欠損）: 飛んだ高値Askは掴まず、Best Bidまたは実勢価格で指値待機
-                    target_bid = bid if (bid is not None and bid <= ref_price * (1.0 + MAX_SPREAD_TOLERANCE)) else ref_price
-                    ask_str = f"${ask:.4f}" if ask is not None else "None"
-                    return target_bid, f"Demo Safe Bid (${target_bid:.4f}, Ask={ask_str} 乖離大)"
-            else:
-                target_bid = bid if bid is not None else ref_price
-                return target_bid, f"Live Best Bid (${target_bid:.4f})"
+            # PROJECT_RULES準拠: Longエントリーは常に best_bid (買い気配最良値) のMaker指値優先
+            if bid is not None and bid > 0 and bid <= ref_price * (1.0 + MAX_SPREAD_TOLERANCE):
+                return bid, f"Maker Best Bid (${bid:.4f})"
+            return ref_price, f"Safe Ref Price (${ref_price:.4f})"
 
         order_price, price_type_str = determine_target_price(best_bid, best_ask, current_price)
         final_price = self.bingx._quantize_price(order_price)
@@ -750,17 +742,10 @@ class api_bingx:
         MAX_SPREAD_TOLERANCE = 0.005  # 0.5%
 
         def determine_short_target_price(bid: Optional[float], ask: Optional[float], ref_price: float) -> tuple[float, str]:
-            if is_testnet:
-                # Bidが実勢価格に対して-0.5%以内に収まる正常な板であれば、テストネット・デモの利便性のためBid約定を許可
-                if bid is not None and bid >= ref_price * (1.0 - MAX_SPREAD_TOLERANCE):
-                    return bid, f"Demo Normal Bid (${bid:.4f})"
-                else:
-                    target_ask = ask if (ask is not None and ask >= ref_price * (1.0 - MAX_SPREAD_TOLERANCE)) else ref_price
-                    bid_str = f"${bid:.4f}" if bid is not None else "None"
-                    return target_ask, f"Demo Safe Ask (${target_ask:.4f}, Bid={bid_str} 乖離大)"
-            else:
-                target_ask = ask if ask is not None else ref_price
-                return target_ask, f"Live Best Ask (${target_ask:.4f})"
+            # PROJECT_RULES準拠: Shortエントリーは常に best_ask (売り気配最良値) のMaker指値優先
+            if ask is not None and ask > 0 and ask >= ref_price * (1.0 - MAX_SPREAD_TOLERANCE):
+                return ask, f"Maker Best Ask (${ask:.4f})"
+            return ref_price, f"Safe Ref Price (${ref_price:.4f})"
 
         order_price, price_type_str = determine_short_target_price(best_bid, best_ask, current_price)
         final_price = self.bingx._quantize_price(order_price)

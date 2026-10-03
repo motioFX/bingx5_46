@@ -215,7 +215,7 @@ JST = timezone(timedelta(hours=9))
 MIX_SCRIPT_PATH = Path(__file__).resolve().parent / "bingx5_46_4mix_candle_Merged_Alt10.py"
 SCORES_CSV_PATH = MIX_SCRIPT_PATH.parent / "Data" / "symbol_selection_scores.csv"
 
-TARGET_POSITION_VALUE_USDT = 100.0
+TARGET_POSITION_VALUE_USDT = BINGX_TARGET_POSITION_VALUE_USDT
 LEVERAGE_FACTOR = 10.0
 LEVERAGE_USAGE_RATIO = 0.25
 TARGET_LEVERAGE = 8.5
@@ -859,9 +859,9 @@ async def validate_profitable_candidates(trade_side: str, mode: str, base_symbol
     default_best_params: Dict[str, Any] = {
         "strategy": "rsima",
         "interval": 60,
-        "mp": 7,
+        "mp": 48,
         "er": 40.0,
-        "margin": 2.0,
+        "margin": 1.0,
         "params": {"rsi_len": 9, "lma_len": 7, "lEp": 40.0, "lCp": 60.0, "max_trades": MAX_TRADES_COUNT}
     }
 
@@ -1095,6 +1095,8 @@ async def wait_until_next_hour(
                             f"   └ 現在値: ${cur_px:,.4f} < 利確ライン: ${ttp['trail_stop']:,.4f} (最高値: ${ttp['peak_price']:,.4f} から反落) | 概算PnL: {pnl_est:+.2f} USDT ➔ 成行利確"
                         )
                         await flatten_current_position_bingx(sym, "USDT", mode, exit_reason, force_market=True)
+                        from real_trade_tracker import record_real_trade
+                        record_real_trade(sym, "LONG", "CLOSE", cur_px, buy_qty, pnl_est, f"実運用決済 ({exit_reason})")
                         trailing_tp_states.pop(sym, None)
                         save_trailing_tp_states(trailing_tp_states)
                 except Exception as mon_err:
@@ -1427,7 +1429,7 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
             last_screening_slot = current_slot
             logic = logicinstance()
             discord.print_log(f"[Periodic Reset Complete] 新しい選定銘柄 (LONG ONLY): {', '.join(selected_symbols)} | 現在の全監視対象: {', '.join(symbol_apis.keys())}")
-            continue
+            # continue を廃止: リセット完了直後も当足 (01/09/17時) のポジション決済・エントリー判定を漏れなく実行
 
         # ========== 毎時: クジラセンチメント更新のみ（パラメータ最適化は8時間ごと定期選定時のみ） ==========
         if cycle_count > 1:
@@ -1525,7 +1527,7 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                 cand_p = sym_params.get("params", {})
                 df = logic.make_logic(
                     df,
-                    market_profile_period=sym_params.get("mp", 7),
+                    market_profile_period=sym_params.get("mp", 48),
                     er_threshold=sym_params.get("er", 40.0),
                     strategy_type=cand_strat,
                     env_len=cand_p.get("length", 15),
@@ -1743,7 +1745,7 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                         # 1. 決済トレードチャート画像の生成 & 送信
                         exit_chart_file = plot_exit_chart(
                             symbol=sym, df=df, exit_price=current_price, entry_price=entry_px,
-                            pnl=pnl_current, exit_reason="VP_Trailing/Exit_Rule", side="LONG", whale_signal=whale_sig
+                            pnl=pnl_current, exit_reason=exit_reason, side="LONG", whale_signal=whale_sig
                         )
                         if exit_chart_file and exit_chart_file.exists():
                             discord.send_file(exit_chart_file, f"📊 【決済チャート】{sym} LONG 決済完了 (PnL: {pnl_current:+.2f} USDT)")

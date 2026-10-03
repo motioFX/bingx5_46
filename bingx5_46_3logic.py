@@ -6,6 +6,7 @@ import asyncio
 import time
 import os
 import requests
+import json
 import pybotters
 import pandas as pd
 import numpy as np
@@ -523,6 +524,13 @@ class send_discord:
         if not p.exists():
             print(f"[send_discord] File not found: {p}")
             return False
+        
+        # Discord 25MB制限の安全ガード (413 Payload Too Large 防止)
+        size_mb = p.stat().st_size / (1024 * 1024)
+        if size_mb > 24.5:
+            self.print_log(f"⚠️ [Discord Skip] {p.name} ({size_mb:.2f}MB) はDiscord送信上限(25MB)を超過するため送信を安全にスキップしました。(ローカル保存済み)")
+            return False
+
         mime = "image/png" if p.suffix.lower() == ".png" else "image/jpeg" if p.suffix.lower() in (".jpg", ".jpeg") else "application/octet-stream"
         return bool(self._send_file(description, str(p), p.name, mime))
 
@@ -1971,9 +1979,10 @@ def run_interval_comparison(df_60m, lot=1.0, data_equity=100.0, side_mode="long"
     except Exception as ch_err:
         print(f"[Chart Error] {symbol}: {ch_err}")
 
-    cand_mp = best_params.get('malen', best_params.get('lma_len', 7))
+    # PROJECT_RULES準拠: ボリュームプロファイル(VP)期間は戦略パラメータ(lma_len等)から独立させ、標準48時間(48本)とする
+    cand_mp = 48
     cand_er = best_params.get('lower_pct', best_params.get('lEp', 40))
-    cand_margin = best_params.get('lower_pct', 2.0)
+    cand_margin = 1.0
     return results, best_strat, 60, cand_mp, cand_er, cand_margin
 
 
@@ -1983,8 +1992,8 @@ class VPTrailingManager:
         self,
         side: str,
         entry_price: float,
-        fee_margin_pct: float = 0.0005,      # 手数料カバーマージン (0.05%)
-        initial_margin_pct: float = 0.0005,  # VAL/VAH 初期マージン (0.05%)
+        fee_margin_pct: float = 0.0010,      # 手数料カバーマージン (0.10% 往復手数料を確実にカバー)
+        initial_margin_pct: float = 0.010,   # VAL/VAH 初期マージン (1.0%)
         strategy_type: str = "range",        # 戦略タイプ（range時はマージン拡大）
         entry_val: Optional[float] = None,   # エントリー時の VAL（固定初期SL基準）
         entry_vah: Optional[float] = None    # エントリー時の VAH（固定初期SL基準）
