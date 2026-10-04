@@ -233,6 +233,7 @@ else:
 JST = timezone(timedelta(hours=9))
 MIX_SCRIPT_PATH = Path(__file__).resolve().parent / "download_historical_candles.py"
 SCORES_CSV_PATH = MIX_SCRIPT_PATH.parent / "Data" / "symbol_selection_scores.csv"
+LAST_FULL_SYNC_RECORD_PATH = MIX_SCRIPT_PATH.parent / "Data" / "last_full_sync_slot.json"
 
 TARGET_POSITION_VALUE_USDT = 100.0
 LEVERAGE_FACTOR = 10.0
@@ -538,6 +539,52 @@ def get_latest_analysis_slot_dt(now_dt: datetime, hours: List[int]) -> datetime:
             return slot_cand
     prev_day = now_dt - timedelta(days=1)
     return prev_day.replace(hour=sorted_hours[-1], minute=HOURLY_EXECUTION_MINUTE, second=HOURLY_EXECUTION_SECOND, microsecond=0)
+
+
+def should_perform_8h_full_data_upload(now_dt: datetime) -> bool:
+    """
+    全収集データ（4取引所マルチ時間足ZIPアーカイブ）のDiscord送信を8時間に1回（定期選定スロット）に制限するための判定。
+    直近の8時間選定スロットで既に送信完了しており、かつ前回の送信から7時間未満であれば False を返す。
+    """
+    if "--force-upload" in sys.argv:
+        return True
+    if not LAST_FULL_SYNC_RECORD_PATH.exists():
+        return True
+    try:
+        with open(LAST_FULL_SYNC_RECORD_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        last_slot_str = data.get("last_slot", "")
+        last_ts = float(data.get("timestamp", 0.0))
+
+        # 直近の8時間スロット文字列 (例: "2026-10-05_01")
+        latest_slot_dt = get_latest_analysis_slot_dt(now_dt, ANALYSIS_HOURS)
+        current_slot_str = latest_slot_dt.strftime("%Y-%m-%d_%H")
+
+        elapsed_hours = (now_dt.timestamp() - last_ts) / 3600.0
+        # 同一スロットで既に送信済み、かつ前回から7時間以内の場合はアップロード不要
+        if last_slot_str == current_slot_str and elapsed_hours < 7.0:
+            return False
+        return True
+    except Exception:
+        return True
+
+
+def record_full_sync_completed(now_dt: datetime) -> None:
+    """全収集データのDiscord送信完了をスロットとともに記録する"""
+    try:
+        latest_slot_dt = get_latest_analysis_slot_dt(now_dt, ANALYSIS_HOURS)
+        current_slot_str = latest_slot_dt.strftime("%Y-%m-%d_%H")
+        data = {
+            "last_sync_time": now_dt.strftime("%Y-%m-%d %H:%M:%S JST"),
+            "last_slot": current_slot_str,
+            "timestamp": now_dt.timestamp(),
+        }
+        LAST_FULL_SYNC_RECORD_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with open(LAST_FULL_SYNC_RECORD_PATH, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+        print(f"[Sync Registry] 全データDiscord送信完了を記録しました: スロット {current_slot_str} ({data['last_sync_time']})")
+    except Exception as e:
+        print(f"[Sync Registry Error] 記録失敗: {e}")
 
 
 def check_skip_mix_analysis() -> bool:
@@ -904,7 +951,7 @@ async def select_top_bingx_symbols(top_n: int = 10, mode: str = 'demo') -> List[
         if mix_script.exists():
             try:
                 import subprocess
-                subprocess.run([sys.executable, str(mix_script)], check=True)
+                subprocess.run([sys.executable, str(mix_script), "--skip-upload", "--skip-charts"], check=True)
             except Exception as sub_err:
                 print(f"[Symbol Selection Error] 銘柄選定スクリプト実行エラー: {sub_err}")
             
@@ -958,7 +1005,7 @@ async def run_screening_and_optimization(mode: str, send_charts: bool = False, s
     mix_script = Path(__file__).resolve().parent / "download_historical_candles.py"
     if mix_script.exists():
         try:
-            cmd = [sys.executable, str(mix_script)]
+            cmd = [sys.executable, str(mix_script), "--skip-upload"]
             if not send_charts:
                 cmd.append("--skip-charts")
             subprocess.run(cmd, check=True)
@@ -1150,6 +1197,8 @@ async def sync_historical_and_charts(
             skip_charts=False
         )
         discord.print_log("✅ 【4大取引所 データ同期完了】 全銘柄マルチ時間足のアーカイブ同期＆配信が完了しました。")
+        if not skip_upload:
+            record_full_sync_completed(datetime.now(JST))
     except Exception as e:
         discord.print_log(f"⚠️ 【4大取引所 データ同期例外】 エラーが発生しました: {e}")
 
@@ -1204,7 +1253,10 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
     # ========== 【トレード前準備 ステップ2】: 全銘柄ヒストリカルデータ (2ヶ月×2分割ZIP) ＆ 30d/10d/5d ノーマライズチャート ==========
     skip_history = ("--skip-history" in sys.argv or "--no-history" in sys.argv)
     if not skip_history:
-        await sync_historical_and_charts(days=120)
+        should_upload = should_perform_8h_full_data_upload(datetime.now(JST))
+        if not should_upload:
+            discord.print_log("📌 [8H Sync Guard] 直近8時間スロットで全収集データは既にDiscord送信済みです。ローカル差分同期のみ行い、Discordアップロードはスキップします。")
+        await sync_historical_and_charts(days=120, skip_upload=(not should_upload))
 
     # ========== 【トレード前準備 ステップ3 & 4 & 5】: 指定11銘柄設定 ==========
     selected_symbols = [normalize_symbol(s) for s in FIXED_SYMBOLS][:MAX_SELECTED_SYMBOLS]

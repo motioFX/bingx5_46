@@ -34,11 +34,11 @@
   - 毎時06分00秒（データ収集＆配信タイミングを6分シフト）に1回だけ数十秒稼働し、残りの時間はスリープ待機するため、常時接続切断トラブルがなくVPSのCPU負荷が極めて低く安定する。
 - **Startup Sequence**:
   - 1. Bitbank ASCII Art banner & account settings display (Order Mode: "エアトレード").
-  - 2. 120-day historical data sync (4ヶ月分 / 2分割ZIP) ＆ 30d/10d/5d normalized return charts sent to Discord (Bitbank 47銘柄 ＆ Binance Japan 27銘柄).
+  - 2. 120-day historical data sync (4ヶ月分 / 2分割ZIP) ＆ 30d/10d/5d normalized return charts (直近8時間で未送信の場合のみDiscord送信).
   - 3. Cross-exchange portfolio & active limit orders audit report (Bitbank RENDER/BTC & Binance Japan NEAR) to terminal & Discord.
   - 4. Enter 1H candle execution loop.
-- **Periodic Screening (Every 8 Hours at 01:00, 09:00, 17:00 JST)**:
-  - Re-run historical sync (Bitbank ＆ Binance Japan 4ヶ月分2分割ZIP), normalized charts, and cross-exchange portfolio audit.
+- **Periodic Screening (Every 8 Hours at 01:06, 09:06, 17:06 JST)**:
+  - 8時間に1回の全収集データDiscord送信 (4取引所マルチ時間足ZIP ＆ ノーマライズ比較チャート), 戦略スクリーニング, およびポートフォリオ監査.
   - **Do NOT show the ASCII Art banner during periodic screening cycles** (banner is startup-only).
 
 ## 5. Dual-Exchange 120-Day 2-Part ZIP & Rate Limit / CPU Safety

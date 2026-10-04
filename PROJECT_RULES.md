@@ -6,7 +6,7 @@
 * **対象スクリプト**: 
   - Bitbank: `download_historical_candles.py`
   - Binance Japan: `download_binance_candles.py`
-* **実行タイミング**: ボット起動時（ステップ2）および定期選定時刻（8時間ごと: 01:00, 09:00, 17:00 JST）
+* **実行タイミング**: 厳格に8時間に1回（定期選定時刻: 01:06, 09:06, 17:06 JST）。起動時は直近8時間で未送信の場合のみ送信し、重複送信を防止。
 * **必須要件**:
   1. **全銘柄4ヶ月分（120日分）の完全取得**:
      - **Bitbank**: 現物 JPY 全47銘柄（`btc_jpy`, `eth_jpy`, `xrp_jpy`, `sol_jpy` ... 全ペア）の過去120日分の1時間足OHLCVデータを取得。ローカルCSV（`Data/historical_candles/{symbol}_1h.csv`）に差分蓄積。
