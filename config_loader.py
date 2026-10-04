@@ -92,21 +92,21 @@ def load_binance_api_keys(platform: Optional[str] = None, config: Optional[Dict[
     return ["", ""]
 
 
-# Webhook チャンネル名正規化エイリアスマップ
+# Webhook チャンネル名正規化エイリアスマップ (全取引所データ送信先を bitbank チャンネルへ集約)
 WEBHOOK_ALIASES = {
     "real1": "real1_bitbank",
     "bitbank": "real1_bitbank",
     "real1_bitbank": "real1_bitbank",
 
-    "real2": "real2_hype",
-    "hype": "real2_hype",
-    "hyperliquid": "real2_hype",
-    "real2_hype": "real2_hype",
+    "real2": "real1_bitbank",
+    "hype": "real1_bitbank",
+    "hyperliquid": "real1_bitbank",
+    "real2_hype": "real1_bitbank",
 
-    "real3": "real3_bngx",
-    "bngx": "real3_bngx",
-    "bingx": "real3_bngx",
-    "real3_bngx": "real3_bngx",
+    "real3": "real1_bitbank",
+    "bngx": "real1_bitbank",
+    "bingx": "real1_bitbank",
+    "real3_bngx": "real1_bitbank",
 
     "test4": "test4_test",
     "test": "test4_test",

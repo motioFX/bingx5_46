@@ -308,11 +308,11 @@ async def run_pipeline(
             min_parts=2
         )
 
-        # 4. 古い順からの Discord 順次アップロード
+        # 4. 古い順からの Discord 順次アップロード (全データ送信先を Bitbank チャンネルへ集約)
         if not skip_upload:
             upload_time_split_zips_to_discord(
                 parts=parts,
-                webhook_name="real3_bngx",
+                webhook_name="real1_bitbank",
                 exchange_label="BingX",
                 interval_label=interval,
                 interval_wait_sec=3.0,

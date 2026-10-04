@@ -383,8 +383,8 @@ class send_discord:
     def __init__(self):
         self.real1_webhook = get_webhook_url("real1_bitbank")
         self.test4_webhook = get_webhook_url("test4_test")
-        self.real2_webhook = get_webhook_url("real2_hype")
-        self.real3_webhook = get_webhook_url("real3_bngx")
+        self.real2_webhook = self.real1_webhook
+        self.real3_webhook = self.real1_webhook
 
         # デフォルト出力先: Windows実行時は test4_test、VPS(Linux)実行時は real1_bitbank
         if sys.platform == "win32":

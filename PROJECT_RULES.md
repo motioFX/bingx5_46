@@ -32,7 +32,7 @@
        2. **Binance Japan 全銘柄 直近ZIP** (`binance_japan_all_symbols_recent_*.zip`)
        3. **ノーマライズ比較チャート** (30d / 10d / 5d 主要12銘柄)
        4. **口座状況** (全保有暗号資産 総合ポジション監査)
-     - VPS（Linux環境）稼働時: **`real1_bitbank`** チャンネルへ自動出力
+     - VPS（Linux環境）稼働時: 全取引所（Bitbank, Binance Japan, Hyperliquid, BingX）データZIPおよび通知を **`real1_bitbank`** チャンネルへ集約・自動出力
      - Windows（win32環境）テスト時: **`test4_test`** チャンネルへ自動出力
   5. **データファイルの最新保持・自動クリーンアップ規約**:
      - 生成されたZIPファイルおよびチャート画像は**「常に最新のものだけを維持する」**ことを厳守する。
