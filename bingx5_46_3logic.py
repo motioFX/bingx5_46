@@ -322,7 +322,7 @@ class logicinstance:
         r_len = int(kwargs.get('rsi_len', 9))
         l_len = int(kwargs.get('lma_len', 7))
         r_lep = float(kwargs.get('lEp', 40.0))
-        r_lcp = float(kwargs.get('lCp', 60.0))
+        r_lcp = float(kwargs.get('lCp', 70.0))
         rsi_series = calc_rsi(df['close'], r_len)
         lrsiMA_series = calc_ema(rsi_series, l_len)
         df['rsi'] = rsi_series
@@ -1641,7 +1641,7 @@ def simulate_rsima_strategy(
     rsi_len: int = 9,
     lma_len: int = 7,
     lEp: float = 40.0,
-    lCp: float = 60.0,
+    lCp: float = 70.0,
     max_trades: int = 1,
     initial_equity: float = 100.0,
     fee_rate: float = 0.0006,
@@ -1830,10 +1830,11 @@ def optimize_symbol_strategy(
 
     # 2. RSIMA 戦略グリッドサーチ
     if force_strategy is None or force_strategy.lower() == "rsima":
-        rsi_lengths = [7, 9, 14]
-        lma_lengths = [5, 7, 10]
-        lEps = [30, 35, 40, 45]
-        lCps = [55, 60, 65, 70]
+        # PROJECT_RULES準拠: RSI=9, MALen=7, EMA固定。lEp(30〜50)およびlCp(60〜80)を最適化
+        rsi_lengths = [9]
+        lma_lengths = [7]
+        lEps = [30, 35, 40, 45, 50]
+        lCps = [60, 65, 70, 75, 80]
         
         for rl in rsi_lengths:
             for ml in lma_lengths:

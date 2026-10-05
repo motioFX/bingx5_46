@@ -862,7 +862,7 @@ async def validate_profitable_candidates(trade_side: str, mode: str, base_symbol
         "mp": 48,
         "er": 40.0,
         "margin": 1.0,
-        "params": {"rsi_len": 9, "lma_len": 7, "lEp": 40.0, "lCp": 60.0, "max_trades": MAX_TRADES_COUNT}
+        "params": {"rsi_len": 9, "lma_len": 7, "lEp": 40.0, "lCp": 70.0, "max_trades": MAX_TRADES_COUNT}
     }
 
     for cand_idx, cand in enumerate(target_cands):
@@ -1182,7 +1182,7 @@ async def run_screening_and_optimization(mode: str, send_charts: bool = False, s
         if strat == "ENVELOPE":
             param_str = f"Len={p_detail.get('length', 15)}, Band=±{p_detail.get('lower_pct', 2.0)}%, MALen={p_detail.get('malen', 200)}"
         else:
-            param_str = f"RSI={p_detail.get('rsi_len', 9)}, MALen={p_detail.get('lma_len', 7)}, L-Entry<{p_detail.get('lEp', 40)}, L-Exit>{p_detail.get('lCp', 60)}"
+            param_str = f"RSI={p_detail.get('rsi_len', 9)}, MALen={p_detail.get('lma_len', 7)}, L-Entry<{p_detail.get('lEp', 40)}, L-Exit>{p_detail.get('lCp', 70)}"
 
         discord.print_log(
             f"   📌 [{sym}] 戦略={strat} (ナンピン数:{MAX_TRADES_COUNT}) | {param_str} | "
@@ -1537,7 +1537,7 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                     rsi_len=cand_p.get("rsi_len", 9),
                     lma_len=cand_p.get("lma_len", 7),
                     lEp=cand_p.get("lEp", 40.0),
-                    lCp=cand_p.get("lCp", 60.0),
+                    lCp=cand_p.get("lCp", 70.0),
                 )
 
                 required_cols = ["long", "close"]
