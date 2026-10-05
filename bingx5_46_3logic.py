@@ -798,7 +798,7 @@ class send_discord:
             dd_val = peak_val - pnl_vals
             ax_pnl_dd = ax_pnl.twinx()
             ax_pnl_dd.fill_between(x_indices, -dd_val, 0, color='#ff3355', alpha=0.2, label='Drawdown')
-            ax_pnl_dd.set_ylabel("DD", color='#ff8888', fontsize=8)
+            ax_pnl_dd.set_ylabel("DD [USDT (%)]", color='#ff8888', fontsize=8)
             ax_pnl_dd.tick_params(colors='#ff8888', labelsize=7)
             ax_pnl_dd.set_ylim(-max(15, float(dd_val.max()) * 1.4), 0)
             
@@ -831,7 +831,8 @@ class send_discord:
             ax1.set_xticks(tick_idx)
             ax1.set_xticklabels(tick_lbl, rotation=15, ha="right", fontsize=8, color='#888888')
 
-        ax1.set_title(f"{title_prefix}{display_label} | Final PnL: {final_pnl:+.2f} USDT", fontsize=11, color='white', pad=8, fontweight='bold')
+        max_dd_val = float(dd_val.max()) if 'dd_val' in locals() and len(dd_val) > 0 else 0.0
+        ax1.set_title(f"{title_prefix}{display_label} | PnL: {final_pnl:+.2f} USDT | MaxDD: -{max_dd_val:.2f} USDT (-{max_dd_val:.1f}%)", fontsize=11, color='white', pad=8, fontweight='bold')
         ax1.legend(loc='upper left', facecolor='#2a2e39', edgecolor='#444444', labelcolor='white', fontsize=8)
 
         os.makedirs(os.path.dirname(img_file) if os.path.dirname(img_file) else "backtest_data", exist_ok=True)
@@ -1911,17 +1912,22 @@ def run_interval_comparison(df_60m, lot=1.0, data_equity=100.0, side_mode="long"
         }
     
     discord.print_log("【個別最適化バックテスト結果 (Top 10)】")
-    header = f"{'設定':<35} {'PnL [USDT]':>12} {'DD_max':>8} {'勝率':>7} {'取引':>6}"
-    separator = "-" * 73
+    header = f"{'設定':<35} {'PnL [USDT]':>12} {'最大DD [USDT(%)]':>16} {'勝率':>7} {'取引':>6}"
+    separator = "-" * 81
     all_rows = []
     for label, data in top10:
         row_disp = f"{symbol}_{label}" if (symbol and not str(label).startswith(symbol)) else label
-        all_rows.append(f"{row_disp:<35} {data['final_pnl']:>+12.4f} {data['DD_max']:>8.4f} {data['win_rate']:>6.1f}% {data['trade_count']:>6}")
+        dd_val = data['DD_max']
+        dd_pct = (dd_val / fixed_initial_equity) * 100.0
+        dd_str = f"{dd_val:.2f} ({dd_pct:.1f}%)"
+        all_rows.append(f"{row_disp:<35} {data['final_pnl']:>+12.4f} {dd_str:>16} {data['win_rate']:>6.1f}% {data['trade_count']:>6}")
     table_lines = ["```", header, separator] + all_rows + ["```"]
     discord.print_log("\n".join(table_lines))
     
     best_disp = f"{symbol}_{best_strat.upper()}"
-    discord.print_log(f"★ PnL最大選定: {best_disp} -> 純利益: {best_res['final_pnl']:+.4f} USDT (勝率: {best_res['win_rate']:.1f}%, 取引: {best_res['trade_count']}回, 最大DD: {best_res['DD_max']:.4f})")
+    best_dd_val = best_res['DD_max']
+    best_dd_pct = (best_dd_val / fixed_initial_equity) * 100.0
+    discord.print_log(f"★ PnL最大選定: {best_disp} -> 純利益: {best_res['final_pnl']:+.4f} USDT (勝率: {best_res['win_rate']:.1f}%, 取引: {best_res['trade_count']}回, 最大DD: {best_dd_val:.2f} USDT ({best_dd_pct:.1f}%))")
     discord.print_log(f"   └ 採用パラメータ: {best_params}")
 
     # バックテストチャートの生成

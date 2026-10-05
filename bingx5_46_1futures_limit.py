@@ -916,7 +916,7 @@ async def validate_profitable_candidates(trade_side: str, mode: str, base_symbol
                 if cand_pnl > 0 and trade_cnt > 0:
                     discord.print_log(
                         f"   [合格 🟢] {cand}: 戦略={cand_strat.upper()} | "
-                        f"純利益: +${cand_pnl:.2f} USDT (取引: {trade_cnt}回, 勝率: {win_rt:.1f}%, DD: {max_dd:.2f})"
+                        f"純利益: +${cand_pnl:.2f} USDT (取引: {trade_cnt}回, 勝率: {win_rt:.1f}%, DD: {max_dd:.2f} USDT ({max_dd:.1f}%))"
                     )
                     profitable_cands.append(cand)
                 else:
@@ -1186,7 +1186,7 @@ async def run_screening_and_optimization(mode: str, send_charts: bool = False, s
 
         discord.print_log(
             f"   📌 [{sym}] 戦略={strat} (ナンピン数:{MAX_TRADES_COUNT}) | {param_str} | "
-            f"純利益: {pnl_val:+.4f} USDT (取引: {tc_val}回, 勝率: {wr_val:.1f}%, DD: {dd_val:.4f})"
+            f"純利益: {pnl_val:+.4f} USDT (取引: {tc_val}回, 勝率: {wr_val:.1f}%, DD: {dd_val:.2f} USDT ({dd_val:.1f}%))"
         )
 
     global current_strategy_type
