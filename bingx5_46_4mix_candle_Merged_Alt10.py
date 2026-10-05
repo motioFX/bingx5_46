@@ -1361,26 +1361,15 @@ async def main():
     tier3_cnt = sum(1 for c in prioritized_candidates if c.get("tier") == 3)
     log(f"Saved precursor selection scores to {scores_path} (Top: {', '.join([c['symbol'] for c in prioritized_candidates[:5]])} | Tier1: {tier1_cnt}, Tier2: {tier2_cnt}, Tier3: {tier3_cnt})")
 
-    # 4. 選定候補 Top 10 銘柄の OHLCV & Funding データ取得 (過去2ヶ月分: 60日間)・ファイル保存
+    # 4. 選定銘柄 (固定選定5銘柄 + BTC-USDT) の OHLCV & Funding データ取得 (過去1ヶ月分: 30日間)
+    # ユーザー指示: 大きなデータを取る作業を廃止し、選定銘柄のみの1ヶ月分データに特化
     end_utc = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0)
-    start_utc = end_utc - timedelta(days=60)
-    # 取引高上位10銘柄 (FOREXのみ除外、コモディティ・株・指数は許容)
-    crypto_tickers = [
-        t for t in tickers 
-        if not is_forex_symbol(t.get("symbol", ""))
-    ]
-    top10_vol_symbols = [t["symbol"] for t in crypto_tickers[:10]]
-    if "BTC-USDT" not in top10_vol_symbols:
-        top10_vol_symbols.insert(0, "BTC-USDT")
-        top10_vol_symbols = top10_vol_symbols[:10]
-
-    # 全銘柄（有効な全暗号資産USDT無期限先物）を完全ダウンロード対象とする
-    all_crypto_symbols = [t["symbol"] for t in crypto_tickers]
-    target_symbols = list(dict.fromkeys(all_crypto_symbols + [t["symbol"] for t in prioritized_candidates] + top10_vol_symbols + FIXED_SYMBOLS + ["BTC-USDT"]))
+    start_utc = end_utc - timedelta(days=30)
+    target_symbols = list(dict.fromkeys(FIXED_SYMBOLS + ["BTC-USDT"]))
 
     ticker_map = {t.get("symbol"): t for t in tickers}
 
-    print(f"\n[Download Engine] Downloading 60-day (2 months) OHLCV, Funding Rate & OI for ALL {len(target_symbols)} symbols in parallel...")
+    print(f"\n[Download Engine] Downloading 30-day (1 month) OHLCV & Funding Rate for SELECTED {len(target_symbols)} symbols: {', '.join(target_symbols)}...")
 
     sem = asyncio.Semaphore(12)
     async def fetch_one(rank, sym):
@@ -1407,54 +1396,7 @@ async def main():
 
     # 3. チャート作成および解析処理
     if all_dfs:
-        df_merged_all = pd.concat(all_dfs, ignore_index=True)
-        merged_all_path = out_dir / "historical_all_symbols_merged.csv"
-        df_merged_all.to_csv(merged_all_path, index=False, encoding="utf-8-sig")
-        print(f"\n[Success] Merged 60-day (2 months) dataset successfully saved to: {merged_all_path} ({len(df_merged_all)} rows)")
-
-        # 日付スタンプ付きCSVおよびZIPアーカイブの作成
-        now_jst = datetime.now(JST)
-        today_tag = now_jst.strftime("%Y%m%d")
-        acq_tag = f"{now_jst.strftime('%H')}h"
-        dated_csv_name = f"bingx_all_markets_1h_{today_tag}_{acq_tag}.csv"
-        dated_csv_path = out_dir / dated_csv_name
-        df_merged_all.to_csv(dated_csv_path, index=False, float_format="%.6g", encoding="utf-8-sig")
-
-        # ==============================================================================
-        # 【必須ルール】正規化（normalize）処理の前に、選定全銘柄+BTCの過去2ヶ月分（60日）データを
-        # 1回すべてダウンロード完了し、必ずまとめてZIPファイル化してDiscordへ送信する
-        # ==============================================================================
-        zip_name = f"bingx_all_markets_1h_{today_tag}_{acq_tag}.zip"
-        zip_path = out_dir / zip_name
-        
-        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED, compresslevel=9) as zf:
-            # 全銘柄統合マージドCSV 1ファイルのみ格納（個別ファイルは含めずシンプル化）
-            zf.write(dated_csv_path, arcname=dated_csv_name)
-
-        zip_size_mb = zip_path.stat().st_size / (1024 * 1024)
-        send_target_zip = zip_path
-
-        master_zip_path = out_dir / "historical_all_symbols_merged.zip"
-        with zipfile.ZipFile(master_zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
-            zf.write(merged_all_path, arcname="historical_all_symbols_merged.csv")
-
-        discord = send_discord()
-        if not args.skip_zip and not args.no_chart_send and send_target_zip.exists():
-            if should_upload_file(send_target_zip):
-                log(f"📤 [Discord送信中] {send_target_zip.name} (新規またはデータ更新あり)...")
-                zip_desc = (
-                    f"📦 **【BingX全銘柄 2ヶ月分1HマージドデータZIP】** ({today_tag}_{acq_tag})\n"
-                    f"• 取得日時: `{now_jst.strftime('%Y/%m/%d %H:%M JST')}` ({acq_tag})\n"
-                    f"• 対象期間: 過去60日間（2ヶ月分 / 約1,440時間足）\n"
-                    f"• 収録銘柄数: 全 `{len(all_dfs)}` 銘柄 (全データ行数: `{len(df_merged_all):,}` 行)\n"
-                    f"• ファイル名: `{send_target_zip.name}`\n"
-                    f"• ファイルサイズ: `{zip_size_mb:.2f} MB` (Discord最適化)\n"
-                    f"• 内容: 全銘柄統合CSV（`{dated_csv_name}` 1ファイルのみ格納）"
-                )
-                discord.send_file(send_target_zip, zip_desc)
-                record_file_uploaded(send_target_zip, rows=len(df_merged_all))
-            else:
-                log(f"📦 [アップロード不要] {send_target_zip.name} はすでにDiscord送信完了済み（データ変更なし）のため送信をスキップしました。")
+        print(f"\n[Success] Loaded 30-day (1 month) dataset for selected symbols ({len(all_dfs)} symbols). Huge merged CSV & ZIP creation disabled as per rules.")
 
         # ==============================================================================
         # 【30日・10日・5日 ノーマライズチャート前半高値除外フィルター】
@@ -1506,21 +1448,7 @@ async def main():
         )
         summary_text += f"\n📊 **[1. マルチタイムフレーム地合い判定]**\n"
 
-        # ① 取引高上位 10 銘柄のノーマライズチャート (30D, 10D, 5D)
-        print("\n[Volume Top 10 Charts] Generating 30d, 10d, 5d Normalized Charts...")
-        for win_label, win_hours in windows:
-            vol_chart = generate_custom_normalized_charts(
-                all_dfs=all_dfs,
-                target_symbols=top10_vol_symbols,
-                out_dir=out_dir,
-                window_name=win_label,
-                hours_limit=win_hours,
-                title="BingX Top 10 Volume Normalized Performance",
-                file_prefix="normalized_top10_volume",
-                benchmark_symbol="BTC-USDT"
-            )
-            if not args.no_chart_send and vol_chart and vol_chart.exists():
-                discord.send_file(vol_chart, f"📊 **【BingX 取引高上位10銘柄 ノーマライズチャート [{win_label.upper()}]】**")
+        # ユーザー指示: 選定銘柄（固定5銘柄 + BTC）のみで 30d, 10d, 5d ノーマライズチャートを生成
 
         # ② 固定選定銘柄 (HYPE, NEAR, ZEC, ARB, UNI + BTC) のノーマライズチャート (30D, 10D, 5D)
         print("\n[Fixed Selection Charts] Generating 30d, 10d, 5d Normalized Charts...")
