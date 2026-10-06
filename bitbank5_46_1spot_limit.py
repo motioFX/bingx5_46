@@ -80,7 +80,7 @@ BITBANK_IS_LIVE = True
 BITBANK_IS_AIR = ("--real-trade" not in sys.argv) or ("--air" in sys.argv)
 
 # [ 3 ] ポジション・ロット設定
-BITBANK_TARGET_POSITION_VALUE_JPY = 15000.0  # 目標投資額 15,000 円
+BITBANK_TARGET_POSITION_VALUE_JPY = 10000000.0  # 目標投資額 10,000,000 円 (1,000万円)
 TARGET_POSITION_VALUE_JPY = BITBANK_TARGET_POSITION_VALUE_JPY
 TARGET_POSITION_VALUE_USDT = TARGET_POSITION_VALUE_JPY
 LEVERAGE_FACTOR = 1.0  # 現物取引のため 1.0 倍
@@ -1254,9 +1254,9 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
         f"==================================================\n"
         f"  取引口座設定 : {account_mode_str}\n"
         f"  発注モード   : {air_mode_str}\n"
-        f"  目標投資額   : {BITBANK_TARGET_POSITION_VALUE_JPY:,.0f} JPY (現物 1.0倍)\n"
+        f"  目標投資額   : {BITBANK_TARGET_POSITION_VALUE_JPY:,.0f} JPY (1,000万円 / 現物 1.0倍)\n"
         f"  戦略方向     : LONG ONLY (現物買い ＆ 手仕舞い売り)\n"
-        f"  ローソク足   : 1時間足 (1H)\n"
+        f"  ローソク足   : 日足 (1D) / 1時間足 (1H) / 15分足 (15M) / 5分足 (5M)\n"
         f"  銘柄選定時刻 : 毎日 {hours_str} JST (8時間ごと)\n"
         f"=================================================="
     )

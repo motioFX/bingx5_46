@@ -38,7 +38,7 @@ from config_loader import (
 ALLOW_LIVE_TRADING = False  # 本番リアル発注を許可する場合は True に設定
 
 bitbank_mode = 'demo'  # 'live' または 'demo'
-BITBANK_TARGET_POSITION_VALUE_JPY = 15000.0  # 1ポジションあたりの目標投資額 (JPY)
+BITBANK_TARGET_POSITION_VALUE_JPY = 10000000.0  # 1ポジションあたりの目標投資額 (JPY: 1,000万円)
 LEVERAGE_FACTOR = 1.0  # 現物取引のため 1.0 倍固定
 is_air = True  # AIRモード: True の場合は取引所へ実注文を出さず仮想シミュレーション実行
 
