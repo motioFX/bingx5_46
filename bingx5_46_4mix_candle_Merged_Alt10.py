@@ -462,80 +462,148 @@ async def build_merged_dataset(
     premium_dict: Optional[Dict[datetime, float]] = None,
     ticker_info: Optional[Dict[str, Any]] = None,
 ) -> Tuple[pd.DataFrame, Path]:
-    start_ms = to_ms(start_utc)
-    end_ms = to_ms(end_utc)
-    log(f"Start unified fetch for {symbol} {start_utc.isoformat()} -> {end_utc.isoformat()}")
+    ind_dir = out_dir / "individual" if out_dir.name != "individual" else out_dir
+    ind_dir.mkdir(parents=True, exist_ok=True)
+    out_file = ind_dir / f"merged_{symbol}.csv"
 
-    # 1. OHLCV フェッチ
+    clean_sym = normalize_symbol(symbol).replace("-USDT", "").replace("USDT", "")
+
+    # 1. 既存ローカルデータの探索 (individual/merged_{symbol}.csv, merged_{symbol}.csv, historical_candles)
+    existing_file = None
+    candidate_paths = [
+        out_file,
+        out_dir / f"merged_{symbol}.csv",
+        out_dir / f"merged_{clean_sym}.csv",
+        out_dir / "historical_candles" / f"{symbol}_1h.csv",
+        out_dir / "historical_candles" / f"{clean_sym}_1h.csv",
+    ]
+    for cp in candidate_paths:
+        if cp.exists():
+            existing_file = cp
+            break
+
+    df_existing = None
+    is_incremental = False
+    req_start_utc = start_utc
+
+    if existing_file and existing_file.exists():
+        try:
+            df_old = pd.read_csv(existing_file)
+            if not df_old.empty and "timestamp" in df_old.columns and len(df_old) >= 24:
+                df_old["timestamp"] = pd.to_datetime(df_old["timestamp"])
+                df_old = df_old.sort_values("timestamp").reset_index(drop=True)
+                last_ts = df_old["timestamp"].iloc[-1]
+
+                # タイムゾーンの調整 (UTC または JST)
+                if last_ts.tzinfo is None:
+                    # JSTと仮定して比較
+                    last_ts_utc = last_ts.tz_localize(JST).tz_convert(timezone.utc)
+                else:
+                    last_ts_utc = last_ts.tz_convert(timezone.utc)
+
+                diff_hours = (end_utc - last_ts_utc).total_seconds() / 3600.0
+                # 既存データが過去45日以内の有効データであれば増分（差分）フェッチ
+                if 0 <= diff_hours <= 24 * 45:
+                    is_incremental = True
+                    df_existing = df_old
+                    # 直近確定足の上書き・同期のため2時間手前（安全オーバーラップ）から取得
+                    fetch_start = last_ts_utc - timedelta(hours=2)
+                    req_start_utc = max(fetch_start, end_utc - timedelta(days=30))
+                    log(f"[Incremental Fetch] {symbol}: 既存データ {len(df_existing)}行あり (最終: {last_ts_utc.strftime('%m/%d %H:%M')} UTC)。直近差分 ({req_start_utc.strftime('%m/%d %H:%M')} 〜 {end_utc.strftime('%m/%d %H:%M')} UTC) のみ取得します。")
+        except Exception as read_err:
+            log(f"[Warning] 既存データ読込失敗 ({existing_file}): {read_err}. 全件再取得に切り替えます。")
+
+    if not is_incremental:
+        log(f"[Full Fetch] {symbol}: 初回1ヶ月分 ({start_utc.strftime('%m/%d %H:%M')} 〜 {end_utc.strftime('%m/%d %H:%M')} UTC) を全件取得します。")
+
+    start_ms = to_ms(req_start_utc)
+    end_ms = to_ms(end_utc)
+
+    # 2. OHLCV フェッチ
     ohlcv_rows = await fetch_bingx_ohlcv(symbol, product_type, granularity, start_ms, end_ms)
 
-    if not ohlcv_rows:
+    if not ohlcv_rows and df_existing is None:
         raise RuntimeError(f"No OHLCV data returned for {symbol}.")
 
     price_records = []
-    for it in ohlcv_rows:
-        ts = int(it[0])
-        price_records.append(
-            {
-                "timestamp": from_ms_jst(ts),
-                "open": float(it[1]),
-                "high": float(it[2]),
-                "low": float(it[3]),
-                "close": float(it[4]),
-                "volume": float(it[5]) if len(it) > 5 else 0.0,
-                "qv": float(it[6]) if len(it) > 6 else 0.0,
-            }
-        )
-    df_price = (
-        pd.DataFrame.from_records(price_records)
-        .drop_duplicates(subset=["timestamp"])
-        .sort_values("timestamp")
-        .reset_index(drop=True)
-    )
+    if ohlcv_rows:
+        for it in ohlcv_rows:
+            ts = int(it[0])
+            price_records.append(
+                {
+                    "timestamp": from_ms_jst(ts),
+                    "open": float(it[1]),
+                    "high": float(it[2]),
+                    "low": float(it[3]),
+                    "close": float(it[4]),
+                    "volume": float(it[5]) if len(it) > 5 else 0.0,
+                    "qv": float(it[6]) if len(it) > 6 else 0.0,
+                }
+            )
 
-    df = df_price.copy()
-    df["timestamp"] = pd.to_datetime(df["timestamp"])
-
-    # 2. Funding History (FR & Premium) フェッチ & マージ
-    funding_rows = await fetch_bingx_funding_history(symbol, start_ms, end_ms)
-    fallback_fr = float(ticker_info.get("funding", 0.0)) if ticker_info else 0.0
-
-    if funding_rows:
-        df_funding = (
-            pd.DataFrame(funding_rows)
+    if price_records:
+        df_new = (
+            pd.DataFrame.from_records(price_records)
             .drop_duplicates(subset=["timestamp"])
             .sort_values("timestamp")
             .reset_index(drop=True)
         )
-        df_funding["timestamp"] = pd.to_datetime(df_funding["timestamp"])
-        df = pd.merge(df, df_funding, on="timestamp", how="left")
+        df_new["timestamp"] = pd.to_datetime(df_new["timestamp"])
+
+        # 3. Funding History (FR & Premium) フェッチ & マージ
+        funding_rows = await fetch_bingx_funding_history(symbol, start_ms, end_ms)
+        fallback_fr = float(ticker_info.get("funding", 0.0)) if ticker_info else 0.0
+
+        if funding_rows:
+            df_funding = (
+                pd.DataFrame(funding_rows)
+                .drop_duplicates(subset=["timestamp"])
+                .sort_values("timestamp")
+                .reset_index(drop=True)
+            )
+            df_funding["timestamp"] = pd.to_datetime(df_funding["timestamp"])
+            df_new = pd.merge(df_new, df_funding, on="timestamp", how="left")
+        else:
+            df_new["fundingRate"] = fallback_fr
+            df_new["fundingRate_1h_pct"] = fallback_fr * 100.0
+            df_new["fundingRate_annual_pct"] = fallback_fr * 24.0 * 365.0 * 100.0
+            df_new["premium"] = 0.0
+
+        # 欠損値を前後補間、それでも残ればフォールバックFRで補完
+        df_new["fundingRate"] = df_new["fundingRate"].ffill().bfill().fillna(fallback_fr)
+        df_new["fundingRate_1h_pct"] = df_new["fundingRate"] * 100.0
+        df_new["fundingRate_annual_pct"] = df_new["fundingRate"] * 24.0 * 365.0 * 100.0
+        df_new["premium"] = df_new.get("premium", pd.Series(0.0, index=df_new.index)).ffill().bfill().fillna(0.0)
+
+        # 4. Open Interest (建玉)
+        oi_coins = float(ticker_info.get("openInterestCoins", 0.0)) if ticker_info else 0.0
+        if oi_coins <= 0.0:
+            oi_coins = await fetch_bingx_open_interest(symbol, mode="live")
+        df_new["openInterest"] = oi_coins
+        df_new["openInterestVal"] = df_new["openInterest"] * df_new["close"]
+        df_new["symbol"] = symbol
     else:
-        df["fundingRate"] = fallback_fr
-        df["fundingRate_1h_pct"] = fallback_fr * 100.0
-        df["fundingRate_annual_pct"] = fallback_fr * 24.0 * 365.0 * 100.0
-        df["premium"] = 0.0
+        df_new = pd.DataFrame()
 
-    # 欠損値を前後補間、それでも残ればフォールバックFRで補完
-    df["fundingRate"] = df["fundingRate"].ffill().bfill().fillna(fallback_fr)
-    df["fundingRate_1h_pct"] = df["fundingRate"] * 100.0
-    df["fundingRate_annual_pct"] = df["fundingRate"] * 24.0 * 365.0 * 100.0
-    df["premium"] = df.get("premium", pd.Series(0.0, index=df.index)).ffill().bfill().fillna(0.0)
+    # 5. 既存データと新規差分データのリッチなマージ
+    if df_existing is not None and not df_existing.empty:
+        if not df_new.empty:
+            df = pd.concat([df_existing, df_new], ignore_index=True)
+            df = df.drop_duplicates(subset=["timestamp"], keep="last")
+        else:
+            df = df_existing
+    else:
+        df = df_new
 
-    # 3. Open Interest (建玉)
-    oi_coins = float(ticker_info.get("openInterestCoins", 0.0)) if ticker_info else 0.0
-    if oi_coins <= 0.0:
-        oi_coins = await fetch_bingx_open_interest(symbol, mode="live")
-    df["openInterest"] = oi_coins
-    df["openInterestVal"] = df["openInterest"] * df["close"]
-    df["symbol"] = symbol
-
+    df["timestamp"] = pd.to_datetime(df["timestamp"])
     df = df.sort_values("timestamp").reset_index(drop=True)
 
-    ind_dir = out_dir / "individual" if out_dir.name != "individual" else out_dir
-    ind_dir.mkdir(parents=True, exist_ok=True)
-    out_file = ind_dir / f"merged_{symbol}.csv"
+    # 直近30日分以上（最低720本、最大1440本 = 2ヶ月分）を保持してローカル保存
+    if len(df) > 1440:
+        df = df.tail(1440).reset_index(drop=True)
+
     df.to_csv(out_file, index=False, encoding="utf-8-sig")
-    log(f"Saved merged dataset for {symbol} to {out_file} ({len(df)} rows)")
+    log(f"Saved merged dataset for {symbol} to {out_file} ({len(df)} rows, incremental={is_incremental})")
 
     return df, out_file
 
