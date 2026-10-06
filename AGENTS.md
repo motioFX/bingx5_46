@@ -8,37 +8,29 @@
   3. SSH into the VPS and pull the latest code (`cd /home/ubuntu/bitbank5_46 && git pull origin bitbank`).
   4. Safely verify/restart the bot process on the VPS (`bitbank5_46_1spot_limit.py --loop`).
 
-## 2. Bitbank Spot Trading Rules (Spot / JPY / LONG ONLY)
-- **Spot Trading Only (No Shorting / No Margin)**:
-  - Bitbank is a spot exchange. Strategies must be **LONG ONLY** (Buy to enter, Sell to exit). No short selling.
-  - Leverage is fixed at **1.0x** (`LEVERAGE_FACTOR = 1.0`). Edge (funding rate, interest) is not considered.
-- **Maker Limit Orders & Quantization**:
-  - Long entries must prioritize Maker limit orders at **`best_bid`**.
-  - Unfilled orders must be safely cancelled before relocating or replacing.
-  - Price and lot sizes must strictly conform to Bitbank asset specifications (`sz_decimals`, `price_place`).
+## 2. Operation Mode (Pure Monitor & Overseas Data Collection)
+- **No Order Placement / No Air Trade**:
+  - 発注処理・売買シグナル判定・エアトレード（ペーパートレード）は完全に廃止し、ボットは「実保有ポジション監査」および「海外取引所データ収集＆配信」に専念する。
+  - レバレッジや余計な戦略バックテスト最適化・トレーリング等は行わない。
 
-## 3. Air Mode & Oracle No.1 Monitoring Operation
-- **Air Mode Operation (オラクルNo.1 監視運用)**:
-  - オラクルNo.1ボットは相場監視・シグナル通知に専念するため、実発注は行わずエアトレード（`BITBANK_IS_AIR = True`）として動作させる。
-  - Live API（`BITBANK_IS_LIVE = True`）から本番レート・板情報・実残高を取得しつつ、発注処理はペーパートレードとして仮想執行。
-  - ロングエントリー（LONG ENTRY）および利確・手仕舞い（LONG CLOSE）のタイミングで、Discordへ明瞭なシグナル通知および決済トレードチャートを送信する。
+## 3. Cross-Exchange Portfolio Tracking & Asset Protection
 - **Cross-Exchange Portfolio Tracking (毎時ポジション監査)**:
-  - `portfolio_tracker.py` と連携し、**Bitbank（現物 RENDER, BTC 等）** および **Binance Japan（現物 NEAR 等）** の購入済み暗号資産を毎時間サイクルごとに自動監査。
-  - 保有数量、移動加重平均建値、現在市場価格、評価額、含み損益、未約定指値注文（拘束JPY）を、ボット起動時・定期選定時・毎時ループにてログおよびDiscordへ自動報告する。
+  - `portfolio_tracker.py` と連携し、**Bitbank（現物 RENDER, BTC 等）** および **Binance Japan（現物 NEAR 等）** の購入済み暗号資産を毎時06分サイクルごとに自動監査。
+  - 保有数量、移動加重平均建値、現在市場価格、評価額、含み損益、未約定指値注文（拘束JPY）を、ボット起動時・定期スロット・毎時ループにてログおよびDiscordへ自動報告する。
 - **Long-Term BTC Asset Protection**:
-  - 口座内の長期保有現物BTC（0.1434 BTC等）は、ボットの売買から完全に隔離・保護する。
+  - 口座内の長期保有現物BTC（0.1434 BTC等）は、ボットの操作対象外として安全に保護・監査表示される。
 
 ## 4. Execution Sequence & Periodic Timing Rule
 - **Architecture Characteristic (1H Candle & REST API Only)**:
   - 5分足の監視ループや WebSocket 常時接続は使用せず、完全な **「1時間足（1h）確定足・HTTP REST API方式」** で動作する。
-  - 毎時06分00秒（データ収集＆配信タイミングを6分シフト）に1回だけ数十秒稼働し、残りの時間はスリープ待機するため、常時接続切断トラブルがなくVPSのCPU負荷が極めて低く安定する。
+  - 毎時06分00秒に1回だけ数十秒稼働（ポジション監査・古いファイルクリーンアップ）し、残りの時間はスリープ待機するため、常時接続切断トラブルがなくVPSのCPU負荷が極めて低く安定する。
 - **Startup Sequence**:
-  - 1. Bitbank ASCII Art banner & account settings display (Order Mode: "エアトレード").
-  - 2. 120-day historical data sync (4ヶ月分 / 2分割ZIP) ＆ 30d/10d/5d normalized return charts (直近8時間で未送信の場合のみDiscord送信).
-  - 3. Cross-exchange portfolio & active limit orders audit report (Bitbank RENDER/BTC & Binance Japan NEAR) to terminal & Discord.
-  - 4. Enter 1H candle execution loop.
-- **Periodic Screening (Every 8 Hours at 01:06, 09:06, 17:06 JST)**:
-  - 8時間に1回の全収集データDiscord送信 (4取引所マルチ時間足ZIP ＆ ノーマライズ比較チャート), 戦略スクリーニング, およびポートフォリオ監査.
+  - 1. Bitbank ASCII Art banner & account settings display (動作モード: ポジション監査 ＆ データ収集配信 (売買発注なし)).
+  - 2. 起動時 総合ポジション監査（Bitbank BTC/RENDER ＆ Binance Japan NEAR）.
+  - 3. 海外取引所（Hyperliquid & BingX）全銘柄マルチ時間足データ同期（非同期バックグラウンド実行）.
+  - 4. 1時間足確定ポジション監査ループ開始.
+- **Periodic Sync Slot (Every 8 Hours at 01:06, 09:06, 17:06 JST)**:
+  - 8時間に1回の海外取引所全収集データ（Hyperliquid ＆ BingX 4大カテゴリー別差分ZIP）のバックグラウンド収集・Discord配信、および総合ポジション監査.
   - **Do NOT show the ASCII Art banner during periodic screening cycles** (banner is startup-only).
 
 ## 5. Dual-Exchange 120-Day 2-Part ZIP & Rate Limit / CPU Safety

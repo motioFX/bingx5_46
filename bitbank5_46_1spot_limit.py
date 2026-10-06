@@ -1228,15 +1228,8 @@ async def sync_historical_and_charts(
 
 
 async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60'):
-    from bitbank5_46_2api import (
-        api_bitbank,
-        fetch_instrument_spec_bitbank,
-        flatten_current_position_bitbank,
-    )
-    from bitbank5_46_3logic import PnLCalculator
-
     account_mode_str = "[LIVE Account] (Bitbank ＆ Binance Japan 本番口座 接続中)" if BITBANK_IS_LIVE else "[OFFLINE/MOCK]"
-    air_mode_str = "エアトレード (本番リアルタイム監視 ＆ ペーパートレード発注)" if BITBANK_IS_AIR else "リアル発注 (実際にBitbank取引所へ発注)"
+    op_mode_str = "ポジション監査 ＆ データ収集配信 (売買発注なし)"
 
     hours_str = ", ".join([f"{h:02d}:00" for h in sorted(ANALYSIS_HOURS)])
     start_msg = (
@@ -1253,11 +1246,11 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
         f"[Bitbank 5.46 Auto Trading System (Spot / LONG ONLY)]\n"
         f"==================================================\n"
         f"  取引口座設定 : {account_mode_str}\n"
-        f"  発注モード   : {air_mode_str}\n"
+        f"  動作モード   : {op_mode_str}\n"
         f"  目標投資額   : {BITBANK_TARGET_POSITION_VALUE_JPY:,.0f} JPY (1,000万円 / 現物 1.0倍)\n"
-        f"  戦略方向     : LONG ONLY (現物買い ＆ 手仕舞い売り)\n"
+        f"  戦略方向     : 現物ポジション自動監査 ＆ 海外全銘柄データ収集\n"
         f"  ローソク足   : 日足 (1D) / 1時間足 (1H) / 15分足 (15M) / 5分足 (5M)\n"
-        f"  銘柄選定時刻 : 毎日 {hours_str} JST (8時間ごと)\n"
+        f"  定期同期時刻 : 毎日 {hours_str} JST (8時間ごと)\n"
         f"=================================================="
     )
     if "--no-banner" not in sys.argv:
@@ -1272,34 +1265,7 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
     except Exception as port_err:
         discord.print_log(f"⚠️ 起動時 総合ポジション監査エラー: {port_err}")
 
-    # ========== 【トレード前準備 ステップ2】: 指定11銘柄設定 ＆ 口座ポジション引継ぎ ==========
-    selected_symbols = [normalize_symbol(s) for s in FIXED_SYMBOLS][:MAX_SELECTED_SYMBOLS]
-    symbol_params_map: Dict[str, Dict[str, Any]] = {}
-    best_params: Dict[str, Any] = {
-        "strategy": "rsima",
-        "interval": 60,
-        "mp": 7,
-        "er": 40.0,
-        "params": {"rsi_len": 9, "lma_len": 7, "lEp": 40.0, "lCp": 60.0}
-    }
-    for s in selected_symbols:
-        symbol_params_map[s] = best_params
-
-    # 各銘柄の api インスタンスを保持（トレーリングSL状態を維持するため）
-    symbol_apis: Dict[str, Any] = {}
-    for sym in selected_symbols:
-        api = api_bitbank(symbol=sym, mode=mode)
-        spec = fetch_instrument_spec_bitbank(sym, mode)
-        if spec:
-            api.update_instrument_spec(spec)
-        symbol_apis[sym] = api
-
-    # 起動時にも口座内のポジションを監査し、選定外でも保有中ならGraceful Exitとして引き継ぐ
-    symbol_apis, symbol_params_map = await audit_and_retain_positions(
-        selected_symbols, symbol_apis, symbol_params_map, best_params, mode
-    )
-
-    # ========== 【トレード前準備 ステップ3】: 全銘柄ヒストリカルデータ同期 ＆ ノーマライズチャート (非同期バックグラウンド実行) ==========
+    # ========== 【起動時 ステップ2】: 全銘柄ヒストリカルデータ同期 (非同期バックグラウンド実行) ==========
     skip_history = ("--skip-history" in sys.argv or "--no-history" in sys.argv)
     if not skip_history:
         should_upload = should_perform_8h_full_data_upload(datetime.now(JST))
@@ -1307,17 +1273,15 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
             discord.print_log("📌 [8H Sync Guard] 直近8時間スロットで全収集データは既にDiscord送信済みです。ローカル差分同期のみ行い、Discordアップロードはスキップします。")
         else:
             record_full_sync_slot(datetime.now(JST), status="in_progress")
-        # トレード監視・毎時ポジション監査ループをブロックしないよう非同期バックグラウンドで起動
+        # ポジション監査ループをブロックしないよう非同期バックグラウンドで起動
         asyncio.create_task(sync_historical_and_charts(incremental_hours=8, skip_upload=(not should_upload)))
 
-    logic = logicinstance()
     last_screening_slot = (datetime.now(JST).date(), datetime.now(JST).hour)
     cycle_count = 0
-    previous_hourly_oi: Dict[str, float] = {}
 
-    discord.print_log(f"[Phase B] 1時間足エントリー/クローズループを開始します。新選定銘柄: {', '.join(selected_symbols)} (全監視: {', '.join(symbol_apis.keys())})")
+    discord.print_log("[Monitor Loop] 1時間足確定ポジション監査ループを開始します。")
 
-    # ========== フェーズB: 1時間足ループ ==========
+    # ========== 1時間足ループ ==========
     while True:
         cycle_count += 1
         now_jst = datetime.now(JST)
@@ -1336,11 +1300,11 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
         # --loop フラグがない場合は1サイクルのみ実行
         if cycle_count > 1 and "--loop" not in sys.argv:
             print("\n==================================================")
-            print("  [Success] 1サイクルの選定・最適化・トレード判定が完走しました。")
+            print("  [Success] 1サイクルのポジション監査が完走しました。")
             print("==================================================")
             break
 
-        # ========== フェーズC: 定期銘柄選定 & Graceful Exit 管理 & スロットリセット ==========
+        # ========== 8時間ごと: 定期ポジション監査 ＆ 海外データ同期配信 ==========
         today_date = now_jst.date()
         current_slot = (today_date, now_jst.hour)
         is_periodic_reset_time = (
@@ -1349,513 +1313,50 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
             and current_slot != last_screening_slot
         )
         if is_periodic_reset_time:
-            discord.print_log(f"[Phase C] 定期銘柄選定時刻 ({now_jst.hour:02d}:{HOURLY_EXECUTION_MINUTE:02d} JST / 8時間ごと) 到達。")
+            discord.print_log(f"[Periodic Slot] 定期スロット ({now_jst.hour:02d}:{HOURLY_EXECUTION_MINUTE:02d} JST / 8時間ごと) 到達。")
 
             # 1. 最優先: Bitbank ＆ Binance Japan 全保有暗号資産・損益・未約定指値 総合ポジション監査
             try:
                 from portfolio_tracker import report_all_positions
-                await report_all_positions(mode=mode, to_discord=True, header_title=f"🏦 【定期選定時 ({now_jst.hour:02d}:00 JST) 全保有暗号資産 総合ポジション監査】")
+                await report_all_positions(mode=mode, to_discord=True, header_title=f"🏦 【定期監査 ({now_jst.hour:02d}:00 JST) 全保有暗号資産 総合ポジション監査】")
             except Exception as port_err:
-                discord.print_log(f"⚠️ 定期選定時 総合ポジション監査エラー: {port_err}")
-
-            # 2. 定期選定: バックテスト最適化は行わず固定12銘柄をそのまま安全に維持
-            selected_symbols = [normalize_symbol(s) for s in FIXED_SYMBOLS][:MAX_SELECTED_SYMBOLS]
-            new_symbol_params_map: Dict[str, Dict[str, Any]] = {}
-            default_best_params: Dict[str, Any] = {
-                "strategy": "rsima",
-                "interval": 60,
-                "mp": 7,
-                "er": 40.0,
-                "params": {"rsi_len": 9, "lma_len": 7, "lEp": 40.0, "lCp": 60.0}
-            }
-            for s in selected_symbols:
-                new_symbol_params_map[s] = default_best_params
-            best_params = default_best_params
-
-            # 3. 旧インスタンスの引き継ぎと新選定銘柄の symbol_apis 構築
-            old_apis = symbol_apis
-            old_params = symbol_params_map
-            symbol_apis = {}
-            symbol_params_map = new_symbol_params_map
-
-            for sym in selected_symbols:
-                if sym in old_apis and old_apis[sym] is not None:
-                    symbol_apis[sym] = old_apis[sym]
-                else:
-                    api = api_bitbank(symbol=sym, mode=mode)
-                    spec = fetch_instrument_spec_bitbank(sym, mode)
-                    if spec:
-                        api.update_instrument_spec(spec)
-                    symbol_apis[sym] = api
-
-            # 4. 口座全体の全ポジションをスキャンし、選定外でも保有中の銘柄はGraceful Exitとして引き継ぐ
-            symbol_apis, symbol_params_map = await audit_and_retain_positions(
-                selected_symbols, symbol_apis, symbol_params_map, best_params, mode, old_apis=old_apis, old_params=old_params
-            )
-
-            # ポジションのない旧選定銘柄のインスタンスをメモリ破棄
-            for old_sym in list(old_apis.keys()):
-                if old_sym not in symbol_apis:
-                    old_apis[old_sym] = None
-            gc.collect()
+                discord.print_log(f"⚠️ 定期 総合ポジション監査エラー: {port_err}")
 
             last_screening_slot = current_slot
-            logic = logicinstance()
-            discord.print_log(f"[Periodic Reset Complete] 監視対象銘柄 (LONG ONLY): {', '.join(selected_symbols)} | 現在の全監視対象: {', '.join(symbol_apis.keys())}")
+            gc.collect()
 
-            # 5. 海外取引所（Hyperliquid & BingX 4大カテゴリー別）全銘柄データ同期をバックグラウンド非同期実行
+            # 2. 海外取引所（Hyperliquid & BingX 4大カテゴリー別）全銘柄データ同期をバックグラウンド非同期実行
             should_upload_periodic = should_perform_8h_full_data_upload(now_jst)
             if should_upload_periodic:
                 record_full_sync_slot(now_jst, status="in_progress")
             asyncio.create_task(sync_historical_and_charts(incremental_hours=8, skip_upload=(not should_upload_periodic)))
 
+            # 古いZIP・チャート画像の自動クリーンアップ
+            try:
+                from download_historical_candles import cleanup_data_dir
+                cleanup_data_dir(max_age_hours=24.0)
+            except Exception:
+                pass
+
             continue
 
-        # ========== 毎時: クジラセンチメント更新のみ（パラメータ最適化は8時間ごと定期選定時のみ） ==========
-        if cycle_count > 1:
-            try:
-                whale_script = Path(__file__).resolve().parent / "fetch_whale_sentiment.py"
-                if whale_script.exists():
-                    try:
-                        subprocess.run([sys.executable, str(whale_script)], check=True, timeout=60)
-                    except Exception:
-                        pass
-
-                # 古いZIP・チャート画像の自動クリーンアップ (24時間超過ファイルを毎時クリーンアップ)
-                try:
-                    from download_historical_candles import cleanup_data_dir
-                    cleanup_data_dir(max_age_hours=24.0)
-                except Exception:
-                    pass
-
-                # 保有中ポジションの確認
-                held_symbols = set()
-                for sym, api in symbol_apis.items():
-                    pos = await api.get_positions()
-                    if float(pos.get("buy", 0)) > 0:
-                        held_symbols.add(sym)
-
-                # 銘柄リストは日次最適化結果を維持（ポジション保有中の銘柄が消えないようにする）
-                updated_symbols = list(held_symbols)
-                for sym in selected_symbols:
-                    if sym not in updated_symbols:
-                        updated_symbols.append(sym)
-
-                # symbol_apis の同期更新
-                new_symbol_apis = {}
-                for sym in updated_symbols:
-                    if sym in symbol_apis:
-                        new_symbol_apis[sym] = symbol_apis[sym]
-                    else:
-                        api = api_bitbank(symbol=sym, mode=mode)
-                        spec = fetch_instrument_spec_bitbank(sym, mode)
-                        if spec:
-                            api.update_instrument_spec(spec)
-                        new_symbol_apis[sym] = api
-                symbol_apis = new_symbol_apis
-
-            except Exception as rot_err:
-                discord.print_log(f"[Hourly Update Error] クジラセンチメント更新エラー: {rot_err}")
-
-        # ========== 各銘柄のトレード判定 (LONG ONLY) ==========
-        discord.print_log(f"\n[Cycle #{cycle_count}] {now_jst.strftime('%Y-%m-%d %H:%M')} JST | 対象: {', '.join(symbol_apis.keys())}", level="debug")
-
-        # 💎 毎時サイクル開始時: Bitbank ＆ Binance Japan 全保有暗号資産・損益・未約定指値 総合監査 (毎時間チェック)
-        if cycle_count > 1 or "--loop" in sys.argv:
-            try:
-                from portfolio_tracker import report_all_positions
-                await report_all_positions(
-                    mode=mode,
-                    to_discord=True,
-                    header_title=f"🏦 【毎時ポジション監査 (Cycle #{cycle_count} / {now_jst.strftime('%H:%M')} JST)】"
-                )
-            except Exception as port_err:
-                discord.print_log(f"⚠️ 毎時ポジション監査エラー: {port_err}")
-
+        # ========== 毎時06分: Bitbank ＆ Binance Japan 全保有暗号資産 総合ポジション監査 ==========
         try:
-            active_positions = {}
-            valid_entry_candidates = []
-            selected_set = set(selected_symbols)
-            freed_symbols = []
+            from portfolio_tracker import report_all_positions
+            await report_all_positions(
+                mode=mode,
+                to_discord=True,
+                header_title=f"🏦 【毎時ポジション監査 (Cycle #{cycle_count} / {now_jst.strftime('%H:%M')} JST)】"
+            )
+        except Exception as port_err:
+            discord.print_log(f"⚠️ 毎時ポジション監査エラー: {port_err}")
 
-            # 1. 全銘柄のリアルタイム価格・出来高を一括取得
-            all_asset_ctxs = await fetch_all_asset_contexts(mode=mode)
-
-            # 口座総残高をサイクル開始時に1回取得
-            first_api = next(iter(symbol_apis.values())) if symbol_apis else None
-            cycle_balance = await first_api.get_account() if first_api else 100000.0
-            hourly_summary_rows = []
-
-            # 2. 全銘柄のポジション状況とシグナル判定を一括評価
-            for sym, api in list(symbol_apis.items()):
-                df = await fetch_bitbank_candles(sym, "1h", limit=300, mode=mode)
-                if df.empty or len(df) < 20:
-                    discord.print_log(f"[{sym}] ローソク足データ不足 (rows={len(df)}). スキップ。")
-                    continue
-
-                # リアルタイム FR / OI の付与
-                ctx = all_asset_ctxs.get(sym, {})
-                funding_val = ctx.get("funding", 0.0)
-                curr_oi_val = ctx.get("openInterest", 0.0)
-                df["funding"] = funding_val
-                df["openInterest"] = curr_oi_val
-
-                # OI変化率の計算 (前時間比)
-                prev_oi = previous_hourly_oi.get(sym, curr_oi_val)
-                oi_delta_pct = ((curr_oi_val - prev_oi) / prev_oi * 100.0) if prev_oi > 0 else 0.0
-                previous_hourly_oi[sym] = curr_oi_val
-
-                # 各銘柄の個別最適化パラメータを取得
-                sym_params = symbol_params_map.get(sym, best_params)
-                cand_interval = int(sym_params.get("interval", 60))
-
-                # 60分を超える時間足（120分、180分など）で個別最適化されている場合はリサンプリング
-                if cand_interval > 60:
-                    df = resample_candles(df, cand_interval)
-                    if not df.empty:
-                        last_ts = pd.to_datetime(df['timestamp'].iloc[-1], utc=True)
-                        candle_close_time = last_ts + timedelta(minutes=cand_interval)
-                        if candle_close_time > datetime.now(timezone.utc):
-                            df = df.iloc[:-1].reset_index(drop=True)
-
-                if df.empty or len(df) < 15:
-                    discord.print_log(f"[{sym}] データ不足 (rows={len(df)}). スキップ。")
-                    continue
-
-                cand_strat = sym_params.get("strategy", "rsima")
-                cand_p = sym_params.get("params", {})
-                df = logic.make_logic(
-                    df,
-                    market_profile_period=sym_params.get("mp", 7),
-                    er_threshold=sym_params.get("er", 40.0),
-                    strategy_type=cand_strat,
-                    env_len=cand_p.get("length", 15),
-                    env_lower_pct=cand_p.get("lower_pct", 2.0),
-                    env_upper_pct=cand_p.get("upper_pct", 2.0),
-                    env_malen=cand_p.get("malen", 200),
-                    rsi_len=cand_p.get("rsi_len", 9),
-                    lma_len=cand_p.get("lma_len", 7),
-                    lEp=cand_p.get("lEp", 40.0),
-                    lCp=cand_p.get("lCp", 60.0),
-                )
-
-                required_cols = ["long", "close"]
-                missing = [c for c in required_cols if c not in df.columns]
-                if missing:
-                    discord.print_log(f"[{sym}] シグナルカラム不足: {missing}. スキップ。")
-                    continue
-
-                current_price = df["close"].iloc[-1]
-                long_signal = bool(df["long"].iloc[-1])
-                vah = df["VAH"].iloc[-1]
-                val = df["VAL"].iloc[-1]
-                poc = df["POC"].iloc[-1]
-                vol_surge = float(df["vol_surge_ratio"].iloc[-1]) if "vol_surge_ratio" in df.columns else 1.0
-
-                position = await api.get_positions()
-                balance = cycle_balance
-                has_long = float(position.get("buy", 0)) > 0
-
-                spec = api.bingx.instrument_spec or {}
-                lot_size = compute_lot_size(current_price, TARGET_POSITION_VALUE_USDT, spec)
-
-                pos_str = "LONG" if has_long else "FLAT"
-                sig_str = "LONG↑" if long_signal else "---"
-                pnl_current = float(position.get("profit", 0.0)) if has_long else 0.0
-                pnl_str = f" | 含み損益: {pnl_current:+,.0f} 円" if has_long else ""
-
-                whale_info = get_whale_sentiment_info(sym)
-                whale_sig = whale_info.get("signal", "NEUTRAL")
-
-                strat_name = sym_params.get("strategy", "RANGE").upper()
-                px_fmt = f"{current_price:,.3f} 円" if current_price < 1000 else f"{current_price:,.0f} 円"
-                discord.print_log(
-                    f"[{sym}] Price: {px_fmt} | Pos: {pos_str}{pnl_str} | Signal: {sig_str} ({strat_name}) | "
-                    f"VolSurge: {vol_surge:.1f}x | "
-                    f"VAH: {vah:,.0f} | VAL: {val:,.0f} | POC: {poc:,.0f} | 口座残高: {balance:,.0f} 円",
-                    level="debug"
-                )
-
-                whale_tag_short = "🟢買い" if whale_sig == "LONG_ONLY" else ("🔴売り" if whale_sig == "SHORT_ONLY" else "⚪中立")
-                pos_tag_short = f"LONG({pnl_current:+.0f})" if has_long else "FLAT"
-                sig_tag_short = "LONG↑" if long_signal else "---"
-                hourly_summary_rows.append({
-                    "sym": sym,
-                    "price": current_price,
-                    "pos": pos_tag_short,
-                    "sig": sig_tag_short,
-                    "whale": whale_tag_short,
-                })
-
-                if has_long:
-                    active_positions[sym] = (has_long, df, position, current_price, pnl_current)
-                else:
-                    # ポジション未保有（FLAT）の場合
-                    # 旧選定銘柄で既にFLATであれば、監視リストから解放
-                    if sym not in selected_set:
-                        discord.print_log(f"[{sym}] 旧選定銘柄ですがポジションがFLATのため、監視リストから解放します。")
-                        freed_symbols.append(sym)
-                        continue
-
-                    # クジラ判定が SHORT_ONLY でなければロング許可
-                    is_long_allowed = whale_sig in ("LONG_ONLY", "NEUTRAL")
-
-                    if long_signal:
-                        if is_long_allowed:
-                            valid_entry_candidates.append({
-                                "symbol": sym,
-                                "side": "LONG",
-                                "df": df,
-                                "position": position,
-                                "balance": balance,
-                                "lot_size": lot_size,
-                                "current_price": current_price,
-                                "whale_sig": whale_sig
-                            })
-                        else:
-                            discord.print_log(f"[{sym}] [FILTER] ロングシグナル検出も、クジラセンチメント ({whale_sig}) が売り優勢のため見送り。", level="debug")
-                    else:
-                        discord.print_log(f"[{sym}] [--] シグナルなし。エントリー見送り (クジラ判定: {whale_sig})。", level="debug")
-
-                await asyncio.sleep(0.1)
-
-            # スマホ1画面完結サマリーのDiscord送信 (16行程度・スクロール不要)
-            if hourly_summary_rows:
-                next_hour_str = (now_jst.replace(minute=HOURLY_EXECUTION_MINUTE, second=HOURLY_EXECUTION_SECOND, microsecond=0) + timedelta(hours=1)).strftime('%H:%M:%S')
-                summary_lines = [
-                    f"⏱ [Cycle #{cycle_count}] {now_jst.strftime('%H:%M')} JST (エアトレ監視)",
-                    "───────────────────────────────────",
-                    "銘柄       現在値    保有   シグナル  大口",
-                    "───────────────────────────────────",
-                ]
-                for r in hourly_summary_rows:
-                    px = r["price"]
-                    px_str = f"{px:,.3f}円" if px < 1000 else f"{px:,.0f}円"
-                    summary_lines.append(f"{r['sym']:<8s} {px_str:>10s}  {r['pos']:<6s}  {r['sig']:^6s}  {r['whale']}")
-                summary_lines.append("───────────────────────────────────")
-                summary_lines.append(f"次回確定: {next_hour_str} JST")
-                discord.print_log("```text\n" + "\n".join(summary_lines) + "\n```")
-
-            # FLATになった旧選定銘柄のメモリ解放
-            for fsym in freed_symbols:
-                if fsym in symbol_apis:
-                    del symbol_apis[fsym]
-                if fsym in symbol_params_map:
-                    del symbol_params_map[fsym]
-
-            # 2. 既存ポジションの決済・トレーリングSL判定
-            from real_trade_tracker import record_real_trade, plot_real_trading_performance, plot_exit_chart
-
-            for sym, (has_long, df, position, current_price, pnl_current) in list(active_positions.items()):
-                api = symbol_apis[sym]
-                entry_px = float(position.get("buy_pos", 0)) or current_price
-                entry_time = position.get("entry_time")
-                sym_params = symbol_params_map.get(sym, best_params)
-                whale_sig = get_whale_sentiment_info(sym).get("signal", "NEUTRAL")
-
-                if has_long:
-                    cand_strat = sym_params.get("strategy", "rsima")
-                    longclose_sig = bool(df["longclose"].iloc[-1]) if "longclose" in df.columns else False
-                    is_take_profit = longclose_sig and (current_price > entry_px)
-                    exit_reason = f"TakeProfit_{cand_strat.upper()}" if is_take_profit else "VP_Trailing"
-
-                    if is_take_profit:
-                        discord.print_log(f"[{sym}] [TAKE PROFIT] 🎯 新戦略利確シグナル点灯 (現在値: {current_price:,.0f}円 > 建値: {entry_px:,.0f}円, 戦略: {cand_strat.upper()})")
-                        try:
-                            discord.send(
-                                f"📢 **【シグナル通知: LONG CLOSE】**\n"
-                                f"🎯 **{sym.upper()}** にロング利確・クローズシグナルが点灯しました！\n"
-                                f"・現在値: `{current_price:,.1f}円`\n"
-                                f"・建値: `{entry_px:,.1f}円`\n"
-                                f"・含み損益: `{pnl_current:+,.0f}円`\n"
-                                f"・理由: `{exit_reason}` (戦略: `{cand_strat.upper()}`)\n"
-                                f"*(※エアトレード決済シグナル)*"
-                            )
-                        except Exception:
-                            pass
-
-                        from bitbank5_46_2api import flatten_current_position_bitbank
-                        await flatten_current_position_bitbank(sym, "JPY", mode, exit_reason, force_market=True)
-                        closed = True
-                    else:
-                        closed = await api.long_close(
-                            df, position, commission=0.0,
-                            sl_margin_pct=sym_params.get("margin", 2.0),
-                            strategy_type=cand_strat,
-                        )
-                    if closed:
-                        record_real_trade(sym, "LONG", "CLOSE", current_price, float(position.get("buy", 0)), pnl_current, f"実運用決済 ({exit_reason})")
-                        discord.print_log(f"[{sym}] [CLOSE] 🟢 ロングポジション決済完了 (PnL: {pnl_current:+.2f} 円, 理由: {exit_reason})")
-                        
-                        sym_exch = "Binance Japan" if (str(sym).upper().endswith("JPY") and "_" not in str(sym)) else "Bitbank"
-                        # 1. 決済トレードチャート画像の生成 & 送信
-                        exit_chart_file = plot_exit_chart(
-                            symbol=sym, df=df, exit_price=current_price, entry_price=entry_px,
-                            pnl=pnl_current, exit_reason="VP_Trailing/Exit_Rule", side="LONG", whale_signal=whale_sig,
-                            entry_time=entry_time
-                        )
-                        if exit_chart_file and exit_chart_file.exists():
-                            discord.send_file(exit_chart_file, f"📊 【{sym_exch} 決済チャート】{sym.upper()} LONG 決済完了 (PnL: {pnl_current:+.2f} 円)")
-
-                        # 2. 累積 PnL パフォーマンスチャートの生成 & 送信
-                        chart_file = plot_real_trading_performance()
-                        if chart_file and chart_file.exists():
-                            discord.send_file(chart_file, f"📈 【{sym_exch} 実運用実績】累積損益パフォーマンス更新 (PnL: {pnl_current:+.2f} 円)")
-                        del active_positions[sym]
-
-                        # 旧選定銘柄の決済完了時は監視リストから解放
-                        if sym not in selected_set:
-                            discord.print_log(f"[{sym}] [Graceful Exit Completed] 旧選定銘柄のポジション決済が完了したため、監視リストから解放します。")
-                            if sym in symbol_apis:
-                                del symbol_apis[sym]
-                            if sym in symbol_params_map:
-                                del symbol_params_map[sym]
-
-            # 3. 新規エントリー実行 (最大同時保有ポジション数制限: MAX_ACTIVE_POSITIONS)
-            current_pos_count = len(active_positions)
-            if current_pos_count >= MAX_ACTIVE_POSITIONS:
-                held_syms = ", ".join(active_positions.keys())
-                discord.print_log(f"[ENTRY BLOCK] 現在最大ポジション枠({current_pos_count}/{MAX_ACTIVE_POSITIONS})保有中のため新規エントリーは見送ります。(保有中: {held_syms})")
-            elif valid_entry_candidates:
-                # 既にポジション保有中の銘柄はエントリー候補から除外
-                candidates_to_enter = [c for c in valid_entry_candidates if c["symbol"] not in active_positions]
-
-                if not candidates_to_enter:
-                    discord.print_log(f"[ENTRY BLOCK] シグナル検出銘柄はすでに保有中のためエントリーをスキップします。")
-                else:
-                    sym_rank_map = {sym: i for i, sym in enumerate(selected_symbols)}
-                    candidates_to_enter.sort(key=lambda x: sym_rank_map.get(x["symbol"], 999))
-
-                    available_slots = MAX_ACTIVE_POSITIONS - current_pos_count
-                    all_cand_syms = ", ".join([c["symbol"] for c in candidates_to_enter])
-                    discord.print_log(
-                        f"[CANDIDATES] エントリーシグナル検出: {all_cand_syms} (空き枠: {available_slots}/{MAX_ACTIVE_POSITIONS})"
-                    )
-
-                    for cand_idx, best_cand in enumerate(candidates_to_enter):
-                        # 空き枠チェック（約定するたびに active_positions が増加）
-                        if len(active_positions) >= MAX_ACTIVE_POSITIONS:
-                            discord.print_log(
-                                f"[ENTRY LIMIT] 最大ポジション枠({MAX_ACTIVE_POSITIONS})に達したため、残りの候補エントリーを終了します。"
-                            )
-                            break
-
-                        best_sym = best_cand["symbol"]
-                        api = symbol_apis[best_sym]
-                        df = best_cand["df"]
-                        position = best_cand["position"]
-                        balance = best_cand["balance"]
-                        lot_size = best_cand["lot_size"]
-                        current_price = best_cand["current_price"]
-                        whale_sig = best_cand["whale_sig"]
-
-                        px_fmt = f"{current_price:,.3f}円" if current_price < 1000 else f"{current_price:,.0f}円"
-                        best_sym_params = symbol_params_map.get(best_sym, best_params)
-                        strat_desc = f"{best_sym_params.get('strategy', 'BREAKOUT').upper()} (MP={best_sym_params.get('mp', '-')}, ER={best_sym_params.get('er', '-')})"
-
-                        discord.print_log(
-                            f"📢 【シグナル通知: LONG ENTRY】🚀 {best_sym.upper()} にロングエントリーシグナル点灯！\n"
-                            f"   ・現在値: {px_fmt} | クジラ判定: {whale_sig} | 戦略: {strat_desc}"
-                        )
-                        try:
-                            discord.send(
-                                f"📢 **【シグナル通知: LONG ENTRY】**\n"
-                                f"🚀 **{best_sym.upper()}** にロングエントリーシグナルが点灯しました！\n"
-                                f"・現在値: `{px_fmt}`\n"
-                                f"・クジラ判定: `{whale_sig}`\n"
-                                f"・戦略: `{strat_desc}`\n"
-                                f"*(※エアトレードエントリー)*"
-                            )
-                        except Exception:
-                            pass
-
-                        discord.print_log(f"[{best_sym}] [ENTRY>>] ロングエントリー試行 ({cand_idx+1}/{len(candidates_to_enter)}) (クジラ判定: {whale_sig})")
-                        entered = await api.long_entry(df, position, balance, lot_size, max_lot)
-                        if entered:
-                            now_iso = datetime.now(timezone.utc).isoformat()
-                            if isinstance(position, dict):
-                                position['entry_time'] = now_iso
-                                position['buy_pos'] = current_price
-                            active_positions[best_sym] = (True, df, position, current_price, 0.0)
-                            # 1. 実運用トレード履歴の記録
-                            record_real_trade(best_sym, "LONG", "ENTRY", current_price, lot_size, 0.0, "実運用新規エントリー")
-                            
-                            # 2. 指標値・クジラ情報の取得
-                            last_row = df.iloc[-1] if not df.empty else None
-                            vah_val = float(last_row.get("VAH", 0.0)) if last_row is not None and "VAH" in last_row else 0.0
-                            val_val = float(last_row.get("VAL", 0.0)) if last_row is not None and "VAL" in last_row else 0.0
-                            poc_val = float(last_row.get("POC", 0.0)) if last_row is not None and "POC" in last_row else 0.0
-                            
-                            entry_notional = current_price * lot_size
-                            best_sym_params = symbol_params_map.get(best_sym, best_params)
-                            strat_desc = f"{best_sym_params.get('strategy', 'BREAKOUT').upper()} (MP={best_sym_params.get('mp', '-')}, ER={best_sym_params.get('er', '-')})"
-                            whale_info = get_whale_sentiment_info(best_sym)
-                            whale_flow_val = float(whale_info.get("net_flow", 0.0)) if whale_info else 0.0
-                            
-                            # 3. Discord バッファをフラッシュ
-                            discord.flush_all()
-                            
-                            # 4. エントリーチャート画像の生成 & Discord送信
-                            from real_trade_tracker import plot_entry_chart
-                            entry_chart_file = plot_entry_chart(
-                                symbol=best_sym,
-                                df=df,
-                                entry_price=current_price,
-                                vah=vah_val,
-                                val=val_val,
-                                poc=poc_val,
-                                strategy_name=strat_desc,
-                                whale_signal=whale_sig,
-                                whale_flow=whale_flow_val
-                            )
-                            
-                            best_exch = "Binance Japan" if (str(best_sym).upper().endswith("JPY") and "_" not in str(best_sym)) else "Bitbank"
-                            px_fmt = f"{current_price:,.0f} 円" if current_price >= 100 else (f"{current_price:,.2f} 円" if current_price >= 1 else f"{current_price:.4f} 円")
-                            vah_fmt = f"{vah_val:,.0f} 円" if vah_val >= 100 else (f"{vah_val:,.2f} 円" if vah_val >= 1 else f"{vah_val:.4f} 円")
-                            poc_fmt = f"{poc_val:,.0f} 円" if poc_val >= 100 else (f"{poc_val:,.2f} 円" if poc_val >= 1 else f"{poc_val:.4f} 円")
-                            val_fmt = f"{val_val:,.0f} 円" if val_val >= 100 else (f"{val_val:,.2f} 円" if val_val >= 1 else f"{val_val:.4f} 円")
-                            
-                            entry_msg = (
-                                f"🚀🚀🚀 **【{best_exch} 新規ロングエントリー約定】** 🚀🚀🚀\n"
-                                f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                                f"📌 **取引所 / 銘柄**: `【{best_exch}】 {best_sym.upper()}` (LONG 🟢)\n"
-                                f"💰 **約定価格**: `{px_fmt}`\n"
-                                f"📦 **発注数量**: `{lot_size:,.4f} {best_sym.upper()}` (約 `{entry_notional:,.0f} 円`)\n"
-                                f"⚙️ **適用戦略**: `{strat_desc}`\n"
-                                f"🐋 **クジラ判定**: `{whale_sig}` (流入: `{whale_flow_val:+,.0f} 円`)\n"
-                                f"📐 **Volume Profile 指標**:\n"
-                                f"  - **VAH (上値抵抗)**: `{vah_fmt}`\n"
-                                f"  - **POC (中心値)**  : `{poc_fmt}`\n"
-                                f"  - **VAL (初期SL)** : `{val_fmt}`\n"
-                                f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-                            )
-                            
-                            if entry_chart_file and Path(entry_chart_file).exists():
-                                discord.send_file(entry_chart_file, description=entry_msg)
-                            else:
-                                discord.print_log(entry_msg)
-                        else:
-                            discord.print_log(f"[{best_sym}] [FALLTHROUGH] 約定しなかったため見送ります。次の候補銘柄へ移行します。")
-
-
-
-            # PnL 損益グラフ更新 (初回のみ)
-            if cycle_count == 1:
-                try:
-                    from bitbank5_46_2api import apis
-                    pnl_calc = PnLCalculator(apis_config=apis, mode=mode)
-                    df_pnl = await pnl_calc.get_bingx_trade_history(apis)
-                    if isinstance(df_pnl, list) and df_pnl:
-                        pnl_calc.calculate_bingx_pnl_from_df(pd.DataFrame(df_pnl))
-                except Exception as pnl_err:
-                    discord.print_log(f"[PnL Warning]: {pnl_err}")
-
-        except Exception as exc:
-            discord.print_log(f"[Cycle #{cycle_count}] Exception (Auto Recovery - Retrying in 60s): {exc}")
-            import traceback
-            traceback.print_exc()
-            await asyncio.sleep(60)
-            continue
+        # 古いZIP・チャート画像の自動クリーンアップ (24時間超過ファイルを毎時クリーンアップ)
+        try:
+            from download_historical_candles import cleanup_data_dir
+            cleanup_data_dir(max_age_hours=24.0)
+        except Exception:
+            pass
 
         await asyncio.sleep(1)
 
