@@ -1235,7 +1235,7 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
     )
     from bitbank5_46_3logic import PnLCalculator
 
-    account_mode_str = "[LIVE Account] (Bitbank 本番口座 接続中)" if BITBANK_IS_LIVE else "[OFFLINE/MOCK]"
+    account_mode_str = "[LIVE Account] (Bitbank ＆ Binance Japan 本番口座 接続中)" if BITBANK_IS_LIVE else "[OFFLINE/MOCK]"
     air_mode_str = "エアトレード (本番リアルタイム監視 ＆ ペーパートレード発注)" if BITBANK_IS_AIR else "リアル発注 (実際にBitbank取引所へ発注)"
 
     hours_str = ", ".join([f"{h:02d}:00" for h in sorted(ANALYSIS_HOURS)])
