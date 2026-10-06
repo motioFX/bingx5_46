@@ -150,7 +150,7 @@ def fetch_symbol_candle_snapshot(
             break
 
         curr_start = max(curr_start + step_limit, last_t + int_ms)
-        time.sleep(0.04)
+        time.sleep(0.10)
 
     return all_candles
 
@@ -276,9 +276,11 @@ async def run_pipeline(
             if sym_idx % 15 == 0 or sym_idx == len(target_symbols):
                 log(f"   [{sym_idx:3d}/{len(target_symbols)}] {sym} ({interval}) 完了 (保有レコード: {len(df):,} 行)")
 
-            time.sleep(0.04)
+            time.sleep(0.30)
 
         # 2. 全銘柄網羅グリッド生成 (欠損値 NaN 補完)
+        gc.collect()
+        time.sleep(1.0)
         log(f"\n🧩 [{interval.upper()}] 全銘柄包含マスターグリッド生成中...")
         master_df = build_full_symbol_time_grid(symbol_dfs, target_symbols)
 

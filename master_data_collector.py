@@ -143,7 +143,7 @@ async def run_all_exchanges_pipeline(
         except Exception as e:
             log(f"⚠️ [Hyperliquid パイプライン エラー]: {e}")
         gc.collect()
-        await asyncio.sleep(2.0)
+        await asyncio.sleep(5.0)
     else:
         log("⏭️ [Hyperliquid] 対象外のためスキップします。")
 
