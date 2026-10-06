@@ -1308,7 +1308,7 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
         else:
             record_full_sync_slot(datetime.now(JST), status="in_progress")
         # トレード監視・毎時ポジション監査ループをブロックしないよう非同期バックグラウンドで起動
-        asyncio.create_task(sync_historical_and_charts(days=120, skip_upload=(not should_upload)))
+        asyncio.create_task(sync_historical_and_charts(incremental_hours=8, skip_upload=(not should_upload)))
 
     logic = logicinstance()
     last_screening_slot = (datetime.now(JST).date(), datetime.now(JST).hour)
@@ -1358,8 +1358,19 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
             except Exception as port_err:
                 discord.print_log(f"⚠️ 定期選定時 総合ポジション監査エラー: {port_err}")
 
-            # 2. 定期フルスクリーニング＆戦略パラメータ最適化（バックテスト）
-            trade_side, new_symbol_params_map, best_params, selected_symbols = await run_screening_and_optimization(mode, send_charts=True)
+            # 2. 定期選定: バックテスト最適化は行わず固定12銘柄をそのまま安全に維持
+            selected_symbols = [normalize_symbol(s) for s in FIXED_SYMBOLS][:MAX_SELECTED_SYMBOLS]
+            new_symbol_params_map: Dict[str, Dict[str, Any]] = {}
+            default_best_params: Dict[str, Any] = {
+                "strategy": "rsima",
+                "interval": 60,
+                "mp": 7,
+                "er": 40.0,
+                "params": {"rsi_len": 9, "lma_len": 7, "lEp": 40.0, "lCp": 60.0}
+            }
+            for s in selected_symbols:
+                new_symbol_params_map[s] = default_best_params
+            best_params = default_best_params
 
             # 3. 旧インスタンスの引き継ぎと新選定銘柄の symbol_apis 構築
             old_apis = symbol_apis
@@ -1390,13 +1401,13 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
 
             last_screening_slot = current_slot
             logic = logicinstance()
-            discord.print_log(f"[Periodic Reset Complete] 新しい選定銘柄 (LONG ONLY): {', '.join(selected_symbols)} | 現在の全監視対象: {', '.join(symbol_apis.keys())}")
+            discord.print_log(f"[Periodic Reset Complete] 監視対象銘柄 (LONG ONLY): {', '.join(selected_symbols)} | 現在の全監視対象: {', '.join(symbol_apis.keys())}")
 
-            # 5. 全収集データ同期 (4取引所マルチ時間足ZIPアーカイブ ＆ ノーマライズ比較チャート) をバックグラウンド非同期実行
+            # 5. 海外取引所（Hyperliquid & BingX 4大カテゴリー別）全銘柄データ同期をバックグラウンド非同期実行
             should_upload_periodic = should_perform_8h_full_data_upload(now_jst)
             if should_upload_periodic:
                 record_full_sync_slot(now_jst, status="in_progress")
-            asyncio.create_task(sync_historical_and_charts(days=120, skip_upload=(not should_upload_periodic)))
+            asyncio.create_task(sync_historical_and_charts(incremental_hours=8, skip_upload=(not should_upload_periodic)))
 
             continue
 
