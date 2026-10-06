@@ -1195,7 +1195,8 @@ async def wait_until_next_candle(
                     if cur_nanpin < 5 and cur_px <= drop_target:
                         discord.print_log(
                             f"[{sym}] [REALTIME NANPIN] 📉 最後の建値(${last_px:,.4f})から-{req_drop_pct*100:.1f}%下落検出 (${cur_px:,.4f} <= ${drop_target:,.4f})\n"
-                            f"   └ ナンピン発動 ({cur_nanpin + 1}/5 回目)..."
+                            f"   └ ナンピン発動 ({cur_nanpin + 1}/5 回目)...",
+                            level="debug"
                         )
                         bal_val = float(pos.get("margin", 0.0)) or 100.0
                         entered_add = await api.long_entry(
@@ -1209,6 +1210,16 @@ async def wait_until_next_candle(
                             save_scale_in_states(scale_in_states)
                             from real_trade_tracker import record_real_trade
                             record_real_trade(sym, "LONG", "SCALE_IN", cur_px, buy_qty, 0.0, f"実運用ナンピン買い増し ({cur_nanpin + 1}/5)")
+                            discord.print_log(
+                                f"🚀🚀🚀 **【リアルタイム ナンピン買い増し約定】** 🚀🚀🚀\n"
+                                f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                                f"📌 **銘柄 / 方向**: `{sym}` (LONG 🟢)\n"
+                                f"💰 **約定価格**: `${cur_px:.6f}`\n"
+                                f"📦 **追加数量**: `{buy_qty:,.2f} {sym}`\n"
+                                f"🔢 **ナンピン段階**: `{cur_nanpin + 1}/5 回目`\n"
+                                f"🎯 **目標POC**: `${poc_val:.6f}`\n"
+                                f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+                            )
                 except Exception as scale_err:
                     pass
 
@@ -1532,6 +1543,27 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
             and current_slot != last_screening_slot
         )
         if is_periodic_reset_time:
+            periodic_banner = (
+                "```\n"
+                " ____  _               __  __\n"
+                "| __ )(_)_ __   __ _  \\ \\/ /\n"
+                "|  _ \\| | '_ \\ / _` |  \\  / \n"
+                "| |_) | | | | | (_| |  /  \\ \n"
+                "|____/|_|_| |_|\\__, | /_/\\_\\\n"
+                "               |___/        \n"
+                "----------------------------\n"
+                " PERIODIC SCREENING & OPTIMIZE \n"
+                "----------------------------\n"
+                "```\n"
+                f"[BingX Periodic Screening (LONG ONLY)]\n"
+                f"==================================================\n"
+                f"  実行時刻     : {now_jst.strftime('%Y-%m-%d %H:%M')} JST\n"
+                f"  取引口座設定 : {account_mode_str}\n"
+                f"  戦略方向     : LONG ONLY (上昇特化)\n"
+                f"  ローソク足   : 5分足 (5m) & pybotters WebSocket リアルタイム配信\n"
+                f"=================================================="
+            )
+            discord.print_log(periodic_banner)
             discord.print_log(f"[Phase C] 定期銘柄選定時刻 ({now_jst.hour:02d}:00 JST) 到達。スクリーニング＆最適化を実行します。")
 
             # 1. 定期フルスクリーニング＆最適化（チャート送信付き）
@@ -1636,7 +1668,7 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
             for sym, api in list(symbol_apis.items()):
                 df = await fetch_bingx_candles(sym, "5m", limit=300, mode=mode)
                 if df.empty or len(df) < 20:
-                    discord.print_log(f"[{sym}] ローソク足データ不足 (rows={len(df)}). スキップ。")
+                    discord.print_log(f"[{sym}] ローソク足データ不足 (rows={len(df)}). スキップ。", level="debug")
                     continue
 
                 # リアルタイム FR / OI の付与
@@ -1665,7 +1697,7 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                             df = df.iloc[:-1].reset_index(drop=True)
 
                 if df.empty or len(df) < 15:
-                    discord.print_log(f"[{sym}] データ不足 (rows={len(df)}). スキップ。")
+                    discord.print_log(f"[{sym}] データ不足 (rows={len(df)}). スキップ。", level="debug")
                     continue
 
                 cand_strat = sym_params.get("strategy", "rsima")
@@ -1688,7 +1720,7 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                 required_cols = ["long", "close"]
                 missing = [c for c in required_cols if c not in df.columns]
                 if missing:
-                    discord.print_log(f"[{sym}] シグナルカラム不足: {missing}. スキップ。")
+                    discord.print_log(f"[{sym}] シグナルカラム不足: {missing}. スキップ。", level="debug")
                     continue
 
                 current_price = df["close"].iloc[-1]
@@ -1738,7 +1770,7 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                     # ポジション未保有（FLAT）の場合
                     # 旧選定銘柄で既にFLATであれば、監視リストから解放
                     if sym not in selected_set:
-                        discord.print_log(f"[{sym}] 旧選定銘柄ですがポジションがFLATのため、監視リストから解放します。")
+                        discord.print_log(f"[{sym}] 旧選定銘柄ですがポジションがFLATのため、監視リストから解放します。", level="debug")
                         freed_symbols.append(sym)
                         continue
 
@@ -1873,7 +1905,8 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                             save_trailing_tp_states(trailing_tp_states)
                         else:
                             discord.print_log(
-                                f"[{sym}] [TRAILING TP HOLD] 🟢 利確トレーリング継続中 (現在値: ${current_price:,.4f}, ピーク: ${ttp['peak_price']:,.4f}, 利確ライン: ${ttp['trail_stop']:,.4f})"
+                                f"[{sym}] [TRAILING TP HOLD] 🟢 利確トレーリング継続中 (現在値: ${current_price:,.4f}, ピーク: ${ttp['peak_price']:,.4f}, 利確ライン: ${ttp['trail_stop']:,.4f})",
+                                level="debug"
                             )
                             closed = False
                     else:
@@ -1911,6 +1944,8 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                                     "avg_price": entry_px,
                                     "poc_level": poc_val
                                 })
+                                cur_nanpin = int(scale_state.get("nanpin_count", 0))
+                                last_px = float(scale_state.get("last_entry_price", entry_px)) or entry_px
                                 # 2-B. VAL_POC 戦略: 最後の建値から段階的ナンピン判定 (1〜3回目: 0.2%, 4〜5回目: 0.3%, 最大5回)
                                 req_drop_pct = calc_add_pct(cur_nanpin + 1)
                                 drop_target = last_px * (1.0 - req_drop_pct)
@@ -1918,7 +1953,8 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                                 if cur_nanpin < 5 and current_price <= drop_target:
                                     discord.print_log(
                                         f"[{sym}] [NANPIN TRIGGER] 📉 最後の建値(${last_px:,.4f})から-{req_drop_pct*100:.1f}%下落検出 (${current_price:,.4f} <= ${drop_target:,.4f})\n"
-                                        f"   └ ナンピン発動 ({cur_nanpin + 1}/5 回目)..."
+                                        f"   └ ナンピン発動 ({cur_nanpin + 1}/5 回目)...",
+                                        level="debug"
                                     )
                                     buy_lot = float(position.get("buy", 0))
                                     entered_add = await api.long_entry(
@@ -1932,6 +1968,16 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                                         scale_in_states[sym] = scale_state
                                         save_scale_in_states(scale_in_states)
                                         record_real_trade(sym, "LONG", "SCALE_IN", current_price, buy_lot, 0.0, f"実運用ナンピン買い増し ({cur_nanpin + 1}/5)")
+                                        discord.print_log(
+                                            f"🚀🚀🚀 **【ナンピン買い増し約定】** 🚀🚀🚀\n"
+                                            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                                            f"📌 **銘柄 / 方向**: `{sym}` (LONG 🟢)\n"
+                                            f"💰 **約定価格**: `${current_price:.6f}`\n"
+                                            f"📦 **追加数量**: `{buy_lot:,.2f} {sym}`\n"
+                                            f"🔢 **ナンピン段階**: `{cur_nanpin + 1}/5 回目`\n"
+                                            f"🎯 **目標POC**: `${poc_val:.6f}`\n"
+                                            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+                                        )
 
                         elif not closed:
                             # 2-C. 通常戦略: Volume Profile SL (損切り/撤退) を判定
@@ -1966,7 +2012,7 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
 
                         # 旧選定銘柄の決済完了時は監視リストから解放
                         if sym not in selected_set:
-                            discord.print_log(f"[{sym}] [Graceful Exit Completed] 旧選定銘柄のポジション決済が完了したため、監視リストから解放します。")
+                            discord.print_log(f"[{sym}] [Graceful Exit Completed] 旧選定銘柄のポジション決済が完了したため、監視リストから解放します。", level="debug")
                             if sym in symbol_apis:
                                 del symbol_apis[sym]
                             if sym in symbol_params_map:
@@ -2020,7 +2066,7 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                         current_price = best_cand["current_price"]
                         whale_sig = best_cand["whale_sig"]
 
-                        discord.print_log(f"[{best_sym}] [ENTRY>>] ロングエントリー試行 ({cand_idx+1}/{len(candidates_to_enter)}) (クジラ判定: {whale_sig})")
+                        discord.print_log(f"[{best_sym}] [ENTRY>>] ロングエントリー試行 ({cand_idx+1}/{len(candidates_to_enter)}) (クジラ判定: {whale_sig})", level="debug")
                         entered = await api.long_entry(df, position, balance, lot_size, max_lot)
                         if entered:
                             active_positions[best_sym] = (True, df, position, current_price, 0.0)
@@ -2088,7 +2134,7 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                             else:
                                 discord.print_log(entry_msg)
                         else:
-                            discord.print_log(f"[{best_sym}] [FALLTHROUGH] 約定しなかったため見送ります。次の候補銘柄へ移行します。")
+                            discord.print_log(f"[{best_sym}] [FALLTHROUGH] 約定しなかったため見送ります。次の候補銘柄へ移行します。", level="debug")
 
 
 

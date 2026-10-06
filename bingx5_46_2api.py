@@ -440,12 +440,12 @@ class api_bingx_helper:
             )
             is_ok = (res.get("code") == 0)
             if is_ok:
-                discord.print_log(f"[{self.symbol}] 全未約定指値の取り消しに成功しました。")
+                discord.print_log(f"[{self.symbol}] 全未約定指値の取り消しに成功しました。", level="debug")
             else:
-                discord.print_log(f"[{self.symbol}] 指値取り消し結果: {res.get('msg', res)}")
+                discord.print_log(f"[{self.symbol}] 指値取り消し結果: {res.get('msg', res)}", level="debug")
             return is_ok
         except Exception as e:
-            discord.print_log(f"BingX active_order_cancel error: {e}")
+            discord.print_log(f"BingX active_order_cancel error: {e}", level="debug")
             return False
 
     async def set_leverage(self, leverage: int = 10) -> bool:
@@ -613,15 +613,15 @@ class api_bingx:
         final_price = self.bingx._quantize_price(order_price)
 
         stage_label = f"Stage {stage_num}" if is_scale_in else "Stage 1"
-        discord.print_log(f"[BINGX] Placing {stage_label} Long ({price_type_str}): Target Qty {lot}")
+        discord.print_log(f"[BINGX] Placing {stage_label} Long ({price_type_str}): Target Qty {lot}", level="debug")
         if is_air:
-            discord.print_log(f"[AIR MODE] Executed BingX Long Entry: {self.symbol} Qty={lot} Price={final_price} (Mock)")
+            discord.print_log(f"[AIR MODE] Executed BingX Long Entry: {self.symbol} Qty={lot} Price={final_price} (Mock)", level="debug")
             self.entry_val = float(df['VAL'].iloc[-1]) if 'VAL' in df.columns else (current_price * 0.99)
             self.entry_vah = float(df['VAH'].iloc[-1]) if 'VAH' in df.columns else (current_price * 1.01)
             return True
 
         if not self.bingx.api_key or self.bingx.api_key.startswith("YOUR_"):
-            discord.print_log(f"[BINGX] API Key not configured. Skipping live order.")
+            discord.print_log(f"[BINGX] API Key not configured. Skipping live order.", level="debug")
             return False
 
         await self.bingx.set_leverage(int(LEVERAGE_FACTOR))
@@ -651,27 +651,27 @@ class api_bingx:
                     "POST", self.bingx.base_url, "/openApi/swap/v2/trade/order",
                     self.bingx.api_key, self.bingx.secret_key, params=order_params, timeout=10
                 )
-                discord.print_log(f"BingX Long Limit ({order_mode_label}) attempt {attempt+1}: price={attempt_price}, qty={needed_lot}, result={res}")
+                discord.print_log(f"BingX Long Limit ({order_mode_label}) attempt {attempt+1}: price={attempt_price}, qty={needed_lot}, result={res}", level="debug")
             except Exception as e:
-                discord.print_log(f"BingX Long entry exception (attempt {attempt+1}): {e}")
+                discord.print_log(f"BingX Long entry exception (attempt {attempt+1}): {e}", level="debug")
 
             await asyncio.sleep(4.0)
             pos = await self.get_positions()
             filled_qty = float(pos.get("buy", 0.0))
             if filled_qty >= target_lot * 0.95:
-                discord.print_log(f"[OK] Long エントリー約定完了: 保有量={filled_qty}/{target_lot} (attempt {attempt+1})")
+                discord.print_log(f"[OK] Long エントリー約定完了: 保有量={filled_qty}/{target_lot} (attempt {attempt+1})", level="debug")
                 self.entry_val = float(df['VAL'].iloc[-1]) if 'VAL' in df.columns else (current_price * 0.99)
                 self.entry_vah = float(df['VAH'].iloc[-1]) if 'VAH' in df.columns else (current_price * 1.01)
                 return True
 
         if filled_qty > 0:
-            discord.print_log(f"[PARTIAL] Long 部分約定完了: 保有量={filled_qty}/{target_lot}")
+            discord.print_log(f"[PARTIAL] Long 部分約定完了: 保有量={filled_qty}/{target_lot}", level="debug")
             self.entry_val = float(df['VAL'].iloc[-1]) if 'VAL' in df.columns else (current_price * 0.99)
             self.entry_vah = float(df['VAH'].iloc[-1]) if 'VAH' in df.columns else (current_price * 1.01)
             return True
         else:
             await self.active_order_cancel()
-            discord.print_log(f"[SKIP] Long 指値 3回リトライ全て未約定。エントリー見送り。")
+            discord.print_log(f"[SKIP] Long 指値 3回リトライ全て未約定。エントリー見送り。", level="debug")
             return False
 
     async def long_close(self, df, position, commission, sl_margin_pct=1.0, strategy_type="range", is_new_candle=False, entry_candle_time=None):
@@ -751,15 +751,15 @@ class api_bingx:
         order_price, price_type_str = determine_short_target_price(best_bid, best_ask, current_price)
         final_price = self.bingx._quantize_price(order_price)
 
-        discord.print_log(f"[BINGX] Placing Short Entry ({price_type_str}): Target Qty {lot}")
+        discord.print_log(f"[BINGX] Placing Short Entry ({price_type_str}): Target Qty {lot}", level="debug")
         if is_air:
-            discord.print_log(f"[AIR MODE] Executed BingX Short Entry: {self.symbol} Qty={lot} Price={final_price} (Mock)")
+            discord.print_log(f"[AIR MODE] Executed BingX Short Entry: {self.symbol} Qty={lot} Price={final_price} (Mock)", level="debug")
             self.entry_val = float(df['VAL'].iloc[-1]) if 'VAL' in df.columns else (current_price * 0.99)
             self.entry_vah = float(df['VAH'].iloc[-1]) if 'VAH' in df.columns else (current_price * 1.01)
             return True
 
         if not self.bingx.api_key or self.bingx.api_key.startswith("YOUR_"):
-            discord.print_log(f"[BINGX] API Key not configured. Skipping live order.")
+            discord.print_log(f"[BINGX] API Key not configured. Skipping live order.", level="debug")
             return False
 
         await self.bingx.set_leverage(int(LEVERAGE_FACTOR))
@@ -789,27 +789,27 @@ class api_bingx:
                     "POST", self.bingx.base_url, "/openApi/swap/v2/trade/order",
                     self.bingx.api_key, self.bingx.secret_key, params=order_params, timeout=10
                 )
-                discord.print_log(f"BingX Short Limit ({order_mode_label}) attempt {attempt+1}: price={attempt_price}, qty={needed_lot}, result={res}")
+                discord.print_log(f"BingX Short Limit ({order_mode_label}) attempt {attempt+1}: price={attempt_price}, qty={needed_lot}, result={res}", level="debug")
             except Exception as e:
-                discord.print_log(f"BingX Short entry exception (attempt {attempt+1}): {e}")
+                discord.print_log(f"BingX Short entry exception (attempt {attempt+1}): {e}", level="debug")
 
             await asyncio.sleep(4.0)
             pos = await self.get_positions()
             filled_qty = float(pos.get("sell", 0.0))
             if filled_qty >= target_lot * 0.95:
-                discord.print_log(f"[OK] Short エントリー約定完了: 保有量={filled_qty}/{target_lot} (attempt {attempt+1})")
+                discord.print_log(f"[OK] Short エントリー約定完了: 保有量={filled_qty}/{target_lot} (attempt {attempt+1})", level="debug")
                 self.entry_val = float(df['VAL'].iloc[-1]) if 'VAL' in df.columns else (current_price * 0.99)
                 self.entry_vah = float(df['VAH'].iloc[-1]) if 'VAH' in df.columns else (current_price * 1.01)
                 return True
 
         if filled_qty > 0:
-            discord.print_log(f"[PARTIAL] Short 部分約定完了: 保有量={filled_qty}/{target_lot}")
+            discord.print_log(f"[PARTIAL] Short 部分約定完了: 保有量={filled_qty}/{target_lot}", level="debug")
             self.entry_val = float(df['VAL'].iloc[-1]) if 'VAL' in df.columns else (current_price * 0.99)
             self.entry_vah = float(df['VAH'].iloc[-1]) if 'VAH' in df.columns else (current_price * 1.01)
             return True
         else:
             await self.active_order_cancel()
-            discord.print_log(f"[SKIP] Short 指値 3回リトライ全て未約定。エントリー見送り。")
+            discord.print_log(f"[SKIP] Short 指値 3回リトライ全て未約定。エントリー見送り。", level="debug")
             return False
 
     async def short_close(self, df, position, commission, sl_margin_pct=1.0, strategy_type="range", is_new_candle=False, entry_candle_time=None):
@@ -868,7 +868,7 @@ async def flatten_current_position_bingx(
     local_api = api_bingx_helper(symbol, 'SWAP', coin, mode)
 
     # 1. 成行クローズ前に、まず必ず全ての未約定指値（利確指値・ナンピン指値等）を先行キャンセル
-    discord.print_log(f"[BINGX] {reason}: 成行決済シーケンス開始。まず【{symbol}】の全未約定指値を先行キャンセルします...")
+    discord.print_log(f"[BINGX] {reason}: 成行決済シーケンス開始。まず【{symbol}】の全未約定指値を先行キャンセルします...", level="debug")
     await local_api.active_order_cancel()
     # 取引所側での指値取り消し・ポジション数量のロック解除を確実に待機 (0.5秒)
     await asyncio.sleep(0.5)
@@ -879,12 +879,12 @@ async def flatten_current_position_bingx(
     sell_qty = float(position.get("sell", 0.0))
 
     if buy_qty <= 0 and sell_qty <= 0:
-        discord.print_log(f"[BINGX] {reason}: 保有ポジションなし (FLAT確認済み)。決済完了。")
+        discord.print_log(f"[BINGX] {reason}: 保有ポジションなし (FLAT確認済み)。決済完了。", level="debug")
         return True
 
-    discord.print_log(f"[BINGX] {reason}: 全未約定指値キャンセル完了。成行決済発注を実行 (buy_qty={buy_qty}, sell_qty={sell_qty}).")
+    discord.print_log(f"[BINGX] {reason}: 全未約定指値キャンセル完了。成行決済発注を実行 (buy_qty={buy_qty}, sell_qty={sell_qty}).", level="debug")
     if is_air:
-        discord.print_log(f"[AIR MODE] BingX flatten execution skipped: Reason: {reason} (Mock only)")
+        discord.print_log(f"[AIR MODE] BingX flatten execution skipped: Reason: {reason} (Mock only)", level="debug")
         return True
 
     if not local_api.api_key or local_api.api_key.startswith("YOUR_"):
@@ -901,7 +901,7 @@ async def flatten_current_position_bingx(
                 "quantity": str(order_qty)
             }
             res = await _async_bingx_request("POST", local_api.base_url, "/openApi/swap/v2/trade/order", local_api.api_key, local_api.secret_key, params=params)
-            discord.print_log(f"BingX market_close Long (Qty={order_qty}) result: {res}")
+            discord.print_log(f"BingX market_close Long (Qty={order_qty}) result: {res}", level="debug")
         elif sell_qty > 0:
             order_qty = local_api._quantize_quantity(sell_qty)
             params = {
@@ -912,7 +912,7 @@ async def flatten_current_position_bingx(
                 "quantity": str(order_qty)
             }
             res = await _async_bingx_request("POST", local_api.base_url, "/openApi/swap/v2/trade/order", local_api.api_key, local_api.secret_key, params=params)
-            discord.print_log(f"BingX market_close Short (Qty={order_qty}) result: {res}")
+            discord.print_log(f"BingX market_close Short (Qty={order_qty}) result: {res}", level="debug")
 
         # 3. 成行決済後のポジション解消確認 (0.5秒待機)
         await asyncio.sleep(0.5)
@@ -920,12 +920,12 @@ async def flatten_current_position_bingx(
         after_buy = float(after_pos.get("buy", 0.0))
         after_sell = float(after_pos.get("sell", 0.0))
         if after_buy == 0 and after_sell == 0:
-            discord.print_log(f"[BINGX] 🏁 【{symbol}】成行クローズ正常完了 (残存ポジション: 0 FLAT)")
+            discord.print_log(f"[BINGX] 🏁 【{symbol}】成行クローズ正常完了 (残存ポジション: 0 FLAT)", level="debug")
         else:
-            discord.print_log(f"[BINGX] ⚠️ 【{symbol}】成行クローズ後に残存建玉を検出: buy={after_buy}, sell={after_sell}")
+            discord.print_log(f"[BINGX] ⚠️ 【{symbol}】成行クローズ後に残存建玉を検出: buy={after_buy}, sell={after_sell}", level="debug")
         return True
     except Exception as e:
-        discord.print_log(f"BingX flatten error: {e}")
+        discord.print_log(f"BingX flatten error: {e}", level="debug")
         return False
 
 async def fetch_all_position_symbols_bingx(coin: str = 'USDT', mode: str = 'demo') -> list[str]:
