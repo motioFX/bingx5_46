@@ -9,6 +9,9 @@ BOT_DIR="/home/ubuntu/bitbank5_46"
 if ! pgrep -f "$PROCESS_NAME" >/dev/null; then
     echo "$(date) - $PROCESS_NAME が停止していたため再起動します..."
     cd "$BOT_DIR" || exit 1
+    if [ -f "$BOT_DIR/bot_output.log" ]; then
+        mv "$BOT_DIR/bot_output.log" "$BOT_DIR/bot_output.log.old"
+    fi
     nohup "$PYTHON_BIN" -u "$BOT_DIR/$PROCESS_NAME" --loop > "$BOT_DIR/bot_output.log" 2>&1 &
     
     sleep 3

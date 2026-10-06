@@ -51,11 +51,22 @@ console = Console()
 
 def load_symbol_data(symbol: str, days: int = 120) -> pd.DataFrame:
     """指定銘柄のヒストリカルCSVを読み込み、指定期間分を返す"""
-    csv_path = BASE_DIR / "Data" / "historical_candles" / f"{symbol}_1h.csv"
-    if not csv_path.exists():
-        # 代替パス
-        csv_path = BASE_DIR / "Data" / f"{symbol}_1h.csv"
-    if not csv_path.exists():
+    sym_lower = symbol.lower()
+    sym_upper = symbol.upper()
+    search_paths = [
+        BASE_DIR / "Data" / "historical_candles" / f"{sym_lower}_1h.csv",
+        BASE_DIR / "Data" / "historical_candles" / f"{sym_upper}_1h.csv",
+        BASE_DIR / "Data" / "historical_candles_binance" / f"{sym_lower}_1h.csv",
+        BASE_DIR / "Data" / "historical_candles_binance" / f"{sym_upper}_1h.csv",
+        BASE_DIR / "Data" / f"{sym_lower}_1h.csv",
+        BASE_DIR / "Data" / f"{sym_upper}_1h.csv",
+    ]
+    csv_path = None
+    for p in search_paths:
+        if p.exists():
+            csv_path = p
+            break
+    if not csv_path or not csv_path.exists():
         return pd.DataFrame()
 
     df = pd.read_csv(csv_path)

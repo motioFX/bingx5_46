@@ -544,7 +544,7 @@ def get_latest_analysis_slot_dt(now_dt: datetime, hours: List[int]) -> datetime:
 def should_perform_8h_full_data_upload(now_dt: datetime) -> bool:
     """
     全収集データ（4取引所マルチ時間足ZIPアーカイブ）のDiscord送信を8時間に1回（定期選定スロット）に制限するための判定。
-    直近の8時間選定スロットで既に送信完了しており、かつ前回の送信から7時間未満であれば False を返す。
+    直近の8時間選定スロットで既に送信中または送信完了しており、かつ前回の送信から7時間未満であれば False を返す。
     """
     if "--force-upload" in sys.argv:
         return True
@@ -556,12 +556,12 @@ def should_perform_8h_full_data_upload(now_dt: datetime) -> bool:
         last_slot_str = data.get("last_slot", "")
         last_ts = float(data.get("timestamp", 0.0))
 
-        # 直近の8時間スロット文字列 (例: "2026-10-05_01")
+        # 直近の8時間スロット文字列 (例: "2026-10-06_17")
         latest_slot_dt = get_latest_analysis_slot_dt(now_dt, ANALYSIS_HOURS)
         current_slot_str = latest_slot_dt.strftime("%Y-%m-%d_%H")
 
         elapsed_hours = (now_dt.timestamp() - last_ts) / 3600.0
-        # 同一スロットで既に送信済み、かつ前回から7時間以内の場合はアップロード不要
+        # 同一スロットで既に開始/完了しており、かつ前回から7時間以内の場合はアップロード不要
         if last_slot_str == current_slot_str and elapsed_hours < 7.0:
             return False
         return True
@@ -569,8 +569,8 @@ def should_perform_8h_full_data_upload(now_dt: datetime) -> bool:
         return True
 
 
-def record_full_sync_completed(now_dt: datetime) -> None:
-    """全収集データのDiscord送信完了をスロットとともに記録する"""
+def record_full_sync_slot(now_dt: datetime, status: str = "in_progress") -> None:
+    """全収集データのDiscord送信スロットを記録する（開始時および完了時）"""
     try:
         latest_slot_dt = get_latest_analysis_slot_dt(now_dt, ANALYSIS_HOURS)
         current_slot_str = latest_slot_dt.strftime("%Y-%m-%d_%H")
@@ -578,13 +578,19 @@ def record_full_sync_completed(now_dt: datetime) -> None:
             "last_sync_time": now_dt.strftime("%Y-%m-%d %H:%M:%S JST"),
             "last_slot": current_slot_str,
             "timestamp": now_dt.timestamp(),
+            "status": status,
         }
         LAST_FULL_SYNC_RECORD_PATH.parent.mkdir(parents=True, exist_ok=True)
         with open(LAST_FULL_SYNC_RECORD_PATH, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2, ensure_ascii=False)
-        print(f"[Sync Registry] 全データDiscord送信完了を記録しました: スロット {current_slot_str} ({data['last_sync_time']})")
+        print(f"[Sync Registry] 全データDiscord送信スロット ({status}) を記録しました: スロット {current_slot_str} ({data['last_sync_time']})")
     except Exception as e:
         print(f"[Sync Registry Error] 記録失敗: {e}")
+
+
+def record_full_sync_completed(now_dt: datetime) -> None:
+    """後方互換用: 全収集データのDiscord送信完了をスロットとともに記録する"""
+    record_full_sync_slot(now_dt, status="completed")
 
 
 def check_skip_mix_analysis() -> bool:
@@ -1171,6 +1177,8 @@ async def audit_and_retain_positions(
 
     return symbol_apis, symbol_params_map
 
+_is_sync_pipeline_running: bool = False
+
 async def sync_historical_and_charts(
     days: int = 1460,
     intervals: Optional[Sequence[str]] = None,
@@ -1178,37 +1186,49 @@ async def sync_historical_and_charts(
     skip_upload: bool = False
 ) -> None:
     """4大取引所（Bitbank, Binance Japan, Hyperliquid, BingX）全銘柄マルチ時間足データ収集＆時間分割Discord配信"""
-    discord.print_log(f"\n📦 【4大取引所 全銘柄データ収集＆時間分割アーカイブ同期】 開始...")
-    
-    # 4大取引所統合データ収集パイプライン
-    try:
-        from master_data_collector import run_all_exchanges_pipeline
-        target_intervals = list(intervals) if intervals else ["1d", "1h", "15m", "5m", "1m"]
-        await run_all_exchanges_pipeline(
-            days_1d=1460,
-            days_1h=1460,
-            days_15m=180,
-            days_5m=90,
-            days_1m=30,
-            intervals=target_intervals,
-            force=False,
-            force_upload=force_upload,
-            skip_upload=skip_upload,
-            skip_charts=False
-        )
-        discord.print_log("✅ 【4大取引所 データ同期完了】 全銘柄マルチ時間足のアーカイブ同期＆配信が完了しました。")
-        if not skip_upload:
-            record_full_sync_completed(datetime.now(JST))
-    except Exception as e:
-        discord.print_log(f"⚠️ 【4大取引所 データ同期例外】 エラーが発生しました: {e}")
+    global _is_sync_pipeline_running
+    if _is_sync_pipeline_running:
+        discord.print_log("⚠️ [Sync Pipeline Guard] 前回の全銘柄データ同期パイプラインが現在も実行中のため、二重実行をスキップします。")
+        return
 
-    # ノーマライズ比較チャート送信 (Bitbank 11銘柄 ＋ Binance NEAR)
+    _is_sync_pipeline_running = True
     try:
-        from download_historical_candles import create_and_send_normalized_charts
-        await create_and_send_normalized_charts(skip_upload=skip_upload)
-        discord.print_log("✅ 【ノーマライズチャート送信完了】 主要12銘柄のリターン比較チャートを送信しました。")
-    except Exception as c_err:
-        discord.print_log(f"⚠️ 【ノーマライズチャート送信注意】 エラーが発生しました: {c_err}")
+        if not skip_upload:
+            record_full_sync_slot(datetime.now(JST), status="in_progress")
+
+        discord.print_log(f"\n📦 【4大取引所 全銘柄データ収集＆時間分割アーカイブ同期】 開始...")
+        
+        # 4大取引所統合データ収集パイプライン
+        try:
+            from master_data_collector import run_all_exchanges_pipeline
+            target_intervals = list(intervals) if intervals else ["1d", "1h", "15m", "5m", "1m"]
+            await run_all_exchanges_pipeline(
+                days_1d=1460,
+                days_1h=1460,
+                days_15m=180,
+                days_5m=90,
+                days_1m=30,
+                intervals=target_intervals,
+                force=False,
+                force_upload=force_upload,
+                skip_upload=skip_upload,
+                skip_charts=False
+            )
+            discord.print_log("✅ 【4大取引所 データ同期完了】 全銘柄マルチ時間足のアーカイブ同期＆配信が完了しました。")
+            if not skip_upload:
+                record_full_sync_slot(datetime.now(JST), status="completed")
+        except Exception as e:
+            discord.print_log(f"⚠️ 【4大取引所 データ同期例外】 エラーが発生しました: {e}")
+
+        # ノーマライズ比較チャート送信 (Bitbank 11銘柄 ＋ Binance NEAR)
+        try:
+            from download_historical_candles import create_and_send_normalized_charts
+            await create_and_send_normalized_charts(skip_upload=skip_upload)
+            discord.print_log("✅ 【ノーマライズチャート送信完了】 主要12銘柄のリターン比較チャートを送信しました。")
+        except Exception as c_err:
+            discord.print_log(f"⚠️ 【ノーマライズチャート送信注意】 エラーが発生しました: {c_err}")
+    finally:
+        _is_sync_pipeline_running = False
 
 
 
@@ -1250,15 +1270,14 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
     else:
         print("[Banner Skipped by --no-banner]")
 
-    # ========== 【トレード前準備 ステップ2】: 全銘柄ヒストリカルデータ (2ヶ月×2分割ZIP) ＆ 30d/10d/5d ノーマライズチャート ==========
-    skip_history = ("--skip-history" in sys.argv or "--no-history" in sys.argv)
-    if not skip_history:
-        should_upload = should_perform_8h_full_data_upload(datetime.now(JST))
-        if not should_upload:
-            discord.print_log("📌 [8H Sync Guard] 直近8時間スロットで全収集データは既にDiscord送信済みです。ローカル差分同期のみ行い、Discordアップロードはスキップします。")
-        await sync_historical_and_charts(days=120, skip_upload=(not should_upload))
+    # 💎 【起動時最優先 ステップ1】: Bitbank ＆ Binance Japan 全保有暗号資産・損益・未約定指値 総合ポジション監査
+    try:
+        from portfolio_tracker import report_all_positions
+        await report_all_positions(mode=mode, to_discord=True, header_title="🏦 【ボット起動時 初期状態: 全保有暗号資産 総合ポジション監査】")
+    except Exception as port_err:
+        discord.print_log(f"⚠️ 起動時 総合ポジション監査エラー: {port_err}")
 
-    # ========== 【トレード前準備 ステップ3 & 4 & 5】: 指定11銘柄設定 ==========
+    # ========== 【トレード前準備 ステップ2】: 指定11銘柄設定 ＆ 口座ポジション引継ぎ ==========
     selected_symbols = [normalize_symbol(s) for s in FIXED_SYMBOLS][:MAX_SELECTED_SYMBOLS]
     symbol_params_map: Dict[str, Dict[str, Any]] = {}
     best_params: Dict[str, Any] = {
@@ -1285,12 +1304,16 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
         selected_symbols, symbol_apis, symbol_params_map, best_params, mode
     )
 
-    # 💎 起動時: Bitbank ＆ Binance Japan 全保有暗号資産・損益・未約定指値 総合ポジション監査
-    try:
-        from portfolio_tracker import report_all_positions
-        await report_all_positions(mode=mode, to_discord=True, header_title="🏦 【ボット起動時 初期状態: 全保有暗号資産 総合ポジション監査】")
-    except Exception as port_err:
-        discord.print_log(f"⚠️ 総合ポジション監査エラー: {port_err}")
+    # ========== 【トレード前準備 ステップ3】: 全銘柄ヒストリカルデータ同期 ＆ ノーマライズチャート (非同期バックグラウンド実行) ==========
+    skip_history = ("--skip-history" in sys.argv or "--no-history" in sys.argv)
+    if not skip_history:
+        should_upload = should_perform_8h_full_data_upload(datetime.now(JST))
+        if not should_upload:
+            discord.print_log("📌 [8H Sync Guard] 直近8時間スロットで全収集データは既にDiscord送信済みです。ローカル差分同期のみ行い、Discordアップロードはスキップします。")
+        else:
+            record_full_sync_slot(datetime.now(JST), status="in_progress")
+        # トレード監視・毎時ポジション監査ループをブロックしないよう非同期バックグラウンドで起動
+        asyncio.create_task(sync_historical_and_charts(days=120, skip_upload=(not should_upload)))
 
     logic = logicinstance()
     last_screening_slot = (datetime.now(JST).date(), datetime.now(JST).hour)
@@ -1333,10 +1356,14 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
         if is_periodic_reset_time:
             discord.print_log(f"[Phase C] 定期銘柄選定時刻 ({now_jst.hour:02d}:{HOURLY_EXECUTION_MINUTE:02d} JST / 8時間ごと) 到達。")
 
-            # 1. 全銘柄ヒストリカルデータ同期 (2ヶ月×2分割ZIP) ＆ 30d/10d/5d ノーマライズチャート送信 (アスキーアートなし)
-            await sync_historical_and_charts(days=120)
+            # 1. 最優先: Bitbank ＆ Binance Japan 全保有暗号資産・損益・未約定指値 総合ポジション監査
+            try:
+                from portfolio_tracker import report_all_positions
+                await report_all_positions(mode=mode, to_discord=True, header_title=f"🏦 【定期選定時 ({now_jst.hour:02d}:00 JST) 全保有暗号資産 総合ポジション監査】")
+            except Exception as port_err:
+                discord.print_log(f"⚠️ 定期選定時 総合ポジション監査エラー: {port_err}")
 
-            # 2. 定期フルスクリーニング＆最適化
+            # 2. 定期フルスクリーニング＆戦略パラメータ最適化（バックテスト）
             trade_side, new_symbol_params_map, best_params, selected_symbols = await run_screening_and_optimization(mode, send_charts=True)
 
             # 3. 旧インスタンスの引き継ぎと新選定銘柄の symbol_apis 構築
@@ -1355,7 +1382,7 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                         api.update_instrument_spec(spec)
                     symbol_apis[sym] = api
 
-            # 4. 口座全体の全ポジションをスキャンし、選定外でも保有中の銘柄はGraceful Exitとして引き継ぐ（強制成行決済は廃止）
+            # 4. 口座全体の全ポジションをスキャンし、選定外でも保有中の銘柄はGraceful Exitとして引き継ぐ
             symbol_apis, symbol_params_map = await audit_and_retain_positions(
                 selected_symbols, symbol_apis, symbol_params_map, best_params, mode, old_apis=old_apis, old_params=old_params
             )
@@ -1370,12 +1397,11 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
             logic = logicinstance()
             discord.print_log(f"[Periodic Reset Complete] 新しい選定銘柄 (LONG ONLY): {', '.join(selected_symbols)} | 現在の全監視対象: {', '.join(symbol_apis.keys())}")
 
-            # 5. Bitbank ＆ Binance Japan 全保有暗号資産・損益・未約定指値 総合ポジション監査
-            try:
-                from portfolio_tracker import report_all_positions
-                await report_all_positions(mode=mode, to_discord=True, header_title=f"🏦 【定期選定時 ({now_jst.hour:02d}:00 JST) 全保有暗号資産 総合ポジション監査】")
-            except Exception as port_err:
-                discord.print_log(f"⚠️ 総合ポジション監査エラー: {port_err}")
+            # 5. 全収集データ同期 (4取引所マルチ時間足ZIPアーカイブ ＆ ノーマライズ比較チャート) をバックグラウンド非同期実行
+            should_upload_periodic = should_perform_8h_full_data_upload(now_jst)
+            if should_upload_periodic:
+                record_full_sync_slot(now_jst, status="in_progress")
+            asyncio.create_task(sync_historical_and_charts(days=120, skip_upload=(not should_upload_periodic)))
 
             continue
 
