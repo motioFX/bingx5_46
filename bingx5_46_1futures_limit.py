@@ -704,10 +704,12 @@ def get_bingx_granularity(bybit_interval: str) -> str:
     return mapping.get(str(bybit_interval), '1h')
 
 
-async def fetch_bingx_candles(symbol: str, granularity: str, limit: int = 300, mode: str = 'demo') -> pd.DataFrame:
+async def fetch_bingx_candles(symbol: str, granularity: str = "5m", limit: int = 300, mode: str = 'demo') -> pd.DataFrame:
     from bingx5_46_4mix_candle_Merged_Alt10 import fetch_bingx_ohlcv
+    granularity_sec_map = {"1M": 60, "3M": 180, "5M": 300, "15M": 900, "30M": 1800, "1H": 3600, "2H": 7200, "4H": 14400, "1D": 86400}
+    gran_sec = granularity_sec_map.get(granularity.upper(), 300)
     now_ms = int(time.time() * 1000)
-    start_ms = now_ms - (limit * 3600 * 1000)
+    start_ms = now_ms - (limit * gran_sec * 1000)
     try:
         rows = await fetch_bingx_ohlcv(symbol, "SWAP", granularity.upper(), start_ms, now_ms, mode=mode)
         if rows:
@@ -723,8 +725,6 @@ async def fetch_bingx_candles(symbol: str, granularity: str, limit: int = 300, m
             # --- 確定足（クローズ完了足）のみを厳格に抽出 ---
             # 最新行が現在進行形で形成中の未確定足である場合を除外し、前足確定バーのみを返す
             if not df.empty:
-                granularity_sec_map = {"1H": 3600, "2H": 7200, "4H": 14400, "1D": 86400}
-                gran_sec = granularity_sec_map.get(granularity.upper(), 3600)
                 now_utc = datetime.now(timezone.utc)
                 last_ts = pd.to_datetime(df['timestamp'].iloc[-1], utc=True)
                 candle_close_time = last_ts + timedelta(seconds=gran_sec)
@@ -1044,37 +1044,41 @@ def save_scale_in_states(states: dict):
         pass
 
 
-async def wait_until_next_hour(
+async def wait_until_next_candle(
     symbol_apis: Optional[dict] = None,
     trailing_tp_states: Optional[dict] = None,
     scale_in_states: Optional[dict] = None,
-    mode: str = "demo"
+    mode: str = "demo",
+    interval_minutes: int = 5,
+    ws_mgr: Optional[Any] = None
 ):
-    """毎時00分05秒まで待機する（前足確定の安全マージン5秒）。
-    ポジション保有中の銘柄がある場合、60秒ごとに現在価格をチェックし、
+    """次の5分足確定（毎時00分, 05分, 10分...55分の02秒）まで待機する。
+    ポジション保有中の銘柄がある場合、pybotters WebSocket から取得したリアルタイム価格を用いて、
     - 利確トレーリング(TTP)の最高値追従および反落成行利確
     - VAL_POC戦略のリアルタイムPOC到達クローズ
-    - 直近建値から0.2%下落時のナンピン買い増し（最大5回）
-    を行う。"""
+    - 段階的ナンピン（1〜3回目: 0.2%, 4〜5回目: 0.3%, 最大5回）
+    - 3%固定ストップロス
+    を超低遅延で即応実行する。"""
     now = datetime.now(JST)
-    next_hour = now.replace(minute=0, second=5, microsecond=0) + timedelta(hours=1)
-    wait_seconds = (next_hour - now).total_seconds()
+    rem_min = interval_minutes - (now.minute % interval_minutes)
+    next_candle = (now + timedelta(minutes=rem_min)).replace(second=2, microsecond=0)
+    wait_seconds = (next_candle - now).total_seconds()
     if wait_seconds > 0:
-        discord.print_log(f"[Wait] 次の1時間足確定まで {wait_seconds/60:.1f} 分待機 (次回: {next_hour.strftime('%H:%M:%S')} JST)", level="debug")
+        discord.print_log(f"[Wait] 次の{interval_minutes}分足確定まで {wait_seconds:.1f} 秒待機 (次回: {next_candle.strftime('%H:%M:%S')} JST)", level="debug")
     
     while True:
         now = datetime.now(JST)
-        rem_sec = (next_hour - now).total_seconds()
-        if rem_sec <= 2.0:
+        rem_sec = (next_candle - now).total_seconds()
+        if rem_sec <= 1.0:
             if rem_sec > 0:
                 await asyncio.sleep(rem_sec)
             break
             
-        sleep_step = min(60.0, max(rem_sec - 1.0, 1.0))
+        sleep_step = min(5.0, max(rem_sec - 0.5, 0.5))
         await asyncio.sleep(sleep_step)
         
         now = datetime.now(JST)
-        if now >= next_hour:
+        if now >= next_candle:
             break
             
         # 1. ポジション保有中銘柄のリアルタイム利確トレーリング監視
@@ -1096,9 +1100,12 @@ async def wait_until_next_hour(
                     if entry_px <= 0:
                         continue
                         
-                    from bingx5_46_2api import get_bingx_orderbook, flatten_current_position_bingx
-                    best_bid, best_ask = get_bingx_orderbook(sym, api.bingx.base_url)
-                    cur_px = best_bid if (best_bid and best_bid > 0) else entry_px
+                    # WebSocket リアルタイム価格を最優先参照
+                    cur_px = (ws_mgr.get_latest_price(sym) if ws_mgr else None)
+                    if not cur_px or cur_px <= 0:
+                        from bingx5_46_2api import get_bingx_orderbook
+                        best_bid, _ = get_bingx_orderbook(sym, api.bingx.base_url)
+                        cur_px = best_bid if (best_bid and best_bid > 0) else entry_px
                     
                     ttp = trailing_tp_states.get(sym)
                     if not ttp or not ttp.get("active"):
@@ -1123,6 +1130,7 @@ async def wait_until_next_hour(
                             f"[{sym}] [REALTIME TRAILING TP] 🎯 リアルタイム利確トレーリング成立!\n"
                             f"   └ 現在値: ${cur_px:,.4f} < 利確ライン: ${ttp['trail_stop']:,.4f} (最高値: ${ttp['peak_price']:,.4f} から反落) | 概算PnL: {pnl_est:+.2f} USDT ➔ 成行利確"
                         )
+                        from bingx5_46_2api import flatten_current_position_bingx
                         await flatten_current_position_bingx(sym, "USDT", mode, exit_reason, force_market=True)
                         from real_trade_tracker import record_real_trade
                         record_real_trade(sym, "LONG", "CLOSE", cur_px, buy_qty, pnl_est, f"実運用決済 ({exit_reason})")
@@ -1150,9 +1158,12 @@ async def wait_until_next_hour(
                     if entry_px <= 0:
                         continue
 
-                    from bingx5_46_2api import get_bingx_orderbook, flatten_current_position_bingx
-                    best_bid, best_ask = get_bingx_orderbook(sym, api.bingx.base_url)
-                    cur_px = best_bid if (best_bid and best_bid > 0) else entry_px
+                    # WebSocket リアルタイム価格を最優先参照
+                    cur_px = (ws_mgr.get_latest_price(sym) if ws_mgr else None)
+                    if not cur_px or cur_px <= 0:
+                        from bingx5_46_2api import get_bingx_orderbook
+                        best_bid, _ = get_bingx_orderbook(sym, api.bingx.base_url)
+                        cur_px = best_bid if (best_bid and best_bid > 0) else entry_px
 
                     scale_state = scale_in_states.get(sym)
                     if not scale_state:
@@ -1170,6 +1181,7 @@ async def wait_until_next_hour(
                             f"[{sym}] [REALTIME POC CLOSE] 🎯 リアルタイムPOCクローズ成立!\n"
                             f"   └ 現在値: ${cur_px:,.4f} >= POC: ${poc_val:,.4f} (平均建値: ${entry_px:,.4f}) | 概算PnL: {pnl_est:+.2f} USDT ➔ 成行利確"
                         )
+                        from bingx5_46_2api import flatten_current_position_bingx
                         await flatten_current_position_bingx(sym, "USDT", mode, exit_reason, force_market=True)
                         from real_trade_tracker import record_real_trade
                         record_real_trade(sym, "LONG", "CLOSE", cur_px, buy_qty, pnl_est, f"実運用決済 ({exit_reason})")
@@ -1199,6 +1211,9 @@ async def wait_until_next_hour(
                             record_real_trade(sym, "LONG", "SCALE_IN", cur_px, buy_qty, 0.0, f"実運用ナンピン買い増し ({cur_nanpin + 1}/5)")
                 except Exception as scale_err:
                     pass
+
+# 下位互換エイリアス
+wait_until_next_hour = wait_until_next_candle
 
 
 async def run_screening_and_optimization(mode: str, send_charts: bool = False, skip_zip: bool = False) -> tuple:
@@ -1416,7 +1431,7 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
         f"  取引口座設定 : {account_mode_str}\n"
         f"  発注モード   : {air_mode_str}\n"
         f"  戦略方向     : LONG ONLY (上昇特化)\n"
-        f"  ローソク足   : 1時間足 (1H)\n"
+        f"  ローソク足   : 5分足 (5m) & pybotters WebSocket リアルタイム配信\n"
         f"  銘柄選定時刻 : 毎日 {hours_str} JST (8時間ごと)\n"
         f"=================================================="
     )
@@ -1470,6 +1485,11 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
         for sym in symbol_params_map:
             symbol_params_map[sym]["strategy"] = FORCE_STRATEGY
 
+    # pybotters BingX WebSocket マネージャー初期化 & バックグラウンドストリーミング開始
+    from bingx_ws_manager import BingXWSManager
+    ws_mgr = BingXWSManager(symbols=list(symbol_apis.keys()))
+    await ws_mgr.start()
+
     logic = logicinstance()
     last_screening_slot = (datetime.now(JST).date(), datetime.now(JST).hour)
     cycle_count = 0
@@ -1477,22 +1497,22 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
     trailing_tp_states = load_trailing_tp_states()
     scale_in_states = load_scale_in_states()
 
-    discord.print_log(f"[Phase B] 1時間足エントリー/クローズループを開始します。新選定銘柄: {', '.join(selected_symbols)} (全監視: {', '.join(symbol_apis.keys())})")
+    discord.print_log(f"[Phase B] 5分足エントリー/クローズループ（pybotters WebSocket連動）を開始します。新選定銘柄: {', '.join(selected_symbols)} (全監視: {', '.join(symbol_apis.keys())})")
 
-    # ========== フェーズB: 1時間足ループ ==========
+    # ========== フェーズB: 5分足ループ (WebSocket リアルタイム価格監視 & 5分確定足同期) ==========
     while True:
         cycle_count += 1
         now_jst = datetime.now(JST)
 
-        # 初回サイクルでも、正時直後（00分00秒〜00分30秒の確定直後安全枠）でない限り、
-        # 確定足と完全に同期するため次の正時（毎時00分05秒）まで待機する
+        # 初回サイクルでも、5分確定直後（00秒〜15秒の確定直後安全枠）でない限り、
+        # 確定足と完全に同期するため次の5分足確定（毎時XX分02秒）まで待機する
         if cycle_count == 1:
-            if "--loop" in sys.argv and not (now_jst.minute == 0 and now_jst.second < 30):
-                discord.print_log(f"[Sync] 初回起動時刻: {now_jst.strftime('%H:%M:%S')} JST。確定足と同期するため次の正時まで待機します。")
-                await wait_until_next_hour(symbol_apis=symbol_apis, trailing_tp_states=trailing_tp_states, scale_in_states=scale_in_states, mode=mode)
+            if "--loop" in sys.argv and not (now_jst.minute % 5 == 0 and now_jst.second < 15):
+                discord.print_log(f"[Sync] 初回起動時刻: {now_jst.strftime('%H:%M:%S')} JST。確定足と同期するため次の5分足確定まで待機します。")
+                await wait_until_next_candle(symbol_apis=symbol_apis, trailing_tp_states=trailing_tp_states, scale_in_states=scale_in_states, mode=mode, interval_minutes=5, ws_mgr=ws_mgr)
                 now_jst = datetime.now(JST)
         else:
-            await wait_until_next_hour(symbol_apis=symbol_apis, trailing_tp_states=trailing_tp_states, scale_in_states=scale_in_states, mode=mode)
+            await wait_until_next_candle(symbol_apis=symbol_apis, trailing_tp_states=trailing_tp_states, scale_in_states=scale_in_states, mode=mode, interval_minutes=5, ws_mgr=ws_mgr)
             now_jst = datetime.now(JST)
 
         # --loop フラグがない場合は1サイクルのみ実行
@@ -1547,13 +1567,16 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                     old_apis[old_sym] = None
             gc.collect()
 
+            # 5. WebSocket 購読銘柄を最新の symbol_apis に更新
+            await ws_mgr.update_symbols(list(symbol_apis.keys()))
+
             last_screening_slot = current_slot
             logic = logicinstance()
             discord.print_log(f"[Periodic Reset Complete] 新しい選定銘柄 (LONG ONLY): {', '.join(selected_symbols)} | 現在の全監視対象: {', '.join(symbol_apis.keys())}")
             # continue を廃止: リセット完了直後も当足 (01/09/17時) のポジション決済・エントリー判定を漏れなく実行
 
-        # ========== 毎時: クジラセンチメント更新のみ（パラメータ最適化は8時間ごと定期選定時のみ） ==========
-        if cycle_count > 1:
+        # ========== 毎時00分: クジラセンチメント更新（パラメータ最適化は8時間ごと定期選定時のみ） ==========
+        if cycle_count > 1 and now_jst.minute < 5:
             try:
                 whale_script = Path(__file__).resolve().parent / "fetch_whale_sentiment.py"
                 if whale_script.exists():
@@ -1608,9 +1631,9 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
             cycle_balance = await first_api.get_account() if first_api else 1000.0
             hourly_summary_rows = []
 
-            # 2. 全銘柄のポジション状況とシグナル判定を一括評価
+            # 2. 全銘柄のポジション状況とシグナル判定を一括評価 (5分足)
             for sym, api in list(symbol_apis.items()):
-                df = await fetch_bingx_candles(sym, "1h", limit=300, mode=mode)
+                df = await fetch_bingx_candles(sym, "5m", limit=300, mode=mode)
                 if df.empty or len(df) < 20:
                     discord.print_log(f"[{sym}] ローソク足データ不足 (rows={len(df)}). スキップ。")
                     continue
@@ -1629,10 +1652,10 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
 
                 # 各銘柄の個別最適化パラメータを取得
                 sym_params = symbol_params_map.get(sym, best_params)
-                cand_interval = int(sym_params.get("interval", 60))
+                cand_interval = int(sym_params.get("interval", 5))
 
-                # 60分を超える時間足（120分、180分など）で個別最適化されている場合はリサンプリング
-                if cand_interval > 60:
+                # 時間足リサンプリング (5分を超える時間足で個別設定されている場合)
+                if cand_interval > 5:
                     df = resample_candles(df, cand_interval)
                     if not df.empty:
                         last_ts = pd.to_datetime(df['timestamp'].iloc[-1], utc=True)
@@ -1741,10 +1764,19 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                 await asyncio.sleep(0.1)
 
             # スマホ1画面完結サマリーのDiscord送信 (16行程度・スクロール不要)
+            # 5分足実行時は、毎時00分(正時) または ポジション保有中 または シグナル点灯時に送信して通知過多を防止
+            has_any_pos = any(r["pos"] != "FLAT" for r in hourly_summary_rows)
+            has_any_sig = any(r["sig"] != "---" for r in hourly_summary_rows)
+            is_hourly_tick = (now_jst.minute < 5)
+
             if hourly_summary_rows:
-                next_hour_str = (now_jst.replace(minute=0, second=5, microsecond=0) + timedelta(hours=1)).strftime('%H:%M:%S')
+                rem_min = 5 - (now_jst.minute % 5)
+                if rem_min == 0:
+                    rem_min = 5
+                next_candle_dt = (now_jst + timedelta(minutes=rem_min)).replace(second=2, microsecond=0)
+                next_candle_str = next_candle_dt.strftime('%H:%M:%S')
                 summary_lines = [
-                    f"⏱ [Cycle #{cycle_count}] {now_jst.strftime('%H:%M')} JST | 残高: ${cycle_balance:.2f}",
+                    f"⏱ [Cycle #{cycle_count}] {now_jst.strftime('%H:%M')} JST (5分足) | 残高: ${cycle_balance:.2f}",
                     "───────────────────────────────────",
                     "銘柄     現在値    保有   シグナル  大口",
                     "───────────────────────────────────",
@@ -1754,8 +1786,13 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                     px_str = f"${px:,.4f}" if px < 10 else (f"${px:,.2f}" if px < 1000 else f"${px:,.1f}")
                     summary_lines.append(f"{r['sym']:<6s} {px_str:>9s}  {r['pos']:<6s}  {r['sig']:^6s}  {r['whale']}")
                 summary_lines.append("───────────────────────────────────")
-                summary_lines.append(f"次回確定: {next_hour_str} JST")
-                discord.print_log("```text\n" + "\n".join(summary_lines) + "\n```")
+                summary_lines.append(f"次回確定: {next_candle_str} JST")
+                summary_formatted = "```text\n" + "\n".join(summary_lines) + "\n```"
+
+                if is_hourly_tick or has_any_pos or has_any_sig or cycle_count == 1:
+                    discord.print_log(summary_formatted)
+                else:
+                    discord.print_log(summary_formatted, level="debug")
 
             # FLATになった旧選定銘柄のメモリ解放
             for fsym in freed_symbols:
@@ -2073,7 +2110,7 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
 if __name__ == "__main__":
     mode = 'live' if BINGX_IS_LIVE else 'demo'
     max_lot = 10.0
-    interval = '60'
+    interval = '5'
     try:
         asyncio.run(start(mode, max_lot, interval))
     except KeyboardInterrupt:

@@ -267,14 +267,17 @@ async def fetch_bingx_ohlcv(
     mode: str = "live",
 ) -> List[List[Any]]:
     url = f"{REST_API_URL['bingx']}/openApi/swap/v2/quote/klines"
-    interval_map = {"1H": "1h", "2H": "2h", "4H": "4h", "1D": "1d"}
-    bx_interval = interval_map.get(granularity, "1h")
+    interval_map = {"1M": "1m", "3M": "3m", "5M": "5m", "15M": "15m", "30M": "30m", "1H": "1h", "2H": "2h", "4H": "4h", "1D": "1d"}
+    bx_interval = interval_map.get(granularity.upper(), granularity.lower())
     clean_sym = normalize_symbol(symbol)
+    
+    gran_sec_map = {"1M": 60, "3M": 180, "5M": 300, "15M": 900, "30M": 1800, "1H": 3600, "2H": 7200, "4H": 14400, "1D": 86400}
+    gran_sec = gran_sec_map.get(granularity.upper(), 300)
     
     rows = []
     max_retries = 3
     curr_start = start_ms
-    step_ms = 900 * 3600 * 1000  # 900 hours per request
+    step_ms = 900 * gran_sec * 1000  # 900 bars per request
     
     import aiohttp
     async with aiohttp.ClientSession() as session:
