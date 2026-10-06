@@ -1910,10 +1910,11 @@ def simulate_val_poc_strategy(
                     avg_price = pos_cost / pos_qty
                     pos_count = 1
                     exec_history.append({"timestamp": ts, "price": c, "size": qty, "type": "ENTRY_VAL_GC"})
-            # ナンピン: 最後の建値から 0.2% 下落、最大5回まで追加
+            # ナンピン: 最後の建値から段階的下落（1〜3回目: 0.2%, 4〜5回目: 0.3%）、最大5回まで追加
             elif 1 <= pos_count < total_max_stages:
-                if (c <= last_entry_price * (1.0 - nanpin_drop_pct)) or (l <= last_entry_price * (1.0 - nanpin_drop_pct)):
-                    add_price = min(c, last_entry_price * (1.0 - nanpin_drop_pct))
+                drop_pct = calc_add_pct(pos_count) if (nanpin_drop_pct is None or nanpin_drop_pct == 0.002) else nanpin_drop_pct
+                if (c <= last_entry_price * (1.0 - drop_pct)) or (l <= last_entry_price * (1.0 - drop_pct)):
+                    add_price = min(c, last_entry_price * (1.0 - drop_pct))
                     buy_val = trade_size_usdt
                     qty = buy_val / add_price
                     fee = buy_val * fee_rate
@@ -1923,7 +1924,7 @@ def simulate_val_poc_strategy(
                     last_entry_price = add_price
                     avg_price = pos_cost / pos_qty
                     pos_count += 1
-                    exec_history.append({"timestamp": ts, "price": add_price, "size": qty, "type": f"NANPIN_{pos_count-1}"})
+                    exec_history.append({"timestamp": ts, "price": add_price, "size": qty, "type": f"NANPIN_{pos_count-1}", "drop_pct": drop_pct})
 
         unrealized = (pos_qty * c - pos_cost) if pos_qty > 0 else 0.0
         unrealized_list.append(unrealized)

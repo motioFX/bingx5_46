@@ -99,7 +99,9 @@
       - **エントリー条件**: ボリュームプロファイルの VAL（Value Area Low）をゴールデンクロス（`close > VAL` かつ `close[i-1] <= VAL[i-1]`）した確定足でロングエントリー。
       - **ナンピン（Scale-in）仕様**:
         - 最大ナンピン回数: **5回まで**（初期エントリー1回 ＋ ナンピン最大5回 ＝ 最大計6回ポジション保有）。
-        - ナンピン発動条件: **最後の建値（直近約定価格 `last_entry_price`）から 0.2% 下落**（`current_price <= last_entry_price * 0.998`）。
+        - 段階的ナンピン発動条件:
+          - **1〜3回目ナンピン**: 最後の建値（直近約定価格 `last_entry_price`）から **0.2% 下落**（`current_price <= last_entry_price * 0.998`）。
+          - **4〜5回目ナンピン**: 最後の建値（直近約定価格 `last_entry_price`）から **0.3% 下落**（`current_price <= last_entry_price * 0.997`）。
       - **決済（利確）条件**:
         - 価格がボリュームプロファイルの **POC（Point of Control）に到達・上抜け**（確定足 `close >= POC` またはリアルタイム監視 `current_price >= POC`）した時点でポジションを全決済（成行クローズ）。
 2. **第2段階（トレーリングモード適用・総合評価）**:

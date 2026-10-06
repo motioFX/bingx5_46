@@ -163,7 +163,7 @@ from bingx5_46_2api import (
     compute_bingx_lot_size,
     normalize_symbol,
 )
-from bingx5_46_3logic import send_discord, logicinstance, PnLCalculator, MPStrategy, backtester, run_interval_comparison, resample_candles
+from bingx5_46_3logic import send_discord, logicinstance, PnLCalculator, MPStrategy, backtester, run_interval_comparison, resample_candles, calc_add_pct
 
 from datetime import datetime, timezone, timedelta
 from decimal import Decimal, ROUND_HALF_UP
@@ -1178,11 +1178,12 @@ async def wait_until_next_hour(
                         save_scale_in_states(scale_in_states)
                         continue
 
-                    # B. リアルタイム 0.2% 下落ナンピン判定 (最大5回まで)
-                    drop_target = last_px * (1.0 - 0.002)
+                    # B. リアルタイム 段階的ナンピン判定 (1〜3回目: 0.2%, 4〜5回目: 0.3%, 最大5回まで)
+                    req_drop_pct = calc_add_pct(cur_nanpin + 1)
+                    drop_target = last_px * (1.0 - req_drop_pct)
                     if cur_nanpin < 5 and cur_px <= drop_target:
                         discord.print_log(
-                            f"[{sym}] [REALTIME NANPIN] 📉 最後の建値(${last_px:,.4f})から-0.2%下落検出 (${cur_px:,.4f} <= ${drop_target:,.4f})\n"
+                            f"[{sym}] [REALTIME NANPIN] 📉 最後の建値(${last_px:,.4f})から-{req_drop_pct*100:.1f}%下落検出 (${cur_px:,.4f} <= ${drop_target:,.4f})\n"
                             f"   └ ナンピン発動 ({cur_nanpin + 1}/5 回目)..."
                         )
                         bal_val = float(pos.get("margin", 0.0)) or 100.0
@@ -1857,13 +1858,13 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                                     "avg_price": entry_px,
                                     "poc_level": poc_val
                                 })
-                                last_px = float(scale_state.get("last_entry_price", entry_px)) or entry_px
-                                cur_nanpin = int(scale_state.get("nanpin_count", 0))
-                                drop_target = last_px * (1.0 - 0.002)
+                                # 2-B. VAL_POC 戦略: 最後の建値から段階的ナンピン判定 (1〜3回目: 0.2%, 4〜5回目: 0.3%, 最大5回)
+                                req_drop_pct = calc_add_pct(cur_nanpin + 1)
+                                drop_target = last_px * (1.0 - req_drop_pct)
 
                                 if cur_nanpin < 5 and current_price <= drop_target:
                                     discord.print_log(
-                                        f"[{sym}] [NANPIN TRIGGER] 📉 最後の建値(${last_px:,.4f})から-0.2%下落検出 (${current_price:,.4f} <= ${drop_target:,.4f})\n"
+                                        f"[{sym}] [NANPIN TRIGGER] 📉 最後の建値(${last_px:,.4f})から-{req_drop_pct*100:.1f}%下落検出 (${current_price:,.4f} <= ${drop_target:,.4f})\n"
                                         f"   └ ナンピン発動 ({cur_nanpin + 1}/5 回目)..."
                                     )
                                     buy_lot = float(position.get("buy", 0))
