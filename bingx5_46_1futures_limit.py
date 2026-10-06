@@ -845,7 +845,7 @@ async def validate_profitable_candidates(trade_side: str, mode: str, base_symbol
     from bingx5_46_2api import api_bingx
     from bingx5_46_3logic import run_interval_comparison, logicinstance, resample_candles
 
-    discord.print_log("👑 【固定5銘柄 MTF完全ロング判定 ＆ Envelope / RSI MA 個別最適化】を開始します...")
+    discord.print_log("👑 【固定5銘柄 MTF完全ロング判定 ＆ 2大戦略 (RSIMA / VAL_POC) 個別最適化】を開始します...")
     
     # 1. trade_eligible_symbols.json から MTF 完全ロング判定合格銘柄をロード
     eligible_file = Path(__file__).resolve().parent / "Data" / "trade_eligible_symbols.json"
@@ -1268,7 +1268,7 @@ async def run_screening_and_optimization(mode: str, send_charts: bool = False, s
     print(f"\n[Selection Result] 選定{len(selected_symbols)}銘柄 (固定5銘柄 MTF完全ロング・個別最適化): {', '.join(selected_symbols)}")
 
     # 選定銘柄の個別最適化パラメータをDiscordログ表示
-    discord.print_log("\n★ 【銘柄別 個別最適化パラメータ一覧 (Envelope / RSI MA)】")
+    discord.print_log("\n★ 【銘柄別 個別最適化パラメータ一覧 (RSIMA / VAL_POC)】")
     for sym in selected_symbols:
         p = symbol_params_map.get(sym, default_best_params)
         pnl_val = p.get('pnl', 0.0)
@@ -1278,13 +1278,13 @@ async def run_screening_and_optimization(mode: str, send_charts: bool = False, s
         strat = p.get('strategy', 'rsima').upper()
         p_detail = p.get('params', {})
         
-        if strat == "ENVELOPE":
-            param_str = f"Len={p_detail.get('length', 15)}, Band=±{p_detail.get('lower_pct', 2.0)}%, MALen={p_detail.get('malen', 200)}"
+        if strat in ("VAL_POC", "VP_VAL_GC"):
+            param_str = f"VAL_GC ➔ 段階的ナンピン(最大{p_detail.get('max_nanpin', 5)}回: 0.2%/0.3%) ➔ POCクローズ"
         else:
             param_str = f"RSI={p_detail.get('rsi_len', 9)}, MALen={p_detail.get('lma_len', 7)}, L-Entry<{p_detail.get('lEp', 40)}, L-Exit>{p_detail.get('lCp', 70)}"
 
         discord.print_log(
-            f"   📌 [{sym}] 戦略={strat} (ナンピン数:{MAX_TRADES_COUNT}) | {param_str} | "
+            f"   📌 [{sym}] 戦略={strat} (ナンピン数:{MAX_TRADES_COUNT if strat != 'VAL_POC' else 5}) | {param_str} | "
             f"純利益: {pnl_val:+.4f} USDT (取引: {tc_val}回, 勝率: {wr_val:.1f}%, DD: {dd_val:.2f} USDT ({dd_val:.1f}%))"
         )
 

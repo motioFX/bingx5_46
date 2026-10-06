@@ -1973,25 +1973,7 @@ def optimize_symbol_strategy(
     """
     results = {}
     
-    # 1. Envelope 戦略グリッドサーチ
-    if force_strategy is None or force_strategy.lower() == "envelope":
-        env_lengths = [10, 15, 20, 25]
-        env_lower_pcts = [1.5, 2.0, 2.5, 3.0]
-        env_malens = [100]
-        
-        for l in env_lengths:
-            for lp in env_lower_pcts:
-                for ml in env_malens:
-                    res = simulate_envelope_strategy(
-                        df, length=l, lower_pct=lp, upper_pct=lp, malen=ml,
-                        max_trades=max_trades, initial_equity=initial_equity,
-                        sl_pct=0.03, use_trend_filter=False
-                    )
-                    label = f"Envelope_L{l}_P{lp}"
-                    results[label] = res
-
-
-    # 2. RSIMA 戦略グリッドサーチ
+    # 1. RSIMA 戦略グリッドサーチ (オシレーター反転)
     if force_strategy is None or force_strategy.lower() == "rsima":
         # PROJECT_RULES準拠: RSI=9, MALen=7, EMA固定。lEp(30〜50)およびlCp(60〜80)を最適化
         rsi_lengths = [9]
@@ -2011,24 +1993,24 @@ def optimize_symbol_strategy(
                         label = f"RSIMA_R{rl}_M{ml}_Ep{ep}_Cp{cp}"
                         results[label] = res
 
-    # 3. VAL_POC 戦略 (VAL GC + 0.2%下落ナンピン5回 + POCクローズ)
+    # 2. VAL_POC 戦略 (出来高構造リバウンド ＆ 段階的ナンピン最大5回 ＆ POCクローズ)
     if force_strategy is None or force_strategy.lower() in ("val_poc", "vp_val_gc"):
         res_val_poc = simulate_val_poc_strategy(
-            df, max_nanpin=5, nanpin_drop_pct=0.002, initial_equity=initial_equity, sl_pct=0.03
+            df, max_nanpin=5, nanpin_drop_pct=None, initial_equity=initial_equity, sl_pct=0.03
         )
-        results["VAL_POC_N5_D0.2"] = res_val_poc
+        results["VAL_POC_N5_Stepped"] = res_val_poc
 
     if not results:
         default_res = {
-            "strategy": "envelope",
+            "strategy": "rsima",
             "final_pnl": 0.0,
             "trade_count": 0,
             "win_rate": 0.0,
             "DD_max": 0.0,
             "max_unrealized_loss": 0.0,
-            "params": {"length": 15, "lower_pct": 2.0, "upper_pct": 2.0, "malen": 200, "max_trades": max_trades}
+            "params": {"rsi_len": 9, "lma_len": 7, "lEp": 40.0, "lCp": 70.0, "max_trades": max_trades, "sl_pct": 0.03}
         }
-        return "envelope", default_res["params"], default_res, []
+        return "rsima", default_res["params"], default_res, []
 
     active_results = {k: v for k, v in results.items() if v.get("trade_count", 0) > 0}
     eval_pool = active_results if active_results else results
@@ -2046,14 +2028,14 @@ def optimize_symbol_strategy(
 
 def run_interval_comparison(df_60m, lot=1.0, data_equity=100.0, side_mode="long", symbol="", force_strategy=None, prefer_breakout=False, max_trades=1):
     """
-    エンベロープ戦略および RSI MA 戦略の網羅的グリッドサーチを実行し、
+    2大戦略（RSIMA ＆ VAL_POC）の網羅的グリッドサーチを実行し、
     各銘柄のPnLが最大となる戦略と最適パラメータを選定する。
     """
     logic = logicinstance()
     os.makedirs("backtest_data", exist_ok=True)
     fixed_initial_equity = float(data_equity) if (data_equity is not None and data_equity > 0) else 100.0
     
-    discord.print_log(f"\n====== [{symbol}] エンベロープ ＆ RSI MA 個別最適化（PnL最大化）開始 ======")
+    discord.print_log(f"\n====== [{symbol}] 2大戦略（RSIMA ＆ VAL_POC）個別最適化（PnL最大化）開始 ======")
     best_strat, best_params, best_res, top10 = optimize_symbol_strategy(
         df=df_60m,
         symbol=symbol,
