@@ -858,11 +858,10 @@ async def validate_profitable_candidates(trade_side: str, mode: str, base_symbol
                 discord.print_log(f"   [MTF判定済] トレード適格銘柄: {', '.join(target_cands) if target_cands else 'なし (全銘柄見送り)'}")
         except Exception as e:
             discord.print_log(f"   [Warning] eligible_symbols 読込失敗: {e}")
-
-    # ファイル未生成または空の場合は固定5銘柄をデフォルト対象とする
-    if not target_cands:
+            target_cands = list(FIXED_SYMBOLS)
+    else:
         target_cands = list(FIXED_SYMBOLS)
-        discord.print_log(f"   [デフォルト採用] 固定5銘柄を最適化対象に設定: {', '.join(target_cands)}")
+        discord.print_log(f"   [初期デフォルト採用] trade_eligible_symbols.json 未生成のため固定5銘柄を対象に設定: {', '.join(target_cands)}")
 
     profitable_cands = []
     symbol_params_map: Dict[str, Dict[str, Any]] = {}
@@ -1249,44 +1248,57 @@ async def run_screening_and_optimization(mode: str, send_charts: bool = False, s
     btc_whale_sig = btc_whale_info.get("signal", "NEUTRAL")
     print(f"[Market State] Strategy Mode: LONG ONLY | BTC Whale Sentiment: {btc_whale_sig}")
 
-    # 5. パラメータ最適化 & バックテスト合格銘柄選抜 (銘柄個別最適化: 最大10銘柄)
+    # 5. パラメータ最適化 & バックテスト合格銘柄選抜 (MTF適格 ＆ PnL > 0)
     base_sym = selected_symbols_info[0]["symbol"] if selected_symbols_info else "HYPE"
     profitable_cands, symbol_params_map, default_best_params = await validate_profitable_candidates(
         trade_side=trade_side, mode=mode, base_symbol=base_sym
     )
 
-    # バックテスト合格銘柄を優先し、未合格でも固定5銘柄から選定
-    selected_set = set(profitable_cands)
-    selected_symbols = list(profitable_cands)
-    for sym in FIXED_SYMBOLS:
-        if sym not in selected_set:
-            selected_symbols.append(sym)
-        if len(selected_symbols) >= MAX_SELECTED_SYMBOLS:
-            break
+    # MTF適格 かつ バックテスト合格銘柄のみを選定（不適格銘柄の強制追加は完全撤廃）
+    selected_symbols = list(profitable_cands)[:MAX_SELECTED_SYMBOLS]
+    print(f"\n[Selection Result] 選定{len(selected_symbols)}銘柄 (MTF合格 ＆ 個別最適化合格): {', '.join(selected_symbols) if selected_symbols else 'なし (全銘柄見送り・完全ノーポジ維持)'}")
 
-    selected_symbols = selected_symbols[:MAX_SELECTED_SYMBOLS]
-    print(f"\n[Selection Result] 選定{len(selected_symbols)}銘柄 (固定5銘柄 MTF完全ロング・個別最適化): {', '.join(selected_symbols)}")
+    # 除外された固定銘柄の理由をDiscordログ出力
+    rejected_symbols = [s for s in FIXED_SYMBOLS if s not in selected_symbols]
+    if rejected_symbols:
+        discord.print_log(f"🛑 【トレード見送り・除外銘柄 ({len(rejected_symbols)}銘柄)】: {', '.join(rejected_symbols)}")
+        eligible_file = Path(__file__).resolve().parent / "Data" / "trade_eligible_symbols.json"
+        if eligible_file.exists():
+            try:
+                with open(eligible_file, "r", encoding="utf-8") as ef:
+                    el_data = json.load(ef)
+                    reports = el_data.get("reports", {})
+                    for r_sym in rejected_symbols:
+                        r_info = reports.get(r_sym, {})
+                        reasons = r_info.get("rejection_reasons", [])
+                        reason_str = ", ".join(reasons) if reasons else "MTF判定アウトまたは最適化不合格"
+                        discord.print_log(f"   └ ❌ [{r_sym}] 除外理由: {reason_str}")
+            except Exception:
+                pass
 
     # 選定銘柄の個別最適化パラメータをDiscordログ表示
-    discord.print_log("\n★ 【銘柄別 個別最適化パラメータ一覧 (RSIMA / VAL_POC)】")
-    for sym in selected_symbols:
-        p = symbol_params_map.get(sym, default_best_params)
-        pnl_val = p.get('pnl', 0.0)
-        wr_val = p.get('win_rate', 0.0)
-        tc_val = p.get('trade_count', 0)
-        dd_val = p.get('max_dd', 0.0)
-        strat = p.get('strategy', 'rsima').upper()
-        p_detail = p.get('params', {})
-        
-        if strat in ("VAL_POC", "VP_VAL_GC"):
-            param_str = f"VAL_GC ➔ 段階的ナンピン(最大{p_detail.get('max_nanpin', 5)}回: 0.2%/0.3%) ➔ POCクローズ"
-        else:
-            param_str = f"RSI={p_detail.get('rsi_len', 9)}, MALen={p_detail.get('lma_len', 7)}, L-Entry<{p_detail.get('lEp', 40)}, L-Exit>{p_detail.get('lCp', 70)}"
+    if selected_symbols:
+        discord.print_log("\n★ 【合格銘柄 個別最適化パラメータ一覧 (RSIMA / VAL_POC)】")
+        for sym in selected_symbols:
+            p = symbol_params_map.get(sym, default_best_params)
+            pnl_val = p.get('pnl', 0.0)
+            wr_val = p.get('win_rate', 0.0)
+            tc_val = p.get('trade_count', 0)
+            dd_val = p.get('max_dd', 0.0)
+            strat = p.get('strategy', 'rsima').upper()
+            p_detail = p.get('params', {})
+            
+            if strat in ("VAL_POC", "VP_VAL_GC"):
+                param_str = f"VAL_GC ➔ 段階的ナンピン(最大{p_detail.get('max_nanpin', 5)}回: 0.2%/0.3%) ➔ POCクローズ"
+            else:
+                param_str = f"RSI={p_detail.get('rsi_len', 9)}, MALen={p_detail.get('lma_len', 7)}, L-Entry<{p_detail.get('lEp', 40)}, L-Exit>{p_detail.get('lCp', 70)}"
 
-        discord.print_log(
-            f"   📌 [{sym}] 戦略={strat} (ナンピン数:{MAX_TRADES_COUNT if strat != 'VAL_POC' else 5}) | {param_str} | "
-            f"純利益: {pnl_val:+.4f} USDT (取引: {tc_val}回, 勝率: {wr_val:.1f}%, DD: {dd_val:.2f} USDT ({dd_val:.1f}%))"
-        )
+            discord.print_log(
+                f"   📌 [{sym}] 戦略={strat} (ナンピン数:{MAX_TRADES_COUNT if strat != 'VAL_POC' else 5}) | {param_str} | "
+                f"純利益: {pnl_val:+.4f} USDT (取引: {tc_val}回, 勝率: {wr_val:.1f}%, DD: {dd_val:.2f} USDT ({dd_val:.1f}%))"
+            )
+    else:
+        discord.print_log("\n⚠️ 【トレード適格銘柄なし】本日MTF条件を満たす銘柄がないため、新規エントリーは全停止しノーポジ待機します。")
 
     global current_strategy_type
     current_strategy_type = default_best_params["strategy"]
