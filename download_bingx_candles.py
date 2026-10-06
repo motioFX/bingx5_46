@@ -76,35 +76,73 @@ def log(message: str) -> None:
         sys.stdout.flush()
 
 
-def is_forex_symbol(symbol: str) -> bool:
-    """BingXの外国為替（FOREX）ペアを判定 (FOREXのみ除外、暗号資産・株・コモディティは許可)"""
+CATEGORY_METADATA = {
+    "crypto": {
+        "label": "🪙 クリプト",
+        "file_tag": "crypto",
+    },
+    "indices_commodities": {
+        "label": "🥇 指数＆コモディティ",
+        "file_tag": "indices_commodities",
+    },
+    "forex": {
+        "label": "💱 FX",
+        "file_tag": "forex",
+    },
+    "stocks": {
+        "label": "📈 株式",
+        "file_tag": "stocks",
+    },
+}
+
+
+def get_symbol_category(symbol: str) -> str:
+    """銘柄コードからカテゴリーを判定 (crypto, indices_commodities, forex, stocks)"""
     sym = symbol.strip().upper()
-    base = sym.replace("-USDT", "").replace("-USDC", "").replace("_USDT", "")
-    if base.startswith("NCFX") or "FOREX" in base:
-        return True
-    return False
+    if sym.startswith("NCFX") or "FOREX" in sym:
+        return "forex"
+    elif sym.startswith("NCSK"):
+        return "stocks"
+    elif sym.startswith("NCCO") or sym.startswith("NCSI") or sym.startswith("NCID") or sym.startswith("NCIN"):
+        return "indices_commodities"
+    else:
+        return "crypto"
 
 
-def fetch_bingx_non_forex_symbols() -> List[str]:
-    """BingX のFX以外の全銘柄（クリプト、株、コモディティ）を取得"""
+def fetch_bingx_symbols_by_category() -> Dict[str, List[str]]:
+    """BingX の全1,200+銘柄を4大カテゴリー別に分類して取得"""
     url = f"{BINGX_API_URL}/openApi/swap/v2/quote/contracts"
+    categorized: Dict[str, List[str]] = {
+        "crypto": [],
+        "indices_commodities": [],
+        "forex": [],
+        "stocks": [],
+    }
     try:
         resp = requests.get(url, timeout=12).json()
         contracts = resp.get("data", [])
-        symbols = []
         for c in contracts:
             sym = c.get("symbol", "")
-            if sym and not is_forex_symbol(sym):
-                symbols.append(sym)
-        if symbols:
-            return sorted(symbols)
+            if not sym:
+                continue
+            cat = get_symbol_category(sym)
+            if cat in categorized:
+                categorized[cat].append(sym)
+        for cat in categorized:
+            categorized[cat].sort()
+        return categorized
     except Exception as e:
         log(f"[BingX API Error] 銘柄一覧取得失敗: {e}")
 
-    return [
-        "BTC-USDT", "ETH-USDT", "SOL-USDT", "NEAR-USDT", "ARB-USDT",
-        "DOGE-USDT", "BNB-USDT", "XRP-USDT", "SUI-USDT", "AVAX-USDT", "LINK-USDT"
-    ]
+    return {
+        "crypto": [
+            "BTC-USDT", "ETH-USDT", "SOL-USDT", "NEAR-USDT", "ARB-USDT",
+            "DOGE-USDT", "BNB-USDT", "XRP-USDT", "SUI-USDT", "AVAX-USDT", "LINK-USDT"
+        ],
+        "indices_commodities": ["NCCOGOLD2USD-USDT", "NCSINASDAQ1002USD-USDT", "NCSISP5002USD-USDT"],
+        "forex": ["NCFXUSD2JPY-USDT", "NCFXEUR2USD-USDT"],
+        "stocks": ["NCSKTSLA2USD-USDT", "NCSKNVDA2USD-USDT", "NCSKMSFT2USD-USDT"],
+    }
 
 
 def fetch_symbol_klines_bingx(
@@ -243,6 +281,7 @@ async def run_pipeline(
     days_5m: int = 90,      # 90日分
     days_1m: int = 30,      # 30日分
     intervals: Optional[Sequence[str]] = None,
+    categories: Optional[Sequence[str]] = None,
     force: bool = False,
     force_upload: bool = False,
     skip_upload: bool = False,
@@ -256,106 +295,128 @@ async def run_pipeline(
     now_jst = datetime.now(JST).strftime("%Y%m%d_%H%M%S")
     target_intervals = list(intervals) if intervals else ["1d", "1h", "15m", "5m"]
 
-    log("=" * 70)
-    log("🚀 [BingX] 全銘柄（FX除くクリプト・株・コモディティ）マルチ時間足データ収集開始")
-    log(f"   対象足種: {target_intervals} | 実行日時タグ: {now_jst}")
-    log("=" * 70)
+    default_cat_order = ["crypto", "indices_commodities", "forex", "stocks"]
+    target_categories = [c.lower() for c in categories] if categories else default_cat_order
 
-    # 1. 銘柄一覧
+    log("=" * 75)
+    log("🚀 [BingX] 4大カテゴリー別マルチ時間足データ収集＆時間分割配信パイプライン開始")
+    log(f"   対象カテゴリー: {target_categories}")
+    log(f"   対象足種: {target_intervals} | 実行日時タグ: {now_jst}")
+    log("=" * 75)
+
     if symbols_override:
-        target_symbols = [s.strip().upper() for s in symbols_override]
-        log(f"📌 指定銘柄 ({len(target_symbols)} 銘柄): {', '.join(target_symbols)}")
+        # 指定銘柄のみをカスタムカテゴリーとして実行
+        all_categories = {"custom": [s.strip().upper() for s in symbols_override]}
+        run_cats = ["custom"]
     else:
-        target_symbols = fetch_bingx_non_forex_symbols()
-        log(f"📌 BingX 対象銘柄: {len(target_symbols)} 銘柄 ({', '.join(target_symbols[:8])} ...)")
+        all_categories = fetch_bingx_symbols_by_category()
+        run_cats = [c for c in target_categories if c in all_categories and all_categories[c]]
 
     days_map = {"1d": days_1d, "1h": days_1h, "15m": days_15m, "5m": days_5m, "1m": days_1m}
 
-    for interval in target_intervals:
-        log(f"\n📂 ========== BingX 【{interval.upper()}足】 収集開始 ==========")
-        target_days = days_map.get(interval, 30)
+    for cat_idx, cat in enumerate(run_cats, 1):
+        target_symbols = all_categories[cat]
+        cat_meta = CATEGORY_METADATA.get(cat, {"label": cat, "file_tag": cat})
+        cat_label = cat_meta["label"]
+        cat_tag = cat_meta["file_tag"]
 
-        symbol_dfs: Dict[str, pd.DataFrame] = {}
+        log("\n" + "=" * 75)
+        log(f"🏷️ [{cat_idx}/{len(run_cats)}] BingX カテゴリー: 【{cat_label}】 収集開始 ({len(target_symbols)} 銘柄)")
+        log("=" * 75)
 
-        for sym_idx, sym in enumerate(target_symbols, 1):
-            df = download_symbol_candles_bingx(
-                symbol=sym,
-                interval=interval,
-                days=target_days,
-                candles_dir=candles_dir,
-                force=force,
-                incremental_hours=incremental_hours
-            )
-            if not df.empty:
-                symbol_dfs[sym] = df
+        for interval in target_intervals:
+            log(f"\n📂 ========== BingX [{cat_label}] 【{interval.upper()}足】 収集開始 ==========")
+            target_days = days_map.get(interval, 30)
 
-            if sym_idx % 20 == 0 or sym_idx == len(target_symbols):
-                log(f"   [{sym_idx:4d}/{len(target_symbols)}] {sym} ({interval}) 完了 (保有レコード: {len(df):,} 行)")
+            symbol_dfs: Dict[str, pd.DataFrame] = {}
 
-            time.sleep(0.30)
+            for sym_idx, sym in enumerate(target_symbols, 1):
+                df = download_symbol_candles_bingx(
+                    symbol=sym,
+                    interval=interval,
+                    days=target_days,
+                    candles_dir=candles_dir,
+                    force=force,
+                    incremental_hours=incremental_hours
+                )
+                if not df.empty:
+                    symbol_dfs[sym] = df
 
-        # 2. 全銘柄網羅グリッド生成 (欠損値 NaN 補完)
+                if sym_idx % 20 == 0 or sym_idx == len(target_symbols):
+                    log(f"   [{sym_idx:4d}/{len(target_symbols)}] {sym} ({interval}) 完了 (保有レコード: {len(df):,} 行)")
+
+                time.sleep(0.30)
+
+            # 2. カテゴリー別 全銘柄網羅グリッド生成 (欠損値 NaN 補完)
+            gc.collect()
+            time.sleep(1.0)
+            log(f"\n🧩 [{cat_label}] [{interval.upper()}] 全銘柄包含マスターグリッド生成中...")
+            master_df = build_full_symbol_time_grid(symbol_dfs, target_symbols)
+
+            if interval == "1h":
+                cat_csv = data_dir / f"bingx_{cat_tag}_all_symbols_merged.csv"
+                master_df.to_csv(cat_csv, index=False, encoding="utf-8")
+                log(f"📄 [BingX] [{cat_label}] 1H 統合マスターCSVを更新しました: {cat_csv.name} ({len(master_df):,} 行)")
+
+            # 3. カテゴリー別 ZIP アーカイブ生成 (8時間つけ足し時は最新1本スライス、全件時はN分割)
+            exchange_slug = f"bingx_{cat_tag}"
+            if incremental_hours > 0 and not force:
+                parts = create_recent_slice_zip(
+                    df=master_df,
+                    exchange=exchange_slug,
+                    interval=interval,
+                    out_dir=data_dir,
+                    timestamp_tag=now_jst,
+                    hours=incremental_hours
+                )
+            else:
+                parts = split_and_create_time_zips(
+                    df=master_df,
+                    exchange=exchange_slug,
+                    interval=interval,
+                    out_dir=data_dir,
+                    timestamp_tag=now_jst,
+                    max_part_rows=400_000,
+                    min_parts=2
+                )
+
+            # 4. 古い順からの Discord 順次アップロード (全データ送信先を Bitbank チャンネルへ集約)
+            if not skip_upload:
+                upload_time_split_zips_to_discord(
+                    parts=parts,
+                    webhook_name="real1_bitbank",
+                    exchange_label=f"BingX [{cat_label}]",
+                    interval_label=interval,
+                    interval_wait_sec=3.0,
+                    force_upload=force_upload
+                )
+
+            del master_df
+            del symbol_dfs
+            gc.collect()
+            time.sleep(1.5)
+
+        # カテゴリー完了後のクールダウン
+        log(f"\n✅ BingX カテゴリー: 【{cat_label}】 全足種の収集・配信が完了しました。")
         gc.collect()
-        time.sleep(1.0)
-        log(f"\n🧩 [{interval.upper()}] 全銘柄包含マスターグリッド生成中...")
-        master_df = build_full_symbol_time_grid(symbol_dfs, target_symbols)
-
-        if interval == "1h":
-            fixed_csv = data_dir / "bingx_all_symbols_merged.csv"
-            master_df.to_csv(fixed_csv, index=False, encoding="utf-8")
-            log(f"📄 [BingX] 1H 統合マスターCSVを更新しました: {fixed_csv.name} ({len(master_df):,} 行)")
-
-        # 3. ZIP アーカイブ生成 (8時間つけ足し時は最新1本スライス、全件時はN分割)
-        if incremental_hours > 0 and not force:
-            parts = create_recent_slice_zip(
-                df=master_df,
-                exchange="bingx",
-                interval=interval,
-                out_dir=data_dir,
-                timestamp_tag=now_jst,
-                hours=incremental_hours
-            )
-        else:
-            parts = split_and_create_time_zips(
-                df=master_df,
-                exchange="bingx",
-                interval=interval,
-                out_dir=data_dir,
-                timestamp_tag=now_jst,
-                max_part_rows=400_000,
-                min_parts=2
-            )
-
-        # 4. 古い順からの Discord 順次アップロード (全データ送信先を Bitbank チャンネルへ集約)
-        if not skip_upload:
-            upload_time_split_zips_to_discord(
-                parts=parts,
-                webhook_name="real1_bitbank",
-                exchange_label="BingX",
-                interval_label=interval,
-                interval_wait_sec=3.0,
-                force_upload=force_upload
-            )
-
-        del master_df
-        del symbol_dfs
-        gc.collect()
+        await asyncio.sleep(2.0)
 
     # 5. クリーンアップ
     log("\n🧹 不要な古いZIPファイルの自動クリーンアップを実行中...")
     cleanup_expired_archives(data_dir=data_dir, patterns=("bingx_*.zip",), max_age_hours=24.0)
 
-    log("\n🎉 [BingX] 全銘柄マルチ時間足データ収集＆時間分割配信パイプラインが完了しました！")
+    log("\n🎉 [BingX] 全4大カテゴリー・マルチ時間足データ収集＆時間分割配信パイプラインがすべて完了しました！")
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="BingX 全銘柄マルチ時間足データ収集パイプライン")
+    parser = argparse.ArgumentParser(description="BingX 4大カテゴリー別 全銘柄マルチ時間足データ収集パイプライン")
     parser.add_argument("--days-1d", type=int, default=1460, help="日足取得期間（日）")
     parser.add_argument("--days-1h", type=int, default=1460, help="1時間足取得期間（日）")
     parser.add_argument("--days-15m", type=int, default=180, help="15分足取得期間（日）")
     parser.add_argument("--days-5m", type=int, default=90, help="5分足取得期間（日）")
     parser.add_argument("--days-1m", type=int, default=30, help="1分足取得期間（日）")
     parser.add_argument("--intervals", nargs="+", default=["1d", "1h", "15m", "5m"], help="実行する足種 (デフォルト: 1d 1h 15m 5m)")
+    parser.add_argument("--categories", nargs="+", default=["crypto", "indices_commodities", "forex", "stocks"], help="対象カテゴリー (crypto, indices_commodities, forex, stocks)")
     parser.add_argument("--force", action="store_true", help="既存キャッシュを無視して全件再取得")
     parser.add_argument("--force-upload", action="store_true", help="ハッシュを無視して強制アップロード")
     parser.add_argument("--skip-upload", action="store_true", help="Discordアップロードをスキップ")
@@ -370,6 +431,7 @@ if __name__ == "__main__":
         days_5m=args.days_5m,
         days_1m=args.days_1m,
         intervals=args.intervals,
+        categories=args.categories,
         force=args.force,
         force_upload=args.force_upload,
         skip_upload=args.skip_upload,

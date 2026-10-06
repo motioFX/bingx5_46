@@ -56,6 +56,7 @@ async def run_all_exchanges_pipeline(
     days_1m: int = 30,
     intervals: Optional[Sequence[str]] = None,
     exchanges: Optional[Sequence[str]] = None,
+    bingx_categories: Optional[Sequence[str]] = None,
     force: bool = False,
     force_upload: bool = False,
     skip_upload: bool = False,
@@ -158,6 +159,7 @@ async def run_all_exchanges_pipeline(
                 days_5m=days_5m,
                 days_1m=days_1m,
                 intervals=target_intervals,
+                categories=bingx_categories,
                 force=force,
                 force_upload=force_upload,
                 skip_upload=skip_upload,
@@ -184,6 +186,7 @@ if __name__ == "__main__":
     parser.add_argument("--days-1m", type=int, default=30, help="1分足取得期間（日）")
     parser.add_argument("--intervals", nargs="+", default=["1d", "1h", "15m", "5m"], help="実行する足種 (デフォルト: 1d 1h 15m 5m)")
     parser.add_argument("--exchanges", nargs="+", default=["hyperliquid", "bingx"], help="実行する取引所 (デフォルト: hyperliquid bingx)")
+    parser.add_argument("--bingx-categories", nargs="+", default=None, help="BingX対象カテゴリー (crypto, indices_commodities, forex, stocks)")
     parser.add_argument("--force", action="store_true", help="既存キャッシュを無視して全件再取得")
     parser.add_argument("--force-upload", action="store_true", help="ハッシュを無視して強制アップロード")
     parser.add_argument("--skip-upload", action="store_true", help="Discordアップロードをスキップ")
@@ -200,6 +203,7 @@ if __name__ == "__main__":
         days_1m=args.days_1m,
         intervals=args.intervals,
         exchanges=args.exchanges,
+        bingx_categories=args.bingx_categories,
         force=args.force,
         force_upload=args.force_upload,
         skip_upload=args.skip_upload,
