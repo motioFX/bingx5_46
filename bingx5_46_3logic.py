@@ -331,6 +331,12 @@ class logicinstance:
         df['long_rsima'] = rsi_gc & (df['lrsiMA'] < r_lep) & (df['rsi'] < r_lcp)
         df['longclose_rsima'] = df['rsi'] > r_lcp
 
+        # --- VAL_GC ＆ POCクローズ (val_poc) 戦略シグナル ---
+        # VALゴールデンクロス: 1本前がVAL以下、かつ当足終値がVALを上抜け復帰
+        df['long_val_gc'] = (df['close'].shift(1) <= df['VAL'].shift(1)) & (df['close'] > df['VAL'])
+        # POCクローズ: 終値がPOC以上
+        df['longclose_poc'] = df['close'] >= df['POC']
+
         strat_lower = str(strategy_type).lower()
         if strat_lower == "envelope":
             df['long'] = df['long_envelope']
@@ -341,6 +347,11 @@ class logicinstance:
             df['long'] = df['long_rsima']
             df['short'] = False
             df['longclose'] = df['longclose_rsima']
+            df['shortclose'] = False
+        elif strat_lower in ("val_poc", "vp_val_gc"):
+            df['long'] = df['long_val_gc']
+            df['short'] = False
+            df['longclose'] = df['longclose_poc']
             df['shortclose'] = False
         elif strat_lower in ("breakout", "squeeze_breakout"):
             df['long'] = df['long_breakout']
@@ -1798,6 +1809,156 @@ def simulate_rsima_strategy(
     }
 
 
+def simulate_val_poc_strategy(
+    df: pd.DataFrame,
+    max_nanpin: int = 5,
+    nanpin_drop_pct: float = 0.002,
+    initial_equity: float = 100.0,
+    fee_rate: float = 0.0006,
+    sl_pct: float = 0.03
+) -> dict:
+    """
+    VAL ゴールデンクロス ＆ 直近建値 0.2% 下落ナンピン最大5回 ＆ POC クローズ戦略
+    """
+    closes = df["close"].values
+    highs = df["high"].values if "high" in df.columns else closes
+    lows = df["low"].values if "low" in df.columns else closes
+    n = len(closes)
+    
+    if "VAL" not in df.columns or "POC" not in df.columns or df["VAL"].isna().all():
+        logic = logicinstance()
+        df_mp = logic.make_market_profile(df, period=48)
+        vals = df_mp["VAL"].values
+        pocs = df_mp["POC"].values
+    else:
+        vals = df["VAL"].values
+        pocs = df["POC"].values
+
+    if n < 10:
+        return {"final_pnl": 0.0, "trade_count": 0, "win_rate": 0.0, "DD_max": 0.0, "max_unrealized_loss": 0.0}
+
+    total_max_stages = max_nanpin + 1  # 初期エントリー1回 + ナンピン5回 = 計6回
+    trade_size_usdt = initial_equity / total_max_stages
+
+    pos_qty = 0.0
+    pos_cost = 0.0
+    avg_price = 0.0
+    pos_count = 0
+    last_entry_price = 0.0
+
+    cum_realized_pnl = 0.0
+    cum_fees = 0.0
+    trades = []
+    equity_curve = [initial_equity]
+    unrealized_list = [0.0]
+    exec_history = []
+
+    for i in range(1, n):
+        c = closes[i]
+        h = highs[i]
+        l = lows[i]
+        val = vals[i]
+        prev_val = vals[i-1]
+        poc = pocs[i]
+        ts = df["timestamp"].iloc[i] if "timestamp" in df.columns else i
+
+        # 1. 決済チェック (保有ポジションがある場合)
+        if pos_qty > 0:
+            # A. 固定損切り (3% SL)
+            if sl_pct > 0 and l < avg_price * (1.0 - sl_pct):
+                sl_price = avg_price * (1.0 - sl_pct)
+                sell_val = pos_qty * sl_price
+                fee = sell_val * fee_rate
+                pnl = sell_val - pos_cost - fee
+                cum_realized_pnl += pnl
+                cum_fees += fee
+                trades.append(pnl)
+                exec_history.append({"timestamp": ts, "price": sl_price, "size": -pos_qty, "type": "STOP_LOSS", "pnl": pnl})
+                pos_qty = 0.0
+                pos_cost = 0.0
+                avg_price = 0.0
+                pos_count = 0
+                last_entry_price = 0.0
+            # B. POC クローズ (高値または終値が POC に到達・上抜け)
+            elif not np.isnan(poc) and (h >= poc or c >= poc):
+                exit_price = max(c, poc) if h >= poc else c
+                sell_val = pos_qty * exit_price
+                fee = sell_val * fee_rate
+                pnl = sell_val - pos_cost - fee
+                cum_realized_pnl += pnl
+                cum_fees += fee
+                trades.append(pnl)
+                exec_history.append({"timestamp": ts, "price": exit_price, "size": -pos_qty, "type": "POC_CLOSE", "pnl": pnl})
+                pos_qty = 0.0
+                pos_cost = 0.0
+                avg_price = 0.0
+                pos_count = 0
+                last_entry_price = 0.0
+
+        # 2. エントリー / ナンピン判定
+        if not np.isnan(val) and not np.isnan(prev_val):
+            # 初期エントリー: ポジションなし かつ VAL ゴールデンクロス
+            if pos_count == 0:
+                if (closes[i-1] <= prev_val) and (c > val):
+                    buy_val = trade_size_usdt
+                    qty = buy_val / c
+                    fee = buy_val * fee_rate
+                    cum_fees += fee
+                    pos_cost += buy_val
+                    pos_qty += qty
+                    last_entry_price = c
+                    avg_price = pos_cost / pos_qty
+                    pos_count = 1
+                    exec_history.append({"timestamp": ts, "price": c, "size": qty, "type": "ENTRY_VAL_GC"})
+            # ナンピン: 最後の建値から 0.2% 下落、最大5回まで追加
+            elif 1 <= pos_count < total_max_stages:
+                if (c <= last_entry_price * (1.0 - nanpin_drop_pct)) or (l <= last_entry_price * (1.0 - nanpin_drop_pct)):
+                    add_price = min(c, last_entry_price * (1.0 - nanpin_drop_pct))
+                    buy_val = trade_size_usdt
+                    qty = buy_val / add_price
+                    fee = buy_val * fee_rate
+                    cum_fees += fee
+                    pos_cost += buy_val
+                    pos_qty += qty
+                    last_entry_price = add_price
+                    avg_price = pos_cost / pos_qty
+                    pos_count += 1
+                    exec_history.append({"timestamp": ts, "price": add_price, "size": qty, "type": f"NANPIN_{pos_count-1}"})
+
+        unrealized = (pos_qty * c - pos_cost) if pos_qty > 0 else 0.0
+        unrealized_list.append(unrealized)
+        current_eq = initial_equity + cum_realized_pnl + unrealized - cum_fees
+        equity_curve.append(current_eq)
+
+    eq_series = pd.Series(equity_curve)
+    peak = eq_series.cummax()
+    dd = peak - eq_series
+    dd_max = float(dd.max()) if not dd.empty else 0.0
+
+    trade_cnt = len(trades)
+    win_cnt = sum(1 for t in trades if t > 0)
+    win_rate = (win_cnt / trade_cnt * 100.0) if trade_cnt > 0 else 0.0
+    final_pnl = float(equity_curve[-1]) - initial_equity
+    min_unrealized = float(min(unrealized_list)) if unrealized_list else 0.0
+
+    return {
+        "final_pnl": final_pnl,
+        "trade_count": trade_cnt,
+        "win_rate": win_rate,
+        "DD_max": dd_max,
+        "max_unrealized_loss": min_unrealized,
+        "strategy": "val_poc",
+        "equity_curve": equity_curve,
+        "exec_history": exec_history,
+        "params": {
+            "max_nanpin": max_nanpin,
+            "nanpin_drop_pct": nanpin_drop_pct,
+            "max_trades": total_max_stages,
+            "sl_pct": sl_pct
+        }
+    }
+
+
 def optimize_symbol_strategy(
     df: pd.DataFrame,
     symbol: str = "",
@@ -1806,7 +1967,7 @@ def optimize_symbol_strategy(
     force_strategy: Optional[str] = None
 ) -> Tuple[str, Dict[str, Any], Dict[str, Any], list]:
     """
-    対象銘柄に対して Envelope 戦略と RSI MA 戦略のグリッドサーチを実行し、
+    対象銘柄に対して Envelope 戦略、RSI MA 戦略、および VAL_POC 戦略のグリッドサーチを実行し、
     PnLが最大となる戦略と最適パラメータを決定する。
     """
     results = {}
@@ -1848,6 +2009,13 @@ def optimize_symbol_strategy(
                         )
                         label = f"RSIMA_R{rl}_M{ml}_Ep{ep}_Cp{cp}"
                         results[label] = res
+
+    # 3. VAL_POC 戦略 (VAL GC + 0.2%下落ナンピン5回 + POCクローズ)
+    if force_strategy is None or force_strategy.lower() in ("val_poc", "vp_val_gc"):
+        res_val_poc = simulate_val_poc_strategy(
+            df, max_nanpin=5, nanpin_drop_pct=0.002, initial_equity=initial_equity, sl_pct=0.03
+        )
+        results["VAL_POC_N5_D0.2"] = res_val_poc
 
     if not results:
         default_res = {

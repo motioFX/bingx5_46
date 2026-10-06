@@ -133,6 +133,16 @@ for _idx, _arg in enumerate(sys.argv):
             ANALYSIS_HOURS = [int(_arg.split("=")[1])]
         except ValueError:
             pass
+
+# コマンドライン引数からの戦略指定オーバーライド (--strategy=val_poc / --val-poc)
+FORCE_STRATEGY: Optional[str] = None
+for _idx, _arg in enumerate(sys.argv):
+    if _arg == "--val-poc":
+        FORCE_STRATEGY = "val_poc"
+    elif _arg in ("--strategy", "--strat") and _idx + 1 < len(sys.argv):
+        FORCE_STRATEGY = sys.argv[_idx + 1].strip().lower()
+    elif _arg.startswith("--strategy=") or _arg.startswith("--strat="):
+        FORCE_STRATEGY = _arg.split("=")[1].strip().lower()
 # ========================================================================
 
 import bingx5_46_2api
@@ -998,6 +1008,7 @@ async def select_top_bingx_symbols(top_n: int = 10, mode: str = 'demo') -> List[
 
 
 TRAILING_TP_FILE = Path(__file__).resolve().parent / "Data" / "trailing_tp_state.json"
+SCALE_IN_FILE = Path(__file__).resolve().parent / "Data" / "scale_in_state.json"
 
 def load_trailing_tp_states() -> dict:
     if TRAILING_TP_FILE.exists():
@@ -1016,15 +1027,36 @@ def save_trailing_tp_states(states: dict):
     except Exception:
         pass
 
+def load_scale_in_states() -> dict:
+    if SCALE_IN_FILE.exists():
+        try:
+            with open(SCALE_IN_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {}
+
+def save_scale_in_states(states: dict):
+    try:
+        SCALE_IN_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with open(SCALE_IN_FILE, "w", encoding="utf-8") as f:
+            json.dump(states, f, indent=2, ensure_ascii=False)
+    except Exception:
+        pass
+
 
 async def wait_until_next_hour(
     symbol_apis: Optional[dict] = None,
     trailing_tp_states: Optional[dict] = None,
+    scale_in_states: Optional[dict] = None,
     mode: str = "demo"
 ):
     """毎時00分05秒まで待機する（前足確定の安全マージン5秒）。
-    ポジション保有＆利確モード中の銘柄がある場合、60秒ごとに現在価格をチェックし、
-    利確トレーリングの最高値追従および反落ストップ割れの即時成行利確を行う。"""
+    ポジション保有中の銘柄がある場合、60秒ごとに現在価格をチェックし、
+    - 利確トレーリング(TTP)の最高値追従および反落成行利確
+    - VAL_POC戦略のリアルタイムPOC到達クローズ
+    - 直近建値から0.2%下落時のナンピン買い増し（最大5回）
+    を行う。"""
     now = datetime.now(JST)
     next_hour = now.replace(minute=0, second=5, microsecond=0) + timedelta(hours=1)
     wait_seconds = (next_hour - now).total_seconds()
@@ -1046,11 +1078,9 @@ async def wait_until_next_hour(
         if now >= next_hour:
             break
             
-        # ポジション保有中銘柄のリアルタイム利確トレーリング監視
+        # 1. ポジション保有中銘柄のリアルタイム利確トレーリング監視
         if symbol_apis and trailing_tp_states:
             active_keys = [k for k, v in list(trailing_tp_states.items()) if v.get("active")]
-            if not active_keys:
-                continue
             for sym in active_keys:
                 api = symbol_apis.get(sym)
                 if not api:
@@ -1100,6 +1130,74 @@ async def wait_until_next_hour(
                         trailing_tp_states.pop(sym, None)
                         save_trailing_tp_states(trailing_tp_states)
                 except Exception as mon_err:
+                    pass
+
+        # 2. VAL_POC 戦略のリアルタイム監視（POC到達クローズ ＆ 0.2%下落ナンピン）
+        if symbol_apis and scale_in_states:
+            active_scale_syms = list(scale_in_states.keys())
+            for sym in active_scale_syms:
+                api = symbol_apis.get(sym)
+                if not api:
+                    continue
+                try:
+                    pos = await api.get_positions()
+                    buy_qty = float(pos.get("buy", 0.0))
+                    if buy_qty <= 0:
+                        scale_in_states.pop(sym, None)
+                        save_scale_in_states(scale_in_states)
+                        continue
+
+                    entry_px = float(pos.get("buy_pos", 0.0))
+                    if entry_px <= 0:
+                        continue
+
+                    from bingx5_46_2api import get_bingx_orderbook, flatten_current_position_bingx
+                    best_bid, best_ask = get_bingx_orderbook(sym, api.bingx.base_url)
+                    cur_px = best_bid if (best_bid and best_bid > 0) else entry_px
+
+                    scale_state = scale_in_states.get(sym)
+                    if not scale_state:
+                        continue
+
+                    poc_val = float(scale_state.get("poc_level", 0.0))
+                    last_px = float(scale_state.get("last_entry_price", entry_px)) or entry_px
+                    cur_nanpin = int(scale_state.get("nanpin_count", 0))
+
+                    # A. リアルタイム POC クローズ判定
+                    if poc_val > 0 and cur_px >= poc_val:
+                        exit_reason = "POC_CLOSE_REALTIME"
+                        pnl_est = (cur_px - entry_px) * buy_qty
+                        discord.print_log(
+                            f"[{sym}] [REALTIME POC CLOSE] 🎯 リアルタイムPOCクローズ成立!\n"
+                            f"   └ 現在値: ${cur_px:,.4f} >= POC: ${poc_val:,.4f} (平均建値: ${entry_px:,.4f}) | 概算PnL: {pnl_est:+.2f} USDT ➔ 成行利確"
+                        )
+                        await flatten_current_position_bingx(sym, "USDT", mode, exit_reason, force_market=True)
+                        from real_trade_tracker import record_real_trade
+                        record_real_trade(sym, "LONG", "CLOSE", cur_px, buy_qty, pnl_est, f"実運用決済 ({exit_reason})")
+                        scale_in_states.pop(sym, None)
+                        save_scale_in_states(scale_in_states)
+                        continue
+
+                    # B. リアルタイム 0.2% 下落ナンピン判定 (最大5回まで)
+                    drop_target = last_px * (1.0 - 0.002)
+                    if cur_nanpin < 5 and cur_px <= drop_target:
+                        discord.print_log(
+                            f"[{sym}] [REALTIME NANPIN] 📉 最後の建値(${last_px:,.4f})から-0.2%下落検出 (${cur_px:,.4f} <= ${drop_target:,.4f})\n"
+                            f"   └ ナンピン発動 ({cur_nanpin + 1}/5 回目)..."
+                        )
+                        bal_val = float(pos.get("margin", 0.0)) or 100.0
+                        entered_add = await api.long_entry(
+                            None, pos, bal_val, buy_qty, max_lot=10.0,
+                            max_stage=6, is_scale_in=True, stage_num=cur_nanpin + 2
+                        )
+                        if entered_add:
+                            scale_state["nanpin_count"] = cur_nanpin + 1
+                            scale_state["last_entry_price"] = cur_px
+                            scale_in_states[sym] = scale_state
+                            save_scale_in_states(scale_in_states)
+                            from real_trade_tracker import record_real_trade
+                            record_real_trade(sym, "LONG", "SCALE_IN", cur_px, buy_qty, 0.0, f"実運用ナンピン買い増し ({cur_nanpin + 1}/5)")
+                except Exception as scale_err:
                     pass
 
 
@@ -1354,11 +1452,17 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
         selected_symbols, symbol_apis, symbol_params_map, best_params, mode
     )
 
+    if FORCE_STRATEGY:
+        discord.print_log(f"[STRATEGY OVERRIDE] CLI引数により全銘柄の戦略を強制適用します: {FORCE_STRATEGY.upper()}")
+        for sym in symbol_params_map:
+            symbol_params_map[sym]["strategy"] = FORCE_STRATEGY
+
     logic = logicinstance()
     last_screening_slot = (datetime.now(JST).date(), datetime.now(JST).hour)
     cycle_count = 0
     previous_hourly_oi: Dict[str, float] = {}
     trailing_tp_states = load_trailing_tp_states()
+    scale_in_states = load_scale_in_states()
 
     discord.print_log(f"[Phase B] 1時間足エントリー/クローズループを開始します。新選定銘柄: {', '.join(selected_symbols)} (全監視: {', '.join(symbol_apis.keys())})")
 
@@ -1372,10 +1476,10 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
         if cycle_count == 1:
             if "--loop" in sys.argv and not (now_jst.minute == 0 and now_jst.second < 30):
                 discord.print_log(f"[Sync] 初回起動時刻: {now_jst.strftime('%H:%M:%S')} JST。確定足と同期するため次の正時まで待機します。")
-                await wait_until_next_hour(symbol_apis=symbol_apis, trailing_tp_states=trailing_tp_states, mode=mode)
+                await wait_until_next_hour(symbol_apis=symbol_apis, trailing_tp_states=trailing_tp_states, scale_in_states=scale_in_states, mode=mode)
                 now_jst = datetime.now(JST)
         else:
-            await wait_until_next_hour(symbol_apis=symbol_apis, trailing_tp_states=trailing_tp_states, mode=mode)
+            await wait_until_next_hour(symbol_apis=symbol_apis, trailing_tp_states=trailing_tp_states, scale_in_states=scale_in_states, mode=mode)
             now_jst = datetime.now(JST)
 
         # --loop フラグがない場合は1サイクルのみ実行
@@ -1419,6 +1523,10 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
             symbol_apis, symbol_params_map = await audit_and_retain_positions(
                 selected_symbols, symbol_apis, symbol_params_map, best_params, mode, old_apis=old_apis, old_params=old_params
             )
+
+            if FORCE_STRATEGY:
+                for sym in symbol_params_map:
+                    symbol_params_map[sym]["strategy"] = FORCE_STRATEGY
 
             # 4. ポジションのない旧選定銘柄のインスタンスをメモリ破棄
             for old_sym in list(old_apis.keys()):
@@ -1727,8 +1835,52 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                             await flatten_current_position_bingx(sym, "USDT", mode, exit_reason, force_market=True)
                             closed = True
 
-                        if not closed:
-                            # 2. 利確シグナル未到達時は通常の Volume Profile SL (損切り/撤退) を判定
+                        if not closed and cand_strat in ("val_poc", "vp_val_gc"):
+                            # 2-A. VAL_POC 戦略: POC到達・上抜けクローズ判定
+                            poc_val = float(df["POC"].iloc[-1]) if ("POC" in df.columns and not pd.isna(df["POC"].iloc[-1])) else 0.0
+                            cur_high = max(current_price, float(df["high"].iloc[-1]) if "high" in df.columns else current_price)
+                            if poc_val > 0 and (cur_high >= poc_val or current_price >= poc_val):
+                                exit_reason = "POC_CLOSE"
+                                discord.print_log(
+                                    f"[{sym}] [POC CLOSE TRIGGERED] 🎯 POCクローズ成立!\n"
+                                    f"   └ 現在値: ${current_price:,.4f} >= POC: ${poc_val:,.4f} (建値: ${entry_px:,.4f}) ➔ 成行利確決済"
+                                )
+                                from bingx5_46_2api import flatten_current_position_bingx
+                                await flatten_current_position_bingx(sym, "USDT", mode, exit_reason, force_market=True)
+                                closed = True
+
+                            # 2-B. VAL_POC 戦略: 最後の建値から0.2%下落時のナンピン判定 (最大5回)
+                            if not closed:
+                                scale_state = scale_in_states.get(sym, {
+                                    "nanpin_count": 0,
+                                    "last_entry_price": entry_px,
+                                    "avg_price": entry_px,
+                                    "poc_level": poc_val
+                                })
+                                last_px = float(scale_state.get("last_entry_price", entry_px)) or entry_px
+                                cur_nanpin = int(scale_state.get("nanpin_count", 0))
+                                drop_target = last_px * (1.0 - 0.002)
+
+                                if cur_nanpin < 5 and current_price <= drop_target:
+                                    discord.print_log(
+                                        f"[{sym}] [NANPIN TRIGGER] 📉 最後の建値(${last_px:,.4f})から-0.2%下落検出 (${current_price:,.4f} <= ${drop_target:,.4f})\n"
+                                        f"   └ ナンピン発動 ({cur_nanpin + 1}/5 回目)..."
+                                    )
+                                    buy_lot = float(position.get("buy", 0))
+                                    entered_add = await api.long_entry(
+                                        df, position, balance, buy_lot, max_lot,
+                                        max_stage=6, is_scale_in=True, stage_num=cur_nanpin + 2
+                                    )
+                                    if entered_add:
+                                        scale_state["nanpin_count"] = cur_nanpin + 1
+                                        scale_state["last_entry_price"] = current_price
+                                        scale_state["poc_level"] = poc_val
+                                        scale_in_states[sym] = scale_state
+                                        save_scale_in_states(scale_in_states)
+                                        record_real_trade(sym, "LONG", "SCALE_IN", current_price, buy_lot, 0.0, f"実運用ナンピン買い増し ({cur_nanpin + 1}/5)")
+
+                        elif not closed:
+                            # 2-C. 通常戦略: Volume Profile SL (損切り/撤退) を判定
                             closed = await api.long_close(
                                 df, position, commission=0.0,
                                 sl_margin_pct=sym_params.get("margin", 2.0),
@@ -1739,6 +1891,8 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                     if closed:
                         trailing_tp_states.pop(sym, None)
                         save_trailing_tp_states(trailing_tp_states)
+                        scale_in_states.pop(sym, None)
+                        save_scale_in_states(scale_in_states)
                         record_real_trade(sym, "LONG", "CLOSE", current_price, float(position.get("buy", 0)), pnl_current, f"実運用決済 ({exit_reason})")
                         discord.print_log(f"[{sym}] [CLOSE] 🟢 ロングポジション決済完了 (PnL: {pnl_current:+.2f} USDT, 理由: {exit_reason})")
                         
@@ -1822,6 +1976,18 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                             vah_val = float(last_row.get("VAH", 0.0)) if last_row is not None and "VAH" in last_row else 0.0
                             val_val = float(last_row.get("VAL", 0.0)) if last_row is not None and "VAL" in last_row else 0.0
                             poc_val = float(last_row.get("POC", 0.0)) if last_row is not None and "POC" in last_row else 0.0
+
+                            # scale_in_states の初期化
+                            best_sym_params = symbol_params_map.get(best_sym, best_params)
+                            cur_strat = best_sym_params.get("strategy", "val_poc" if FORCE_STRATEGY == "val_poc" else "rsima")
+                            scale_in_states[best_sym] = {
+                                "nanpin_count": 0,
+                                "last_entry_price": current_price,
+                                "avg_price": current_price,
+                                "poc_level": poc_val,
+                                "strategy": cur_strat
+                            }
+                            save_scale_in_states(scale_in_states)
                             
                             entry_notional = current_price * lot_size
                             best_sym_params = symbol_params_map.get(best_sym, best_params)

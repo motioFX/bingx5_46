@@ -575,13 +575,13 @@ class api_bingx:
     async def get_open_orders(self, include_stop: bool = True) -> list[dict]:
         return await self.bingx.get_open_orders()
 
-    async def long_entry(self, df, position, usdt_onhand_amount, lot_size, max_lot):
+    async def long_entry(self, df, position, usdt_onhand_amount, lot_size, max_lot, max_stage=1, is_scale_in=False, stage_num=1):
         if lot_size == 0:
             raise ValueError("lot_size cannot be zero")
-        current_stage = int(position["pos_count"])
-        if current_stage >= 1:
+        current_stage = int(position.get("pos_count", 0))
+        if not is_scale_in and current_stage >= max_stage:
             return False
-        if not df['long'].iloc[-1]:
+        if not is_scale_in and not df['long'].iloc[-1]:
             return False
 
         current_price = df['close'].iloc[-1]
@@ -612,7 +612,8 @@ class api_bingx:
         order_price, price_type_str = determine_target_price(best_bid, best_ask, current_price)
         final_price = self.bingx._quantize_price(order_price)
 
-        discord.print_log(f"[BINGX] Placing Stage 1 Long ({price_type_str}): Target Qty {lot}")
+        stage_label = f"Stage {stage_num}" if is_scale_in else "Stage 1"
+        discord.print_log(f"[BINGX] Placing {stage_label} Long ({price_type_str}): Target Qty {lot}")
         if is_air:
             discord.print_log(f"[AIR MODE] Executed BingX Long Entry: {self.symbol} Qty={lot} Price={final_price} (Mock)")
             self.entry_val = float(df['VAL'].iloc[-1]) if 'VAL' in df.columns else (current_price * 0.99)
