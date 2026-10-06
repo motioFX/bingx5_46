@@ -58,14 +58,16 @@ async def run_all_exchanges_pipeline(
     force: bool = False,
     force_upload: bool = False,
     skip_upload: bool = False,
-    skip_charts: bool = False
+    skip_charts: bool = False,
+    incremental_hours: int = 8
 ) -> None:
-    """4大取引所のデータ収集パイプラインを安全・低負荷で順次実行"""
+    """4大取引所のデータ収集パイプラインを安全・低負荷で順次実行（8時間差分つけ足し対応）"""
     start_time = time.time()
     now_jst = datetime.now(JST).strftime("%Y-%m-%d %H:%M:%S JST")
 
+    mode_label = f"8時間差分つけ足し更新 (直近{incremental_hours}H)" if incremental_hours > 0 and not force else "全期間フル同期"
     log("=" * 80)
-    log("🌍 【4大取引所 全銘柄マルチ時間足 統合データ収集・時間分割配信パイプライン開始】")
+    log(f"🌍 【4大取引所 全銘柄マルチ時間足 統合データ収集パイプライン開始】 ({mode_label})")
     log(f"   開始時刻: {now_jst}")
     log(f"   対象足種: {intervals or ['1d', '1h', '15m', '5m', '1m']}")
     log("=" * 80)
@@ -83,7 +85,8 @@ async def run_all_exchanges_pipeline(
             force=force,
             force_upload=force_upload,
             skip_upload=skip_upload,
-            skip_charts=skip_charts
+            skip_charts=skip_charts,
+            incremental_hours=incremental_hours
         )
     except Exception as e:
         log(f"⚠️ [Bitbank パイプライン エラー]: {e}")
@@ -102,7 +105,8 @@ async def run_all_exchanges_pipeline(
             intervals=intervals,
             force=force,
             force_upload=force_upload,
-            skip_upload=skip_upload
+            skip_upload=skip_upload,
+            incremental_hours=incremental_hours
         )
     except Exception as e:
         log(f"⚠️ [Binance Japan パイプライン エラー]: {e}")
@@ -121,7 +125,8 @@ async def run_all_exchanges_pipeline(
             intervals=intervals,
             force=force,
             force_upload=force_upload,
-            skip_upload=skip_upload
+            skip_upload=skip_upload,
+            incremental_hours=incremental_hours
         )
     except Exception as e:
         log(f"⚠️ [Hyperliquid パイプライン エラー]: {e}")
@@ -140,7 +145,8 @@ async def run_all_exchanges_pipeline(
             intervals=intervals,
             force=force,
             force_upload=force_upload,
-            skip_upload=skip_upload
+            skip_upload=skip_upload,
+            incremental_hours=incremental_hours
         )
     except Exception as e:
         log(f"⚠️ [BingX パイプライン エラー]: {e}")
@@ -164,6 +170,7 @@ if __name__ == "__main__":
     parser.add_argument("--force-upload", action="store_true", help="ハッシュを無視して強制アップロード")
     parser.add_argument("--skip-upload", action="store_true", help="Discordアップロードをスキップ")
     parser.add_argument("--skip-charts", action="store_true", help="チャート生成スキップ")
+    parser.add_argument("--incremental-hours", type=int, default=8, help="直近N時間分の差分つけ足し取得・送信（デフォルト8時間）")
 
     args = parser.parse_args()
 
@@ -177,5 +184,6 @@ if __name__ == "__main__":
         force=args.force,
         force_upload=args.force_upload,
         skip_upload=args.skip_upload,
-        skip_charts=args.skip_charts
+        skip_charts=args.skip_charts,
+        incremental_hours=args.incremental_hours
     ))

@@ -1183,9 +1183,10 @@ async def sync_historical_and_charts(
     days: int = 1460,
     intervals: Optional[Sequence[str]] = None,
     force_upload: bool = False,
-    skip_upload: bool = False
+    skip_upload: bool = False,
+    incremental_hours: int = 8
 ) -> None:
-    """4大取引所（Bitbank, Binance Japan, Hyperliquid, BingX）全銘柄マルチ時間足データ収集＆時間分割Discord配信"""
+    """4大取引所（Bitbank, Binance Japan, Hyperliquid, BingX）全銘柄マルチ時間足データ収集＆時間分割Discord配信（8時間つけ足し運用）"""
     global _is_sync_pipeline_running
     if _is_sync_pipeline_running:
         discord.print_log("⚠️ [Sync Pipeline Guard] 前回の全銘柄データ同期パイプラインが現在も実行中のため、二重実行をスキップします。")
@@ -1196,7 +1197,7 @@ async def sync_historical_and_charts(
         if not skip_upload:
             record_full_sync_slot(datetime.now(JST), status="in_progress")
 
-        discord.print_log(f"\n📦 【4大取引所 全銘柄データ収集＆時間分割アーカイブ同期】 開始...")
+        discord.print_log(f"\n📦 【4大取引所 全銘柄データ収集＆8時間差分同期】 開始 (直近{incremental_hours}Hつけ足し)...")
         
         # 4大取引所統合データ収集パイプライン
         try:
@@ -1212,7 +1213,8 @@ async def sync_historical_and_charts(
                 force=False,
                 force_upload=force_upload,
                 skip_upload=skip_upload,
-                skip_charts=False
+                skip_charts=False,
+                incremental_hours=incremental_hours
             )
             discord.print_log("✅ 【4大取引所 データ同期完了】 全銘柄マルチ時間足のアーカイブ同期＆配信が完了しました。")
             if not skip_upload:

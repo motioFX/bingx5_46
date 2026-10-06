@@ -49,6 +49,7 @@ from upload_registry import should_upload_file, record_file_uploaded
 from data_pipeline_utils import (
     build_full_symbol_time_grid,
     split_and_create_time_zips,
+    create_recent_slice_zip,
     upload_time_split_zips_to_discord,
     cleanup_expired_archives
 )
@@ -350,7 +351,8 @@ async def run_pipeline(
     force_upload: bool = False,
     skip_charts: bool = False,
     skip_upload: bool = False,
-    symbols_override: Optional[List[str]] = None
+    symbols_override: Optional[List[str]] = None,
+    incremental_hours: int = 8
 ) -> None:
     data_dir = Path(__file__).resolve().parent / "Data"
     candles_dir = data_dir / "historical_candles"
@@ -395,9 +397,11 @@ async def run_pipeline(
 
             # ブロック生成
             if interval == "1d":
-                blocks = [str(y) for y in range(current_year - 4, current_year + 1)]
+                fetch_years = 1 if (incremental_hours > 0 and not force) else 4
+                blocks = [str(y) for y in range(current_year - fetch_years, current_year + 1)]
             else:
-                start_d = today_utc - timedelta(days=target_days)
+                fetch_days = 2 if (incremental_hours > 0 and not force) else target_days
+                start_d = today_utc - timedelta(days=fetch_days)
                 blocks = []
                 cur = start_d
                 while cur <= today_utc:
@@ -467,16 +471,26 @@ async def run_pipeline(
                 master_df.to_csv(legacy_csv, index=False, encoding="utf-8")
                 log(f"📄 [Bitbank] 1H 統合マスターCSVを更新しました: {fixed_csv.name} ({len(master_df):,} 行)")
 
-            # 3. 時間軸での N 分割 ZIP アーカイブ生成 (Part 1 最古 〜 Part N 最新)
-            parts = split_and_create_time_zips(
-                df=master_df,
-                exchange="bitbank",
-                interval=interval,
-                out_dir=data_dir,
-                timestamp_tag=now_jst,
-                max_part_rows=400_000,
-                min_parts=2
-            )
+            # 3. ZIP アーカイブ生成 (8時間つけ足し時は最新1本スライス、全件時はN分割)
+            if incremental_hours > 0 and not force:
+                parts = create_recent_slice_zip(
+                    df=master_df,
+                    exchange="bitbank",
+                    interval=interval,
+                    out_dir=data_dir,
+                    timestamp_tag=now_jst,
+                    hours=incremental_hours
+                )
+            else:
+                parts = split_and_create_time_zips(
+                    df=master_df,
+                    exchange="bitbank",
+                    interval=interval,
+                    out_dir=data_dir,
+                    timestamp_tag=now_jst,
+                    max_part_rows=400_000,
+                    min_parts=2
+                )
 
             # 4. 古い順からの Discord 順次アップロード
             if not skip_upload:

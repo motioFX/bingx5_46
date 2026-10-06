@@ -45,6 +45,7 @@ from upload_registry import should_upload_file, record_file_uploaded
 from data_pipeline_utils import (
     build_full_symbol_time_grid,
     split_and_create_time_zips,
+    create_recent_slice_zip,
     upload_time_split_zips_to_discord,
     cleanup_expired_archives
 )
@@ -159,7 +160,8 @@ def download_symbol_candles_hyperliquid(
     interval: str,
     days: int,
     candles_dir: Path,
-    force: bool = False
+    force: bool = False,
+    incremental_hours: int = 8
 ) -> pd.DataFrame:
     """差分キャッシュを考慮して指定銘柄・時間足のデータを取得・保存"""
     csv_path = candles_dir / f"{coin}_{interval}.csv"
@@ -177,6 +179,8 @@ def download_symbol_candles_hyperliquid(
                 max_ts = old_df["timestamp"].max()
                 latest_ms = int(max_ts.replace(tzinfo=timezone.utc).timestamp() * 1000)
                 start_ms = max(target_start_ms, latest_ms + 1)
+                if incremental_hours > 0:
+                    start_ms = max(start_ms, now_ms - (incremental_hours + 1) * 3600 * 1000)
         except Exception:
             old_df = pd.DataFrame()
 
@@ -226,7 +230,8 @@ async def run_pipeline(
     force: bool = False,
     force_upload: bool = False,
     skip_upload: bool = False,
-    symbols_override: Optional[List[str]] = None
+    symbols_override: Optional[List[str]] = None,
+    incremental_hours: int = 8
 ) -> None:
     data_dir = Path(__file__).resolve().parent / "Data"
     candles_dir = data_dir / "historical_candles_hyperliquid"
@@ -262,7 +267,8 @@ async def run_pipeline(
                 interval=interval,
                 days=target_days,
                 candles_dir=candles_dir,
-                force=force
+                force=force,
+                incremental_hours=incremental_hours
             )
             if not df.empty:
                 symbol_dfs[sym] = df
@@ -281,16 +287,26 @@ async def run_pipeline(
             master_df.to_csv(fixed_csv, index=False, encoding="utf-8")
             log(f"📄 [Hyperliquid] 1H 統合マスターCSVを更新しました: {fixed_csv.name} ({len(master_df):,} 行)")
 
-        # 3. 時間軸での N 分割 ZIP アーカイブ生成 (Part 1 最古 〜 Part N 最新)
-        parts = split_and_create_time_zips(
-            df=master_df,
-            exchange="hyperliquid",
-            interval=interval,
-            out_dir=data_dir,
-            timestamp_tag=now_jst,
-            max_part_rows=400_000,
-            min_parts=2
-        )
+        # 3. ZIP アーカイブ生成 (8時間つけ足し時は最新1本スライス、全件時はN分割)
+        if incremental_hours > 0 and not force:
+            parts = create_recent_slice_zip(
+                df=master_df,
+                exchange="hyperliquid",
+                interval=interval,
+                out_dir=data_dir,
+                timestamp_tag=now_jst,
+                hours=incremental_hours
+            )
+        else:
+            parts = split_and_create_time_zips(
+                df=master_df,
+                exchange="hyperliquid",
+                interval=interval,
+                out_dir=data_dir,
+                timestamp_tag=now_jst,
+                max_part_rows=400_000,
+                min_parts=2
+            )
 
         # 4. 古い順からの Discord 順次アップロード (全データ送信先を Bitbank チャンネルへ集約)
         if not skip_upload:

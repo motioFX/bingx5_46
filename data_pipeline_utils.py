@@ -185,6 +185,58 @@ def split_and_create_time_zips(
     return results
 
 
+def create_recent_slice_zip(
+    df: pd.DataFrame,
+    exchange: str,
+    interval: str,
+    out_dir: Path,
+    timestamp_tag: str,
+    hours: int = 8
+) -> List[Tuple[str, Path, str, int, int]]:
+    """
+    全銘柄マスターデータフレームから、直近N時間分（デフォルト8時間分）のスライスのみを抽出し、
+    1本の最新ZIPアーカイブを作成する。（8時間差分つけ足し運用用）
+    戻り値: [(part_name, zip_path, period_str, row_count, total_symbols)]
+    """
+    out_dir.mkdir(parents=True, exist_ok=True)
+    if df.empty:
+        return []
+
+    unique_ts = sorted(df["timestamp"].dropna().unique())
+    if not unique_ts:
+        return []
+
+    max_ts = unique_ts[-1]
+    cutoff_ts = max_ts - pd.Timedelta(hours=hours)
+    sub_df = df[df["timestamp"] >= cutoff_ts].copy()
+
+    if sub_df.empty:
+        sub_df = df.iloc[-min(len(df), 5000):].copy()
+
+    min_ts_slice = sub_df["timestamp"].min()
+    max_ts_slice = sub_df["timestamp"].max()
+    p_start_str = pd.to_datetime(min_ts_slice).strftime("%Y%m%d_%H%M")
+    p_end_str = pd.to_datetime(max_ts_slice).strftime("%Y%m%d_%H%M")
+    period_label = f"{pd.to_datetime(min_ts_slice).strftime('%Y-%m-%d %H:%M')} 〜 {pd.to_datetime(max_ts_slice).strftime('%Y-%m-%d %H:%M')}"
+    n_symbols = len(sub_df["symbol"].unique()) if "symbol" in sub_df.columns else len(sub_df)
+
+    part_name = f"最新{hours}H差分"
+    zip_filename = f"{exchange}_{interval}_recent_{hours}h_{p_start_str}_{p_end_str}_{timestamp_tag}.zip"
+    inner_csv_name = f"{exchange}_{interval}_recent_{hours}h_{p_start_str}_{p_end_str}_{timestamp_tag}.csv"
+    zip_path = out_dir / zip_filename
+
+    csv_buf = sub_df.to_csv(index=False).encode("utf-8")
+    with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=1) as zf:
+        zf.writestr(inner_csv_name, csv_buf)
+
+    del csv_buf
+    gc.collect()
+
+    file_size_mb = zip_path.stat().st_size / (1024 * 1024)
+    log_util(f"   ✓ [{part_name}] 作成: {zip_path.name} ({len(sub_df):,} 行 / {file_size_mb:.2f} MB / 期間: {period_label})")
+    return [(part_name, zip_path, period_label, len(sub_df), n_symbols)]
+
+
 def upload_time_split_zips_to_discord(
     parts: List[Tuple[str, Path, str, int, int]],
     webhook_name: str,
