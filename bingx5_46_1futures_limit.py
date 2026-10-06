@@ -1492,6 +1492,7 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
 
     logic = logicinstance()
     last_screening_slot = (datetime.now(JST).date(), datetime.now(JST).hour)
+    last_summary_hour_slot = None
     cycle_count = 0
     previous_hourly_oi: Dict[str, float] = {}
     trailing_tp_states = load_trailing_tp_states()
@@ -1764,10 +1765,12 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                 await asyncio.sleep(0.1)
 
             # スマホ1画面完結サマリーのDiscord送信 (16行程度・スクロール不要)
-            # 5分足実行時は、毎時00分(正時) または ポジション保有中 または シグナル点灯時に送信して通知過多を防止
-            has_any_pos = any(r["pos"] != "FLAT" for r in hourly_summary_rows)
-            has_any_sig = any(r["sig"] != "---" for r in hourly_summary_rows)
-            is_hourly_tick = (now_jst.minute < 5)
+            # トレード稼働時は【1時間ごと（毎時00分）】のみDiscord送信し、平時の5分確定足はコンソール/ログ(debug)にとどめる
+            current_hour_slot = (now_jst.date(), now_jst.hour)
+            is_hourly_report_due = (
+                (now_jst.minute < 5 and current_hour_slot != last_summary_hour_slot)
+                or cycle_count == 1
+            )
 
             if hourly_summary_rows:
                 rem_min = 5 - (now_jst.minute % 5)
@@ -1789,8 +1792,9 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                 summary_lines.append(f"次回確定: {next_candle_str} JST")
                 summary_formatted = "```text\n" + "\n".join(summary_lines) + "\n```"
 
-                if is_hourly_tick or has_any_pos or has_any_sig or cycle_count == 1:
+                if is_hourly_report_due:
                     discord.print_log(summary_formatted)
+                    last_summary_hour_slot = current_hour_slot
                 else:
                     discord.print_log(summary_formatted, level="debug")
 
@@ -1972,21 +1976,21 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                         if ttp.get("active", False):
                             ttp_info = f" [利確トレーリング中: ピーク=${ttp['peak_price']:,.4f}, 撤退=${ttp['trail_stop']:,.4f}]"
                         pnl_icon = "🟢" if pnl_current >= 0 else "🔴"
-                        discord.print_log(f"──────────────────────────────────────────────────────────")
-                        discord.print_log(f"💰 【{sym} 現在の含み損益】: {pnl_current:+.2f} USDT {pnl_icon}{ttp_info} (ロング継続保有中)")
-                        discord.print_log(f"──────────────────────────────────────────────────────────")
+                        discord.print_log(f"──────────────────────────────────────────────────────────", level="debug")
+                        discord.print_log(f"💰 【{sym} 現在の含み損益】: {pnl_current:+.2f} USDT {pnl_icon}{ttp_info} (ロング継続保有中)", level="debug")
+                        discord.print_log(f"──────────────────────────────────────────────────────────", level="debug")
 
             # 3. 新規エントリー実行 (最大同時保有ポジション数制限: MAX_ACTIVE_POSITIONS)
             current_pos_count = len(active_positions)
             if current_pos_count >= MAX_ACTIVE_POSITIONS:
                 held_syms = ", ".join(active_positions.keys())
-                discord.print_log(f"[ENTRY BLOCK] 現在最大ポジション枠({current_pos_count}/{MAX_ACTIVE_POSITIONS})保有中のため新規エントリーは見送ります。(保有中: {held_syms})")
+                discord.print_log(f"[ENTRY BLOCK] 現在最大ポジション枠({current_pos_count}/{MAX_ACTIVE_POSITIONS})保有中のため新規エントリーは見送ります。(保有中: {held_syms})", level="debug")
             elif valid_entry_candidates:
                 # 既にポジション保有中の銘柄はエントリー候補から除外
                 candidates_to_enter = [c for c in valid_entry_candidates if c["symbol"] not in active_positions]
 
                 if not candidates_to_enter:
-                    discord.print_log(f"[ENTRY BLOCK] シグナル検出銘柄はすでに保有中のためエントリーをスキップします。")
+                    discord.print_log(f"[ENTRY BLOCK] シグナル検出銘柄はすでに保有中のためエントリーをスキップします。", level="debug")
                 else:
                     sym_rank_map = {sym: i for i, sym in enumerate(selected_symbols)}
                     candidates_to_enter.sort(key=lambda x: sym_rank_map.get(x["symbol"], 999))
@@ -1994,14 +1998,16 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                     available_slots = MAX_ACTIVE_POSITIONS - current_pos_count
                     all_cand_syms = ", ".join([c["symbol"] for c in candidates_to_enter])
                     discord.print_log(
-                        f"[CANDIDATES] エントリーシグナル検出: {all_cand_syms} (空き枠: {available_slots}/{MAX_ACTIVE_POSITIONS})"
+                        f"[CANDIDATES] エントリーシグナル検出: {all_cand_syms} (空き枠: {available_slots}/{MAX_ACTIVE_POSITIONS})",
+                        level="debug"
                     )
 
                     for cand_idx, best_cand in enumerate(candidates_to_enter):
                         # 空き枠チェック（約定するたびに active_positions が増加）
                         if len(active_positions) >= MAX_ACTIVE_POSITIONS:
                             discord.print_log(
-                                f"[ENTRY LIMIT] 最大ポジション枠({MAX_ACTIVE_POSITIONS})に達したため、残りの候補エントリーを終了します。"
+                                f"[ENTRY LIMIT] 最大ポジション枠({MAX_ACTIVE_POSITIONS})に達したため、残りの候補エントリーを終了します。",
+                                level="debug"
                             )
                             break
 
