@@ -254,7 +254,7 @@ async def run_pipeline(
     candles_dir.mkdir(parents=True, exist_ok=True)
 
     now_jst = datetime.now(JST).strftime("%Y%m%d_%H%M%S")
-    target_intervals = list(intervals) if intervals else ["1d", "1h", "15m", "5m", "1m"]
+    target_intervals = list(intervals) if intervals else ["1d", "1h", "15m", "5m"]
 
     log("=" * 70)
     log("🚀 [BingX] 全銘柄（FX除くクリプト・株・コモディティ）マルチ時間足データ収集開始")
@@ -353,7 +353,7 @@ if __name__ == "__main__":
     parser.add_argument("--days-15m", type=int, default=180, help="15分足取得期間（日）")
     parser.add_argument("--days-5m", type=int, default=90, help="5分足取得期間（日）")
     parser.add_argument("--days-1m", type=int, default=30, help="1分足取得期間（日）")
-    parser.add_argument("--intervals", nargs="+", default=None, help="実行する足種 (例: 1d 1h 15m 5m 1m)")
+    parser.add_argument("--intervals", nargs="+", default=["1d", "1h", "15m", "5m"], help="実行する足種 (デフォルト: 1d 1h 15m 5m)")
     parser.add_argument("--force", action="store_true", help="既存キャッシュを無視して全件再取得")
     parser.add_argument("--force-upload", action="store_true", help="ハッシュを無視して強制アップロード")
     parser.add_argument("--skip-upload", action="store_true", help="Discordアップロードをスキップ")

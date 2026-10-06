@@ -1197,12 +1197,12 @@ async def sync_historical_and_charts(
         if not skip_upload:
             record_full_sync_slot(datetime.now(JST), status="in_progress")
 
-        discord.print_log(f"\n📦 【4大取引所 全銘柄データ収集＆8時間差分同期】 開始 (直近{incremental_hours}Hつけ足し)...")
+        discord.print_log(f"\n📦 【海外取引所（Hyperliquid & BingX）全銘柄データ収集＆8時間差分同期】 開始 (直近{incremental_hours}Hつけ足し / 日足・1h・15m・5m足)...")
         
-        # 4大取引所統合データ収集パイプライン
+        # 海外取引所統合データ収集パイプライン
         try:
             from master_data_collector import run_all_exchanges_pipeline
-            target_intervals = list(intervals) if intervals else ["1d", "1h", "15m", "5m", "1m"]
+            target_intervals = list(intervals) if intervals else ["1d", "1h", "15m", "5m"]
             await run_all_exchanges_pipeline(
                 days_1d=1460,
                 days_1h=1460,
@@ -1210,25 +1210,18 @@ async def sync_historical_and_charts(
                 days_5m=90,
                 days_1m=30,
                 intervals=target_intervals,
+                exchanges=["hyperliquid", "bingx"],
                 force=False,
                 force_upload=force_upload,
                 skip_upload=skip_upload,
-                skip_charts=False,
+                skip_charts=True,
                 incremental_hours=incremental_hours
             )
-            discord.print_log("✅ 【4大取引所 データ同期完了】 全銘柄マルチ時間足のアーカイブ同期＆配信が完了しました。")
+            discord.print_log("✅ 【海外取引所 データ同期完了】 Hyperliquid & BingX 全銘柄マルチ時間足のアーカイブ同期＆配信が完了しました。")
             if not skip_upload:
                 record_full_sync_slot(datetime.now(JST), status="completed")
         except Exception as e:
-            discord.print_log(f"⚠️ 【4大取引所 データ同期例外】 エラーが発生しました: {e}")
-
-        # ノーマライズ比較チャート送信 (Bitbank 11銘柄 ＋ Binance NEAR)
-        try:
-            from download_historical_candles import create_and_send_normalized_charts
-            await create_and_send_normalized_charts(skip_upload=skip_upload)
-            discord.print_log("✅ 【ノーマライズチャート送信完了】 主要12銘柄のリターン比較チャートを送信しました。")
-        except Exception as c_err:
-            discord.print_log(f"⚠️ 【ノーマライズチャート送信注意】 エラーが発生しました: {c_err}")
+            discord.print_log(f"⚠️ 【海外取引所 データ同期例外】 エラーが発生しました: {e}")
     finally:
         _is_sync_pipeline_running = False
 
