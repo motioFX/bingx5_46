@@ -1197,7 +1197,7 @@ async def sync_historical_and_charts(
         if not skip_upload:
             record_full_sync_slot(datetime.now(JST), status="in_progress")
 
-        discord.print_log(f"\n📦 【海外取引所（Hyperliquid & BingX）全銘柄データ収集＆8時間差分同期】 開始 (直近{incremental_hours}Hつけ足し / 日足・1h・15m・5m足)...")
+        discord.print_log(f"\n📦 【海外取引所（Hyperliquid & BingX）全銘柄データ収集＆4年分アーカイブ配信】 開始 (直近{incremental_hours}H差分つけ足し最新化 / 日足・1h・15m・5m足)...")
         
         # 海外取引所統合データ収集パイプライン
         try:

@@ -30,7 +30,7 @@
   - 3. 海外取引所（Hyperliquid & BingX）全銘柄マルチ時間足データ同期（非同期バックグラウンド実行）.
   - 4. 1時間足確定ポジション監査ループ開始.
 - **Periodic Sync Slot (Every 8 Hours at 01:06, 09:06, 17:06 JST)**:
-  - 8時間に1回の海外取引所全収集データ（Hyperliquid ＆ BingX 4大カテゴリー別差分ZIP）のバックグラウンド収集・Discord配信、および総合ポジション監査.
+  - 8時間に1回の海外取引所全収集データ（直近8時間差分を足し合わせた4年分全期間アーカイブZIP）のバックグラウンド収集・Discord配信、および総合ポジション監査.
   - **Do NOT show the ASCII Art banner during periodic screening cycles** (banner is startup-only).
 
 ## 5. Dual-Exchange 120-Day 2-Part ZIP & Rate Limit / CPU Safety

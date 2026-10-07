@@ -358,27 +358,17 @@ async def run_pipeline(
                 master_df.to_csv(cat_csv, index=False, encoding="utf-8")
                 log(f"📄 [BingX] [{cat_label}] 1H 統合マスターCSVを更新しました: {cat_csv.name} ({len(master_df):,} 行)")
 
-            # 3. カテゴリー別 ZIP アーカイブ生成 (8時間つけ足し時は最新1本スライス、全件時はN分割)
+            # 3. カテゴリー別 ZIP アーカイブ生成 (直近8時間差分を足し合わせた全期間データを時間分割ZIP)
             exchange_slug = f"bingx_{cat_tag}"
-            if incremental_hours > 0 and not force:
-                parts = create_recent_slice_zip(
-                    df=master_df,
-                    exchange=exchange_slug,
-                    interval=interval,
-                    out_dir=data_dir,
-                    timestamp_tag=now_jst,
-                    hours=incremental_hours
-                )
-            else:
-                parts = split_and_create_time_zips(
-                    df=master_df,
-                    exchange=exchange_slug,
-                    interval=interval,
-                    out_dir=data_dir,
-                    timestamp_tag=now_jst,
-                    max_part_rows=400_000,
-                    min_parts=2
-                )
+            parts = split_and_create_time_zips(
+                df=master_df,
+                exchange=exchange_slug,
+                interval=interval,
+                out_dir=data_dir,
+                timestamp_tag=now_jst,
+                max_part_rows=400_000,
+                min_parts=1
+            )
 
             # 4. 古い順からの Discord 順次アップロード (全データ送信先を Bitbank チャンネルへ集約)
             if not skip_upload:
