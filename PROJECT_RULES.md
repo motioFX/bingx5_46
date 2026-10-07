@@ -78,10 +78,14 @@
 * **ポジション取得価格の厳格仕様 (`avgPrice`)**:
   - BingX 先物 API（`/openApi/swap/v2/user/positions`）は平均取得価格を **`avgPrice`** フィールドで返却する（`entryPrice` は存在しない）。
   - ポジションの建値・損益計算・ストップ判定を行う際は、必ず **`p.get("avgPrice")`** を最優先で参照すること。
-* **Maker指値優先（Post-Only / GTC）**:
-  - **Longエントリー**: 常に **`best_bid`（買い気配最良値）** に指値（`timeInForce: "GTC"`）を発注する。
-  - **Shortエントリー**: 常に **`best_ask`（売り気配最良値）** に指値（`timeInForce: "GTC"`）を発注する。
-  - **未約定安全キャンセル再配置**: 未約定リトライ時は、前回の未約定指値を安全に全キャンセル（`active_order_cancel`）した上で最新気配値に再配置する。
+* **Maker指値優先（本番リアル口座） ＆ 成行エントリー特例（デモ口座）**:
+  - **本番リアル口座（`BINGX_IS_LIVE = True`）**:
+    - **Longエントリー**: 常に **`best_bid`（買い気配最良値）** に指値（`timeInForce: "GTC"`）を発注し、Maker手数料（0.02%）と約定を最適化。
+    - **Shortエントリー**: 常に **`best_ask`（売り気配最良値）** に指値（`timeInForce: "GTC"`）を発注。
+    - **未約定安全キャンセル再配置**: 未約定リトライ時は、前回の未約定指値を安全に全キャンセル（`active_order_cancel`）した上で最新気配値に再配置する。
+  - **デモ口座（`BINGX_IS_LIVE = False` / VSTテストネット）**:
+    - **成行エントリー（`type: "MARKET"`）特例**: デモ取引所板は実需の成行注文（対向注文）が極めて乏しく、`best_bid` 指値では上昇初動時に上に逃げられて約定しないため、デモ環境での取引検証時は **成行（`MARKET`）で即座に約定（約定率100%）** させる。
+    - これにより、約定後のナンピン、POC利確、ボリュームプロファイルトレーリング、ストップロス等の決済・ポジション管理ロジックを本番同様に徹底検証する。
 * **ロット・価格の厳格な丸め込み（Quantization）**:
   - 取引所API（`/openApi/swap/v2/quote/contracts`）より `quantityPrecision`、`pricePrecision`、`tradeMinQuantity`（最小発注枚数）を取得し、端数処理エラーによる発注拒否を厳格に防止する。
 * **レバレッジ設定**:
