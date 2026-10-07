@@ -66,8 +66,13 @@ NORMALIZED_WINDOWS: Sequence[NormalizedWindow] = (
 
 DEFAULT_PRODUCT_TYPE = "PERP"
 
-# 固定選定銘柄 (HYPE, NEAR, ZEC, ARB, UNI)
-FIXED_SYMBOLS = ["HYPE-USDT", "NEAR-USDT", "ZEC-USDT", "ARB-USDT", "UNI-USDT"]
+# 固定選定銘柄 (主要アルトコイン20銘柄)
+FIXED_SYMBOLS = [
+    "HYPE-USDT", "SOL-USDT", "DOGE-USDT", "XRP-USDT", "SUI-USDT",
+    "AVAX-USDT", "LINK-USDT", "APT-USDT", "NEAR-USDT", "ARB-USDT",
+    "UNI-USDT", "OP-USDT", "TIA-USDT", "RENDER-USDT", "INJ-USDT",
+    "FET-USDT", "TAO-USDT", "AAVE-USDT", "ENA-USDT", "ZEC-USDT"
+]
 
 
 class send_discord:
@@ -1519,9 +1524,9 @@ async def main():
         )
         summary_text += f"\n📊 **[1. マルチタイムフレーム地合い判定]**\n"
 
-        # ユーザー指示: 選定銘柄（固定5銘柄 + BTC）のみで 30d, 10d, 5d ノーマライズチャートを生成
+        # ユーザー指示: 選定銘柄（固定20銘柄 + BTC）のみで 30d, 10d, 5d ノーマライズチャートを生成
 
-        # ② 固定選定銘柄 (HYPE, NEAR, ZEC, ARB, UNI + BTC) のノーマライズチャート (30D, 10D, 5D)
+        # ② 固定選定銘柄 (主要アルトコイン20銘柄 + BTC) のノーマライズチャート (30D, 10D, 5D)
         print("\n[Fixed Selection Charts] Generating 30d, 10d, 5d Normalized Charts...")
         fixed_target_list = list(FIXED_SYMBOLS)
         if "BTC-USDT" not in fixed_target_list:
@@ -1533,12 +1538,12 @@ async def main():
                 out_dir=out_dir,
                 window_name=win_label,
                 hours_limit=win_hours,
-                title="BingX Fixed Selection (HYPE, NEAR, ZEC, ARB, UNI) Normalized",
+                title="BingX Top 20 Alts Normalized",
                 file_prefix="normalized_fixed_symbols",
                 benchmark_symbol="BTC-USDT"
             )
             if not args.no_chart_send and fixed_chart and fixed_chart.exists():
-                discord.send_file(fixed_chart, f"🎯 **【固定選定銘柄 (HYPE, NEAR, ZEC, ARB, UNI) ノーマライズチャート [{win_label.upper()}]】**")
+                discord.send_file(fixed_chart, f"🎯 **【主要20銘柄 ノーマライズチャート [{win_label.upper()}]】**")
 
         # ③ 30d, 10d, 5d のマルチタイムフレーム地合い判定 (チャート生成・Discord送信は廃止、地合い計算のみ維持)
         print("\n[MTF Market State Analysis] Analyzing 30d, 10d, 5d Market States...")
@@ -1550,11 +1555,11 @@ async def main():
             summary_text += f"• **[{win_label.upper()}]**: {state_icon} `{market_state}` (平均騰落: `{mean_norm:.4f}`)\n"
             window_states.append((win_label, market_state, mean_norm))
 
-        # ④ 固定5銘柄 MTF完全ロング判定レポート (HYPE, NEAR, ZEC, ARB, UNI)
+        # ④ 主要20銘柄 MTF完全ロング判定レポート
         print("\n==================================================================================")
-        print(" [Step 2: Fixed 5 Symbols MTF Complete Long Eligibility Assessment]")
+        print(" [Step 2: Fixed 20 Symbols MTF Complete Long Eligibility Assessment]")
         print("==================================================================================")
-        summary_text += f"\n👑 **[2. 固定5銘柄 MTF完全ロング判定レポート]**\n"
+        summary_text += f"\n👑 **[2. 主要20銘柄 MTF完全ロング判定レポート]**\n"
         
         df_map_all = {}
         for d in all_dfs:

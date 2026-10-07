@@ -54,8 +54,13 @@ REST_API_URL = {
     "bingx_demo": "https://open-api-vst.bingx.com",
 }
 
-# 固定選定銘柄リスト
-FIXED_SYMBOLS = ["HYPE-USDT", "NEAR-USDT", "ZEC-USDT", "ARB-USDT", "UNI-USDT"]
+# 固定選定銘柄リスト (主要アルトコイン20銘柄)
+FIXED_SYMBOLS = [
+    "HYPE-USDT", "SOL-USDT", "DOGE-USDT", "XRP-USDT", "SUI-USDT",
+    "AVAX-USDT", "LINK-USDT", "APT-USDT", "NEAR-USDT", "ARB-USDT",
+    "UNI-USDT", "OP-USDT", "TIA-USDT", "RENDER-USDT", "INJ-USDT",
+    "FET-USDT", "TAO-USDT", "AAVE-USDT", "ENA-USDT", "ZEC-USDT"
+]
 
 # チャート期間設定 (ラベル, 時間数)
 CHART_WINDOWS = [

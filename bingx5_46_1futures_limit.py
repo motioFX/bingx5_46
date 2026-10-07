@@ -84,13 +84,18 @@ BINGX_TARGET_POSITION_VALUE_USDT = 15.0
 TARGET_POSITION_VALUE_USDT = BINGX_TARGET_POSITION_VALUE_USDT
 LEVERAGE_FACTOR = 10.0
 MAX_ACTIVE_POSITIONS: int = 2  # 最大同時保有ポジション数 (資金効率と分散を最適化)
-MAX_SELECTED_SYMBOLS: int = 5  # 最大選定・監視銘柄数 (固定5銘柄)
+MAX_SELECTED_SYMBOLS: int = 10  # 最大選定・監視銘柄数 (合格銘柄のうち最大10銘柄を5分足監視)
 
 # [ 4 ] ナンピン数設定 (Pyramiding / Scale-in count: 1〜10、初期値: 1)
 MAX_TRADES_COUNT: int = 1
 
-# [ 5 ] 固定選定銘柄
-FIXED_SYMBOLS: List[str] = ["HYPE-USDT", "NEAR-USDT", "ZEC-USDT", "ARB-USDT", "UNI-USDT"]
+# [ 5 ] 固定選定銘柄 (主要アルトコイン20銘柄)
+FIXED_SYMBOLS: List[str] = [
+    "HYPE-USDT", "SOL-USDT", "DOGE-USDT", "XRP-USDT", "SUI-USDT",
+    "AVAX-USDT", "LINK-USDT", "APT-USDT", "NEAR-USDT", "ARB-USDT",
+    "UNI-USDT", "OP-USDT", "TIA-USDT", "RENDER-USDT", "INJ-USDT",
+    "FET-USDT", "TAO-USDT", "AAVE-USDT", "ENA-USDT", "ZEC-USDT"
+]
 
 # [ 6 ] 定期銘柄選定・リセット時刻（JST時間: 0〜23時）
 #       デフォルト: [1, 9, 17] (01:00, 09:00, 17:00 JST / 8時間ごと・主要セッション＆FR節目)。
@@ -845,7 +850,7 @@ async def validate_profitable_candidates(trade_side: str, mode: str, base_symbol
     from bingx5_46_2api import api_bingx
     from bingx5_46_3logic import run_interval_comparison, logicinstance, resample_candles
 
-    discord.print_log("👑 【固定5銘柄 MTF完全ロング判定 ＆ 2大戦略 (RSIMA / VAL_POC) 個別最適化】を開始します...")
+    discord.print_log("👑 【固定20銘柄 MTF完全ロング判定 ＆ 2大戦略 (RSIMA / VAL_POC) 個別最適化】を開始します...")
     
     # 1. trade_eligible_symbols.json から MTF 完全ロング判定合格銘柄をロード
     eligible_file = Path(__file__).resolve().parent / "Data" / "trade_eligible_symbols.json"
@@ -861,7 +866,7 @@ async def validate_profitable_candidates(trade_side: str, mode: str, base_symbol
             target_cands = list(FIXED_SYMBOLS)
     else:
         target_cands = list(FIXED_SYMBOLS)
-        discord.print_log(f"   [初期デフォルト採用] trade_eligible_symbols.json 未生成のため固定5銘柄を対象に設定: {', '.join(target_cands)}")
+        discord.print_log(f"   [初期デフォルト採用] trade_eligible_symbols.json 未生成のため固定20銘柄を対象に設定: {', '.join(target_cands)}")
 
     profitable_cands = []
     symbol_params_map: Dict[str, Dict[str, Any]] = {}

@@ -21,8 +21,13 @@ from config_loader import get_webhook_url
 from bingx5_46_3logic import send_discord
 from upload_registry import should_upload_file, record_file_uploaded
 
-JST = timezone(timedelta(hours=9))
-FIXED_SYMBOLS = ["HYPE-USDT", "NEAR-USDT", "ZEC-USDT", "ARB-USDT", "UNI-USDT", "BTC-USDT", "ETH-USDT", "SOL-USDT", "DOGE-USDT", "XRP-USDT"]
+FIXED_SYMBOLS = [
+    "HYPE-USDT", "SOL-USDT", "DOGE-USDT", "XRP-USDT", "SUI-USDT",
+    "AVAX-USDT", "LINK-USDT", "APT-USDT", "NEAR-USDT", "ARB-USDT",
+    "UNI-USDT", "OP-USDT", "TIA-USDT", "RENDER-USDT", "INJ-USDT",
+    "FET-USDT", "TAO-USDT", "AAVE-USDT", "ENA-USDT", "ZEC-USDT",
+    "BTC-USDT"
+]
 
 
 def export_recent_candles(days: int = 60, send_discord_flag: bool = True, all_symbols: bool = True) -> Optional[Path]:
