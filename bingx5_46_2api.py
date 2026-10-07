@@ -626,44 +626,6 @@ class api_bingx:
 
         await self.bingx.set_leverage(int(LEVERAGE_FACTOR))
 
-        if is_testnet:
-            # PROJECT_RULES準拠: デモ口座（VST）は板参加者不足による未約定を回避するため成行（MARKET）発注で即座に約定させる
-            order_params = {
-                "symbol": self.symbol,
-                "side": "BUY",
-                "positionSide": "LONG",
-                "type": "MARKET",
-                "quantity": str(lot)
-            }
-            try:
-                res = await _async_bingx_request(
-                    "POST", self.bingx.base_url, "/openApi/swap/v2/trade/order",
-                    self.bingx.api_key, self.bingx.secret_key, params=order_params, timeout=10
-                )
-                discord.print_log(f"BingX Demo Market Long ({stage_label}): qty={lot}, result={res}", level="debug")
-            except Exception as e:
-                discord.print_log(f"BingX Demo Market Long exception: {e}", level="debug")
-
-            await asyncio.sleep(1.0)
-            pos = await self.get_positions()
-            filled_qty = float(pos.get("buy", 0.0))
-            if filled_qty > 0:
-                discord.print_log(f"[OK] Demo Long 成行エントリー約定完了: 保有量={filled_qty}/{lot}", level="debug")
-                self.entry_val = float(df['VAL'].iloc[-1]) if 'VAL' in df.columns else (current_price * 0.99)
-                self.entry_vah = float(df['VAH'].iloc[-1]) if 'VAH' in df.columns else (current_price * 1.01)
-                return True
-            else:
-                discord.print_log(f"[WARN] Demo Long 成行エントリー後ポジション未反映。再確認中...", level="debug")
-                await asyncio.sleep(1.0)
-                pos = await self.get_positions()
-                filled_qty = float(pos.get("buy", 0.0))
-                if filled_qty > 0:
-                    self.entry_val = float(df['VAL'].iloc[-1]) if 'VAL' in df.columns else (current_price * 0.99)
-                    self.entry_vah = float(df['VAH'].iloc[-1]) if 'VAH' in df.columns else (current_price * 1.01)
-                    return True
-                return False
-
-        # 本番口座（リアルUSDT）: 手数料最適化のため Maker Best Bid 指値（3回リトライ）を実行
         target_lot = lot
         filled_qty = 0.0
         for attempt in range(3):
