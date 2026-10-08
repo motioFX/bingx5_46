@@ -89,10 +89,11 @@ class logicinstance:
         atr = tr.ewm(span=span, adjust=False).mean()
         return round(atr, 1)
 
-    def make_market_profile(self, df, period=100, value_area_pct=0.70, num_bins=100, use_decay=True, decay_half_life=None):
+    def make_market_profile(self, df, period=150, value_area_pct=0.70, num_bins=50, use_decay=True, decay_half_life=None):
         """
         最新・標準仕様に準拠した高精度マーケットプロファイル（ボリュームプロファイル）生成関数
         - 入出力は完全互換 (POC, VAH, VAL を付加して返す)
+        - 5分足直近150本 (約12.5時間)、50 bins、Value Area 70% に準拠 (TradingView VP Strategy v5仕様)
         - 実体とヒゲの出来高密度配分、サブビン重心補正、CBOT/TradingView標準Value Area探索を実装
         - デフォルトで直近重視・指数減衰型（EMA型）ボリュームプロファイルが有効 (use_decay=True)
         """
@@ -1654,11 +1655,11 @@ def simulate_rsima_strategy(
     lma_len: int = 7,
     lEp: float = 40.0,
     lCp: float = 70.0,
-    max_trades: int = 1,
+    max_trades: int = 5,
     initial_equity: float = 100.0,
     fee_rate: float = 0.0006,
     callback_pct: float = 0.015,
-    sl_pct: float = 0.03
+    sl_pct: float = 0.025
 ) -> dict:
     closes = df["close"].values
     highs = df["high"].values if "high" in df.columns else closes
@@ -1707,16 +1708,16 @@ def simulate_rsima_strategy(
         
         # 決済チェック
         if pos_qty > 0:
-            # 1. 損切り (Stop Loss) チェック
-            if sl_pct > 0 and l < avg_price * (1.0 - sl_pct):
-                sl_price = avg_price * (1.0 - sl_pct)
+            # 1. 損切り (Stop Loss) チェック: 5分確定足終値判定 (Close) -2.5%
+            if sl_pct > 0 and c < avg_price * (1.0 - sl_pct):
+                sl_price = c
                 sell_val = pos_qty * sl_price
                 fee = sell_val * fee_rate
                 pnl = sell_val - pos_cost - fee
                 cum_realized_pnl += pnl
                 cum_fees += fee
                 trades.append(pnl)
-                exec_history.append({"timestamp": ts, "price": sl_price, "size": -pos_qty, "type": "STOP_LOSS"})
+                exec_history.append({"timestamp": ts, "price": sl_price, "size": -pos_qty, "type": "STOP_LOSS", "pnl": pnl})
                 pos_qty = 0.0
                 pos_cost = 0.0
                 avg_price = 0.0
@@ -1742,7 +1743,7 @@ def simulate_rsima_strategy(
                         cum_realized_pnl += pnl
                         cum_fees += fee
                         trades.append(pnl)
-                        exec_history.append({"timestamp": ts, "price": c, "size": -pos_qty, "type": "SELL"})
+                        exec_history.append({"timestamp": ts, "price": c, "size": -pos_qty, "type": "SELL", "pnl": pnl})
                         pos_qty = 0.0
                         pos_cost = 0.0
                         avg_price = 0.0
@@ -1751,27 +1752,30 @@ def simulate_rsima_strategy(
                         trail_peak = 0.0
 
                 
-        # エントリーチェック: lrsiMA < lEp and rsi < lCp
-        if pos_count < max_trades and gc:
-            if ma_val < lEp and r < lCp:
-                can_enter = False
-                if pos_count == 0:
+        # エントリー / ナンピン判定
+        if pos_count < max_trades:
+            can_enter = False
+            if pos_count == 0:
+                # 初回エントリー: GC かつ ma_val < lEp かつ r < lCp
+                if gc and (ma_val < lEp) and (r < lCp):
                     can_enter = True
-                else:
-                    add_pct = calc_add_pct(pos_count)
-                    if c < avg_price * (1.0 - add_pct):
-                        can_enter = True
-                        
-                if can_enter:
-                    buy_val = trade_size_usdt
-                    qty = buy_val / c
-                    fee = buy_val * fee_rate
-                    cum_fees += fee
-                    pos_cost += buy_val
-                    pos_qty += qty
-                    avg_price = pos_cost / pos_qty
-                    pos_count += 1
-                    exec_history.append({"timestamp": ts, "price": c, "size": qty, "type": "BUY"})
+            else:
+                # ナンピン (ピラミッディング): 平均建値からの段階的下落率 (1〜3回目: 0.2%, 4〜5回目: 0.3%, 6〜8回目: 0.4%)
+                add_pct = calc_add_pct(pos_count)
+                if c <= avg_price * (1.0 - add_pct):
+                    can_enter = True
+                    
+            if can_enter:
+                buy_val = trade_size_usdt
+                qty = buy_val / c
+                fee = buy_val * fee_rate
+                cum_fees += fee
+                pos_cost += buy_val
+                pos_qty += qty
+                avg_price = pos_cost / pos_qty
+                pos_count += 1
+                entry_type = "ENTRY_RSIMA_GC" if pos_count == 1 else f"NANPIN_RSIMA_{pos_count-1}"
+                exec_history.append({"timestamp": ts, "price": c, "size": qty, "type": entry_type})
                     
         unrealized = (pos_qty * c - pos_cost) if pos_qty > 0 else 0.0
         unrealized_list.append(unrealized)
@@ -1811,14 +1815,18 @@ def simulate_rsima_strategy(
 
 def simulate_val_poc_strategy(
     df: pd.DataFrame,
-    max_nanpin: int = 5,
-    nanpin_drop_pct: float = 0.002,
+    vp_period: int = 150,
+    num_bins: int = 50,
+    max_nanpin: int = 4,
+    nanpin_drop_pct: float = None,
     initial_equity: float = 100.0,
     fee_rate: float = 0.0006,
-    sl_pct: float = 0.03
+    sl_pct: float = 0.09
 ) -> dict:
     """
-    VAL ゴールデンクロス ＆ 直近建値 0.2% 下落ナンピン最大5回 ＆ POC クローズ戦略
+    VAL ゴールデンクロス ＆ 直近建値 段階的ナンピン最大5回 ＆ 建値以上限定POCクローズ (VP Strategy v5仕様)
+    - 損切りは実証知見に基づき 9.0% (終値確定判定) を厳格適用 (7.5%以下厳禁)
+    - VP計算は5分足150本 (12.5時間)、50 bins
     """
     closes = df["close"].values
     highs = df["high"].values if "high" in df.columns else closes
@@ -1827,7 +1835,7 @@ def simulate_val_poc_strategy(
     
     if "VAL" not in df.columns or "POC" not in df.columns or df["VAL"].isna().all():
         logic = logicinstance()
-        df_mp = logic.make_market_profile(df, period=48)
+        df_mp = logic.make_market_profile(df, period=vp_period, num_bins=num_bins)
         vals = df_mp["VAL"].values
         pocs = df_mp["POC"].values
     else:
@@ -1837,7 +1845,7 @@ def simulate_val_poc_strategy(
     if n < 10:
         return {"final_pnl": 0.0, "trade_count": 0, "win_rate": 0.0, "DD_max": 0.0, "max_unrealized_loss": 0.0}
 
-    total_max_stages = max_nanpin + 1  # 初期エントリー1回 + ナンピン5回 = 計6回
+    total_max_stages = max_nanpin + 1  # 初期エントリー1回 + ナンピン4回 = 計5回 (pyramiding 5)
     trade_size_usdt = initial_equity / total_max_stages
 
     pos_qty = 0.0
@@ -1864,9 +1872,9 @@ def simulate_val_poc_strategy(
 
         # 1. 決済チェック (保有ポジションがある場合)
         if pos_qty > 0:
-            # A. 固定損切り (3% SL)
-            if sl_pct > 0 and l < avg_price * (1.0 - sl_pct):
-                sl_price = avg_price * (1.0 - sl_pct)
+            # A. 固定損切り (9.0% SL: 5分確定足終値判定 Close)
+            if sl_pct > 0 and c < avg_price * (1.0 - sl_pct):
+                sl_price = c
                 sell_val = pos_qty * sl_price
                 fee = sell_val * fee_rate
                 pnl = sell_val - pos_cost - fee
@@ -1879,21 +1887,23 @@ def simulate_val_poc_strategy(
                 avg_price = 0.0
                 pos_count = 0
                 last_entry_price = 0.0
-            # B. POC クローズ (高値または終値が POC に到達・上抜け)
+            # B. POC クローズ (高値または終値が POC に到達・上抜け かつ 建値以上 [Quick TP] Only Exit Above Avg Price)
             elif not np.isnan(poc) and (h >= poc or c >= poc):
                 exit_price = max(c, poc) if h >= poc else c
-                sell_val = pos_qty * exit_price
-                fee = sell_val * fee_rate
-                pnl = sell_val - pos_cost - fee
-                cum_realized_pnl += pnl
-                cum_fees += fee
-                trades.append(pnl)
-                exec_history.append({"timestamp": ts, "price": exit_price, "size": -pos_qty, "type": "POC_CLOSE", "pnl": pnl})
-                pos_qty = 0.0
-                pos_cost = 0.0
-                avg_price = 0.0
-                pos_count = 0
-                last_entry_price = 0.0
+                # [Quick TP] Only Exit Above Avg Price: 平均建値（手数料マージン込み）より上のプラス域のみ利確
+                if exit_price > avg_price * (1.0 + fee_rate):
+                    sell_val = pos_qty * exit_price
+                    fee = sell_val * fee_rate
+                    pnl = sell_val - pos_cost - fee
+                    cum_realized_pnl += pnl
+                    cum_fees += fee
+                    trades.append(pnl)
+                    exec_history.append({"timestamp": ts, "price": exit_price, "size": -pos_qty, "type": "POC_CLOSE", "pnl": pnl})
+                    pos_qty = 0.0
+                    pos_cost = 0.0
+                    avg_price = 0.0
+                    pos_count = 0
+                    last_entry_price = 0.0
 
         # 2. エントリー / ナンピン判定
         if not np.isnan(val) and not np.isnan(prev_val):
@@ -1987,16 +1997,16 @@ def optimize_symbol_strategy(
                     for cp in lCps:
                         res = simulate_rsima_strategy(
                             df, rsi_len=rl, lma_len=ml, lEp=ep, lCp=cp,
-                            max_trades=max_trades, initial_equity=initial_equity,
-                            sl_pct=0.03
+                            max_trades=5, initial_equity=initial_equity,
+                            sl_pct=0.025
                         )
                         label = f"RSIMA_R{rl}_M{ml}_Ep{ep}_Cp{cp}"
                         results[label] = res
 
-    # 2. VAL_POC 戦略 (出来高構造リバウンド ＆ 段階的ナンピン最大5回 ＆ POCクローズ)
+    # 2. VAL_POC 戦略 (出来高構造リバウンド ＆ 段階的ナンピン最大5回 ＆ 建値以上Quick TP、VP150本、SL 9.0%)
     if force_strategy is None or force_strategy.lower() in ("val_poc", "vp_val_gc"):
         res_val_poc = simulate_val_poc_strategy(
-            df, max_nanpin=5, nanpin_drop_pct=None, initial_equity=initial_equity, sl_pct=0.03
+            df, vp_period=150, num_bins=50, max_nanpin=4, nanpin_drop_pct=None, initial_equity=initial_equity, sl_pct=0.09
         )
         results["VAL_POC_N5_Stepped"] = res_val_poc
 
@@ -2008,7 +2018,7 @@ def optimize_symbol_strategy(
             "win_rate": 0.0,
             "DD_max": 0.0,
             "max_unrealized_loss": 0.0,
-            "params": {"rsi_len": 9, "lma_len": 7, "lEp": 40.0, "lCp": 70.0, "max_trades": max_trades, "sl_pct": 0.03}
+            "params": {"rsi_len": 9, "lma_len": 7, "lEp": 40.0, "lCp": 70.0, "max_trades": 5, "sl_pct": 0.025}
         }
         return "rsima", default_res["params"], default_res, []
 
@@ -2026,7 +2036,7 @@ def optimize_symbol_strategy(
     return best_strat, best_params, best_res, top10
 
 
-def run_interval_comparison(df_60m, lot=1.0, data_equity=100.0, side_mode="long", symbol="", force_strategy=None, prefer_breakout=False, max_trades=1):
+def run_interval_comparison(df_60m, lot=1.0, data_equity=100.0, side_mode="long", symbol="", force_strategy=None, prefer_breakout=False, max_trades=5):
     """
     2大戦略（RSIMA ＆ VAL_POC）の網羅的グリッドサーチを実行し、
     各銘柄のPnLが最大となる戦略と最適パラメータを選定する。
