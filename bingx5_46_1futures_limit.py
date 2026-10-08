@@ -1918,9 +1918,10 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                     else:
                         closed = False
                         # 1. 戦略別スマート損切り判定 (5分足確定終値判定 Close)
-                        # RSIMA: 2.5% SL, VAL_POC: 9.0% SL (実証知見: 7.5%以下厳禁)
-                        sl_ratio = 0.09 if cand_strat in ("val_poc", "vp_val_gc") else 0.025
-                        sl_pct_label = "9.0%" if cand_strat in ("val_poc", "vp_val_gc") else "2.5%"
+                        # 個別最適化パラメータ sl_pct を優先参照 (デフォルト: RSIMA 2.5%, VAL_POC 9.0%)
+                        default_sl = 0.09 if cand_strat in ("val_poc", "vp_val_gc") else 0.025
+                        sl_ratio = float(sym_params.get("sl_pct", default_sl))
+                        sl_pct_label = f"{sl_ratio * 100:.1f}%"
                         if entry_px > 0 and (current_price < entry_px * (1.0 - sl_ratio)):
                             exit_reason = f"Fixed_SL_{sl_pct_label}"
                             discord.print_log(

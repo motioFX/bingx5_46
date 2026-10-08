@@ -1990,25 +1990,31 @@ def optimize_symbol_strategy(
         lma_lengths = [7]
         lEps = [30, 35, 40, 45, 50]
         lCps = [60, 65, 70, 75, 80]
+        sl_pcts = [0.015, 0.020, 0.025, 0.030, 0.035]  # 中心値2.5%、0.5%刻み (1.5%〜3.5%)
         
         for rl in rsi_lengths:
             for ml in lma_lengths:
                 for ep in lEps:
                     for cp in lCps:
-                        res = simulate_rsima_strategy(
-                            df, rsi_len=rl, lma_len=ml, lEp=ep, lCp=cp,
-                            max_trades=5, initial_equity=initial_equity,
-                            sl_pct=0.025
-                        )
-                        label = f"RSIMA_R{rl}_M{ml}_Ep{ep}_Cp{cp}"
-                        results[label] = res
+                        for sl in sl_pcts:
+                            res = simulate_rsima_strategy(
+                                df, rsi_len=rl, lma_len=ml, lEp=ep, lCp=cp,
+                                max_trades=5, initial_equity=initial_equity,
+                                sl_pct=sl
+                            )
+                            label = f"RSIMA_R{rl}_M{ml}_Ep{ep}_Cp{cp}_SL{sl*100:.1f}"
+                            results[label] = res
 
-    # 2. VAL_POC 戦略 (出来高構造リバウンド ＆ 段階的ナンピン最大5回 ＆ 建値以上Quick TP、VP150本、SL 9.0%)
+    # 2. VAL_POC 戦略 (出来高構造リバウンド ＆ 段階的ナンピン最大5回 ＆ 建値以上Quick TP、VP150本、SL 0.5%刻み最適化)
     if force_strategy is None or force_strategy.lower() in ("val_poc", "vp_val_gc"):
-        res_val_poc = simulate_val_poc_strategy(
-            df, vp_period=150, num_bins=50, max_nanpin=4, nanpin_drop_pct=None, initial_equity=initial_equity, sl_pct=0.09
-        )
-        results["VAL_POC_N5_Stepped"] = res_val_poc
+        vp_sl_pcts = [0.080, 0.085, 0.090, 0.095, 0.100]  # 中心値9.0%、0.5%刻み (8.0%〜10.0%、7.5%以下厳禁)
+        for sl in vp_sl_pcts:
+            res_val_poc = simulate_val_poc_strategy(
+                df, vp_period=150, num_bins=50, max_nanpin=4, nanpin_drop_pct=None,
+                initial_equity=initial_equity, sl_pct=sl
+            )
+            label = f"VAL_POC_N5_SL{sl*100:.1f}"
+            results[label] = res_val_poc
 
     if not results:
         default_res = {
