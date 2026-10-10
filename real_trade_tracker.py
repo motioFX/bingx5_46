@@ -50,7 +50,35 @@ def record_real_trade(symbol: str, side: str, action: str, price: float, qty: fl
     return trade_entry
 
 
-def plot_real_trading_performance():
+def get_real_trading_summary(current_balance: Optional[float] = None) -> Dict[str, Any]:
+    """実トレード履歴の統計サマリーを取得"""
+    trades = load_real_trades()
+    closes = [t for t in trades if t.get("action") == "CLOSE"]
+    pnls = [float(t.get("pnl", 0.0)) for t in closes]
+    wins = [x for x in pnls if x > 0]
+    losses = [x for x in pnls if x < 0]
+    ties = [x for x in pnls if x == 0]
+    total_pnl = sum(pnls)
+    gross_win = sum(wins)
+    gross_loss = abs(sum(losses))
+    pf = (gross_win / gross_loss) if gross_loss > 0 else (99.0 if gross_win > 0 else 0.0)
+    wr = (len(wins) / len(closes) * 100.0) if closes else 0.0
+
+    return {
+        "total_trades": len(closes),
+        "wins": len(wins),
+        "losses": len(losses),
+        "ties": len(ties),
+        "win_rate": round(wr, 1),
+        "gross_win": round(gross_win, 2),
+        "gross_loss": round(gross_loss, 2),
+        "net_pnl": round(total_pnl, 2),
+        "profit_factor": round(pf, 2),
+        "current_balance": round(float(current_balance), 2) if current_balance is not None else None,
+    }
+
+
+def plot_real_trading_performance(current_balance: Optional[float] = None) -> Optional[Path]:
     trades = load_real_trades()
     if not trades:
         return None
@@ -62,7 +90,9 @@ def plot_real_trading_performance():
     # 累積 PnL の計算
     df["cum_pnl"] = df["pnl"].cumsum()
 
-    fig, ax = plt.subplots(figsize=(11, 5.5), dpi=150)
+    summary = get_real_trading_summary(current_balance=current_balance)
+
+    fig, ax = plt.subplots(figsize=(11, 5.8), dpi=150)
     fig.patch.set_facecolor("#131722")
     ax.set_facecolor("#1e222d")
 
@@ -72,7 +102,7 @@ def plot_real_trading_performance():
     else:
         df["dt_jst"] = df["timestamp"].dt.tz_convert("Asia/Tokyo")
 
-    ax.plot(df["dt_jst"], df["cum_pnl"], marker='o', markersize=6, color='#29b6f6', linewidth=2.2, label="Cumulative Real PnL (USDT)", zorder=3)
+    ax.plot(df["dt_jst"], df["cum_pnl"], marker='o', markersize=6, color='#29b6f6', linewidth=2.2, label=f"Cumulative Real PnL ({summary['net_pnl']:+.2f} USDT)", zorder=3)
     
     # 0ライン
     ax.axhline(0, color="#787b86", linestyle="--", alpha=0.5, zorder=2)
@@ -153,7 +183,24 @@ def plot_real_trading_performance():
     ax.set_ylim(min_pnl - pnl_range * 0.22, max_pnl + pnl_range * 0.25)
     ax.margins(x=0.10)
 
-    ax.set_title("BingX Real Trading Performance (Cumulative Realized PnL)", fontsize=12, color="#ffffff", pad=15, weight="bold")
+    # タイトルと証拠金・実績バナー
+    title_text = "BingX Real Trading Performance & Cumulative PnL"
+    ax.set_title(title_text, fontsize=12, color="#ffffff", pad=28, weight="bold")
+
+    # 上部に証拠金残高・実績サマリーボックスを配置
+    bal_str = f"Margin Balance: ${summary['current_balance']:,.2f} USDT  |  " if summary["current_balance"] is not None else ""
+    info_box_text = (
+        f"{bal_str}Net PnL: {summary['net_pnl']:+.2f} USDT  |  "
+        f"WinRate: {summary['win_rate']:.1f}% ({summary['wins']}W-{summary['losses']}L)  |  "
+        f"PF: {summary['profit_factor']:.2f} ({summary['total_trades']} trades)"
+    )
+    fig.text(
+        0.5, 0.925, info_box_text,
+        ha="center", va="center",
+        fontsize=9.5, color="#00e676" if summary["net_pnl"] >= 0 else "#ff5252",
+        weight="bold",
+        bbox=dict(boxstyle="round,pad=0.35", facecolor="#1e222d", edgecolor="#363c4e", alpha=0.95, lw=1.0)
+    )
     ax.set_xlabel("Time (JST)", fontsize=10, color="#b2b5be")
     ax.set_ylabel("Realized Cumulative PnL (USDT)", fontsize=10, color="#b2b5be")
     ax.tick_params(colors="#b2b5be", labelsize=9)

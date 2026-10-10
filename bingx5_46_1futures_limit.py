@@ -1458,6 +1458,51 @@ async def audit_and_retain_positions(
 
     return symbol_apis, symbol_params_map
 
+
+async def send_periodic_performance_report(symbol_apis: Dict[str, Any], mode: str, label: str = "8時間定期レポート"):
+    """実運用トレード実績（直近PnLチャート画像 ＆ 現在の証拠金残高）をDiscordへ送信 (PROJECT_RULES 準拠)"""
+    try:
+        from real_trade_tracker import plot_real_trading_performance, get_real_trading_summary
+        from bingx5_46_2api import api_bingx
+
+        # 1. 口座残高（証拠金）の取得
+        current_balance = 0.0
+        if symbol_apis:
+            first_api = next(iter(symbol_apis.values()))
+            try:
+                current_balance = await first_api.get_account()
+            except Exception:
+                pass
+        if current_balance <= 0:
+            try:
+                temp_api = api_bingx(symbol="BTC-USDT", mode=mode)
+                current_balance = await temp_api.get_account()
+            except Exception:
+                current_balance = 1000.0
+
+        # 2. 実績サマリーとチャート画像の生成
+        summary = get_real_trading_summary(current_balance=current_balance)
+        chart_file = plot_real_trading_performance(current_balance=current_balance)
+
+        # 3. Discord送信
+        now_str = datetime.now(JST).strftime("%Y-%m-%d %H:%M")
+        msg = (
+            f"📊 **【実運用トレード実績＆証拠金サマリー（{label}）】**\n"
+            f"• **実行時刻**: `{now_str} JST`\n"
+            f"• **現在の口座証拠金**: `${current_balance:,.2f} USDT`\n"
+            f"• **累計実現損益**: `{summary['net_pnl']:+.2f} USDT`\n"
+            f"• **通算成績**: `{summary['wins']}勝 {summary['losses']}敗 {summary['ties']}分 (勝率: {summary['win_rate']:.1f}%)` | PF: `{summary['profit_factor']:.2f}`\n"
+            f"• **決済完了取引数**: `{summary['total_trades']} 件`"
+        )
+        if chart_file and chart_file.exists():
+            discord.send_file(chart_file, msg)
+        else:
+            discord.send_message(msg)
+        discord.print_log(f"[Performance Report] {label} 送信完了 (残高: ${current_balance:.2f}, 累計損益: ${summary['net_pnl']:+.2f})")
+    except Exception as e:
+        discord.print_log(f"[Performance Report Error] 実績レポート送信失敗: {e}")
+
+
 async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60'):
     from bingx5_46_2api import (
         api_bingx,
@@ -1540,6 +1585,9 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
         discord.print_log(f"[STRATEGY OVERRIDE] CLI引数により全銘柄の戦略を強制適用します: {FORCE_STRATEGY.upper()}")
         for sym in symbol_params_map:
             symbol_params_map[sym]["strategy"] = FORCE_STRATEGY
+
+    # 実運用トレード実績（直近PnLチャート画像 ＆ 現在の証拠金残高）をDiscordへ送信
+    await send_periodic_performance_report(symbol_apis, mode, label="起動時初期レポート")
 
     # pybotters BingX WebSocket マネージャー初期化 & バックグラウンドストリーミング開始
     from bingx_ws_manager import BingXWSManager
@@ -1652,6 +1700,9 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
             logic = logicinstance()
             discord.print_log(f"[Periodic Reset Complete] 新しい選定銘柄 (LONG ONLY): {', '.join(selected_symbols)} | 現在の全監視対象: {', '.join(symbol_apis.keys())}")
             # continue を廃止: リセット完了直後も当足 (01/09/17時) のポジション決済・エントリー判定を漏れなく実行
+
+            # 8時間ごとの実運用トレード実績（直近PnLチャート画像 ＆ 現在の証拠金残高）をDiscordへ定期送信
+            await send_periodic_performance_report(symbol_apis, mode, label="8時間定期レポート")
 
         # ========== 毎時00分: クジラセンチメント更新（パラメータ最適化は8時間ごと定期選定時のみ） ==========
         if cycle_count > 1 and now_jst.minute < 5:
