@@ -201,11 +201,39 @@ def plot_real_trading_performance(current_balance: Optional[float] = None) -> Op
         weight="bold",
         bbox=dict(boxstyle="round,pad=0.35", facecolor="#1e222d", edgecolor="#363c4e", alpha=0.95, lw=1.0)
     )
+    # --- 2日ごと & 1週間ごと(日曜日起点)の縦線グリッド描画 (PROJECT_RULES 準拠) ---
+    dt_min = df["dt_jst"].min().floor("D")
+    dt_max = df["dt_jst"].max().ceil("D") + pd.Timedelta(days=1)
+
+    # 1. 1週間ごとの縦線（日曜日 00:00 JST 先頭）
+    sundays = pd.date_range(start=dt_min - pd.Timedelta(days=7), end=dt_max + pd.Timedelta(days=7), freq="W-SUN", tz=df["dt_jst"].dt.tz)
+    first_sun = True
+    for sun_dt in sundays:
+        if dt_min - pd.Timedelta(days=1) <= sun_dt <= dt_max:
+            label = "Week Start (Sunday)" if first_sun else None
+            first_sun = False
+            ax.axvline(sun_dt, color="#4fc3f7", linestyle="--", linewidth=1.3, alpha=0.7, zorder=3, label=label)
+
+    # 2. 2日ごとの縦点線 (日曜日以外)
+    all_2days = pd.date_range(start=dt_min, end=dt_max, freq="2D", tz=df["dt_jst"].dt.tz)
+    first_2d = True
+    for d in all_2days:
+        if d.weekday() != 6:  # 日曜日は週間強調線があるためスキップ
+            label = "2-Day Interval" if first_2d else None
+            first_2d = False
+            ax.axvline(d, color="#546e7a", linestyle=":", linewidth=0.9, alpha=0.45, zorder=2, label=label)
+
+    # 水平グリッド
+    ax.grid(True, axis='y', linestyle=':', color="#363c4e", alpha=0.7)
+
+    # X軸フォーマット & 表示範囲
+    ax.xaxis.set_major_formatter(mdates.DateFormatter('%m/%d\n(%a)', tz=df["dt_jst"].dt.tz))
+    ax.tick_params(colors="#b2b5be", labelsize=8.5)
+    ax.set_xlim(dt_min - pd.Timedelta(hours=12), dt_max + pd.Timedelta(hours=12))
+
     ax.set_xlabel("Time (JST)", fontsize=10, color="#b2b5be")
     ax.set_ylabel("Realized Cumulative PnL (USDT)", fontsize=10, color="#b2b5be")
-    ax.tick_params(colors="#b2b5be", labelsize=9)
-    ax.grid(True, linestyle=':', color="#363c4e", alpha=0.7)
-    ax.legend(loc="upper left", facecolor="#1e222d", edgecolor="#363c4e", fontsize=9, labelcolor="#ffffff")
+    ax.legend(loc="upper left", facecolor="#1e222d", edgecolor="#363c4e", fontsize=8.5, labelcolor="#ffffff")
     plt.tight_layout()
 
     CHART_FILE.parent.mkdir(parents=True, exist_ok=True)
