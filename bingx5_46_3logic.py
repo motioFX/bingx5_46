@@ -60,6 +60,171 @@ def calc_ema(series: pd.Series, length: int) -> pd.Series:
     return series.ewm(span=length, adjust=False).mean()
 
 
+class RegimeFilterManager:
+    """
+    高値圏ロング停止 ＆ セリクラ下ヒゲ陽線底打ちレジームフィルター管理クラス (PROJECT_RULES 準拠)
+    パターンA: 上位足門番 (Macro Regime Gate)
+      - NORMAL (0): 通常ロング許可
+      - TOP_EXHAUSTION (1): 高値圏・出来高細り検知 -> 新規ロング停止 ＆ 既存ストップ引き上げ
+      - DOWN_WAITING (2): 下落待機フェーズ -> ジリ下げ静観 (手出し無用)
+      - BOTTOM_WATCHING (3): 底打ち・セリクラ監視 -> 出来高急増 + 下ヒゲ陽線でロング再開
+    """
+    STATE_NAMES = {
+        0: "NORMAL",
+        1: "TOP_EXHAUSTION",
+        2: "DOWN_WAITING",
+        3: "BOTTOM_WATCHING",
+    }
+
+    def __init__(
+        self,
+        lookback_high: int = 48,
+        stagnation_bars: int = 24,
+        vol_decay_ratio: float = 0.80,
+        btc_drop_pct: float = -0.05,
+        alt_drop_pct: float = -0.10,
+        vol_surge_mult: float = 2.0,
+        rsi_bottom_th: float = 35.0,
+        lower_wick_ratio: float = 0.35,
+    ):
+        self.lookback_high = lookback_high
+        self.stagnation_bars = stagnation_bars
+        self.vol_decay_ratio = vol_decay_ratio
+        self.btc_drop_pct = btc_drop_pct
+        self.alt_drop_pct = alt_drop_pct
+        self.vol_surge_mult = vol_surge_mult
+        self.rsi_bottom_th = rsi_bottom_th
+        self.lower_wick_ratio = lower_wick_ratio
+
+    def evaluate(self, df: pd.DataFrame, is_btc: bool = False) -> Dict[str, Any]:
+        """
+        1時間足データからレジーム状態および門番許可フラグを算出する
+        """
+        if df is None or len(df) < 24:
+            return {
+                "long_allowed": True,
+                "regime_gate": "ALLOW",
+                "state": 0,
+                "state_name": "NORMAL",
+                "action": "NORMAL",
+                "reason": "insufficient_data",
+                "drop_from_peak_pct": 0.0,
+                "recent_peak_price": 0.0,
+                "last_sl_price": 0.0,
+            }
+
+        df = df.copy().reset_index(drop=True)
+        n = len(df)
+        long_allowed = np.ones(n, dtype=bool)
+
+        close = df['close'].values.astype(float)
+        open_ = df['open'].values.astype(float)
+        high = df['high'].values.astype(float)
+        low = df['low'].values.astype(float)
+        vol = df['volume'].values.astype(float)
+
+        vol_s = pd.Series(vol)
+        vol_sma20 = vol_s.rolling(20, min_periods=5).mean().values
+        vol_sma24 = vol_s.rolling(24, min_periods=5).mean().values
+        vol_sma72 = vol_s.rolling(72, min_periods=10).mean().values
+
+        rsi14 = calc_rsi(df['close'], 14).values
+
+        # 下ヒゲ陽線判定
+        is_bullish = close > open_
+        body = np.abs(close - open_)
+        lower_wick = np.where(is_bullish, open_ - low, close - low)
+        total_candle_range = high - low + 1e-9
+
+        is_hammer_bull = (
+            is_bullish &
+            (lower_wick >= body * 0.8) &
+            ((lower_wick / total_candle_range) >= self.lower_wick_ratio)
+        )
+
+        state = 0
+        recent_peak_price = close[0]
+        target_drop = self.btc_drop_pct if is_btc else self.alt_drop_pct
+        regime_states = np.zeros(n, dtype=int)
+        last_sl_price = 0.0
+
+        for i in range(1, n):
+            c = close[i]
+            v = vol[i]
+
+            lookback_start = max(0, i - self.lookback_high)
+            curr_window_high = np.max(high[lookback_start:i+1])
+            curr_window_high_idx = lookback_start + np.argmax(high[lookback_start:i+1])
+            bars_since_new_high = i - curr_window_high_idx
+
+            is_vol_decay = False
+            if i >= 72 and vol_sma72[i] > 0:
+                is_vol_decay = vol_sma24[i] < (vol_sma72[i] * self.vol_decay_ratio)
+
+            drop_from_peak = (c - curr_window_high) / curr_window_high
+
+            if state == 0:  # NORMAL
+                is_near_high = (curr_window_high - c) / curr_window_high <= 0.025
+                if bars_since_new_high >= self.stagnation_bars and is_near_high and is_vol_decay:
+                    state = 1  # TOP_EXHAUSTION
+                    recent_peak_price = curr_window_high
+                long_allowed[i] = True
+
+            elif state == 1:  # TOP_EXHAUSTION
+                long_allowed[i] = False
+                if c > recent_peak_price * 1.005:
+                    state = 0
+                    long_allowed[i] = True
+                elif drop_from_peak <= -0.02:
+                    state = 2  # DOWN_WAITING
+
+            elif state == 2:  # DOWN_WAITING
+                long_allowed[i] = False
+                if drop_from_peak <= target_drop:
+                    state = 3  # BOTTOM_WATCHING
+                elif c > recent_peak_price:
+                    state = 0
+                    long_allowed[i] = True
+
+            elif state == 3:  # BOTTOM_WATCHING
+                long_allowed[i] = False
+                is_climax = (v >= vol_sma20[i] * self.vol_surge_mult) or (rsi14[i] <= self.rsi_bottom_th)
+                if (is_climax and is_hammer_bull[i]) or (is_hammer_bull[i] and rsi14[i] <= self.rsi_bottom_th + 5.0):
+                    state = 0  # NORMAL復帰
+                    long_allowed[i] = True
+                    last_sl_price = low[i]
+                elif c > recent_peak_price:
+                    state = 0
+                    long_allowed[i] = True
+
+            regime_states[i] = state
+
+        curr_state = regime_states[-1]
+        curr_allowed = bool(long_allowed[-1])
+        curr_drop = float((close[-1] - curr_window_high) / curr_window_high)
+
+        action_map = {
+            0: "NORMAL",
+            1: "TIGHTEN_SL_AND_STOP_NEW_LONG",
+            2: "WAIT_FOR_BOTTOM",
+            3: "WATCH_CLIMAX",
+        }
+
+        return {
+            "long_allowed": curr_allowed,
+            "regime_gate": "ALLOW" if curr_allowed else "STOP",
+            "state": int(curr_state),
+            "state_name": self.STATE_NAMES.get(curr_state, "NORMAL"),
+            "action": action_map.get(curr_state, "NORMAL"),
+            "drop_from_peak_pct": round(curr_drop * 100.0, 2),
+            "recent_peak_price": round(float(curr_window_high), 4),
+            "last_sl_price": round(float(last_sl_price), 4) if last_sl_price > 0 else None,
+            "is_hammer_bull_latest": bool(is_hammer_bull[-1]),
+            "rsi14_latest": round(float(rsi14[-1]), 1),
+        }
+
+
+
 class logicinstance:
     def crossover(self, x, y):
         return ((x - y) > 0) & ((x.shift(1) - y.shift(1)) <= 0)

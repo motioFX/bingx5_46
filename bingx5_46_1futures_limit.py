@@ -456,6 +456,45 @@ def get_whale_sentiment_info(symbol: str) -> Dict[str, Any]:
     return default_res
 
 
+def get_regime_gate_info(symbol: str) -> Dict[str, Any]:
+    """Data/market_state.json よりマクロレジーム門番情報（全体門番、BTCステート、個別ステート）を取得 (PROJECT_RULES パターンA準拠)"""
+    state_file = MIX_SCRIPT_PATH.parent / "Data" / "market_state.json"
+    default_res = {
+        "regime_gate": "ALLOW",
+        "regime_reason": "DEFAULT",
+        "action": "NORMAL",
+        "state_name": "NORMAL",
+        "btc_state": "NORMAL",
+    }
+    if not state_file.exists():
+        return default_res
+    try:
+        with open(state_file, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            overall_gate = data.get("regime_gate", "ALLOW")
+            overall_reason = data.get("regime_reason", "NORMAL")
+            btc_info = data.get("btc_regime", {})
+            sym_regimes = data.get("symbol_regimes", {})
+
+            clean_sym = symbol.upper()
+            sym_info = sym_regimes.get(clean_sym, {})
+
+            # 全体門番がSTOP、または個別銘柄がSTOPならSTOP
+            sym_gate = sym_info.get("regime_gate", overall_gate)
+            effective_gate = "STOP" if (overall_gate == "STOP" or sym_gate == "STOP") else "ALLOW"
+            effective_action = sym_info.get("action", btc_info.get("action", "NORMAL"))
+
+            return {
+                "regime_gate": effective_gate,
+                "regime_reason": overall_reason,
+                "action": effective_action,
+                "state_name": sym_info.get("state_name", "NORMAL"),
+                "btc_state": btc_info.get("state_name", "NORMAL"),
+            }
+    except Exception:
+        return default_res
+
+
 def load_top_symbol_from_scores(trade_side: str = "long") -> Optional[str]:
     csv_candidates = [
         SCORES_CSV_PATH,
@@ -1780,8 +1819,11 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                         freed_symbols.append(sym)
                         continue
 
-                    # クジラ判定が SHORT_ONLY でなければロング許可
-                    is_long_allowed = whale_sig in ("LONG_ONLY", "NEUTRAL")
+                    # クジラ判定およびマクロレジーム門番判定 (PROJECT_RULES パターンA準拠)
+                    regime_info = get_regime_gate_info(sym)
+                    is_regime_allowed = (regime_info.get("regime_gate") == "ALLOW")
+                    is_whale_allowed = whale_sig in ("LONG_ONLY", "NEUTRAL")
+                    is_long_allowed = is_regime_allowed and is_whale_allowed
 
                     if long_signal:
                         if is_long_allowed:
@@ -1796,9 +1838,15 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                                 "whale_sig": whale_sig
                             })
                         else:
-                            discord.print_log(f"[{sym}] [FILTER] ロングシグナル検出も、クジラセンチメント ({whale_sig}) が売り優勢のため見送り。", level="debug")
+                            filter_reasons = []
+                            if not is_regime_allowed:
+                                filter_reasons.append(f"レジーム門番停止 ({regime_info.get('regime_reason')}/{regime_info.get('state_name')})")
+                            if not is_whale_allowed:
+                                filter_reasons.append(f"クジラ売り優勢 ({whale_sig})")
+                            discord.print_log(f"[{sym}] [FILTER] ロングシグナル検出も、{' ＆ '.join(filter_reasons)}のためエントリー見送り。", level="debug")
                     else:
-                        discord.print_log(f"[{sym}] [--] シグナルなし。エントリー見送り (クジラ判定: {whale_sig})。", level="debug")
+                        reg_tag = f"門番:{regime_info.get('regime_gate')}"
+                        discord.print_log(f"[{sym}] [--] シグナルなし。エントリー見送り ({reg_tag}, クジラ:{whale_sig})。", level="debug")
 
                 await asyncio.sleep(0.1)
 
@@ -1855,7 +1903,9 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                 if has_long:
                     cand_strat = sym_params.get("strategy", "rsima")
                     longclose_sig = bool(df["longclose"].iloc[-1]) if "longclose" in df.columns else False
-                    
+                    regime_info = get_regime_gate_info(sym)
+                    is_top_tighten = (regime_info.get("action") == "TIGHTEN_SL_AND_STOP_NEW_LONG")
+
                     ttp = trailing_tp_states.get(sym, {
                         "active": False,
                         "peak_price": entry_px,
@@ -1864,8 +1914,8 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                         "strategy": cand_strat
                     })
 
-                    # 利確シグナル点灯時のトレーリング発動（未発動の場合）
-                    if not ttp.get("active", False) and longclose_sig and (current_price > entry_px):
+                    # 利確シグナル点灯、または天井圏検知(TOP_EXHAUSTION)時のトレーリング発動（未発動の場合）
+                    if not ttp.get("active", False) and (longclose_sig or is_top_tighten) and (current_price > entry_px):
                         ttp["active"] = True
                         cur_high = max(current_price, float(df["high"].iloc[-1]) if "high" in df.columns else current_price)
                         ttp["peak_price"] = cur_high
@@ -1879,8 +1929,9 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                         trailing_tp_states[sym] = ttp
                         save_trailing_tp_states(trailing_tp_states)
                         vah_tag = f" | VAH防護: ${vah_guard:,.4f}" if vah_guard > 0 else ""
+                        trigger_reason = "天井圏検知(TOP_EXHAUSTION)ストップ引き上げ" if is_top_tighten and not longclose_sig else "利益確定トレーリング開始"
                         discord.print_log(
-                            f"[{sym}] [TRAILING TP ACTIVATED] 🔥 利益確定トレーリング開始!\n"
+                            f"[{sym}] [TRAILING TP ACTIVATED] 🔥 {trigger_reason}!\n"
                             f"   └ 現在値: ${current_price:,.4f} (建値: ${entry_px:,.4f}) | 高値: ${ttp['peak_price']:,.4f} | 利確ライン: ${ttp['trail_stop']:,.4f} (-1.5%{vah_tag})"
                         )
 

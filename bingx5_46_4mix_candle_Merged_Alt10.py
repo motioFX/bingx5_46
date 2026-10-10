@@ -23,6 +23,7 @@ import requests
 import aiohttp
 from config_loader import get_webhook_url
 from upload_registry import should_upload_file, record_file_uploaded
+from bingx5_46_3logic import RegimeFilterManager
 
 if hasattr(sys.stdout, "reconfigure"):
     try:
@@ -1627,7 +1628,62 @@ async def main():
             json.dump(eligible_data, f, indent=2, ensure_ascii=False)
         log(f"Saved trade eligible symbols to {eligible_file}")
 
-        summary_text += f"========================================"
+        # ⑤ マクロ環境認識 ＆ レジームフィルター判定 (PROJECT_RULES 準拠: パターンA門番)
+        print("\n==================================================================================")
+        print(" [Step 3: Macro Regime Gate Evaluation (Pattern A: Top Stop & Bottom Recovery)]")
+        print("==================================================================================")
+        regime_mgr = RegimeFilterManager()
+
+        # BTCマクロレジーム判定
+        df_btc = df_map_all.get("BTC-USDT")
+        if df_btc is None or df_btc.empty:
+            cand_file_btc = out_dir / "individual" / "merged_BTC-USDT.csv"
+            if cand_file_btc.exists():
+                df_btc = pd.read_csv(cand_file_btc)
+
+        btc_regime = regime_mgr.evaluate(df_btc, is_btc=True) if (df_btc is not None and not df_btc.empty) else {"regime_gate": "ALLOW", "state_name": "NORMAL"}
+        log(f"BTC Macro Regime: Gate={btc_regime.get('regime_gate')} | State={btc_regime.get('state_name')} | Action={btc_regime.get('action')} | PeakDrop={btc_regime.get('drop_from_peak_pct')}%")
+
+        # 各選定銘柄の個別レジーム判定
+        symbol_regimes = {}
+        stop_count = 0
+        for sym in FIXED_SYMBOLS:
+            clean_sym = normalize_symbol(sym)
+            df_sym_reg = df_map_all.get(clean_sym)
+            if df_sym_reg is None or df_sym_reg.empty:
+                cand_f = out_dir / "individual" / f"merged_{clean_sym}.csv"
+                if cand_f.exists():
+                    df_sym_reg = pd.read_csv(cand_f)
+
+            if df_sym_reg is not None and not df_sym_reg.empty:
+                sym_eval = regime_mgr.evaluate(df_sym_reg, is_btc=False)
+                symbol_regimes[clean_sym] = sym_eval
+                if sym_eval.get("regime_gate") == "STOP":
+                    stop_count += 1
+            else:
+                symbol_regimes[clean_sym] = {"regime_gate": "ALLOW", "state_name": "NORMAL", "action": "NORMAL"}
+
+        # 総合判定: BTC門番がSTOP、または選定銘柄の60%以上がSTOPなら全体STOP
+        overall_gate = "ALLOW"
+        if btc_regime.get("regime_gate") == "STOP":
+            overall_gate = "STOP"
+            overall_reason = f"BTC_REGIME_{btc_regime.get('state_name')}"
+        elif stop_count >= len(FIXED_SYMBOLS) * 0.6:
+            overall_gate = "STOP"
+            overall_reason = f"ALTS_MAJORITY_STOP_{stop_count}/{len(FIXED_SYMBOLS)}"
+        else:
+            overall_gate = "ALLOW"
+            overall_reason = "NORMAL_OR_BOTTOM_RECOVERY"
+
+        gate_icon = "🟢" if overall_gate == "ALLOW" else "🛑"
+        summary_text += f"\n🛡️ **[3. マクロレジーム門番判定 (Pattern A)]**\n"
+        summary_text += f"• 総合門番: {gate_icon} `{overall_gate}` (理由: `{overall_reason}`)\n"
+        summary_text += f"• BTCステート: `{btc_regime.get('state_name')}` (直近高値比: `{btc_regime.get('drop_from_peak_pct')}%`)\n"
+        summary_text += f"• 新規ロング制限銘柄数: `{stop_count} / {len(FIXED_SYMBOLS)}`\n"
+        summary_text += f"========================================\n"
+
+        log(f"Overall Regime Gate: {overall_gate} ({overall_reason}) | BTC: {btc_regime.get('state_name')}")
+
         if not args.no_chart_send:
             discord.send_message(summary_text)
 
@@ -1639,11 +1695,27 @@ async def main():
         state_data = {
             "market_state": final_state,
             "mean_norm": last_mean_norm,
+            "regime_gate": overall_gate,
+            "regime_reason": overall_reason,
+            "btc_regime": {
+                "state": btc_regime.get("state", 0),
+                "state_name": btc_regime.get("state_name", "NORMAL"),
+                "action": btc_regime.get("action", "NORMAL"),
+                "drop_from_peak_pct": btc_regime.get("drop_from_peak_pct", 0.0),
+            },
+            "symbol_regimes": {
+                k: {
+                    "regime_gate": v.get("regime_gate", "ALLOW"),
+                    "state_name": v.get("state_name", "NORMAL"),
+                    "action": v.get("action", "NORMAL"),
+                    "drop_from_peak_pct": v.get("drop_from_peak_pct", 0.0),
+                } for k, v in symbol_regimes.items()
+            },
             "timestamp": datetime.now(timezone.utc).isoformat()
         }
         with open(state_file, "w", encoding="utf-8") as f:
-            json.dump(state_data, f, indent=2)
-        log(f"Saved market state ({final_state}) to {state_file}")
+            json.dump(state_data, f, indent=2, ensure_ascii=False)
+        log(f"Saved market state ({final_state}, Gate={overall_gate}) to {state_file}")
 
     print("\n==================================================")
     print("  Smart Selection & Multi-Window Analysis Completed!")
