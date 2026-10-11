@@ -148,7 +148,20 @@ for _idx, _arg in enumerate(sys.argv):
         FORCE_STRATEGY = sys.argv[_idx + 1].strip().lower()
     elif _arg.startswith("--strategy=") or _arg.startswith("--strat="):
         FORCE_STRATEGY = _arg.split("=")[1].strip().lower()
+
+# コマンドライン引数からのステータス照会 (--status / --symbols)
+if any(arg in sys.argv for arg in ("--status", "--symbols", "-s")):
+    try:
+        from show_symbol_status import display_and_send_symbols_status
+        send_d = "--discord" in sys.argv
+        print("[Status Mode] 主要アルト20銘柄の最新選定・除外ステータスを出力します...")
+        display_and_send_symbols_status(send_to_discord=send_d)
+    except Exception as e:
+        print(f"[Status Mode Error] {e}")
+    sys.exit(0)
 # ========================================================================
+
+
 
 import bingx5_46_2api
 bingx5_46_2api.bingx_mode = 'live' if BINGX_IS_LIVE else 'demo'
@@ -1329,23 +1342,29 @@ async def run_screening_and_optimization(mode: str, send_charts: bool = False, s
     selected_symbols = list(profitable_cands)[:MAX_SELECTED_SYMBOLS]
     print(f"\n[Selection Result] 選定{len(selected_symbols)}銘柄 (サイクル適格 ＆ 個別最適化合格): {', '.join(selected_symbols) if selected_symbols else 'なし (全銘柄見送り・完全ノーポジ維持)'}")
 
-    # 除外された固定銘柄の理由をDiscordログ出力
-    rejected_symbols = [s for s in FIXED_SYMBOLS if s not in selected_symbols]
-    if rejected_symbols:
-        discord.print_log(f"🛑 【トレード見送り・除外銘柄 ({len(rejected_symbols)}銘柄)】: {', '.join(rejected_symbols)}")
-        eligible_file = Path(__file__).resolve().parent / "Data" / "trade_eligible_symbols.json"
-        if eligible_file.exists():
-            try:
-                with open(eligible_file, "r", encoding="utf-8") as ef:
-                    el_data = json.load(ef)
-                    reports = el_data.get("reports", {})
-                    for r_sym in rejected_symbols:
-                        r_info = reports.get(r_sym, {})
-                        reasons = r_info.get("rejection_reasons", [])
-                        reason_str = ", ".join(reasons) if reasons else "MTF判定アウトまたは最適化不合格"
-                        discord.print_log(f"   └ ❌ [{r_sym}] 除外理由: {reason_str}")
-            except Exception:
-                pass
+    # 直近の選定結果を JSON に永続化 (show_symbol_status 用)
+    last_res_file = Path(__file__).resolve().parent / "Data" / "last_selection_result.json"
+    try:
+        with open(last_res_file, "w", encoding="utf-8") as f:
+            json.dump({
+                "selected_symbols": selected_symbols,
+                "symbol_params_map": symbol_params_map,
+                "evaluated_at": datetime.now(timezone.utc).isoformat()
+            }, f, indent=2, ensure_ascii=False)
+    except Exception as e:
+        pass
+
+    # 全20銘柄の選定・除外ステータス完全一覧ダッシュボードを出力 ＆ Discord送信 (PROJECT_RULES.md 準拠)
+    try:
+        from show_symbol_status import display_and_send_symbols_status
+        display_and_send_symbols_status(
+            selected_symbols=selected_symbols,
+            symbol_params_map=symbol_params_map,
+            send_to_discord=True
+        )
+    except Exception as e:
+        discord.print_log(f"[Warning] 全銘柄ステータスダッシュボード出力エラー: {e}")
+
 
     # 選定銘柄の個別最適化パラメータをDiscordログ表示
     if selected_symbols:
