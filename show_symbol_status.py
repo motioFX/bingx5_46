@@ -250,48 +250,85 @@ def format_status_table_console(summary_data: Dict[str, Any]) -> str:
 
 
 def format_status_table_discord(summary_data: Dict[str, Any]) -> str:
-    """Discord向けの整形テキスト (文字数制限考慮)"""
+    """
+    Discord（特にスマホ表示）に最適化した整形テキスト
+    ・重要銘柄（選定中・高値警戒・セリクラ）のハイライト箇条書き
+    ・スマホの縦画面でも横スクロールせず収まる全20銘柄コンパクト一覧 (幅約36文字)
+    """
     counts = summary_data.get("counts", {})
     symbols = summary_data.get("symbols", [])
+    eval_time = summary_data.get("evaluated_at", "")[:16].replace("T", " ")
 
     lines = []
-    lines.append("📊 **【主要20銘柄 選定・除外ステータス一覧ダッシュボード】**")
+    lines.append(f"📊 **【主要20銘柄 選定・除外ステータス】** (`{eval_time} UTC`)")
+    lines.append(
+        f"💡 **内訳**: 監視: `{counts.get('SELECTED', 0)}` | 高値警戒: `{counts.get('TOP_STOP', 0)}` | "
+        f"セリクラ: `{counts.get('BOTTOM_WATCHING', 0)}` | 不合格: `{counts.get('OPT_REJECTED', 0)}`"
+    )
+
+    # 1. 重要グループのハイライト (スマホで真っ先に把握したい情報)
+    selected_list = [s for s in symbols if s["category"] == "SELECTED"]
+    top_stop_list = [s for s in symbols if s["category"] == "TOP_STOP"]
+    climax_list = [s for s in symbols if s["category"] == "BOTTOM_WATCHING"]
+    whale_list = [s for s in symbols if s["category"] == "WHALE_SHORT"]
+
+    if selected_list:
+        lines.append("\n🟢 **【トレード選定・監視中】**")
+        for s in selected_list:
+            sym_clean = s["symbol"].replace("-USDT", "")
+            strat = s.get("strategy", "")
+            pnl_str = f"+${s['pnl']:.2f}" if s.get("pnl") is not None else ""
+            wr_str = f"勝率{s['win_rate']:.0f}%" if s.get("win_rate") else ""
+            lines.append(f"• **{sym_clean}**: `{strat}` | {pnl_str} ({wr_str})")
+
+    if top_stop_list:
+        lines.append("\n🔴 **【高値圏警戒見送り (天井掴み防止)】**")
+        for s in top_stop_list:
+            sym_clean = s["symbol"].replace("-USDT", "")
+            lines.append(f"• **{sym_clean}**: 1週高値から `{s['drop_pct']:+.1f}%` 滞在 (停止幅2.0〜2.5%)")
+
+    if climax_list:
+        lines.append("\n🟡 **【セリクラ下落待機 (底打ち確認中)】**")
+        for s in climax_list:
+            sym_clean = s["symbol"].replace("-USDT", "")
+            lines.append(f"• **{sym_clean}**: 出来高急増後、反転足の確定待ち")
+
+    if whale_list:
+        lines.append("\n🔴 **【大口売り優勢 (Whale除外)】**")
+        for s in whale_list:
+            sym_clean = s["symbol"].replace("-USDT", "")
+            lines.append(f"• **{sym_clean}**: クジラ判定売り偏重 (SHORT_ONLY)")
+
+    # 2. スマホの画面幅 (36文字等幅) に収まる全20銘柄コンパクト表
+    lines.append("\n📱 **【全20銘柄 コンパクト一覧】**")
     lines.append("```text")
-    lines.append(f"{'銘柄':10s} | {'状態':14s} | {'1週乖離':7s} | {'PnL':9s} | {'詳細理由 / 戦略'}")
-    lines.append("-" * 68)
+    lines.append("銘柄      | 状態       | 1週乖離| PnL")
+    lines.append("------------------------------------")
 
     for s in symbols:
         sym = s["symbol"].replace("-USDT", "")
-        # 短縮バッジ
         cat = s["category"]
         if cat == "SELECTED":
-            b_short = "🟢選定・監視"
+            b_short = "🟢選定監視"
         elif cat == "TOP_STOP":
-            b_short = "🔴高値見送り"
+            b_short = "🔴高値警戒"
         elif cat == "BOTTOM_WATCHING":
-            b_short = "🟡セリクラ待機"
+            b_short = "🟡セリクラ"
         elif cat == "WHALE_SHORT":
-            b_short = "🔴クジラ売り"
+            b_short = "🔴大口売り"
         elif cat == "OVER_LIMIT":
-            b_short = "⚪選定枠外"
+            b_short = "⚪上限枠外"
         else:
-            b_short = "🔴最適化不合格"
+            b_short = "🔴不合格"
 
         drop = f"{s['drop_pct']:+5.1f}%"
-        pnl = f"${s['pnl']:+.1f}" if s["pnl"] is not None else "  ---  "
-        
-        # 理由の要約
-        reason = s["detail_reason"]
-        if len(reason) > 28:
-            reason = reason[:27] + "…"
+        if s["pnl"] is not None and s["trade_count"] > 0:
+            pnl_val = f"${s['pnl']:+5.1f}"
+        else:
+            pnl_val = " --- "
 
-        lines.append(f"{sym:10s} | {b_short:14s} | {drop:>7s} | {pnl:>9s} | {reason}")
+        lines.append(f"{sym:9s} | {b_short:8s} | {drop:>6s} | {pnl_val:>5s}")
 
-    lines.append("-" * 68)
-    lines.append(
-        f"選定監視: {counts.get('SELECTED', 0)} | 高値警戒: {counts.get('TOP_STOP', 0)} | "
-        f"セリクラ: {counts.get('BOTTOM_WATCHING', 0)} | 不合格: {counts.get('OPT_REJECTED', 0)} | 枠外: {counts.get('OVER_LIMIT', 0)}"
-    )
     lines.append("```")
     return "\n".join(lines)
 
@@ -309,7 +346,8 @@ def safe_print(text: str) -> None:
 def display_and_send_symbols_status(
     selected_symbols: Optional[List[str]] = None,
     symbol_params_map: Optional[Dict[str, Any]] = None,
-    send_to_discord: bool = True
+    send_to_discord: bool = True,
+    webhook_name: str = "real3_bngx"
 ) -> Dict[str, Any]:
     """
     全20銘柄のステータスを集計し、コンソールに表示してDiscordにも送信する。
@@ -323,17 +361,30 @@ def display_and_send_symbols_status(
             from config_loader import get_webhook_url
             import requests
 
-            webhook_url = get_webhook_url("real3_bngx") or get_webhook_url("test4_backtest")
+            webhook_url = get_webhook_url(webhook_name) or get_webhook_url("test4_backtest")
             if webhook_url:
                 discord_text = format_status_table_discord(summary)
-                requests.post(webhook_url, json={"content": discord_text}, timeout=10)
+                res = requests.post(webhook_url, json={"content": discord_text}, timeout=10)
+                res.raise_for_status()
+                safe_print(f"[Discord] {webhook_name} 宛にステータス通知を正常送信しました。")
+            else:
+                safe_print(f"[Discord Warning] Webhook URL ({webhook_name}) が見つかりません。")
         except Exception as e:
-            print(f"[Warning] Discord送信エラー: {e}")
+            safe_print(f"[Discord Error] Webhook送信失敗 ({webhook_name}): {e}")
 
     return summary
 
 
 if __name__ == "__main__":
-    send_discord_flag = "--discord" in sys.argv
-    print("[Status Tool] 20銘柄の最新選定・除外ステータスを集計中...")
-    display_and_send_symbols_status(send_to_discord=send_discord_flag)
+    send_discord_flag = ("--discord" in sys.argv or "--test4" in sys.argv)
+    target_wh = "test4_backtest" if ("--test4" in sys.argv or "test4" in sys.argv) else "real3_bngx"
+    
+    # --webhook 引数がある場合
+    for idx, arg in enumerate(sys.argv):
+        if arg == "--webhook" and idx + 1 < len(sys.argv):
+            target_wh = sys.argv[idx + 1].strip()
+            send_discord_flag = True
+
+    print(f"[Status Tool] 20銘柄の最新選定・除外ステータスを集計中... (送信先: {target_wh if send_discord_flag else 'なし'})")
+    display_and_send_symbols_status(send_to_discord=send_discord_flag, webhook_name=target_wh)
+
