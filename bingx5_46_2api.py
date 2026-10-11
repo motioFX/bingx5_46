@@ -628,50 +628,73 @@ class api_bingx:
 
         target_lot = lot
         filled_qty = 0.0
-        for attempt in range(3):
-            await self.active_order_cancel()
-            cur_bid, cur_ask = get_bingx_orderbook(self.symbol, self.bingx.base_url)
-            current_target, order_mode_label = determine_target_price(cur_bid, cur_ask, current_price)
-            attempt_price = self.bingx._quantize_price(current_target)
-            needed_lot = self.bingx._quantize_quantity(target_lot - filled_qty)
-            if needed_lot <= 0:
-                break
+        MAX_WAIT_SECONDS = 240  # PROJECT_RULES準拠: 最大約4分間 (240秒) 待機
+        INTERVAL_SECONDS = 15.0 # 15秒インターバル
+        max_attempts = int(MAX_WAIT_SECONDS / INTERVAL_SECONDS) # 16回
+        last_placed_price = None
 
-            order_params = {
-                "symbol": self.symbol,
-                "side": "BUY",
-                "positionSide": "LONG",
-                "type": "LIMIT",
-                "price": str(attempt_price),
-                "quantity": str(needed_lot),
-                "timeInForce": "GTC"
-            }
-            try:
-                res = await _async_bingx_request(
-                    "POST", self.bingx.base_url, "/openApi/swap/v2/trade/order",
-                    self.bingx.api_key, self.bingx.secret_key, params=order_params, timeout=10
-                )
-                discord.print_log(f"BingX Long Limit ({order_mode_label}) attempt {attempt+1}: price={attempt_price}, qty={needed_lot}, result={res}", level="debug")
-            except Exception as e:
-                discord.print_log(f"BingX Long entry exception (attempt {attempt+1}): {e}", level="debug")
-
-            await asyncio.sleep(4.0)
+        for attempt in range(max_attempts):
+            # 1. 約定状況チェック (フェイルファスト即時完了)
             pos = await self.get_positions()
             filled_qty = float(pos.get("buy", 0.0))
             if filled_qty >= target_lot * 0.95:
-                discord.print_log(f"[OK] Long エントリー約定完了: 保有量={filled_qty}/{target_lot} (attempt {attempt+1})", level="debug")
+                discord.print_log(f"[OK] Long エントリー約定完了: 保有量={filled_qty}/{target_lot} (待機: {attempt*INTERVAL_SECONDS:.0f}s/{MAX_WAIT_SECONDS}s)", level="debug")
                 self.entry_val = float(df['VAL'].iloc[-1]) if 'VAL' in df.columns else (current_price * 0.99)
                 self.entry_vah = float(df['VAH'].iloc[-1]) if 'VAH' in df.columns else (current_price * 1.01)
                 return True
 
-        if filled_qty > 0:
-            discord.print_log(f"[PARTIAL] Long 部分約定完了: 保有量={filled_qty}/{target_lot}", level="debug")
+            needed_lot = self.bingx._quantize_quantity(target_lot - filled_qty)
+            if needed_lot <= 0:
+                break
+
+            # 2. 板情報から最新の最良気配値を取得
+            cur_bid, cur_ask = get_bingx_orderbook(self.symbol, self.bingx.base_url)
+            current_target, order_mode_label = determine_target_price(cur_bid, cur_ask, current_price)
+            attempt_price = self.bingx._quantize_price(current_target)
+
+            # 3. 価格変化チェック（スマート追随）: 価格が同じならキャンセルせず指値キュー優先順位（Time Priority）を維持
+            if last_placed_price is not None and last_placed_price == attempt_price:
+                pass
+            else:
+                await self.active_order_cancel()
+                order_params = {
+                    "symbol": self.symbol,
+                    "side": "BUY",
+                    "positionSide": "LONG",
+                    "type": "LIMIT",
+                    "price": str(attempt_price),
+                    "quantity": str(needed_lot),
+                    "timeInForce": "GTC"
+                }
+                try:
+                    res = await _async_bingx_request(
+                        "POST", self.bingx.base_url, "/openApi/swap/v2/trade/order",
+                        self.bingx.api_key, self.bingx.secret_key, params=order_params, timeout=10
+                    )
+                    discord.print_log(f"BingX Long Limit ({order_mode_label}) [待機 {attempt*INTERVAL_SECONDS:.0f}s/{MAX_WAIT_SECONDS}s]: price={attempt_price}, qty={needed_lot}, result={res}", level="debug")
+                    last_placed_price = attempt_price
+                except Exception as e:
+                    discord.print_log(f"BingX Long entry exception (attempt {attempt+1}): {e}", level="debug")
+
+            await asyncio.sleep(INTERVAL_SECONDS)
+
+        # 最終判定 (約4分間経過後)
+        pos = await self.get_positions()
+        filled_qty = float(pos.get("buy", 0.0))
+        if filled_qty >= target_lot * 0.95:
+            discord.print_log(f"[OK] Long エントリー約定完了: 保有量={filled_qty}/{target_lot}", level="debug")
+            self.entry_val = float(df['VAL'].iloc[-1]) if 'VAL' in df.columns else (current_price * 0.99)
+            self.entry_vah = float(df['VAH'].iloc[-1]) if 'VAH' in df.columns else (current_price * 1.01)
+            return True
+        elif filled_qty > 0:
+            await self.active_order_cancel()
+            discord.print_log(f"[PARTIAL] Long 部分約定完了 (最大待機到達): 保有量={filled_qty}/{target_lot}", level="debug")
             self.entry_val = float(df['VAL'].iloc[-1]) if 'VAL' in df.columns else (current_price * 0.99)
             self.entry_vah = float(df['VAH'].iloc[-1]) if 'VAH' in df.columns else (current_price * 1.01)
             return True
         else:
             await self.active_order_cancel()
-            discord.print_log(f"[SKIP] Long 指値 3回リトライ全て未約定。エントリー見送り。", level="debug")
+            discord.print_log(f"[SKIP] Long 指値 最大4分間(240秒)未約定。次足確定に備えエントリー見送り。", level="debug")
             return False
 
     async def long_close(self, df, position, commission, sl_margin_pct=1.0, strategy_type="range", is_new_candle=False, entry_candle_time=None):
@@ -766,50 +789,73 @@ class api_bingx:
 
         target_lot = lot
         filled_qty = 0.0
-        for attempt in range(3):
-            await self.active_order_cancel()
-            cur_bid, cur_ask = get_bingx_orderbook(self.symbol, self.bingx.base_url)
-            current_target, order_mode_label = determine_short_target_price(cur_bid, cur_ask, current_price)
-            attempt_price = self.bingx._quantize_price(current_target)
-            needed_lot = self.bingx._quantize_quantity(target_lot - filled_qty)
-            if needed_lot <= 0:
-                break
+        MAX_WAIT_SECONDS = 240  # PROJECT_RULES準拠: 最大約4分間 (240秒) 待機
+        INTERVAL_SECONDS = 15.0 # 15秒インターバル
+        max_attempts = int(MAX_WAIT_SECONDS / INTERVAL_SECONDS) # 16回
+        last_placed_price = None
 
-            order_params = {
-                "symbol": self.symbol,
-                "side": "SELL",
-                "positionSide": "SHORT",
-                "type": "LIMIT",
-                "price": str(attempt_price),
-                "quantity": str(needed_lot),
-                "timeInForce": "GTC"
-            }
-            try:
-                res = await _async_bingx_request(
-                    "POST", self.bingx.base_url, "/openApi/swap/v2/trade/order",
-                    self.bingx.api_key, self.bingx.secret_key, params=order_params, timeout=10
-                )
-                discord.print_log(f"BingX Short Limit ({order_mode_label}) attempt {attempt+1}: price={attempt_price}, qty={needed_lot}, result={res}", level="debug")
-            except Exception as e:
-                discord.print_log(f"BingX Short entry exception (attempt {attempt+1}): {e}", level="debug")
-
-            await asyncio.sleep(4.0)
+        for attempt in range(max_attempts):
+            # 1. 約定状況チェック (フェイルファスト即時完了)
             pos = await self.get_positions()
             filled_qty = float(pos.get("sell", 0.0))
             if filled_qty >= target_lot * 0.95:
-                discord.print_log(f"[OK] Short エントリー約定完了: 保有量={filled_qty}/{target_lot} (attempt {attempt+1})", level="debug")
+                discord.print_log(f"[OK] Short エントリー約定完了: 保有量={filled_qty}/{target_lot} (待機: {attempt*INTERVAL_SECONDS:.0f}s/{MAX_WAIT_SECONDS}s)", level="debug")
                 self.entry_val = float(df['VAL'].iloc[-1]) if 'VAL' in df.columns else (current_price * 0.99)
                 self.entry_vah = float(df['VAH'].iloc[-1]) if 'VAH' in df.columns else (current_price * 1.01)
                 return True
 
-        if filled_qty > 0:
-            discord.print_log(f"[PARTIAL] Short 部分約定完了: 保有量={filled_qty}/{target_lot}", level="debug")
+            needed_lot = self.bingx._quantize_quantity(target_lot - filled_qty)
+            if needed_lot <= 0:
+                break
+
+            # 2. 板情報から最新の最良気配値を取得
+            cur_bid, cur_ask = get_bingx_orderbook(self.symbol, self.bingx.base_url)
+            current_target, order_mode_label = determine_short_target_price(cur_bid, cur_ask, current_price)
+            attempt_price = self.bingx._quantize_price(current_target)
+
+            # 3. 価格変化チェック（スマート追随）: 価格が同じならキャンセルせず指値キュー優先順位（Time Priority）を維持
+            if last_placed_price is not None and last_placed_price == attempt_price:
+                pass
+            else:
+                await self.active_order_cancel()
+                order_params = {
+                    "symbol": self.symbol,
+                    "side": "SELL",
+                    "positionSide": "SHORT",
+                    "type": "LIMIT",
+                    "price": str(attempt_price),
+                    "quantity": str(needed_lot),
+                    "timeInForce": "GTC"
+                }
+                try:
+                    res = await _async_bingx_request(
+                        "POST", self.bingx.base_url, "/openApi/swap/v2/trade/order",
+                        self.bingx.api_key, self.bingx.secret_key, params=order_params, timeout=10
+                    )
+                    discord.print_log(f"BingX Short Limit ({order_mode_label}) [待機 {attempt*INTERVAL_SECONDS:.0f}s/{MAX_WAIT_SECONDS}s]: price={attempt_price}, qty={needed_lot}, result={res}", level="debug")
+                    last_placed_price = attempt_price
+                except Exception as e:
+                    discord.print_log(f"BingX Short entry exception (attempt {attempt+1}): {e}", level="debug")
+
+            await asyncio.sleep(INTERVAL_SECONDS)
+
+        # 最終判定 (約4分間経過後)
+        pos = await self.get_positions()
+        filled_qty = float(pos.get("sell", 0.0))
+        if filled_qty >= target_lot * 0.95:
+            discord.print_log(f"[OK] Short エントリー約定完了: 保有量={filled_qty}/{target_lot}", level="debug")
+            self.entry_val = float(df['VAL'].iloc[-1]) if 'VAL' in df.columns else (current_price * 0.99)
+            self.entry_vah = float(df['VAH'].iloc[-1]) if 'VAH' in df.columns else (current_price * 1.01)
+            return True
+        elif filled_qty > 0:
+            await self.active_order_cancel()
+            discord.print_log(f"[PARTIAL] Short 部分約定完了 (最大待機到達): 保有量={filled_qty}/{target_lot}", level="debug")
             self.entry_val = float(df['VAL'].iloc[-1]) if 'VAL' in df.columns else (current_price * 0.99)
             self.entry_vah = float(df['VAH'].iloc[-1]) if 'VAH' in df.columns else (current_price * 1.01)
             return True
         else:
             await self.active_order_cancel()
-            discord.print_log(f"[SKIP] Short 指値 3回リトライ全て未約定。エントリー見送り。", level="debug")
+            discord.print_log(f"[SKIP] Short 指値 最大4分間(240秒)未約定。次足確定に備えエントリー見送り。", level="debug")
             return False
 
     async def short_close(self, df, position, commission, sl_margin_pct=1.0, strategy_type="range", is_new_candle=False, entry_candle_time=None):
