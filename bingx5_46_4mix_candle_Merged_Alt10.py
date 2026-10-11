@@ -1522,13 +1522,27 @@ async def main():
         window_states = []
 
         ts_jst_str = datetime.now(JST).strftime("%Y-%m-%d %H:%M")
+        ascii_banner = (
+            "```\n"
+            " ____  _               __  __\n"
+            "| __ )(_)_ __   __ _  \\ \\/ /\n"
+            "|  _ \\| | '_ \\ / _` |  \\  / \n"
+            "| |_) | | | | | (_| |  /  \\ \n"
+            "|____/|_|_| |_|\\__, | /_/\\_\\\n"
+            "               |___/        \n"
+            "----------------------------\n"
+            " BINGX TOP 20 CYCLE SCANNER \n"
+            "----------------------------\n"
+            "```"
+        )
+        print(ascii_banner)
+        if not args.no_chart_send:
+            discord.send_message(ascii_banner)
+
         summary_text = (
-            f"🚀 **【BingX ブレイクアウト前兆選定 & 多期間分析レポート】** ({ts_jst_str} JST)\n"
+            f"🚀 **【BingX 主要20銘柄 サイクル危険回避判定 & ノーマライズ分析】** ({ts_jst_str} JST)\n"
             f"========================================\n"
         )
-        summary_text += f"\n📊 **[1. マルチタイムフレーム地合い判定]**\n"
-
-        # ユーザー指示: 選定銘柄（固定20銘柄 + BTC）のみで 30d, 10d, 5d ノーマライズチャートを生成
 
         # ② 固定選定銘柄 (主要アルトコイン20銘柄 + BTC) のノーマライズチャート (30D, 10D, 5D)
         print("\n[Fixed Selection Charts] Generating 30d, 10d, 5d Normalized Charts...")
@@ -1549,21 +1563,11 @@ async def main():
             if not args.no_chart_send and fixed_chart and fixed_chart.exists():
                 discord.send_file(fixed_chart, f"🎯 **【主要20銘柄 ノーマライズチャート [{win_label.upper()}]】**")
 
-        # ③ 30d, 10d, 5d のマルチタイムフレーム地合い判定 (チャート生成・Discord送信は廃止、地合い計算のみ維持)
-        print("\n[MTF Market State Analysis] Analyzing 30d, 10d, 5d Market States...")
-        for win_label, win_hours in windows:
-            _, mean_norm, market_state = generate_normalized_charts(plot_dfs, out_dir, win_label, win_hours, save_chart=False)
-            final_st = "long_only" if market_state == "LONG" else "short_only"
-            state_icon = "🟢" if market_state == "LONG" else "🔴"
-            print(f"   └ [{win_label} Window] Mean Norm: {mean_norm:.4f} -> Market State: {market_state} ({final_st})")
-            summary_text += f"• **[{win_label.upper()}]**: {state_icon} `{market_state}` (平均騰落: `{mean_norm:.4f}`)\n"
-            window_states.append((win_label, market_state, mean_norm))
-
-        # ④ 主要20銘柄 MTF完全ロング判定レポート
+        # ③ 主要20銘柄 1週間高値圏 ＆ セリクラ底打ち危険回避判定レポート
         print("\n==================================================================================")
-        print(" [Step 2: Fixed 20 Symbols MTF Complete Long Eligibility Assessment]")
+        print(" [Step 2: Fixed 20 Symbols 168h Top-Stop & Climax Recovery Safety Assessment]")
         print("==================================================================================")
-        summary_text += f"\n👑 **[2. 主要20銘柄 MTF完全ロング判定レポート]**\n"
+        summary_text += f"\n👑 **【主要20銘柄 1週間高値＆セリクラ危険回避判定レポート】**\n"
         
         df_map_all = {}
         for d in all_dfs:
@@ -1592,33 +1596,40 @@ async def main():
 
             is_ok, report = check_mtf_long_eligibility(df_sym, clean_sym)
             mtf_reports[clean_sym] = report
-            if is_ok:
-                eligible_symbols.append(clean_sym)
-                status_badge = "🟢 【トレードOK】"
-            else:
-                status_badge = "🔴 【見送り (アウト)】"
-
-            w_strs = []
-            for w_name in ["30d", "10d", "5d"]:
-                w_info = report.get("window_results", {}).get(w_name)
-                if w_info:
-                    p_pct = int(w_info["peak_ratio"] * 100)
-                    icon = "🟢" if w_info["passed"] else "⚪"
-                    w_strs.append(f"{w_name}:{p_pct}%{icon}")
-                else:
-                    w_strs.append(f"{w_name}:-")
-            w_line = " ".join(w_strs)
 
             c_info = report.get("cycle_result", {})
             c_state = c_info.get("state_name", "NORMAL")
-            c_climax = "⚡" if c_info.get("climax_hit") else ""
+            drop_pct = c_info.get("drop_from_peak_pct", 0.0)
+            is_near = c_info.get("is_near_top", False)
+            climax_hit = c_info.get("climax_hit", False)
+            vol_ratio = c_info.get("vol_ratio", 1.0)
+            is_bull = c_info.get("is_bullish", False)
+            wick_r = c_info.get("wick_ratio", 0.0)
 
-            log_line = f" • {clean_sym:10s} : {status_badge} | サイクル:{c_state}{c_climax} | MTF: {w_line}"
+            # ステータスバッジの細分化
+            if is_ok:
+                eligible_symbols.append(clean_sym)
+                if climax_hit:
+                    status_badge = "🟢 【トレードOK (底打ち完了✨)】"
+                else:
+                    status_badge = "🟢 【トレードOK (巡航)】"
+            else:
+                if is_near:
+                    status_badge = "🔴 【高値圏見送り⚠️】"
+                elif climax_hit:
+                    status_badge = "🟡 【セリクラ下落待機⚡】"
+                else:
+                    status_badge = "🔴 【見送り】"
+
+            climax_str = f"⚡急増({vol_ratio:.1f}x)" if climax_hit else f"⚪通常({vol_ratio:.1f}x)"
+            wick_str = f"✨陽線ヒゲ{int(wick_r*100)}%" if (is_bull and wick_r >= 0.30) else f"⚪ヒゲ{int(wick_r*100)}%"
+
+            log_line = f" • {clean_sym:10s} : {status_badge:26s} | 1週高値乖離: {drop_pct:+5.1f}% | 出来高: {climax_str:12s} | 反転足: {wick_str}"
             if not is_ok and report.get("rejection_reasons"):
-                log_line += f" | 除外理由: {', '.join(report['rejection_reasons'])}"
+                log_line += f" | 理由: {', '.join(report['rejection_reasons'])}"
             log(log_line)
 
-            summary_text += f"• **{clean_sym}**: {status_badge} [サイクル:{c_state}{c_climax}] (`{w_line}`)\n"
+            summary_text += f"• **{clean_sym}**: {status_badge} [1週高値乖離:`{drop_pct:+5.1f}%`, 出来高:`{climax_str}`, 反転:`{wick_str}`]\n"
 
         print("----------------------------------------------------------------------------------")
         log(f"サイクル適格銘柄: {', '.join(eligible_symbols) if eligible_symbols else 'なし（全銘柄高値圏警戒）'}")

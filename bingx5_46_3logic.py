@@ -193,6 +193,13 @@ class RegimeFilterManager:
             2: "WAIT_RECOVERY_BULL_HAMMER",
         }
 
+        curr_vol_ma = vol_sma24[-1] if not np.isnan(vol_sma24[-1]) and vol_sma24[-1] > 0 else vol[-1]
+        curr_vol_ratio = float(vol[-1] / curr_vol_ma) if curr_vol_ma > 0 else 1.0
+        candle_total_last = high[-1] - low[-1]
+        lower_wick_last = min(open_[-1], close[-1]) - low[-1]
+        curr_wick_ratio = float(lower_wick_last / candle_total_last) if candle_total_last > 0 else 0.0
+        is_near_top = bool(close[-1] >= curr_peak * (1.0 - self.near_top_pct))
+
         return {
             "long_allowed": curr_allowed,
             "regime_gate": "ALLOW" if curr_allowed else "STOP",
@@ -205,6 +212,10 @@ class RegimeFilterManager:
             "last_sl_price": round(float(low[-1]), 4) if low[-1] > 0 else None,
             "climax_hit": climax_hit,
             "tracked_top_peak": curr_peak,
+            "is_near_top": is_near_top,
+            "vol_ratio": round(curr_vol_ratio, 2),
+            "wick_ratio": round(curr_wick_ratio, 2),
+            "is_bullish": bool(close[-1] > open_[-1]),
         }
 
 
