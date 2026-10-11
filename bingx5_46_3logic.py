@@ -1846,6 +1846,9 @@ def simulate_rsima_strategy(
     avg_price = 0.0
     pos_count = 0
     
+    pending_entry = None  # PROJECT_RULES準拠: 終値-0.1%指値待機用
+    maker_fee_rate = 0.0002  # Maker指値手数料 0.02%
+    
     trailing_tp_active = False
     trail_peak = 0.0
 
@@ -1871,7 +1874,24 @@ def simulate_rsima_strategy(
         # ゴールデンクロス判定: rsi > lrsiMA かつ 前足では rsi <= lrsiMA
         gc = (r > ma_val) and (r_prev <= ma_prev)
         
-        # 決済チェック
+        # 0. 前足で配置されたエントリー指値の約定チェック (PROJECT_RULES準拠: 終値-0.1%指値 ➔ 次足安値タッチで約定)
+        if pending_entry is not None:
+            limit_px = pending_entry["limit_price"]
+            if l <= limit_px:
+                exec_price = limit_px
+                buy_val = trade_size_usdt
+                qty = buy_val / exec_price
+                fee = buy_val * maker_fee_rate
+                cum_fees += fee
+                pos_cost += buy_val
+                pos_qty += qty
+                avg_price = pos_cost / pos_qty
+                pos_count += 1
+                exec_history.append({"timestamp": ts, "price": exec_price, "size": qty, "type": pending_entry["entry_type"]})
+            # 1足で届かなければ未約定キャンセル (PROJECT_RULES準拠)
+            pending_entry = None
+
+        # 1. 決済チェック (保有ポジションがある場合、確定足Closeでの成行決済)
         if pos_qty > 0:
             # 1. 損切り (Stop Loss) チェック: 5分確定足終値判定 (Close) -2.5%
             if sl_pct > 0 and c < avg_price * (1.0 - sl_pct):
@@ -1916,31 +1936,31 @@ def simulate_rsima_strategy(
                         trailing_tp_active = False
                         trail_peak = 0.0
 
-                
-        # エントリー / ナンピン判定
-        if pos_count < max_trades:
+        # 2. エントリー / ナンピン指値の発注判定
+        if pos_count < max_trades and pending_entry is None:
             can_enter = False
+            entry_type = None
             if pos_count == 0:
                 # 初回エントリー: GC かつ ma_val < lEp かつ r < lCp
                 if gc and (ma_val < lEp) and (r < lCp):
                     can_enter = True
+                    entry_type = "ENTRY_RSIMA_GC"
             else:
                 # ナンピン (ピラミッディング): 平均建値からの段階的下落率 (1〜3回目: 0.2%, 4〜5回目: 0.3%, 6〜8回目: 0.4%)
                 add_pct = calc_add_pct(pos_count)
                 if c <= avg_price * (1.0 - add_pct):
                     can_enter = True
+                    entry_type = f"NANPIN_RSIMA_{pos_count}"
                     
             if can_enter:
-                buy_val = trade_size_usdt
-                qty = buy_val / c
-                fee = buy_val * fee_rate
-                cum_fees += fee
-                pos_cost += buy_val
-                pos_qty += qty
-                avg_price = pos_cost / pos_qty
-                pos_count += 1
-                entry_type = "ENTRY_RSIMA_GC" if pos_count == 1 else f"NANPIN_RSIMA_{pos_count-1}"
-                exec_history.append({"timestamp": ts, "price": c, "size": qty, "type": entry_type})
+                # PROJECT_RULES準拠: 終値の0.1%下に指値を配置し、次足で約定判定
+                limit_price = c * (1.0 - 0.001)
+                pending_entry = {
+                    "limit_price": limit_price,
+                    "pos_count": pos_count,
+                    "entry_type": entry_type,
+                    "placed_ts": ts
+                }
                     
         unrealized = (pos_qty * c - pos_cost) if pos_qty > 0 else 0.0
         unrealized_list.append(unrealized)
@@ -2019,6 +2039,9 @@ def simulate_val_poc_strategy(
     pos_count = 0
     last_entry_price = 0.0
 
+    pending_entry = None  # PROJECT_RULES準拠: 終値-0.1%指値待機用
+    maker_fee_rate = 0.0002  # Maker指値手数料 0.02%
+
     cum_realized_pnl = 0.0
     cum_fees = 0.0
     trades = []
@@ -2035,7 +2058,25 @@ def simulate_val_poc_strategy(
         poc = pocs[i]
         ts = df["timestamp"].iloc[i] if "timestamp" in df.columns else i
 
-        # 1. 決済チェック (保有ポジションがある場合)
+        # 0. 前足で配置されたエントリー/ナンピン指値の約定チェック (PROJECT_RULES準拠: 終値-0.1%指値 ➔ 次足安値タッチで約定)
+        if pending_entry is not None:
+            limit_px = pending_entry["limit_price"]
+            if l <= limit_px:
+                exec_price = limit_px
+                buy_val = trade_size_usdt
+                qty = buy_val / exec_price
+                fee = buy_val * maker_fee_rate
+                cum_fees += fee
+                pos_cost += buy_val
+                pos_qty += qty
+                last_entry_price = exec_price
+                avg_price = pos_cost / pos_qty
+                pos_count += 1
+                exec_history.append({"timestamp": ts, "price": exec_price, "size": qty, "type": pending_entry["entry_type"]})
+            # 1足で届かなければ未約定キャンセル (PROJECT_RULES準拠)
+            pending_entry = None
+
+        # 1. 決済チェック (保有ポジションがある場合、確定足Closeでの成行決済)
         if pos_qty > 0:
             # A. 固定損切り (9.0% SL: 5分確定足終値判定 Close)
             if sl_pct > 0 and c < avg_price * (1.0 - sl_pct):
@@ -2071,35 +2112,26 @@ def simulate_val_poc_strategy(
                     last_entry_price = 0.0
 
         # 2. エントリー / ナンピン判定
-        if not np.isnan(val) and not np.isnan(prev_val):
+        if not np.isnan(val) and not np.isnan(prev_val) and pending_entry is None:
             # 初期エントリー: ポジションなし かつ VAL ゴールデンクロス
             if pos_count == 0:
                 if (closes[i-1] <= prev_val) and (c > val):
-                    buy_val = trade_size_usdt
-                    qty = buy_val / c
-                    fee = buy_val * fee_rate
-                    cum_fees += fee
-                    pos_cost += buy_val
-                    pos_qty += qty
-                    last_entry_price = c
-                    avg_price = pos_cost / pos_qty
-                    pos_count = 1
-                    exec_history.append({"timestamp": ts, "price": c, "size": qty, "type": "ENTRY_VAL_GC"})
+                    limit_price = c * (1.0 - 0.001)
+                    pending_entry = {
+                        "limit_price": limit_price,
+                        "entry_type": "ENTRY_VAL_GC",
+                        "placed_ts": ts
+                    }
             # ナンピン: 最後の建値から段階的下落（1〜3回目: 0.2%, 4〜5回目: 0.3%）、最大5回まで追加
             elif 1 <= pos_count < total_max_stages:
                 drop_pct = calc_add_pct(pos_count) if (nanpin_drop_pct is None or nanpin_drop_pct == 0.002) else nanpin_drop_pct
                 if (c <= last_entry_price * (1.0 - drop_pct)) or (l <= last_entry_price * (1.0 - drop_pct)):
-                    add_price = min(c, last_entry_price * (1.0 - drop_pct))
-                    buy_val = trade_size_usdt
-                    qty = buy_val / add_price
-                    fee = buy_val * fee_rate
-                    cum_fees += fee
-                    pos_cost += buy_val
-                    pos_qty += qty
-                    last_entry_price = add_price
-                    avg_price = pos_cost / pos_qty
-                    pos_count += 1
-                    exec_history.append({"timestamp": ts, "price": add_price, "size": qty, "type": f"NANPIN_{pos_count-1}", "drop_pct": drop_pct})
+                    limit_price = c * (1.0 - 0.001)
+                    pending_entry = {
+                        "limit_price": limit_price,
+                        "entry_type": f"NANPIN_{pos_count}",
+                        "placed_ts": ts
+                    }
 
         unrealized = (pos_qty * c - pos_cost) if pos_qty > 0 else 0.0
         unrealized_list.append(unrealized)
