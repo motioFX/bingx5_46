@@ -889,9 +889,9 @@ async def validate_profitable_candidates(trade_side: str, mode: str, base_symbol
     from bingx5_46_2api import api_bingx
     from bingx5_46_3logic import run_interval_comparison, logicinstance, resample_candles
 
-    discord.print_log("👑 【固定20銘柄 MTF完全ロング判定 ＆ 2大戦略 (RSIMA / VAL_POC) 個別最適化】を開始します...")
+    discord.print_log("👑 【固定20銘柄 サイクル適格判定(168h高値停止/底打ち再開) ＆ 2大戦略 個別最適化】を開始します...")
     
-    # 1. trade_eligible_symbols.json から MTF 完全ロング判定合格銘柄をロード
+    # 1. trade_eligible_symbols.json から サイクル適格判定合格銘柄をロード
     eligible_file = Path(__file__).resolve().parent / "Data" / "trade_eligible_symbols.json"
     target_cands = []
     if eligible_file.exists():
@@ -899,7 +899,7 @@ async def validate_profitable_candidates(trade_side: str, mode: str, base_symbol
             with open(eligible_file, "r", encoding="utf-8") as ef:
                 el_data = json.load(ef)
                 target_cands = el_data.get("eligible_symbols", [])
-                discord.print_log(f"   [MTF判定済] トレード適格銘柄: {', '.join(target_cands) if target_cands else 'なし (全銘柄見送り)'}")
+                discord.print_log(f"   [サイクル判定済] トレード適格銘柄: {', '.join(target_cands) if target_cands else 'なし (全銘柄高値圏警戒見送り)'}")
         except Exception as e:
             discord.print_log(f"   [Warning] eligible_symbols 読込失敗: {e}")
             target_cands = list(FIXED_SYMBOLS)
@@ -1327,7 +1327,7 @@ async def run_screening_and_optimization(mode: str, send_charts: bool = False, s
 
     # MTF適格 かつ バックテスト合格銘柄のみを選定（不適格銘柄の強制追加は完全撤廃）
     selected_symbols = list(profitable_cands)[:MAX_SELECTED_SYMBOLS]
-    print(f"\n[Selection Result] 選定{len(selected_symbols)}銘柄 (MTF合格 ＆ 個別最適化合格): {', '.join(selected_symbols) if selected_symbols else 'なし (全銘柄見送り・完全ノーポジ維持)'}")
+    print(f"\n[Selection Result] 選定{len(selected_symbols)}銘柄 (サイクル適格 ＆ 個別最適化合格): {', '.join(selected_symbols) if selected_symbols else 'なし (全銘柄見送り・完全ノーポジ維持)'}")
 
     # 除外された固定銘柄の理由をDiscordログ出力
     rejected_symbols = [s for s in FIXED_SYMBOLS if s not in selected_symbols]

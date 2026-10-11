@@ -62,45 +62,41 @@ def calc_ema(series: pd.Series, length: int) -> pd.Series:
 
 class RegimeFilterManager:
     """
-    高値圏ロング停止 ＆ セリクラ下ヒゲ陽線底打ちレジームフィルター管理クラス (PROJECT_RULES 準拠)
-    パターンA: 上位足門番 (Macro Regime Gate)
-      - NORMAL (0): 通常ロング許可
-      - TOP_EXHAUSTION (1): 高値圏・出来高細り検知 -> 新規ロング停止 ＆ 既存ストップ引き上げ
-      - DOWN_WAITING (2): 下落待機フェーズ -> ジリ下げ静観 (手出し無用)
-      - BOTTOM_WATCHING (3): 底打ち・セリクラ監視 -> 出来高急増 + 下ヒゲ陽線でロング再開
+    高値圏ロング停止 ＆ セリクラ下ヒゲ陽線底打ちサイクル管理クラス (PROJECT_RULES / TradingView 実証準拠)
+    TradingView勝率82.5%、PF 3.45の実証ロジック完全準拠:
+      - 監視期間 (range_hours): 168時間 (7日間 / 1週間)
+      - 天井停止 (near_top_pct): 過去168時間最高値の 2.5% 以内に入ったら新規ロング停止
+      - 上放れブレイク: 天井ピークを上抜けたら即座にロング再開 (トレンド継続)
+      - セリクラ検知 (climax_vol_mult): 出来高が直近24SMAの 1.4 倍以上でセリクラ認定
+      - 底打ち反転足: セリクラ検知後、陽線 かつ 下ヒゲ比率 30% 以上の確定足でロング再開
+    状態:
+      - NORMAL (0): 通常ロング許可 (long_allowed = True)
+      - TOP_STOP (1): 天井・高値圏警戒ロング停止 (long_allowed = False, climax_hit = False)
+      - CLIMAX_BOTTOM_WAIT (2): セリクラ検知済・反転陽線待ち (long_allowed = False, climax_hit = True)
     """
     STATE_NAMES = {
         0: "NORMAL",
-        1: "TOP_EXHAUSTION",
-        2: "DOWN_WAITING",
-        3: "BOTTOM_WATCHING",
+        1: "TOP_STOP",
+        2: "CLIMAX_BOTTOM_WAIT",
     }
 
     def __init__(
         self,
-        lookback_high: int = 48,
-        stagnation_bars: int = 24,
-        vol_decay_ratio: float = 0.80,
-        btc_drop_pct: float = -0.05,
-        alt_drop_pct: float = -0.10,
-        vol_surge_mult: float = 2.0,
-        rsi_bottom_th: float = 35.0,
-        lower_wick_ratio: float = 0.35,
+        range_hours: int = 168,
+        near_top_pct: float = 0.025,
+        climax_vol_mult: float = 1.4,
+        wick_ratio_req: float = 0.30,
     ):
-        self.lookback_high = lookback_high
-        self.stagnation_bars = stagnation_bars
-        self.vol_decay_ratio = vol_decay_ratio
-        self.btc_drop_pct = btc_drop_pct
-        self.alt_drop_pct = alt_drop_pct
-        self.vol_surge_mult = vol_surge_mult
-        self.rsi_bottom_th = rsi_bottom_th
-        self.lower_wick_ratio = lower_wick_ratio
+        self.range_hours = range_hours
+        self.near_top_pct = near_top_pct
+        self.climax_vol_mult = climax_vol_mult
+        self.wick_ratio_req = wick_ratio_req
 
     def evaluate(self, df: pd.DataFrame, is_btc: bool = False) -> Dict[str, Any]:
         """
-        1時間足データからレジーム状態および門番許可フラグを算出する
+        1時間足データからサイクル状態および門番許可フラグを算出する (TradingView完全準拠)
         """
-        if df is None or len(df) < 24:
+        if df is None or len(df) < 12:
             return {
                 "long_allowed": True,
                 "regime_gate": "ALLOW",
@@ -111,11 +107,11 @@ class RegimeFilterManager:
                 "drop_from_peak_pct": 0.0,
                 "recent_peak_price": 0.0,
                 "last_sl_price": 0.0,
+                "climax_hit": False,
             }
 
         df = df.copy().reset_index(drop=True)
         n = len(df)
-        long_allowed = np.ones(n, dtype=bool)
 
         close = df['close'].values.astype(float)
         open_ = df['open'].values.astype(float)
@@ -124,103 +120,91 @@ class RegimeFilterManager:
         vol = df['volume'].values.astype(float)
 
         vol_s = pd.Series(vol)
-        vol_sma20 = vol_s.rolling(20, min_periods=5).mean().values
         vol_sma24 = vol_s.rolling(24, min_periods=5).mean().values
-        vol_sma72 = vol_s.rolling(72, min_periods=10).mean().values
 
-        rsi14 = calc_rsi(df['close'], 14).values
+        # 状態追跡変数 (Pine Script の var 変数と同等)
+        long_allowed_arr = np.ones(n, dtype=bool)
+        state_arr = np.zeros(n, dtype=int)
 
-        # 下ヒゲ陽線判定
-        is_bullish = close > open_
-        body = np.abs(close - open_)
-        lower_wick = np.where(is_bullish, open_ - low, close - low)
-        total_candle_range = high - low + 1e-9
-
-        is_hammer_bull = (
-            is_bullish &
-            (lower_wick >= body * 0.8) &
-            ((lower_wick / total_candle_range) >= self.lower_wick_ratio)
-        )
-
-        state = 0
-        recent_peak_price = close[0]
-        target_drop = self.btc_drop_pct if is_btc else self.alt_drop_pct
-        regime_states = np.zeros(n, dtype=int)
-        last_sl_price = 0.0
+        long_allowed = True
+        tracked_top_peak: Optional[float] = None
+        climax_hit = False
 
         for i in range(1, n):
             c = close[i]
+            o = open_[i]
+            h = high[i]
+            l = low[i]
             v = vol[i]
+            v_ma24 = vol_sma24[i] if not np.isnan(vol_sma24[i]) and vol_sma24[i] > 0 else v
 
-            lookback_start = max(0, i - self.lookback_high)
-            curr_window_high = np.max(high[lookback_start:i+1])
-            curr_window_high_idx = lookback_start + np.argmax(high[lookback_start:i+1])
-            bars_since_new_high = i - curr_window_high_idx
+            # 過去 range_hours 本の最高値 (リペイント防止: 直前確定足までの高値ウィンドウ)
+            lookback_start = max(0, i - self.range_hours)
+            h1_peak_high = float(np.max(high[lookback_start:i])) if i > lookback_start else h
 
-            is_vol_decay = False
-            if i >= 72 and vol_sma72[i] > 0:
-                is_vol_decay = vol_sma24[i] < (vol_sma72[i] * self.vol_decay_ratio)
+            # 天井判定 (高値圏 2.5% 以内)
+            is_top_signal = (c >= h1_peak_high * (1.0 - self.near_top_pct))
 
-            drop_from_peak = (c - curr_window_high) / curr_window_high
+            # 1. 上放れブレイクで相場継続とみなして即解除
+            if not long_allowed and tracked_top_peak is not None and h > tracked_top_peak:
+                long_allowed = True
+                climax_hit = False
+                tracked_top_peak = None
 
-            if state == 0:  # NORMAL
-                is_near_high = (curr_window_high - c) / curr_window_high <= 0.025
-                if bars_since_new_high >= self.stagnation_bars and is_near_high and is_vol_decay:
-                    state = 1  # TOP_EXHAUSTION
-                    recent_peak_price = curr_window_high
-                long_allowed[i] = True
+            # 2. 天井検知 -> 新規ロング停止
+            if long_allowed and is_top_signal:
+                long_allowed = False
+                tracked_top_peak = h1_peak_high
+                climax_hit = False
 
-            elif state == 1:  # TOP_EXHAUSTION
-                long_allowed[i] = False
-                if c > recent_peak_price * 1.005:
-                    state = 0
-                    long_allowed[i] = True
-                elif drop_from_peak <= -0.02:
-                    state = 2  # DOWN_WAITING
+            # 3. 下落・底打ち監視
+            if not long_allowed:
+                # セリクラ判定 (出来高が24SMAの1.4倍以上)
+                if v >= v_ma24 * self.climax_vol_mult:
+                    climax_hit = True
 
-            elif state == 2:  # DOWN_WAITING
-                long_allowed[i] = False
-                if drop_from_peak <= target_drop:
-                    state = 3  # BOTTOM_WATCHING
-                elif c > recent_peak_price:
-                    state = 0
-                    long_allowed[i] = True
+                # 反転足判定 (陽線 & 下ヒゲ比率30%以上)
+                candle_total = h - l
+                lower_wick = min(o, c) - l
+                c_wick_ok = (candle_total > 0) and ((lower_wick / candle_total) >= self.wick_ratio_req)
+                is_bullish_h1 = (c > o) and c_wick_ok
 
-            elif state == 3:  # BOTTOM_WATCHING
-                long_allowed[i] = False
-                is_climax = (v >= vol_sma20[i] * self.vol_surge_mult) or (rsi14[i] <= self.rsi_bottom_th)
-                if (is_climax and is_hammer_bull[i]) or (is_hammer_bull[i] and rsi14[i] <= self.rsi_bottom_th + 5.0):
-                    state = 0  # NORMAL復帰
-                    long_allowed[i] = True
-                    last_sl_price = low[i]
-                elif c > recent_peak_price:
-                    state = 0
-                    long_allowed[i] = True
+                if climax_hit and is_bullish_h1:
+                    long_allowed = True
+                    climax_hit = False
+                    tracked_top_peak = None
 
-            regime_states[i] = state
+            long_allowed_arr[i] = long_allowed
+            if long_allowed:
+                state_arr[i] = 0
+            elif climax_hit:
+                state_arr[i] = 2
+            else:
+                state_arr[i] = 1
 
-        curr_state = regime_states[-1]
-        curr_allowed = bool(long_allowed[-1])
-        curr_drop = float((close[-1] - curr_window_high) / curr_window_high)
+        curr_state = int(state_arr[-1])
+        curr_allowed = bool(long_allowed_arr[-1])
+        curr_peak = tracked_top_peak if tracked_top_peak is not None else float(np.max(high[max(0, n - self.range_hours):]))
+        curr_drop = float((close[-1] - curr_peak) / curr_peak) if curr_peak > 0 else 0.0
 
         action_map = {
             0: "NORMAL",
-            1: "TIGHTEN_SL_AND_STOP_NEW_LONG",
-            2: "WAIT_FOR_BOTTOM",
-            3: "WATCH_CLIMAX",
+            1: "STOP_NEW_LONG_NEAR_TOP",
+            2: "WAIT_RECOVERY_BULL_HAMMER",
         }
 
         return {
             "long_allowed": curr_allowed,
             "regime_gate": "ALLOW" if curr_allowed else "STOP",
-            "state": int(curr_state),
+            "state": curr_state,
             "state_name": self.STATE_NAMES.get(curr_state, "NORMAL"),
             "action": action_map.get(curr_state, "NORMAL"),
+            "reason": f"State={self.STATE_NAMES.get(curr_state)} (Allowed={curr_allowed}, Climax={climax_hit}, Peak={curr_peak:.4f}, Drop={curr_drop*100:.1f}%)",
             "drop_from_peak_pct": round(curr_drop * 100.0, 2),
-            "recent_peak_price": round(float(curr_window_high), 4),
-            "last_sl_price": round(float(last_sl_price), 4) if last_sl_price > 0 else None,
-            "is_hammer_bull_latest": bool(is_hammer_bull[-1]),
-            "rsi14_latest": round(float(rsi14[-1]), 1),
+            "recent_peak_price": round(curr_peak, 4),
+            "last_sl_price": round(float(low[-1]), 4) if low[-1] > 0 else None,
+            "climax_hit": climax_hit,
+            "tracked_top_peak": curr_peak,
         }
 
 

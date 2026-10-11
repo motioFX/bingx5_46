@@ -847,9 +847,9 @@ def check_mtf_long_eligibility(
     windows: Sequence[Tuple[str, int]] = (("30d", 720), ("10d", 240), ("5d", 120))
 ) -> Tuple[bool, Dict[str, Any]]:
     """
-    固定銘柄のマルチタイムフレーム (30d, 10d, 5d) における最高値発生位置を検証。
-    各ウィンドウの前半（0〜50%）に最高値がある場合は「ロング判定アウト (見送り 🔴)」。
-    3期間すべてで後半（50〜100%）に最高値がある銘柄のみ「完全ロング認識 (トレードOK 🟢)」と認定する。
+    固定銘柄のマルチタイムフレーム分析 ＆ 高値圏・底打ちサイクル適格判定 (PROJECT_RULES / TradingView 実証準拠)
+    従来の「過去5日間の前半に高値があるだけで一律除外」する過剰足切りを撤廃し、
+    TradingView勝率82.5%、PF 3.45の実証サイクル (168時間高値圏2.5%停止 & 出来高1.4倍・下ヒゲ30%底打ち再開) に基づき判定する。
     """
     if df is None or df.empty or len(df) < 12:
         return False, {
@@ -857,7 +857,8 @@ def check_mtf_long_eligibility(
             "is_eligible": False,
             "status": "DATA_INSUFFICIENT",
             "rejection_reasons": ["データ不足"],
-            "window_results": {}
+            "window_results": {},
+            "cycle_result": {}
         }
 
     closes = df["close"].astype(float).values
@@ -865,14 +866,10 @@ def check_mtf_long_eligibility(
     
     total_bars = len(closes)
     window_results = {}
-    all_passed = True
-    rejection_reasons = []
 
     for w_name, w_hours in windows:
         bars_count = min(total_bars, w_hours)
         if bars_count < 12:
-            all_passed = False
-            rejection_reasons.append(f"{w_name}足数不足")
             window_results[w_name] = {
                 "passed": False,
                 "peak_ratio": 0.0,
@@ -890,30 +887,36 @@ def check_mtf_long_eligibility(
         peak_price = float(w_highs[peak_idx])
         curr_price = float(w_closes[-1])
         
-        # 前半判定: peak_ratio < 0.50 は前半高値（アウト）
-        # 後半判定: peak_ratio >= 0.50 は後半高値（セーフ）
-        is_first_half_peak = (peak_ratio < 0.50)
-        passed = not is_first_half_peak
-        
-        if not passed:
-            all_passed = False
-            rejection_reasons.append(f"{w_name}前半高値(位置:{peak_ratio*100:.1f}%)")
-
         window_results[w_name] = {
-            "passed": passed,
+            "passed": True,
             "peak_ratio": peak_ratio,
             "peak_price": peak_price,
             "curr_price": curr_price,
             "drawdown_from_peak_pct": ((curr_price - peak_price) / peak_price * 100.0) if peak_price > 0 else 0.0
         }
 
-    status_str = "ELIGIBLE" if all_passed else "OUT_FIRST_HALF_PEAK"
-    return all_passed, {
+    # TradingView実証のサイクル判定 (168時間天井停止 & 底打ち再開)
+    regime_mgr = RegimeFilterManager()
+    cycle_res = regime_mgr.evaluate(df, is_btc=(symbol == "BTC-USDT"))
+    long_allowed = cycle_res.get("long_allowed", True)
+    state_name = cycle_res.get("state_name", "NORMAL")
+    rejection_reasons = []
+
+    if not long_allowed:
+        rejection_reasons.append(f"高値圏2.5%警戒中(State:{state_name})")
+        status_str = "OUT_CYCLE_TOP_STOP"
+        is_eligible = False
+    else:
+        status_str = "ELIGIBLE"
+        is_eligible = True
+
+    return is_eligible, {
         "symbol": symbol,
-        "is_eligible": all_passed,
+        "is_eligible": is_eligible,
         "status": status_str,
         "rejection_reasons": rejection_reasons,
-        "window_results": window_results
+        "window_results": window_results,
+        "cycle_result": cycle_res
     }
 
 
@@ -1600,21 +1603,25 @@ async def main():
                 w_info = report.get("window_results", {}).get(w_name)
                 if w_info:
                     p_pct = int(w_info["peak_ratio"] * 100)
-                    icon = "🟢" if w_info["passed"] else "🔴"
+                    icon = "🟢" if w_info["passed"] else "⚪"
                     w_strs.append(f"{w_name}:{p_pct}%{icon}")
                 else:
                     w_strs.append(f"{w_name}:-")
             w_line = " ".join(w_strs)
 
-            log_line = f" • {clean_sym:10s} : {status_badge} | MTF: {w_line}"
+            c_info = report.get("cycle_result", {})
+            c_state = c_info.get("state_name", "NORMAL")
+            c_climax = "⚡" if c_info.get("climax_hit") else ""
+
+            log_line = f" • {clean_sym:10s} : {status_badge} | サイクル:{c_state}{c_climax} | MTF: {w_line}"
             if not is_ok and report.get("rejection_reasons"):
                 log_line += f" | 除外理由: {', '.join(report['rejection_reasons'])}"
             log(log_line)
 
-            summary_text += f"• **{clean_sym}**: {status_badge} (`{w_line}`)\n"
+            summary_text += f"• **{clean_sym}**: {status_badge} [サイクル:{c_state}{c_climax}] (`{w_line}`)\n"
 
         print("----------------------------------------------------------------------------------")
-        log(f"MTF完全ロング適格銘柄: {', '.join(eligible_symbols) if eligible_symbols else 'なし（全銘柄前半高値除外）'}")
+        log(f"サイクル適格銘柄: {', '.join(eligible_symbols) if eligible_symbols else 'なし（全銘柄高値圏警戒）'}")
 
         # trade_eligible_symbols.json に保存
         eligible_file = out_dir / "trade_eligible_symbols.json"
