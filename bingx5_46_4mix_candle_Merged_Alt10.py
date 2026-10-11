@@ -895,15 +895,27 @@ def check_mtf_long_eligibility(
             "drawdown_from_peak_pct": ((curr_price - peak_price) / peak_price * 100.0) if peak_price > 0 else 0.0
         }
 
-    # TradingView実証のサイクル判定 (168時間天井停止 & 底打ち再開)
-    regime_mgr = RegimeFilterManager()
+    # TradingView実証のサイクル判定 (168時間天井停止 & 底打ち再開: 高値2〜5%、セリクラ1〜5倍、下ヒゲ15%)
+    from bingx5_46_3logic import optimize_cycle_filter
+    opt_res = optimize_cycle_filter(df, symbol=symbol, wick_ratio_req=0.15)
+    best_top_pct = opt_res.get("best_top_pct", 0.030)
+    best_vol_mult = opt_res.get("best_vol_mult", 2.5)
+
+    regime_mgr = RegimeFilterManager(
+        range_hours=168,
+        near_top_pct=best_top_pct,
+        climax_vol_mult=best_vol_mult,
+        wick_ratio_req=0.15
+    )
     cycle_res = regime_mgr.evaluate(df, is_btc=(symbol == "BTC-USDT"))
+    cycle_res["best_top_pct"] = best_top_pct
+    cycle_res["best_vol_mult"] = best_vol_mult
     long_allowed = cycle_res.get("long_allowed", True)
     state_name = cycle_res.get("state_name", "NORMAL")
     rejection_reasons = []
 
     if not long_allowed:
-        rejection_reasons.append(f"高値圏2.5%警戒中(State:{state_name})")
+        rejection_reasons.append(f"高値圏{best_top_pct*100:.1f}%警戒中(State:{state_name})")
         status_str = "OUT_CYCLE_TOP_STOP"
         is_eligible = False
     else:
@@ -1621,15 +1633,17 @@ async def main():
                 else:
                     status_badge = "🔴 【見送り】"
 
-            climax_str = f"⚡急増({vol_ratio:.1f}x)" if climax_hit else f"⚪通常({vol_ratio:.1f}x)"
-            wick_str = f"✨陽線ヒゲ{int(wick_r*100)}%" if (is_bull and wick_r >= 0.30) else f"⚪ヒゲ{int(wick_r*100)}%"
+            best_top_pct = c_info.get("best_top_pct", 0.030)
+            best_vol_mult = c_info.get("best_vol_mult", 2.5)
+            climax_str = f"⚡急増({vol_ratio:.1f}x/{best_vol_mult:.1f}x)" if climax_hit else f"⚪通常({vol_ratio:.1f}x/{best_vol_mult:.1f}x)"
+            wick_str = f"✨陽線ヒゲ{int(wick_r*100)}%" if (is_bull and wick_r >= 0.15) else f"⚪ヒゲ{int(wick_r*100)}%"
 
-            log_line = f" • {clean_sym:10s} : {status_badge:26s} | 1週高値乖離: {drop_pct:+5.1f}% | 出来高: {climax_str:12s} | 反転足: {wick_str}"
+            log_line = f" • {clean_sym:10s} : {status_badge:26s} | 1週高値乖離: {drop_pct:+5.1f}% (停止幅:{best_top_pct*100:.1f}%) | 出来高: {climax_str:16s} | 反転足: {wick_str}"
             if not is_ok and report.get("rejection_reasons"):
                 log_line += f" | 理由: {', '.join(report['rejection_reasons'])}"
             log(log_line)
 
-            summary_text += f"• **{clean_sym}**: {status_badge} [1週高値乖離:`{drop_pct:+5.1f}%`, 出来高:`{climax_str}`, 反転:`{wick_str}`]\n"
+            summary_text += f"• **{clean_sym}**: {status_badge} [1週高値乖離:`{drop_pct:+5.1f}%` (停止:`{best_top_pct*100:.1f}%`), 出来高:`{climax_str}`, 反転:`{wick_str}`]\n"
 
         print("----------------------------------------------------------------------------------")
         log(f"サイクル適格銘柄: {', '.join(eligible_symbols) if eligible_symbols else 'なし（全銘柄高値圏警戒）'}")

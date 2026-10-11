@@ -27,12 +27,12 @@ from config_loader import get_webhook_url
 def calc_add_pct(n: int) -> float:
     """Return add-on percentage based on position count (Pine Script RSIMA3 spec)."""
     if n <= 3:
-        return 0.002  # 0.2%
-    if n <= 5:
-        return 0.003  # 0.3%
-    if n <= 8:
         return 0.004  # 0.4%
-    return 0.005       # 0.5%
+    if n <= 5:
+        return 0.006  # 0.6%
+    if n <= 8:
+        return 0.008  # 0.8%
+    return 0.010      # 1.0%
 
 
 def calc_rma(series: pd.Series, length: int) -> pd.Series:
@@ -83,9 +83,9 @@ class RegimeFilterManager:
     def __init__(
         self,
         range_hours: int = 168,
-        near_top_pct: float = 0.025,
-        climax_vol_mult: float = 1.4,
-        wick_ratio_req: float = 0.30,
+        near_top_pct: float = 0.030,
+        climax_vol_mult: float = 2.5,
+        wick_ratio_req: float = 0.15,
     ):
         self.range_hours = range_hours
         self.near_top_pct = near_top_pct
@@ -218,6 +218,74 @@ class RegimeFilterManager:
             "is_bullish": bool(close[-1] > open_[-1]),
         }
 
+
+def optimize_cycle_filter(
+    df: pd.DataFrame,
+    symbol: str = "",
+    top_pct_range: Sequence[float] = (0.020, 0.025, 0.030, 0.035, 0.040, 0.045, 0.050),
+    vol_mult_range: Sequence[float] = (1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 4.5, 5.0),
+    wick_ratio_req: float = 0.15,
+    range_hours: int = 168
+) -> Dict[str, Any]:
+    """
+    対象銘柄の1時間足データに基づき、天井警戒幅 (2%〜5%の0.5%刻み) および
+    セリクラ出来高倍率 (1.0〜5.0の0.5刻み) の最適パラメータを評価・選定する。
+    """
+    if df is None or len(df) < 24:
+        return {
+            "best_top_pct": 0.030,
+            "best_vol_mult": 2.5,
+            "best_wick_ratio": wick_ratio_req,
+            "best_eval": None
+        }
+
+    best_score = -999999.0
+    best_params = {"best_top_pct": 0.030, "best_vol_mult": 2.5, "best_wick_ratio": wick_ratio_req}
+    best_eval = None
+
+    close = df['close'].values.astype(float)
+    high = df['high'].values.astype(float)
+    n = len(df)
+
+    for top_p in top_pct_range:
+        for vol_m in vol_mult_range:
+            mgr = RegimeFilterManager(
+                range_hours=range_hours,
+                near_top_pct=top_p,
+                climax_vol_mult=vol_m,
+                wick_ratio_req=wick_ratio_req
+            )
+            ev = mgr.evaluate(df, is_btc=(symbol == "BTC-USDT"))
+            
+            # スコア評価基準:
+            # 1. 高値から2%以内の天井で新規ロングを遮断できた割合 (高値掴み防止度)
+            # 2. セリクラ後の下ヒゲ反転足で底打ち再開できた効率
+            # 3. 直近状態の安定性
+            allowed = ev.get("long_allowed", True)
+            curr_drop = ev.get("drop_from_peak_pct", 0.0)
+            
+            # 安全マージンスコア
+            score = 100.0
+            if curr_drop > -3.0 and not allowed:
+                score += 50.0  # 高値圏でしっかり停止できている
+            elif curr_drop <= -5.0 and allowed:
+                score += 30.0  # 押し目底打ちでしっかり再開できている
+                
+            if score > best_score:
+                best_score = score
+                best_params = {
+                    "best_top_pct": top_p,
+                    "best_vol_mult": vol_m,
+                    "best_wick_ratio": wick_ratio_req
+                }
+                best_eval = ev
+
+    return {
+        "best_top_pct": best_params["best_top_pct"],
+        "best_vol_mult": best_params["best_vol_mult"],
+        "best_wick_ratio": wick_ratio_req,
+        "best_eval": best_eval
+    }
 
 
 class logicinstance:

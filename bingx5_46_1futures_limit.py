@@ -1360,7 +1360,7 @@ async def run_screening_and_optimization(mode: str, send_charts: bool = False, s
             p_detail = p.get('params', {})
             
             if strat in ("VAL_POC", "VP_VAL_GC"):
-                param_str = f"VAL_GC ➔ 段階的ナンピン(最大{p_detail.get('max_nanpin', 5)}回: 0.2%/0.3%) ➔ POCクローズ"
+                param_str = f"VAL_GC ➔ 段階的ナンピン(最大{p_detail.get('max_nanpin', 5)}回: 0.4%/0.6%) ➔ POCクローズ"
             else:
                 param_str = f"RSI={p_detail.get('rsi_len', 9)}, MALen={p_detail.get('lma_len', 7)}, L-Entry<{p_detail.get('lEp', 40)}, L-Exit>{p_detail.get('lCp', 70)}"
 
