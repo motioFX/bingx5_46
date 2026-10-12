@@ -26,7 +26,7 @@ from config_loader import get_webhook_url
 
 def calc_add_pct(n: int, strategy: str = "val_poc") -> float:
     """Return add-on percentage based on position count.
-    VAL_POC: 3.0% (実証黄金最適値: 浅いノイズでの建玉肥大化を防ぎ損失リスク半減)
+    VAL_POC: 3.0% (1年分実証最適値: 浅いノイズでの建玉肥大化を防ぎ損失リスク半減)
     RSIMA: 0.4%〜1.0% (Pine Script RSIMA3 spec)
     """
     strat = str(strategy).lower()
@@ -839,7 +839,7 @@ class logicinstance:
         df['long_rsima'] = rsi_gc & (df['lrsiMA'] < r_lep) & (df['rsi'] < r_lcp)
         df['longclose_rsima'] = df['rsi'] > r_lcp
 
-        # --- VAL_POC 黄金最適仕様 (EMA 200 + バリュー幅 >= 1.5% + VAL-VAH 60%利確) ---
+        # --- VAL_POC 実証最適仕様 (EMA 200 + バリュー幅 >= 1.5% + VAL-VAH 60%利確) ---
         # 1. EMA 200 トレンドフィルター (5分足 200本)
         df['ema200'] = calc_ema(df['close'], 200)
         # 2. バリューエリア幅フィルター (1.5%以上: スクイーズ騙し排除)
@@ -2364,7 +2364,7 @@ def simulate_val_poc_strategy(
     sl_pct: float = 0.09
 ) -> dict:
     """
-    VAL ゴールデンクロス ＆ EMA200 ＆ バリュー幅>=1.5% ＆ VAL-VAH 60%利確 ＆ -3%ナンピン最大2回 (VAL_POC 実証黄金仕様)
+    VAL ゴールデンクロス ＆ EMA200 ＆ バリュー幅>=1.5% ＆ VAL-VAH 60%利確 ＆ -3%ナンピン最大2回 (VAL_POC 実証最適仕様)
     - EMA 200 トレンドフィルター: close >= EMA(close, 200)
     - バリュー幅フィルター: (VAH - VAL) / VAL >= 1.5%
     - 利確: VAL + (VAH - VAL) * 0.60 (60%水準) かつ 建値以上
@@ -2559,7 +2559,7 @@ def optimize_symbol_strategy(
         lma_lengths = [7]
         lEps = [30, 35, 40, 45, 50]
         lCps = [60, 65, 70, 75, 80]
-        sl_pcts = [0.020, 0.025, 0.030, 0.035, 0.040]  # 中心値3.0%、0.5%刻み (2.0%〜4.0%、黄金値3.0%)
+        sl_pcts = [0.020, 0.025, 0.030, 0.035, 0.040]  # 中心値3.0%、0.5%刻み (2.0%〜4.0%、最適値3.0%)
         
         for rl in rsi_lengths:
             for ml in lma_lengths:
@@ -2576,7 +2576,7 @@ def optimize_symbol_strategy(
 
     # 2. VAL_POC 戦略 (出来高構造リバウンド ＆ EMA200 ＆ バリュー幅>=1.5% ＆ 60%利確 ＆ -3%ナンピン最大2回 ＆ SL 9.0%)
     if force_strategy is None or force_strategy.lower() in ("val_poc", "vp_val_gc"):
-        vp_sl_pcts = [0.085, 0.090, 0.095]  # 実証黄金最適値 9.0% (±0.5%)
+        vp_sl_pcts = [0.085, 0.090, 0.095]  # 1年分実証最適値 9.0% (±0.5%)
         for sl in vp_sl_pcts:
             res_val_poc = simulate_val_poc_strategy(
                 df, vp_period=150, num_bins=50, max_nanpin=2, nanpin_drop_pct=0.030,

@@ -80,7 +80,7 @@ BINGX_IS_LIVE = False
 BINGX_IS_AIR = ("--air" in sys.argv or "--mock" in sys.argv)
 
 # [ 3 ] ポジション・ロット設定
-BINGX_TARGET_POSITION_VALUE_USDT = 75.0  # 証拠金 $7.5 × レバレッジ10倍 (実証黄金最適値)
+BINGX_TARGET_POSITION_VALUE_USDT = 75.0  # 証拠金 $7.5 × レバレッジ10倍 (1年分実証最適値)
 TARGET_POSITION_VALUE_USDT = BINGX_TARGET_POSITION_VALUE_USDT
 LEVERAGE_FACTOR = 10.0
 MAX_ACTIVE_POSITIONS: int = 2  # 最大同時保有ポジション数 (資金効率と分散を最適化)
