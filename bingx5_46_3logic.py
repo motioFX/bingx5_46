@@ -24,8 +24,14 @@ from bingx5_46_5backtest_mm import make_mm_pl, Backtest, AirExchange
 from config_loader import get_webhook_url
 
 
-def calc_add_pct(n: int) -> float:
-    """Return add-on percentage based on position count (Pine Script RSIMA3 spec)."""
+def calc_add_pct(n: int, strategy: str = "val_poc") -> float:
+    """Return add-on percentage based on position count.
+    VAL_POC: 3.0% (実証黄金最適値: 浅いノイズでの建玉肥大化を防ぎ損失リスク半減)
+    RSIMA: 0.4%〜1.0% (Pine Script RSIMA3 spec)
+    """
+    strat = str(strategy).lower()
+    if strat in ("val_poc", "vp_val_gc"):
+        return 0.030  # -3.0% 下落ナンピン
     if n <= 3:
         return 0.004  # 0.4%
     if n <= 5:
@@ -33,6 +39,7 @@ def calc_add_pct(n: int) -> float:
     if n <= 8:
         return 0.008  # 0.8%
     return 0.010      # 1.0%
+
 
 
 def calc_rma(series: pd.Series, length: int) -> pd.Series:
@@ -832,10 +839,22 @@ class logicinstance:
         df['long_rsima'] = rsi_gc & (df['lrsiMA'] < r_lep) & (df['rsi'] < r_lcp)
         df['longclose_rsima'] = df['rsi'] > r_lcp
 
-        # --- VAL_GC ＆ POCクローズ (val_poc) 戦略シグナル ---
-        # VALゴールデンクロス: 1本前がVAL以下、かつ当足終値がVALを上抜け復帰
-        df['long_val_gc'] = (df['close'].shift(1) <= df['VAL'].shift(1)) & (df['close'] > df['VAL'])
-        # POCクローズ: 終値がPOC以上
+        # --- VAL_POC 黄金最適仕様 (EMA 200 + バリュー幅 >= 1.5% + VAL-VAH 60%利確) ---
+        # 1. EMA 200 トレンドフィルター (5分足 200本)
+        df['ema200'] = calc_ema(df['close'], 200)
+        # 2. バリューエリア幅フィルター (1.5%以上: スクイーズ騙し排除)
+        va_width = (df['VAH'] - df['VAL']) / df['VAL'].replace(0, np.nan)
+        df['va_width_ok'] = va_width >= 0.015
+        # 3. VALゴールデンクロス (1本前がVAL以下、かつ当足終値がVALを上抜け復帰)
+        val_gc = (df['close'].shift(1) <= df['VAL'].shift(1)) & (df['close'] > df['VAL'])
+        # 総合ロングエントリー: VAL上抜け + バリュー幅1.5%以上 + EMA200以上
+        df['long_val_gc'] = val_gc & df['va_width_ok'] & (df['close'] >= df['ema200'])
+
+        # 4. VAL-VAH 60%水準利確ターゲット
+        target_tp = df['VAL'] + (df['VAH'] - df['VAL']) * 0.60
+        df['tp_target_60'] = target_tp
+        df['longclose_val_60'] = (df['close'] >= target_tp) | (df['high'] >= target_tp)
+        # 従来のPOCクローズも参考互換として保持
         df['longclose_poc'] = df['close'] >= df['POC']
 
         strat_lower = str(strategy_type).lower()
@@ -852,8 +871,9 @@ class logicinstance:
         elif strat_lower in ("val_poc", "vp_val_gc"):
             df['long'] = df['long_val_gc']
             df['short'] = False
-            df['longclose'] = df['longclose_poc']
+            df['longclose'] = df['longclose_val_60']
             df['shortclose'] = False
+
         elif strat_lower in ("breakout", "squeeze_breakout"):
             df['long'] = df['long_breakout']
             df['short'] = df['short_breakout']
