@@ -972,7 +972,7 @@ async def validate_profitable_candidates(trade_side: str, mode: str, base_symbol
             try:
                 results, cand_strat, cand_inv, cand_mp, cand_er, cand_margin = run_interval_comparison(
                     df_60m=cand_df, lot=1.0, data_equity=100.0, side_mode=trade_side, symbol=cand,
-                    max_trades=MAX_TRADES_COUNT
+                    max_trades=MAX_TRADES_COUNT, force_strategy=FORCE_STRATEGY
                 )
                 
                 # 有効な最良結果を抽出

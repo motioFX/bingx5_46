@@ -2357,35 +2357,44 @@ def simulate_val_poc_strategy(
     df: pd.DataFrame,
     vp_period: int = 150,
     num_bins: int = 50,
-    max_nanpin: int = 4,
-    nanpin_drop_pct: float = None,
+    max_nanpin: int = 2,
+    nanpin_drop_pct: float = 0.030,
     initial_equity: float = 100.0,
     fee_rate: float = 0.0006,
     sl_pct: float = 0.09
 ) -> dict:
     """
-    VAL ゴールデンクロス ＆ 直近建値 段階的ナンピン最大5回 ＆ 建値以上限定POCクローズ (VP Strategy v5仕様)
-    - 損切りは実証知見に基づき 9.0% (終値確定判定) を厳格適用 (7.5%以下厳禁)
-    - VP計算は5分足150本 (12.5時間)、50 bins
+    VAL ゴールデンクロス ＆ EMA200 ＆ バリュー幅>=1.5% ＆ VAL-VAH 60%利確 ＆ -3%ナンピン最大2回 (VAL_POC 実証黄金仕様)
+    - EMA 200 トレンドフィルター: close >= EMA(close, 200)
+    - バリュー幅フィルター: (VAH - VAL) / VAL >= 1.5%
+    - 利確: VAL + (VAH - VAL) * 0.60 (60%水準) かつ 建値以上
+    - ナンピン: 直近建値から -3.0% 下落ごと、最大2回 (初期1 + ナンピン2 = 計3枠)
+    - 損切り: 9.0% (5分足確定終値判定) ＋ 24時間 (288本) クールダウン
     """
     closes = df["close"].values
     highs = df["high"].values if "high" in df.columns else closes
     lows = df["low"].values if "low" in df.columns else closes
     n = len(closes)
+
+    # 1. EMA 200 算出
+    ema200 = calc_ema(df["close"], 200).values
     
-    if "VAL" not in df.columns or "POC" not in df.columns or df["VAL"].isna().all():
+    # 2. Market Profile 算出
+    if "VAL" not in df.columns or "POC" not in df.columns or "VAH" not in df.columns or df["VAL"].isna().all():
         logic = logicinstance()
         df_mp = logic.make_market_profile(df, period=vp_period, num_bins=num_bins)
         vals = df_mp["VAL"].values
+        vahs = df_mp["VAH"].values
         pocs = df_mp["POC"].values
     else:
         vals = df["VAL"].values
+        vahs = df["VAH"].values if "VAH" in df.columns else (vals * 1.02)
         pocs = df["POC"].values
 
     if n < 10:
         return {"final_pnl": 0.0, "trade_count": 0, "win_rate": 0.0, "DD_max": 0.0, "max_unrealized_loss": 0.0}
 
-    total_max_stages = max_nanpin + 1  # 初期エントリー1回 + ナンピン4回 = 計5回 (pyramiding 5)
+    total_max_stages = max_nanpin + 1  # 初期1 + ナンピン2 = 計3枠
     trade_size_usdt = initial_equity / total_max_stages
 
     pos_qty = 0.0
@@ -2393,9 +2402,10 @@ def simulate_val_poc_strategy(
     avg_price = 0.0
     pos_count = 0
     last_entry_price = 0.0
+    sl_cooldown_until = -1  # 24h (288本) クールダウン
 
-    pending_entry = None  # PROJECT_RULES準拠: 終値-0.1%指値待機用
-    maker_fee_rate = 0.0002  # Maker指値手数料 0.02%
+    pending_entry = None  # Maker指値待機用
+    maker_fee_rate = 0.0002  # Maker手数料 0.02%
 
     cum_realized_pnl = 0.0
     cum_fees = 0.0
@@ -2410,10 +2420,12 @@ def simulate_val_poc_strategy(
         l = lows[i]
         val = vals[i]
         prev_val = vals[i-1]
+        vah = vahs[i]
         poc = pocs[i]
+        e200 = ema200[i]
         ts = df["timestamp"].iloc[i] if "timestamp" in df.columns else i
 
-        # 0. 前足で配置されたエントリー/ナンピン指値の約定チェック (PROJECT_RULES準拠: 終値-0.1%指値 ➔ 次足安値タッチで約定)
+        # 0. 前足で配置されたエントリー/ナンピン指値の約定チェック
         if pending_entry is not None:
             limit_px = pending_entry["limit_price"]
             if l <= limit_px:
@@ -2428,7 +2440,6 @@ def simulate_val_poc_strategy(
                 avg_price = pos_cost / pos_qty
                 pos_count += 1
                 exec_history.append({"timestamp": ts, "price": exec_price, "size": qty, "type": pending_entry["entry_type"]})
-            # 1足で届かなければ未約定キャンセル (PROJECT_RULES準拠)
             pending_entry = None
 
         # 1. 決済チェック (保有ポジションがある場合、確定足Closeでの成行決済)
@@ -2448,38 +2459,44 @@ def simulate_val_poc_strategy(
                 avg_price = 0.0
                 pos_count = 0
                 last_entry_price = 0.0
-            # B. POC クローズ (高値または終値が POC に到達・上抜け かつ 建値以上 [Quick TP] Only Exit Above Avg Price)
-            elif not np.isnan(poc) and (h >= poc or c >= poc):
-                exit_price = max(c, poc) if h >= poc else c
-                # [Quick TP] Only Exit Above Avg Price: 平均建値（手数料マージン込み）より上のプラス域のみ利確
-                if exit_price > avg_price * (1.0 + fee_rate):
-                    sell_val = pos_qty * exit_price
-                    fee = sell_val * fee_rate
-                    pnl = sell_val - pos_cost - fee
-                    cum_realized_pnl += pnl
-                    cum_fees += fee
-                    trades.append(pnl)
-                    exec_history.append({"timestamp": ts, "price": exit_price, "size": -pos_qty, "type": "POC_CLOSE", "pnl": pnl})
-                    pos_qty = 0.0
-                    pos_cost = 0.0
-                    avg_price = 0.0
-                    pos_count = 0
-                    last_entry_price = 0.0
+                sl_cooldown_until = i + 288  # 24時間 (288足) クールダウン発動
+            # B. VAL-VAH 60%水準 利確クローズ (高値または終値が target_tp に到達かつ建値以上)
+            else:
+                target_tp = val + (vah - val) * 0.60 if (vah > val and val > 0) else poc
+                if not np.isnan(target_tp) and (h >= target_tp or c >= target_tp):
+                    exit_price = max(c, target_tp) if h >= target_tp else c
+                    if exit_price > avg_price * (1.0 + fee_rate):
+                        sell_val = pos_qty * exit_price
+                        fee = sell_val * fee_rate
+                        pnl = sell_val - pos_cost - fee
+                        cum_realized_pnl += pnl
+                        cum_fees += fee
+                        trades.append(pnl)
+                        exec_history.append({"timestamp": ts, "price": exit_price, "size": -pos_qty, "type": "VAL_VAH_60_TP", "pnl": pnl})
+                        pos_qty = 0.0
+                        pos_cost = 0.0
+                        avg_price = 0.0
+                        pos_count = 0
+                        last_entry_price = 0.0
 
         # 2. エントリー / ナンピン判定
         if not np.isnan(val) and not np.isnan(prev_val) and pending_entry is None:
-            # 初期エントリー: ポジションなし かつ VAL ゴールデンクロス
+            # 初期エントリー: ポジションなし ＆ クールダウン解除済 ＆ VALゴールデンクロス ＆ バリュー幅>=1.5% ＆ Close >= EMA200
             if pos_count == 0:
-                if (closes[i-1] <= prev_val) and (c > val):
-                    limit_price = c * (1.0 - 0.001)
-                    pending_entry = {
-                        "limit_price": limit_price,
-                        "entry_type": "ENTRY_VAL_GC",
-                        "placed_ts": ts
-                    }
-            # ナンピン: 最後の建値から段階的下落（1〜3回目: 0.2%, 4〜5回目: 0.3%）、最大5回まで追加
+                if i >= sl_cooldown_until:
+                    va_width_pct = ((vah - val) / val) if val > 0 else 0.0
+                    val_gc = (closes[i-1] <= prev_val) and (c > val)
+                    trend_ok = (c >= e200) if not np.isnan(e200) else True
+                    if val_gc and (va_width_pct >= 0.015) and trend_ok:
+                        limit_price = c * (1.0 - 0.001)
+                        pending_entry = {
+                            "limit_price": limit_price,
+                            "entry_type": "ENTRY_VAL_GC",
+                            "placed_ts": ts
+                        }
+            # ナンピン: 最後の建値から -3.0% 下落、最大2回追加 (初期1+ナンピン2=計3枠)
             elif 1 <= pos_count < total_max_stages:
-                drop_pct = calc_add_pct(pos_count) if (nanpin_drop_pct is None or nanpin_drop_pct == 0.002) else nanpin_drop_pct
+                drop_pct = nanpin_drop_pct or 0.030
                 if (c <= last_entry_price * (1.0 - drop_pct)) or (l <= last_entry_price * (1.0 - drop_pct)):
                     limit_price = c * (1.0 - 0.001)
                     pending_entry = {
@@ -2525,7 +2542,7 @@ def simulate_val_poc_strategy(
 def optimize_symbol_strategy(
     df: pd.DataFrame,
     symbol: str = "",
-    max_trades: int = 1,
+    max_trades: int = 3,
     initial_equity: float = 100.0,
     force_strategy: Optional[str] = None
 ) -> Tuple[str, Dict[str, Any], Dict[str, Any], list]:
@@ -2557,15 +2574,15 @@ def optimize_symbol_strategy(
                             label = f"RSIMA_R{rl}_M{ml}_Ep{ep}_Cp{cp}_SL{sl*100:.1f}"
                             results[label] = res
 
-    # 2. VAL_POC 戦略 (出来高構造リバウンド ＆ 段階的ナンピン最大5回 ＆ 建値以上Quick TP、VP150本、SL 0.5%刻み最適化)
+    # 2. VAL_POC 戦略 (出来高構造リバウンド ＆ EMA200 ＆ バリュー幅>=1.5% ＆ 60%利確 ＆ -3%ナンピン最大2回 ＆ SL 9.0%)
     if force_strategy is None or force_strategy.lower() in ("val_poc", "vp_val_gc"):
-        vp_sl_pcts = [0.080, 0.085, 0.090, 0.095, 0.100]  # 中心値9.0%、0.5%刻み (8.0%〜10.0%、7.5%以下厳禁)
+        vp_sl_pcts = [0.085, 0.090, 0.095]  # 実証黄金最適値 9.0% (±0.5%)
         for sl in vp_sl_pcts:
             res_val_poc = simulate_val_poc_strategy(
-                df, vp_period=150, num_bins=50, max_nanpin=4, nanpin_drop_pct=None,
+                df, vp_period=150, num_bins=50, max_nanpin=2, nanpin_drop_pct=0.030,
                 initial_equity=initial_equity, sl_pct=sl
             )
-            label = f"VAL_POC_N5_SL{sl*100:.1f}"
+            label = f"VAL_POC_N3_SL{sl*100:.1f}"
             results[label] = res_val_poc
 
     if not results:
