@@ -49,6 +49,39 @@ def get_whale_sig_quick(symbol: str) -> str:
         return "NEUTRAL"
 
 
+def get_macro_gate_summary() -> Dict[str, Any]:
+    """Data/market_state.json より二層構造門番サマリーを取得"""
+    state_file = DATA_DIR / "market_state.json"
+    default_res = {
+        "tier1_gate": "ALLOW",
+        "tier1_state": "NORMAL",
+        "tier1_desc": "NORMAL",
+        "tier2_gate": "ALLOW",
+        "tier2_desc": "NORMAL"
+    }
+    if not state_file.exists():
+        return default_res
+    try:
+        with open(state_file, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            t1 = data.get("macro_dump_gate", {})
+            t1_gate = t1.get("gate", "ALLOW")
+            t1_state = t1.get("state_name", "NORMAL")
+            t1_desc = t1.get("reason", "NORMAL")
+            
+            t2_gate = data.get("regime_gate", "ALLOW")
+            t2_desc = data.get("regime_reason", "NORMAL")
+            return {
+                "tier1_gate": t1_gate,
+                "tier1_state": t1_state,
+                "tier1_desc": t1_desc,
+                "tier2_gate": t2_gate,
+                "tier2_desc": t2_desc
+            }
+    except Exception:
+        return default_res
+
+
 def build_symbols_status_summary(
     selected_symbols: Optional[List[str]] = None,
     symbol_params_map: Optional[Dict[str, Any]] = None,
@@ -211,10 +244,14 @@ def format_status_table_console(summary_data: Dict[str, Any]) -> str:
     eval_time = summary_data.get("evaluated_at", "")
     counts = summary_data.get("counts", {})
     symbols = summary_data.get("symbols", [])
+    gate_info = get_macro_gate_summary()
+    t1_icon = "🟢" if gate_info["tier1_gate"] == "ALLOW" else "🛑"
+    t2_icon = "🟢" if gate_info["tier2_gate"] == "ALLOW" else "🛑"
 
     lines = []
     lines.append("=" * 115)
     lines.append(f"📊 【主要アルト20銘柄 選定・除外ステータス完全一覧ダッシュボード】 (評価: {eval_time[:19]})")
+    lines.append(f"🛡️  二層構造門番: 第1層全面安 {t1_icon} [{gate_info['tier1_gate']}] ({gate_info['tier1_desc']}) | 第2層高値警戒 {t2_icon} [{gate_info['tier2_gate']}] ({gate_info['tier2_desc']})")
     lines.append("=" * 115)
     lines.append(
         f"{'#':2s} | {'銘柄':10s} | {'ステータス':22s} | {'1週高値乖離':10s} | {'直近PnL':12s} | {'勝率':6s} | {'取引':4s} | {'詳細理由 / 採用戦略'}"
@@ -258,9 +295,13 @@ def format_status_table_discord(summary_data: Dict[str, Any]) -> str:
     counts = summary_data.get("counts", {})
     symbols = summary_data.get("symbols", [])
     eval_time = summary_data.get("evaluated_at", "")[:16].replace("T", " ")
+    gate_info = get_macro_gate_summary()
+    t1_icon = "🟢" if gate_info["tier1_gate"] == "ALLOW" else "🛑"
+    t2_icon = "🟢" if gate_info["tier2_gate"] == "ALLOW" else "🛑"
 
     lines = []
     lines.append(f"📊 **【主要20銘柄 選定・除外ステータス】** (`{eval_time} UTC`)")
+    lines.append(f"🛡️ **二層構造門番**: 第1層全面安 {t1_icon}`{gate_info['tier1_gate']}` | 第2層高値警戒 {t2_icon}`{gate_info['tier2_gate']}`")
     lines.append(
         f"💡 **内訳**: 監視: `{counts.get('SELECTED', 0)}` | 高値警戒: `{counts.get('TOP_STOP', 0)}` | "
         f"セリクラ: `{counts.get('BOTTOM_WATCHING', 0)}` | 不合格: `{counts.get('OPT_REJECTED', 0)}`"

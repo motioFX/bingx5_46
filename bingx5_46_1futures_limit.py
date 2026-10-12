@@ -470,7 +470,7 @@ def get_whale_sentiment_info(symbol: str) -> Dict[str, Any]:
 
 
 def get_regime_gate_info(symbol: str) -> Dict[str, Any]:
-    """Data/market_state.json よりマクロレジーム門番情報（全体門番、BTCステート、個別ステート）を取得 (PROJECT_RULES パターンA準拠)"""
+    """Data/market_state.json より二層構造マクロ門番情報（第1層: 全面安フィルター、第2層: 個別高値警戒門番）を取得 (PROJECT_RULES 準拠)"""
     state_file = MIX_SCRIPT_PATH.parent / "Data" / "market_state.json"
     default_res = {
         "regime_gate": "ALLOW",
@@ -478,12 +478,23 @@ def get_regime_gate_info(symbol: str) -> Dict[str, Any]:
         "action": "NORMAL",
         "state_name": "NORMAL",
         "btc_state": "NORMAL",
+        "macro_dump_gate": "ALLOW",
+        "macro_dump_state": "NORMAL",
+        "macro_dump_reason": "NORMAL",
     }
     if not state_file.exists():
         return default_res
     try:
         with open(state_file, "r", encoding="utf-8") as f:
             data = json.load(f)
+            
+            # 第1層: 市場全体 全面安フィルター (Macro Market Dump Filter)
+            macro_dump = data.get("macro_dump_gate", {})
+            macro_gate = macro_dump.get("gate", "ALLOW")
+            macro_state = macro_dump.get("state_name", "NORMAL")
+            macro_reason = macro_dump.get("reason", "NORMAL")
+
+            # 第2層: 個別高値警戒門番
             overall_gate = data.get("regime_gate", "ALLOW")
             overall_reason = data.get("regime_reason", "NORMAL")
             btc_info = data.get("btc_regime", {})
@@ -491,18 +502,33 @@ def get_regime_gate_info(symbol: str) -> Dict[str, Any]:
 
             clean_sym = symbol.upper()
             sym_info = sym_regimes.get(clean_sym, {})
-
-            # 全体門番がSTOP、または個別銘柄がSTOPならSTOP
             sym_gate = sym_info.get("regime_gate", overall_gate)
-            effective_gate = "STOP" if (overall_gate == "STOP" or sym_gate == "STOP") else "ALLOW"
-            effective_action = sym_info.get("action", btc_info.get("action", "NORMAL"))
+
+            # 二層構造判定:
+            # 1. 第1層（全面安）がSTOPなら無条件で最優先STOP
+            if macro_gate == "STOP":
+                effective_gate = "STOP"
+                effective_reason = f"MACRO_DUMP_LOCKED ({macro_reason})"
+                effective_action = "STOP_MARKET_DUMP"
+            # 2. 第2層（個別高値警戒・全体レジーム）がSTOPならSTOP
+            elif overall_gate == "STOP" or sym_gate == "STOP":
+                effective_gate = "STOP"
+                effective_reason = overall_reason if overall_gate == "STOP" else f"{clean_sym}_{sym_info.get('state_name')}"
+                effective_action = sym_info.get("action", btc_info.get("action", "NORMAL"))
+            else:
+                effective_gate = "ALLOW"
+                effective_reason = "NORMAL_OR_BOTTOM_RECOVERY"
+                effective_action = "NORMAL"
 
             return {
                 "regime_gate": effective_gate,
-                "regime_reason": overall_reason,
+                "regime_reason": effective_reason,
                 "action": effective_action,
                 "state_name": sym_info.get("state_name", "NORMAL"),
                 "btc_state": btc_info.get("state_name", "NORMAL"),
+                "macro_dump_gate": macro_gate,
+                "macro_dump_state": macro_state,
+                "macro_dump_reason": macro_reason,
             }
     except Exception:
         return default_res
@@ -2039,8 +2065,8 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                     else:
                         closed = False
                         # 1. 戦略別スマート損切り判定 (5分足確定終値判定 Close)
-                        # 個別最適化パラメータ sl_pct を優先参照 (デフォルト: RSIMA 2.5%, VAL_POC 9.0%)
-                        default_sl = 0.09 if cand_strat in ("val_poc", "vp_val_gc") else 0.025
+                        # 個別最適化パラメータ sl_pct を優先参照 (デフォルト: RSIMA 3.0%, VAL_POC 9.0% / 実証最適値準拠)
+                        default_sl = 0.09 if cand_strat in ("val_poc", "vp_val_gc") else 0.030
                         sl_ratio = float(sym_params.get("sl_pct", default_sl))
                         sl_pct_label = f"{sl_ratio * 100:.1f}%"
                         if entry_px > 0 and (current_price < entry_px * (1.0 - sl_ratio)):

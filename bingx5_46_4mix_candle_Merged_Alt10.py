@@ -23,7 +23,7 @@ import requests
 import aiohttp
 from config_loader import get_webhook_url
 from upload_registry import should_upload_file, record_file_uploaded
-from bingx5_46_3logic import RegimeFilterManager
+from bingx5_46_3logic import RegimeFilterManager, MacroMarketDumpFilter
 
 if hasattr(sys.stdout, "reconfigure"):
     try:
@@ -1673,8 +1673,28 @@ async def main():
             if cand_file_btc.exists():
                 df_btc = pd.read_csv(cand_file_btc)
 
+        # ----------------------------------------------------------------------
+        # 二層構造門番アーキテクチャ判定 (PROJECT_RULES.md 準拠)
+        # ----------------------------------------------------------------------
+        # 【第1層: 市場全体 全面安フィルター (Macro Market Dump Filter)】
+        macro_dump_filter = MacroMarketDumpFilter(
+            alt_lead_down_ratio=0.90,
+            alt_lead_drop_pct=-3.0,
+            btc_dump_drop_pct=-3.0,
+            btc_dump_down_ratio=0.70,
+            alt_recovery_ratio=0.50,
+            alt_rebound_pct=1.5,
+            min_lock_hours=6,
+            cooldown_hours=4,
+            btc_stable_hours=3,
+            state_file=out_dir / "macro_dump_state.json"
+        )
+        macro_dump_eval = macro_dump_filter.evaluate(df_map_all)
+        log(f"Macro Dump Gate (Tier 1): Gate={macro_dump_eval.get('gate')} | State={macro_dump_eval.get('state_name')} | Reason={macro_dump_eval.get('reason')}")
+
+        # 【第2層: 個別銘柄 高値圏天井停止 ＆ セリクラ底打ちサイクル (Regime Filter)】
         btc_regime = regime_mgr.evaluate(df_btc, is_btc=True) if (df_btc is not None and not df_btc.empty) else {"regime_gate": "ALLOW", "state_name": "NORMAL"}
-        log(f"BTC Macro Regime: Gate={btc_regime.get('regime_gate')} | State={btc_regime.get('state_name')} | Action={btc_regime.get('action')} | PeakDrop={btc_regime.get('drop_from_peak_pct')}%")
+        log(f"BTC Macro Regime (Tier 2): Gate={btc_regime.get('regime_gate')} | State={btc_regime.get('state_name')} | Action={btc_regime.get('action')} | PeakDrop={btc_regime.get('drop_from_peak_pct')}%")
 
         # 各選定銘柄の個別レジーム判定
         symbol_regimes = {}
@@ -1695,7 +1715,7 @@ async def main():
             else:
                 symbol_regimes[clean_sym] = {"regime_gate": "ALLOW", "state_name": "NORMAL", "action": "NORMAL"}
 
-        # 総合判定: BTC門番がSTOP、または選定銘柄の60%以上がSTOPなら全体STOP
+        # 総合判定: 第2層のBTC門番がSTOP、または選定銘柄の60%以上がSTOPなら第2層STOP
         overall_gate = "ALLOW"
         if btc_regime.get("regime_gate") == "STOP":
             overall_gate = "STOP"
@@ -1708,13 +1728,13 @@ async def main():
             overall_reason = "NORMAL_OR_BOTTOM_RECOVERY"
 
         gate_icon = "🟢" if overall_gate == "ALLOW" else "🛑"
-        summary_text += f"\n🛡️ **[3. マクロレジーム門番判定 (Pattern A)]**\n"
-        summary_text += f"• 総合門番: {gate_icon} `{overall_gate}` (理由: `{overall_reason}`)\n"
-        summary_text += f"• BTCステート: `{btc_regime.get('state_name')}` (直近高値比: `{btc_regime.get('drop_from_peak_pct')}%`)\n"
-        summary_text += f"• 新規ロング制限銘柄数: `{stop_count} / {len(FIXED_SYMBOLS)}`\n"
+        macro_icon = "🟢" if macro_dump_eval.get("gate") == "ALLOW" else "🛑"
+        summary_text += f"\n🛡️ **[3. 二層構造マクロ門番判定 (PROJECT_RULES 準拠)]**\n"
+        summary_text += f"• **第1層 全面安フィルター**: {macro_icon} `{macro_dump_eval.get('gate')}` (ステート: `{macro_dump_eval.get('state_name')}`, 理由: `{macro_dump_eval.get('reason')}`)\n"
+        summary_text += f"• **第2層 個別高値警戒門番**: {gate_icon} `{overall_gate}` (BTC: `{btc_regime.get('state_name')}`, 制限銘柄数: `{stop_count}/{len(FIXED_SYMBOLS)}`)\n"
         summary_text += f"========================================\n"
 
-        log(f"Overall Regime Gate: {overall_gate} ({overall_reason}) | BTC: {btc_regime.get('state_name')}")
+        log(f"Overall Gate Summary: Tier1 Dump={macro_dump_eval.get('gate')} | Tier2 Regime={overall_gate} ({overall_reason})")
 
         if not args.no_chart_send:
             discord.send_message(summary_text)
@@ -1729,6 +1749,7 @@ async def main():
             "mean_norm": last_mean_norm,
             "regime_gate": overall_gate,
             "regime_reason": overall_reason,
+            "macro_dump_gate": macro_dump_eval,
             "btc_regime": {
                 "state": btc_regime.get("state", 0),
                 "state_name": btc_regime.get("state_name", "NORMAL"),
@@ -1747,7 +1768,7 @@ async def main():
         }
         with open(state_file, "w", encoding="utf-8") as f:
             json.dump(state_data, f, indent=2, ensure_ascii=False)
-        log(f"Saved market state ({final_state}, Gate={overall_gate}) to {state_file}")
+        log(f"Saved market state ({final_state}, Gate={overall_gate}, MacroDump={macro_dump_eval.get('gate')}) to {state_file}")
 
     print("\n==================================================")
     print("  Smart Selection & Multi-Window Analysis Completed!")

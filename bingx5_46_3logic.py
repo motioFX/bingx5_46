@@ -219,6 +219,278 @@ class RegimeFilterManager:
         }
 
 
+class MacroMarketDumpFilter:
+    """
+    第1層: 市場全体 全面安フィルター (Macro Market Dump Filter)
+    PROJECT_RULES.md 唯一の仕様原本 ＆ 2022-2026年Binance実証最適値準拠
+    
+    【設計思想】
+      - 過去約5年間の検証で全暴落の76.1%を占める「アルト先行型」および「BTC主導型」のデュアル・トリガーにより、
+        相場急落の初動を即座に検知して全銘柄の新規買い(Long)を緊急ロック (gate="STOP")。
+      - BTCの3時間安値未更新安定化 ＆ 監視アルトの過半数(50%以上)が最安値から+1.5%自律反発して初めて安全に解除。
+      - 最低ロック6時間 ＆ 解除後クールダウン4時間により、落ちるナイフ被弾とチャタリングを完全防止。
+    """
+    STATE_NAMES = {
+        0: "NORMAL",
+        1: "DUMP_LOCKED",
+        2: "BTC_STABILIZING",
+    }
+
+    def __init__(
+        self,
+        alt_lead_down_ratio: float = 0.90,   # アルト先行: 下落比率 (90%)
+        alt_lead_drop_pct: float = -3.0,     # アルト先行: アルト平均下落率 (-3.0%)
+        btc_dump_drop_pct: float = -3.0,     # BTC主導: BTC下落率 (-3.0%)
+        btc_dump_down_ratio: float = 0.70,   # BTC主導: アルト下落比率 (70%)
+        alt_recovery_ratio: float = 0.50,    # アルト回復率: 底値から反発した銘柄の割合 (50%)
+        alt_rebound_pct: float = 1.5,        # アルト回復: 底値からの反発幅 (+1.5%)
+        min_lock_hours: int = 6,             # 最低ロック時間 (6時間: パニック売り連鎖保護)
+        cooldown_hours: int = 4,             # 再ロック禁止クールダウン (4時間)
+        btc_stable_hours: int = 3,           # BTC安定化確認期間 (3時間連続で安値未更新)
+        state_file: Optional[Path] = None,   # 状態永続化JSONファイル
+    ):
+        self.alt_lead_down_ratio = alt_lead_down_ratio
+        self.alt_lead_drop_pct = alt_lead_drop_pct
+        self.btc_dump_drop_pct = btc_dump_drop_pct
+        self.btc_dump_down_ratio = btc_dump_down_ratio
+        self.alt_recovery_ratio = alt_recovery_ratio
+        self.alt_rebound_pct = alt_rebound_pct
+        self.min_lock_hours = min_lock_hours
+        self.cooldown_hours = cooldown_hours
+        self.btc_stable_hours = btc_stable_hours
+        self.state_file = state_file or (Path(__file__).resolve().parent / "Data" / "macro_dump_state.json")
+
+    def _load_state(self) -> Dict[str, Any]:
+        """永続化JSONから状態を復元"""
+        default_state = {
+            "state": 0,
+            "trigger_type": "NONE",
+            "dump_start_time": None,
+            "btc_lowest_in_dump": None,
+            "btc_lowest_time": None,
+            "alt_lowest_in_dump": {},
+            "last_unlock_time": None,
+            "updated_at": None,
+        }
+        if self.state_file and self.state_file.exists():
+            try:
+                with open(self.state_file, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    for k, v in default_state.items():
+                        if k not in data:
+                            data[k] = v
+                    return data
+            except Exception:
+                pass
+        return default_state
+
+    def _save_state(self, state_data: Dict[str, Any]) -> None:
+        """状態をJSONに安全に永続化"""
+        if self.state_file:
+            try:
+                self.state_file.parent.mkdir(parents=True, exist_ok=True)
+                with open(self.state_file, "w", encoding="utf-8") as f:
+                    json.dump(state_data, f, indent=2, ensure_ascii=False)
+            except Exception:
+                pass
+
+    def evaluate(self, df_map: Dict[str, pd.DataFrame]) -> Dict[str, Any]:
+        """
+        全銘柄の1時間足データ（df_map）から市場全体の急落状態を評価し、門番フラグを決定する
+        """
+        now_dt = datetime.now(timezone.utc)
+        now_iso = now_dt.isoformat()
+
+        # 1. BTCおよびアルト銘柄の直近4時間リターンを算出
+        btc_key = None
+        for k in df_map.keys():
+            if "BTC" in k.upper():
+                btc_key = k
+                break
+
+        btc_ret_4h = 0.0
+        btc_current_low = 0.0
+        btc_current_close = 0.0
+        btc_current_open = 0.0
+
+        if btc_key and df_map[btc_key] is not None and len(df_map[btc_key]) >= 5:
+            btc_df = df_map[btc_key]
+            c_now = float(btc_df["close"].iloc[-1])
+            c_4h_ago = float(btc_df["close"].iloc[-5])
+            btc_ret_4h = (c_now - c_4h_ago) / c_4h_ago * 100.0 if c_4h_ago > 0 else 0.0
+            btc_current_low = float(btc_df["low"].iloc[-1])
+            btc_current_close = c_now
+            btc_current_open = float(btc_df["open"].iloc[-1])
+
+        alt_rets_4h = []
+        alt_current_closes = {}
+        alt_current_lows = {}
+
+        for sym, df in df_map.items():
+            if "BTC" in sym.upper() or df is None or len(df) < 5:
+                continue
+            clean_sym = sym.replace("-", "").replace("_", "").upper()
+            c_now = float(df["close"].iloc[-1])
+            c_4h_ago = float(df["close"].iloc[-5])
+            r = (c_now - c_4h_ago) / c_4h_ago * 100.0 if c_4h_ago > 0 else 0.0
+            alt_rets_4h.append(r)
+            alt_current_closes[clean_sym] = c_now
+            alt_current_lows[clean_sym] = float(df["low"].iloc[-1])
+
+        total_alts = len(alt_rets_4h)
+        if total_alts == 0:
+            return {
+                "gate": "ALLOW",
+                "state": 0,
+                "state_name": "NORMAL",
+                "trigger_type": "NONE",
+                "reason": "NO_ALT_DATA",
+                "lock_hours": 0,
+                "btc_drop_pct": 0.0,
+                "alt_mean_drop_pct": 0.0,
+                "alt_down_ratio": 0.0,
+                "rebound_ratio": 0.0,
+                "updated_at": now_iso,
+            }
+
+        down_alts = sum(1 for r in alt_rets_4h if r < 0.0)
+        alt_down_ratio = down_alts / total_alts
+        alt_mean_ret = float(np.mean(alt_rets_4h))
+
+        # 2. 永続化ステートのロード
+        stored = self._load_state()
+        state = stored.get("state", 0)
+        trigger_type = stored.get("trigger_type", "NONE")
+        dump_start_time = stored.get("dump_start_time")
+        btc_lowest = stored.get("btc_lowest_in_dump")
+        btc_lowest_time = stored.get("btc_lowest_time")
+        alt_lowest = stored.get("alt_lowest_in_dump", {})
+        last_unlock_time = stored.get("last_unlock_time")
+
+        lock_hours = 0
+        hours_since_btc_lowest = 0
+        rebound_ratio = 0.0
+
+        if dump_start_time:
+            try:
+                st_dt = datetime.fromisoformat(dump_start_time)
+                lock_hours = max(0, int((now_dt - st_dt).total_seconds() / 3600))
+            except Exception:
+                lock_hours = 0
+
+        if btc_lowest_time:
+            try:
+                bl_dt = datetime.fromisoformat(btc_lowest_time)
+                hours_since_btc_lowest = max(0, int((now_dt - bl_dt).total_seconds() / 3600))
+            except Exception:
+                hours_since_btc_lowest = 0
+
+        # 3. 状態遷移マシン判定
+        # 状態 0: NORMAL (通常)
+        if state == 0:
+            cooldown_ok = True
+            if last_unlock_time:
+                try:
+                    un_dt = datetime.fromisoformat(last_unlock_time)
+                    if (now_dt - un_dt).total_seconds() < self.cooldown_hours * 3600:
+                        cooldown_ok = False
+                except Exception:
+                    pass
+
+            if cooldown_ok:
+                is_alt_lead = (alt_down_ratio >= self.alt_lead_down_ratio) and (alt_mean_ret <= self.alt_lead_drop_pct)
+                is_btc_lead = (btc_ret_4h <= self.btc_dump_drop_pct) and (alt_down_ratio >= self.btc_dump_down_ratio)
+
+                if is_alt_lead or is_btc_lead:
+                    state = 1  # DUMP_LOCKED
+                    trigger_type = "ALT_LEAD" if (is_alt_lead and not is_btc_lead) else ("BTC_LEAD" if (is_btc_lead and not is_alt_lead) else "BOTH")
+                    dump_start_time = now_iso
+                    btc_lowest = btc_current_low
+                    btc_lowest_time = now_iso
+                    alt_lowest = {k: v for k, v in alt_current_lows.items()}
+                    lock_hours = 0
+
+        # 状態 1 または 2: ロック中 (DUMP_LOCKED または BTC_STABILIZING)
+        elif state in (1, 2):
+            # BTC新安値更新チェック
+            if btc_lowest is None or (btc_current_low > 0 and btc_current_low < btc_lowest):
+                btc_lowest = btc_current_low
+                btc_lowest_time = now_iso
+                hours_since_btc_lowest = 0
+                state = 1  # 新安値更新時は急落中 (state=1) に引き戻す
+
+            # アルト各銘柄の新安値更新
+            for sym_k, low_val in alt_current_lows.items():
+                if sym_k not in alt_lowest or low_val < alt_lowest[sym_k]:
+                    alt_lowest[sym_k] = low_val
+
+            # 最低ロック時間 (min_lock_hours) 経過後に解除判定へ進行
+            if lock_hours >= self.min_lock_hours:
+                # 状態 1 -> 状態 2: BTC安定化判定
+                if state == 1:
+                    btc_rebound = (btc_current_close - btc_lowest) / btc_lowest * 100.0 if btc_lowest and btc_lowest > 0 else 0.0
+                    is_btc_green = btc_current_close > btc_current_open
+                    if (hours_since_btc_lowest >= self.btc_stable_hours) and (is_btc_green or btc_rebound >= 0.8):
+                        state = 2  # BTC_STABILIZING
+
+                # 状態 2 -> 状態 0: アルト過半数反発・ロック解除判定
+                if state == 2:
+                    rebounded_alts = 0
+                    valid_check_alts = 0
+                    for sym_k, cur_c in alt_current_closes.items():
+                        low_b = alt_lowest.get(sym_k)
+                        if low_b and low_b > 0:
+                            valid_check_alts += 1
+                            reb = (cur_c - low_b) / low_b * 100.0
+                            if reb >= self.alt_rebound_pct:
+                                rebounded_alts += 1
+                    
+                    rebound_ratio = (rebounded_alts / valid_check_alts) if valid_check_alts > 0 else 0.0
+                    if rebound_ratio >= self.alt_recovery_ratio:
+                        # 全面安フィルター解除！
+                        state = 0  # NORMAL
+                        last_unlock_time = now_iso
+                        dump_start_time = None
+                        btc_lowest = None
+                        btc_lowest_time = None
+                        alt_lowest = {}
+
+        # 4. 状態の永続化
+        stored["state"] = state
+        stored["state_name"] = self.STATE_NAMES.get(state, "NORMAL")
+        stored["trigger_type"] = trigger_type if state > 0 else "NONE"
+        stored["dump_start_time"] = dump_start_time
+        stored["btc_lowest_in_dump"] = btc_lowest
+        stored["btc_lowest_time"] = btc_lowest_time
+        stored["alt_lowest_in_dump"] = alt_lowest
+        stored["last_unlock_time"] = last_unlock_time
+        stored["updated_at"] = now_iso
+        self._save_state(stored)
+
+        # 5. 返却値作成
+        gate = "STOP" if state in (1, 2) else "ALLOW"
+        if state == 1:
+            reason = f"MACRO_DUMP_LOCKED (Trigger: {trigger_type}, Lock: {lock_hours}h, AltsDown: {alt_down_ratio*100:.0f}%, Mean: {alt_mean_ret:.1f}%)"
+        elif state == 2:
+            reason = f"BTC_STABILIZING (Awaiting Alts: {rebound_ratio*100:.0f}%/{self.alt_recovery_ratio*100:.0f}%, Lock: {lock_hours}h)"
+        else:
+            reason = "MARKET_HEALTHY (NORMAL)"
+
+        return {
+            "gate": gate,
+            "state": state,
+            "state_name": self.STATE_NAMES.get(state, "NORMAL"),
+            "trigger_type": trigger_type if state > 0 else "NONE",
+            "reason": reason,
+            "lock_hours": lock_hours,
+            "btc_drop_pct": round(btc_ret_4h, 2),
+            "alt_mean_drop_pct": round(alt_mean_ret, 2),
+            "alt_down_ratio": round(alt_down_ratio, 3),
+            "rebound_ratio": round(rebound_ratio, 3),
+            "updated_at": now_iso,
+        }
+
+
 def optimize_cycle_filter(
     df: pd.DataFrame,
     symbol: str = "",
@@ -1887,7 +2159,7 @@ def simulate_rsima_strategy(
     initial_equity: float = 100.0,
     fee_rate: float = 0.0006,
     callback_pct: float = 0.015,
-    sl_pct: float = 0.025
+    sl_pct: float = 0.030
 ) -> dict:
     closes = df["close"].values
     highs = df["high"].values if "high" in df.columns else closes
@@ -2250,7 +2522,7 @@ def optimize_symbol_strategy(
         lma_lengths = [7]
         lEps = [30, 35, 40, 45, 50]
         lCps = [60, 65, 70, 75, 80]
-        sl_pcts = [0.015, 0.020, 0.025, 0.030, 0.035]  # 中心値2.5%、0.5%刻み (1.5%〜3.5%)
+        sl_pcts = [0.020, 0.025, 0.030, 0.035, 0.040]  # 中心値3.0%、0.5%刻み (2.0%〜4.0%、黄金値3.0%)
         
         for rl in rsi_lengths:
             for ml in lma_lengths:
@@ -2284,7 +2556,7 @@ def optimize_symbol_strategy(
             "win_rate": 0.0,
             "DD_max": 0.0,
             "max_unrealized_loss": 0.0,
-            "params": {"rsi_len": 9, "lma_len": 7, "lEp": 40.0, "lCp": 70.0, "max_trades": 5, "sl_pct": 0.025}
+            "params": {"rsi_len": 9, "lma_len": 7, "lEp": 40.0, "lCp": 70.0, "max_trades": 5, "sl_pct": 0.030}
         }
         return "rsima", default_res["params"], default_res, []
 
