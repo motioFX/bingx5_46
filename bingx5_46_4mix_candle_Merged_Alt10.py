@@ -59,6 +59,17 @@ if sys.platform == "win32":
 
 JST = timezone(timedelta(hours=9))
 
+
+async def fetch_bingx_ohlcv(symbol: str, inst_type: str = "SWAP", interval: str = "5m", start_time: int = 0, end_time: int = 0, mode: str = "demo"):
+    """5分足 SSoT からローソク足を辞書リスト形式で取得（後方互換用）"""
+    from candle_5m_store import load_5m_candles, sync_symbol_5m_candles
+    df = sync_symbol_5m_candles(symbol, target_days=3)
+    if df.empty:
+        df = load_5m_candles(symbol)
+    if df.empty:
+        return []
+    return df.to_dict(orient="records")
+
 def is_forex_symbol(s: str) -> bool:
     clean = str(s).upper().replace("-", "").replace("_", "")
     forex_pairs = {"EURUSD", "GBPUSD", "USDJPY", "AUDUSD", "USDCAD", "USDCHF", "NZDUSD"}

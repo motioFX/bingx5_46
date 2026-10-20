@@ -808,36 +808,33 @@ def get_bingx_granularity(bybit_interval: str) -> str:
 
 
 async def fetch_bingx_candles(symbol: str, granularity: str = "5m", limit: int = 300, mode: str = 'demo') -> pd.DataFrame:
-    from bingx5_46_4mix_candle_Merged_Alt10 import fetch_bingx_ohlcv
-    granularity_sec_map = {"1M": 60, "3M": 180, "5M": 300, "15M": 900, "30M": 1800, "1H": 3600, "2H": 7200, "4H": 14400, "1D": 86400}
-    gran_sec = granularity_sec_map.get(granularity.upper(), 300)
-    now_ms = int(time.time() * 1000)
-    start_ms = now_ms - (limit * gran_sec * 1000)
+    """5分足 SSoT ストアから最新のローソク足を取得（確定足のみを抽出）"""
+    from candle_5m_store import sync_symbol_5m_candles, load_5m_candles, resample_from_5m
     try:
-        rows = await fetch_bingx_ohlcv(symbol, "SWAP", granularity.upper(), start_ms, now_ms, mode=mode)
-        if rows:
-            df = pd.DataFrame(rows, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume', 'quote_volume'])
-            df['timestamp'] = pd.to_datetime(df['timestamp'].astype(float), unit='ms')
-            df['open'] = df['open'].astype(float)
-            df['high'] = df['high'].astype(float)
-            df['low'] = df['low'].astype(float)
-            df['close'] = df['close'].astype(float)
-            df['volume'] = df['volume'].astype(float)
-            df = df.sort_values('timestamp').reset_index(drop=True)
+        df = sync_symbol_5m_candles(symbol, target_days=3)
+        if df.empty:
+            df = load_5m_candles(symbol)
 
-            # --- 確定足（クローズ完了足）のみを厳格に抽出 ---
-            # 最新行が現在進行形で形成中の未確定足である場合を除外し、前足確定バーのみを返す
+        if not df.empty:
+            gran_upper = granularity.upper()
+            if gran_upper in ("15M", "30M", "1H", "60M", "1D"):
+                rule_map = {"15M": "15min", "30M": "30min", "1H": "1h", "60M": "1h", "1D": "1d"}
+                rule = rule_map.get(gran_upper, "15min")
+                df = resample_from_5m(df, rule=rule)
+
+            df = df.tail(limit).copy().reset_index(drop=True)
+
+            now_utc = datetime.now(timezone.utc)
+            granularity_sec_map = {"1M": 60, "3M": 180, "5M": 300, "15M": 900, "30M": 1800, "1H": 3600, "60M": 3600, "1D": 86400}
+            gran_sec = granularity_sec_map.get(gran_upper, 300)
             if not df.empty:
-                now_utc = datetime.now(timezone.utc)
                 last_ts = pd.to_datetime(df['timestamp'].iloc[-1], utc=True)
                 candle_close_time = last_ts + timedelta(seconds=gran_sec)
-                # 現在時刻が足のクローズ予定時刻に達していなければ未確定足なので除外
                 if candle_close_time > now_utc:
                     df = df.iloc[:-1].reset_index(drop=True)
-
             return df
     except Exception as e:
-        print(f"fetch_bingx_candles error: {e}")
+        print(f"[{symbol}] fetch_bingx_candles error: {e}")
     return pd.DataFrame()
 
 
