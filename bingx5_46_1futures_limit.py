@@ -45,11 +45,13 @@ def _pad_display(text: str, width: int, align: str = 'left') -> str:
         return text_str + ' ' * pad
 
 
-# Automatic Dual Logging: Output to both Terminal and Data/bot_output.log
+# Automatic Dual Logging: Output to Terminal, Data/bot_output.log, and Data/logs/bot_YYYY-MM-DD.log
 class TeeLogger:
     def __init__(self, filepath: Path, original_stdout, max_size_mb: int = 15):
         self.terminal = original_stdout
         self.filepath = filepath
+        self.daily_log_dir = filepath.parent / "logs"
+        self.daily_log_dir.mkdir(parents=True, exist_ok=True)
         self.max_bytes = max_size_mb * 1024 * 1024
         self._ansi_regex = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
 
@@ -69,6 +71,12 @@ class TeeLogger:
             clean_msg = self._ansi_regex.sub('', message)
             with open(self.filepath, "a", encoding="utf-8") as f:
                 f.write(clean_msg)
+            # 日次ログアーカイブ (Data/logs/bot_YYYY-MM-DD.log) への同時追記
+            from datetime import datetime, timezone, timedelta
+            jst_date = datetime.now(timezone(timedelta(hours=9))).strftime("%Y-%m-%d")
+            daily_file = self.daily_log_dir / f"bot_{jst_date}.log"
+            with open(daily_file, "a", encoding="utf-8") as df_log:
+                df_log.write(clean_msg)
         except Exception:
             pass
 
@@ -170,8 +178,8 @@ for _idx, _arg in enumerate(sys.argv):
         except ValueError:
             pass
 
-# コマンドライン引数からの戦略指定オーバーライド (デフォルト: 実証王者 val_poc)
-FORCE_STRATEGY: Optional[str] = "val_poc"
+# コマンドライン引数からの戦略指定オーバーライド (デフォルト: None = 銘柄ごとにVAL_POC/RSIMAを動的採用)
+FORCE_STRATEGY: Optional[str] = None
 for _idx, _arg in enumerate(sys.argv):
     if _arg == "--val-poc":
         FORCE_STRATEGY = "val_poc"
@@ -213,7 +221,20 @@ from bingx5_46_2api import (
     compute_bingx_lot_size,
     normalize_symbol,
 )
-from bingx5_46_3logic import send_discord, logicinstance, PnLCalculator, MPStrategy, backtester, run_interval_comparison, resample_candles, calc_add_pct
+from bingx5_46_3logic import (
+    send_discord,
+    logicinstance,
+    PnLCalculator,
+    MPStrategy,
+    backtester,
+    run_interval_comparison,
+    resample_candles,
+    calc_add_pct,
+    check_val_poc_signals,
+    check_rsima3_signals,
+    check_normalized_peak_timing,
+    check_market_regime_safe,
+)
 
 from datetime import datetime, timezone, timedelta
 from decimal import Decimal, ROUND_HALF_UP
@@ -957,6 +978,8 @@ async def validate_profitable_candidates(trade_side: str, mode: str, base_symbol
 
     overall_reg = market_state_info.get("overall_regime", "NEUTRAL")
     recommended_symbols = market_state_info.get("recommended_symbols", [])
+    excluded_raw = [str(s).upper() for s in market_state_info.get("excluded_symbols", [])]
+    excluded_clean = set(get_clean_symbol(s) for s in excluded_raw)
 
     default_best_params: Dict[str, Any] = {
         "strategy": "rsima",
@@ -967,17 +990,18 @@ async def validate_profitable_candidates(trade_side: str, mode: str, base_symbol
     }
 
     # 候補銘柄の選定:
-    # 総合地合いが BUY の場合は 3期間買い推奨銘柄を優先。
-    # 総合地合いが非BUY (NEUTRAL / SELL) の場合でもバックテスト完全スキップは行わず、
-    # この過酷な相場環境下でも利益を出せる銘柄を発掘するため、固定選定銘柄に対してバックテスト・最適化を実行する。
+    # 3期間ノーマライズ前半高値・半値割れ除外銘柄 (excluded_symbols) は PROJECT_RULES 第2項に基づき事前除外する。
     if overall_reg == "BUY" and recommended_symbols:
-        all_candidates = [s for s in recommended_symbols if get_clean_symbol(s) != "BTC"]
+        all_candidates = [
+            s for s in recommended_symbols
+            if get_clean_symbol(s) != "BTC" and get_clean_symbol(s) not in excluded_clean
+        ]
         discord.print_log(
-            f"【全体地合い判定: BUY】3期間買い推奨銘柄（計 {len(all_candidates)} 銘柄: {', '.join(all_candidates)}）"
+            f"【全体地合い判定: BUY】3期間買い推奨銘柄（計 {len(all_candidates)} 銘柄: {', '.join(all_candidates) if all_candidates else 'なし'}）"
             f"の個別パラメータ最適化＆バックテスト検証を開始します..."
         )
     else:
-        # 非BUY時: 3期間のいずれかで買い票を獲得した銘柄を優先しつつ固定銘柄全体をテスト
+        # 非BUY時: 前半ピーク半値割れ除外を通過した固定銘柄に対してバックテスト・最適化を実行
         period_res = market_state_info.get("period_results", {})
         any_buy_passed = set()
         for w_info in period_res.values():
@@ -986,8 +1010,12 @@ async def validate_profitable_candidates(trade_side: str, mode: str, base_symbol
                 if cl_s != "BTC":
                     any_buy_passed.add(cl_s)
 
-        prioritized = [s for s in FIXED_SYMBOLS if get_clean_symbol(s) in any_buy_passed]
-        others = [s for s in FIXED_SYMBOLS if get_clean_symbol(s) not in any_buy_passed and get_clean_symbol(s) != "BTC"]
+        eligible_fixed = [
+            s for s in FIXED_SYMBOLS
+            if get_clean_symbol(s) != "BTC"
+        ]
+        prioritized = [s for s in eligible_fixed if get_clean_symbol(s) in any_buy_passed]
+        others = [s for s in eligible_fixed if get_clean_symbol(s) not in any_buy_passed]
         all_candidates = prioritized + others
 
         discord.print_log(
@@ -1187,6 +1215,7 @@ async def select_top_bingx_symbols(top_n: int = 20, mode: str = 'demo') -> List[
 
 TRAILING_TP_FILE = Path(__file__).resolve().parent / "Data" / "trailing_tp_state.json"
 SCALE_IN_FILE = Path(__file__).resolve().parent / "Data" / "scale_in_state.json"
+ACTIVE_POS_META_FILE = Path(__file__).resolve().parent / "Data" / "active_positions_meta.json"
 
 def load_trailing_tp_states() -> dict:
     if TRAILING_TP_FILE.exists():
@@ -1206,21 +1235,25 @@ def save_trailing_tp_states(states: dict):
         pass
 
 def load_scale_in_states() -> dict:
-    if SCALE_IN_FILE.exists():
-        try:
-            with open(SCALE_IN_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
-            pass
+    for path in (SCALE_IN_FILE, ACTIVE_POS_META_FILE):
+        if path.exists():
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    if isinstance(data, dict) and data:
+                        return data
+            except Exception:
+                pass
     return {}
 
 def save_scale_in_states(states: dict):
-    try:
-        SCALE_IN_FILE.parent.mkdir(parents=True, exist_ok=True)
-        with open(SCALE_IN_FILE, "w", encoding="utf-8") as f:
-            json.dump(states, f, indent=2, ensure_ascii=False)
-    except Exception:
-        pass
+    for path in (SCALE_IN_FILE, ACTIVE_POS_META_FILE):
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(states, f, indent=2, ensure_ascii=False)
+        except Exception:
+            pass
 
 SL_COOLDOWN_FILE = Path(__file__).resolve().parent / "Data" / "sl_cooldown_states.json"
 SL_COOLDOWN_HOURS = 24.0
@@ -1429,49 +1462,58 @@ async def wait_until_next_candle(
                         save_scale_in_states(scale_in_states)
                         continue
 
-                    # B. リアルタイム 段階的ナンピン判定 (PROJECT_RULES準拠: 初期1+ナンピン最大2=計3枠, 等倍1.0x)
+                    # B. リアルタイム 段階的ナンピン判定 (PROJECT_RULES準拠: 初期1+ナンピン最大2=計3枠, 等倍1.0x, VA60%間隔)
                     # 地合いが BUY の時のみナンピン許可 (NEUTRAL/BEAR時は即時凍結)
                     if overall_regime != "BUY":
                         continue
 
                     max_allowed_nanpins = 2
-                    req_drop_pct = calc_add_pct(cur_nanpin + 1, strategy=strat_type)
-                    drop_target = last_px * (1.0 - req_drop_pct)
+                    vah_lvl = float(scale_state.get("vah_level", 0.0))
+                    val_lvl = float(scale_state.get("val_level", 0.0))
+                    va_spacing = (vah_lvl - val_lvl) * 0.60 if (vah_lvl > val_lvl and val_lvl > 0) else 0.0
+                    drop_dist = max(last_px * 0.010, va_spacing) if va_spacing > 0 else (last_px * calc_add_pct(cur_nanpin + 1, strategy=strat_type))
+                    drop_target = last_px - drop_dist
+                    req_drop_pct = (drop_dist / last_px) if last_px > 0 else 0.030
+                    spec_rt = getattr(api.bingx, "instrument_spec", {}) or {}
+                    base_lot_rt = compute_lot_size(cur_px, BINGX_TARGET_POSITION_VALUE_USDT, spec_rt)
+                    actual_lots_rt = int(round(buy_qty / max(base_lot_rt, 1e-6))) if base_lot_rt > 0 else 1
+                    eff_nanpin = max(cur_nanpin, actual_lots_rt - 1)
                     cur_notional = buy_qty * cur_px
+                    add_notional = base_lot_rt * cur_px
                     max_notional_limit = BINGX_TARGET_POSITION_VALUE_USDT * 3.15
 
-                    if cur_nanpin < max_allowed_nanpins and cur_px <= drop_target:
-                        if cur_notional >= max_notional_limit:
+                    if eff_nanpin < max_allowed_nanpins and cur_px <= drop_target and base_lot_rt > 0:
+                        if (cur_notional + add_notional) > max_notional_limit:
                             discord.print_log(
-                                f"[{sym}] [NANPIN BLOCKED] 🛑 想定元本上限ガード到達 (${cur_notional:.2f} >= ${max_notional_limit:.2f}) ➔ ナンピン中止",
+                                f"[{sym}] [NANPIN BLOCKED] 🛑 想定元本上限ガード到達 (${cur_notional + add_notional:.2f} > ${max_notional_limit:.2f}) ➔ ナンピン中止",
                                 level="warning"
                             )
                             continue
 
                         discord.print_log(
-                            f"[{sym}] [REALTIME NANPIN] 📉 最後の建値(${last_px:,.4f})から-{req_drop_pct*100:.1f}%下落検出 (${cur_px:,.4f} <= ${drop_target:,.4f})\n"
-                            f"   └ ナンピン発動 ({cur_nanpin + 1}/{max_allowed_nanpins} 回目)...",
+                            f"[{sym}] [REALTIME NANPIN] 📉 最後の建値(${last_px:,.4f})からVA60%(-{req_drop_pct*100:.1f}%)下落検出 (${cur_px:,.4f} <= ${drop_target:,.4f})\n"
+                            f"   └ ナンピン発動 ({eff_nanpin + 1}/{max_allowed_nanpins} 回目, 1x均等ロット={base_lot_rt})...",
                             level="debug"
                         )
                         bal_val = float(pos.get("margin", 0.0)) or 100.0
                         entered_add = await api.long_entry(
-                            None, pos, bal_val, buy_qty, max_lot=10.0,
-                            max_stage=max_allowed_nanpins + 1, is_scale_in=True, stage_num=cur_nanpin + 2
+                            None, pos, bal_val, base_lot_rt, max_lot=10.0,
+                            max_stage=max_allowed_nanpins + 1, is_scale_in=True, stage_num=eff_nanpin + 2
                         )
                         if entered_add:
-                            scale_state["nanpin_count"] = cur_nanpin + 1
+                            scale_state["nanpin_count"] = eff_nanpin + 1
                             scale_state["last_entry_price"] = cur_px
                             scale_in_states[sym] = scale_state
                             save_scale_in_states(scale_in_states)
                             from real_trade_tracker import record_real_trade
-                            record_real_trade(sym, "LONG", "SCALE_IN", cur_px, buy_qty, 0.0, f"実運用ナンピン買い増し ({cur_nanpin + 1}/{max_allowed_nanpins})")
+                            record_real_trade(sym, "LONG", "SCALE_IN", cur_px, base_lot_rt, 0.0, f"実運用ナンピン買い増し ({eff_nanpin + 1}/{max_allowed_nanpins})")
                             discord.print_log(
                                 f"🚀🚀🚀 **【リアルタイム ナンピン買い増し約定】** 🚀🚀🚀\n"
                                 f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
                                 f"📌 **銘柄 / 方向**: `{sym}` (LONG 🟢 / {strat_type.upper()})\n"
                                 f"💰 **約定価格**: `${cur_px:.6f}`\n"
-                                f"📦 **追加数量**: `{buy_qty:,.2f} {sym}`\n"
-                                f"🔢 **ナンピン段階**: `{cur_nanpin + 1}/{max_allowed_nanpins} 回目` (合計 {cur_nanpin + 2}/{max_allowed_nanpins + 1} 枠)\n"
+                                f"📦 **追加数量**: `{base_lot_rt:,.2f} {sym}` (1x均等ロット)\n"
+                                f"🔢 **ナンピン段階**: `{eff_nanpin + 1}/{max_allowed_nanpins} 回目` (合計 {eff_nanpin + 2}/{max_allowed_nanpins + 1} 枠)\n"
                                 f"🎯 **目標60%利確値**: `${target_tp:.6f}`\n"
                                 f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
                             )
@@ -1566,7 +1608,7 @@ async def run_screening_and_optimization(mode: str, send_charts: bool = False, s
 
     # 選定銘柄の個別最適化パラメータをDiscordログ表示
     if selected_symbols:
-        discord.print_log("\n★ 【合格銘柄 個別最適化パラメータ一覧 (RSIMA / VAL_POC)】")
+        discord.print_log("\n★ 【合格銘柄 個別最適化パラメータ一覧 (VAL_POC / RSIMA 2段階72通り検証)】")
         for sym in selected_symbols:
             p = symbol_params_map.get(sym, default_best_params)
             pnl_val = p.get('pnl', 0.0)
@@ -1574,15 +1616,22 @@ async def run_screening_and_optimization(mode: str, send_charts: bool = False, s
             tc_val = p.get('trade_count', 0)
             dd_val = p.get('max_dd', 0.0)
             strat = p.get('strategy', 'rsima').upper()
-            p_detail = p.get('params', {})
+            inv_val = int(p.get('interval', 5))
             
             if strat in ("VAL_POC", "VP_VAL_GC"):
-                param_str = f"VAL_GC ➔ 段階的ナンピン(最大{p_detail.get('max_nanpin', 5)}回: 0.4%/0.6%) ➔ POCクローズ"
+                mp_v = p.get('mp', 200)
+                bins_v = p.get('num_bins', 50)
+                va_v = int(float(p.get('value_area_pct', 0.70)) * 100)
+                ma_v = f"{p.get('ma_type', 'EMA')}_{p.get('ma_condition', 'close_above')}"
+                param_str = f"{inv_val}m / MP={mp_v}, Bins={bins_v}, VA={va_v}%, {ma_v} ➔ VA60%間隔ナンピン(最大2回/計3枠) ➔ VA60%利確"
             else:
-                param_str = f"RSI={p_detail.get('rsi_len', 9)}, MALen={p_detail.get('lma_len', 7)}, L-Entry<{p_detail.get('lEp', 40)}, L-Exit>{p_detail.get('lCp', 70)}"
+                ep_v = int(float(p.get('l_ep', 40)))
+                cp_v = int(float(p.get('l_cp', 60)))
+                sl_v = float(p.get('sl_pct', 0.090)) * 100
+                param_str = f"{inv_val}m / RSI=9, EMA=7, EP={ep_v}, CP={cp_v}, SL={sl_v:.1f}% ➔ VA60%間隔ナンピン(最大2回/計3枠)"
 
             discord.print_log(
-                f"   📌 [{sym}] 戦略={strat} (ナンピン数:{MAX_TRADES_COUNT if strat != 'VAL_POC' else 5}) | {param_str} | "
+                f"   📌 [{sym}] 戦略={strat} (最大{MAX_TRADES_COUNT}枠/1x均等) | {param_str} | "
                 f"純利益: {pnl_val:+.4f} USDT (取引: {tc_val}回, 勝率: {wr_val:.1f}%, DD: {dd_val:.2f} USDT ({dd_val:.1f}%))"
             )
     else:
@@ -1677,9 +1726,13 @@ async def audit_and_retain_positions(
 
 
 async def send_periodic_performance_report(symbol_apis: Dict[str, Any], mode: str, label: str = "8時間定期レポート"):
-    """実運用トレード実績（直近PnLチャート画像 ＆ 現在の証拠金残高）をDiscordへ送信 (PROJECT_RULES 準拠)"""
+    """実運用トレード実績（直近10日間 Clean版/Detail版 2枚の累積PnLチャート画像 ＆ 現在の証拠金残高）をDiscordへ送信 (PROJECT_RULES 準拠)"""
     try:
-        from real_trade_tracker import plot_real_trading_performance, get_real_trading_summary
+        from real_trade_tracker import (
+            send_periodic_pnl_report_discord,
+            check_and_send_monthly_report_on_first_day,
+            get_real_trading_summary,
+        )
         from bingx5_46_2api import api_bingx
 
         # 1. 口座残高（証拠金）の取得
@@ -1697,24 +1750,10 @@ async def send_periodic_performance_report(symbol_apis: Dict[str, Any], mode: st
             except Exception:
                 current_balance = 1000.0
 
-        # 2. 実績サマリーとチャート画像の生成
-        summary = get_real_trading_summary(current_balance=current_balance)
-        chart_file = plot_real_trading_performance(current_balance=current_balance)
-
-        # 3. Discord送信
-        now_str = datetime.now(JST).strftime("%Y-%m-%d %H:%M")
-        msg = (
-            f"📊 **【実運用トレード実績＆証拠金サマリー（{label}）】**\n"
-            f"• **実行時刻**: `{now_str} JST`\n"
-            f"• **現在の口座証拠金**: `${current_balance:,.2f} USDT`\n"
-            f"• **累計実現損益**: `{summary['net_pnl']:+.2f} USDT`\n"
-            f"• **通算成績**: `{summary['wins']}勝 {summary['losses']}敗 {summary['ties']}分 (勝率: {summary['win_rate']:.1f}%)` | PF: `{summary['profit_factor']:.2f}`\n"
-            f"• **決済完了取引数**: `{summary['total_trades']} 件`"
-        )
-        if chart_file and chart_file.exists():
-            discord.send_file(chart_file, msg)
-        else:
-            discord.send_message(msg)
+        # 2. スライディング10日間 Clean版・Detail版2枚出力 ＆ 月次レポート判定
+        summary = get_real_trading_summary(days=10, current_balance=current_balance)
+        await asyncio.to_thread(send_periodic_pnl_report_discord, 10, current_balance)
+        await asyncio.to_thread(check_and_send_monthly_report_on_first_day)
         discord.print_log(f"[Performance Report] {label} 送信完了 (残高: ${current_balance:.2f}, 累計損益: ${summary['net_pnl']:+.2f})")
     except Exception as e:
         discord.print_log(f"[Performance Report Error] 実績レポート送信失敗: {e}")
@@ -1909,7 +1948,7 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
             # 8時間ごとの実運用トレード実績（直近PnLチャート画像 ＆ 現在の証拠金残高）をDiscordへ定期送信
             await send_periodic_performance_report(symbol_apis, mode, label="8時間定期レポート")
 
-        # ========== 毎時00分: クジラセンチメント更新（パラメータ最適化は8時間ごと定期選定時のみ） ==========
+        # ========== 毎時00分: クジラセンチメント更新 ＆ 自前OI/FRスナップショット蓄積 ＆ 日次・月次チェック ==========
         if cycle_count > 1 and now_jst.minute < 5:
             try:
                 whale_script = Path(__file__).resolve().parent / "fetch_whale_sentiment.py"
@@ -1918,6 +1957,23 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                         subprocess.run([sys.executable, str(whale_script)], check=True, timeout=60)
                     except Exception:
                         pass
+
+                # BingX 全対象銘柄の建玉(OI)＆FRスナップショット自動蓄積 (PROJECT_RULES 準拠)
+                try:
+                    from bingx_oi_collector import collect_and_save_oi_snapshot
+                    await asyncio.to_thread(collect_and_save_oi_snapshot, mode)
+                except Exception as oi_err:
+                    discord.print_log(f"[OI Collector Warning] 建玉スナップショット保存警告: {oi_err}", level="debug")
+
+                # 月初（毎月1日）判定 & 月次確定レポート・先月高安(PMH/PML)自動更新
+                if now_jst.hour == 0:
+                    try:
+                        from real_trade_tracker import check_and_send_monthly_report_on_first_day
+                        from monthly_key_levels import get_or_update_monthly_key_levels
+                        await asyncio.to_thread(check_and_send_monthly_report_on_first_day)
+                        await asyncio.to_thread(get_or_update_monthly_key_levels)
+                    except Exception as m_err:
+                        discord.print_log(f"[Monthly Check Warning] 月次処理警告: {m_err}", level="debug")
 
                 # 保有中ポジションの確認
                 held_symbols = set()
@@ -1965,9 +2021,9 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
             cycle_balance = await first_api.get_account() if first_api else 1000.0
             hourly_summary_rows = []
 
-            # 2. 全銘柄のポジション状況とシグナル判定を一括評価 (5分足)
+            # 2. 全銘柄のポジション状況とシグナル判定を一括評価 (5分足 SSoT ➔ 最適化採用足リサンプリング)
             for sym, api in list(symbol_apis.items()):
-                df = await fetch_bingx_candles(sym, "5m", limit=300, mode=mode)
+                df = await fetch_bingx_candles(sym, "5m", limit=3200, mode=mode)
                 if df.empty or len(df) < 20:
                     discord.print_log(f"[{sym}] ローソク足データ不足 (rows={len(df)}). スキップ。", level="debug")
                     continue
@@ -1986,7 +2042,7 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
 
                 # 各銘柄の個別最適化パラメータを取得
                 sym_params = symbol_params_map.get(sym, best_params)
-                cand_interval = int(sym_params.get("interval", 5))
+                cand_interval = int(sym_params.get("interval", 5) or 5)
 
                 # 時間足リサンプリング (5分を超える時間足で個別設定されている場合)
                 if cand_interval > 5:
@@ -1997,15 +2053,24 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                         if candle_close_time > datetime.now(timezone.utc):
                             df = df.iloc[:-1].reset_index(drop=True)
 
-                if df.empty or len(df) < 15:
+                if df.empty or len(df) < 20:
                     discord.print_log(f"[{sym}] データ不足 (rows={len(df)}). スキップ。", level="debug")
                     continue
 
-                cand_strat = sym_params.get("strategy", "rsima")
+                cand_strat = str(sym_params.get("strategy", "rsima")).lower()
                 cand_p = sym_params.get("params", {})
+                opt_mp = int(sym_params.get("mp", 200))
+                opt_bins = int(sym_params.get("num_bins", 50))
+                opt_va = float(sym_params.get("value_area_pct", 0.70))
+                opt_ma_type = str(sym_params.get("ma_type", "EMA"))
+                opt_ma_cond = str(sym_params.get("ma_condition", "close_above"))
+                opt_ep = float(sym_params.get("l_ep", cand_p.get("lEp", 40.0)))
+                opt_cp = float(sym_params.get("l_cp", cand_p.get("lCp", 60.0)))
+                opt_sl = float(sym_params.get("sl_pct", 0.090))
+
                 df = logic.make_logic(
                     df,
-                    market_profile_period=sym_params.get("mp", 48),
+                    market_profile_period=opt_mp,
                     er_threshold=sym_params.get("er", 40.0),
                     strategy_type=cand_strat,
                     env_len=cand_p.get("length", 15),
@@ -2014,39 +2079,92 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                     env_malen=cand_p.get("malen", 100),
                     rsi_len=cand_p.get("rsi_len", 9),
                     lma_len=cand_p.get("lma_len", 7),
-                    lEp=cand_p.get("lEp", 40.0),
-                    lCp=cand_p.get("lCp", 70.0),
+                    lEp=opt_ep,
+                    lCp=opt_cp,
+                    num_bins=opt_bins,
+                    value_area_pct=opt_va,
                 )
 
-                required_cols = ["long", "close"]
-                missing = [c for c in required_cols if c not in df.columns]
-                if missing:
-                    discord.print_log(f"[{sym}] シグナルカラム不足: {missing}. スキップ。", level="debug")
-                    continue
-
-                current_price = df["close"].iloc[-1]
-                long_signal = bool(df["long"].iloc[-1])
-                vah = df["VAH"].iloc[-1]
-                val = df["VAL"].iloc[-1]
-                poc = df["POC"].iloc[-1]
+                current_price = float(df["close"].iloc[-1])
+                vah = float(df["VAH"].iloc[-1]) if ("VAH" in df.columns and not pd.isna(df["VAH"].iloc[-1])) else current_price * 1.02
+                val = float(df["VAL"].iloc[-1]) if ("VAL" in df.columns and not pd.isna(df["VAL"].iloc[-1])) else current_price * 0.98
+                poc = float(df["POC"].iloc[-1]) if ("POC" in df.columns and not pd.isna(df["POC"].iloc[-1])) else current_price
                 vol_surge = float(df["vol_surge_ratio"].iloc[-1]) if "vol_surge_ratio" in df.columns else 1.0
 
                 position = await api.get_positions()
                 balance = cycle_balance
-                has_long = float(position.get("buy", 0)) > 0
+                buy_qty_cur = float(position.get("buy", 0.0))
+                has_long = buy_qty_cur > 0
+                entry_px_cur = float(position.get("buy_pos", 0.0)) or current_price
 
                 spec = api.bingx.instrument_spec or {}
                 lot_size = compute_lot_size(current_price, TARGET_POSITION_VALUE_USDT, spec)
+                actual_lots_count = int(round(buy_qty_cur / max(lot_size, 1e-6))) if (has_long and lot_size > 0) else (1 if has_long else 0)
 
-                pos_str = "LONG" if has_long else "FLAT"
-                sig_str = "LONG↑" if long_signal else "---"
+                scale_state_cur = scale_in_states.get(sym, {})
+                cur_nanpin_cnt = int(scale_state_cur.get("nanpin_count", 0))
+                t_count = max(cur_nanpin_cnt + 1, actual_lots_count) if has_long else 0
+                last_px_cur = float(scale_state_cur.get("last_entry_price", entry_px_cur)) if has_long else 0.0
+
+                regime_info = get_regime_gate_info(sym)
+                overall_regime = regime_info.get("overall_regime", "NEUTRAL")
+                is_emergency_be = (overall_regime != "BUY")
+                in_cooldown, rem_h = is_in_sl_cooldown(sym)
+
+                # 【PROJECT_RULES 第3項準拠】2大基本戦略 (VAL_POC vs RSIMA) シグナル評価
+                if cand_strat in ("val_poc", "vp_val_gc"):
+                    sig_eval = check_val_poc_signals(
+                        df_5m=df,
+                        current_pos_qty=buy_qty_cur,
+                        current_trades_count=t_count,
+                        avg_entry_price=entry_px_cur if has_long else 0.0,
+                        last_entry_price=last_px_cur,
+                        current_price=current_price,
+                        vp_period=opt_mp,
+                        num_bins=opt_bins,
+                        value_area_pct=opt_va,
+                        ma_type=opt_ma_type,
+                        ma_condition=opt_ma_cond,
+                        max_trades=MAX_TRADES_COUNT,
+                        target_ratio=0.60,
+                        min_va_width=0.015,
+                        nanpin_drop_pct=0.030,
+                        sl_pct=opt_sl,
+                        is_cooldown_active=in_cooldown,
+                        is_emergency_breakeven=is_emergency_be,
+                    )
+                else:
+                    sig_eval = check_rsima3_signals(
+                        df_5m=df,
+                        current_pos_qty=buy_qty_cur,
+                        current_trades_count=t_count,
+                        avg_entry_price=entry_px_cur if has_long else 0.0,
+                        current_price=current_price,
+                        rsi_len=9,
+                        ema_len=7,
+                        l_ep=opt_ep,
+                        l_cp=opt_cp,
+                        sl_pct=opt_sl,
+                        max_trades=MAX_TRADES_COUNT,
+                        last_entry_price=last_px_cur,
+                        val_price=val,
+                        vah_price=vah,
+                        is_emergency_breakeven=is_emergency_be,
+                    )
+
+                sig_action = sig_eval.get("action", "NONE")
+                sig_reason = sig_eval.get("reason", "")
+                long_signal = (sig_action == "INITIAL_ENTRY")
+
+                pos_str = f"LONG({t_count}枠)" if has_long else "FLAT"
+                sig_str = sig_action if sig_action not in ("NONE", "HOLD") else "---"
                 pnl_current = float(position.get("profit", 0.0)) if has_long else 0.0
                 pnl_str = f" | 含み損益: {pnl_current:+.2f} USDT" if has_long else ""
 
                 whale_info = get_whale_sentiment_info(sym)
                 whale_sig = whale_info.get("signal", "NEUTRAL")
 
-                strat_name = sym_params.get("strategy", "RANGE").upper()
+                strat_name = f"{cand_strat.upper()}({cand_interval}m)"
                 discord.print_log(
                     f"[{sym}] Price: ${current_price:,.4f} | Pos: {pos_str}{pnl_str} | Signal: {sig_str} ({strat_name}) | "
                     f"FR: {funding_val:+.6f} | VolSurge: {vol_surge:.1f}x | OIΔ: {oi_delta_pct:+.1f}% | "
@@ -2055,40 +2173,37 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                 )
 
                 whale_tag_short = "🟢買い" if whale_sig == "LONG_ONLY" else ("🔴売り" if whale_sig == "SHORT_ONLY" else "⚪中立")
-                pos_tag_short = f"LONG({pnl_current:+.1f})" if has_long else "FLAT"
-                sig_tag_short = "LONG↑" if long_signal else "---"
+                if has_long:
+                    sign_p = "+" if pnl_current >= 0 else "-"
+                    pos_tag_short = f"保有({sign_p}${abs(pnl_current):.2f}/{t_count}本)"
+                else:
+                    pos_tag_short = "ノーポジ"
                 hourly_summary_rows.append({
                     "sym": sym,
                     "price": current_price,
                     "pos": pos_tag_short,
-                    "sig": sig_tag_short,
+                    "sig": sig_str,
                     "whale": whale_tag_short,
                 })
 
                 if has_long:
-                    active_positions[sym] = (has_long, df, position, current_price, pnl_current)
+                    active_positions[sym] = (has_long, df, position, current_price, pnl_current, sig_eval, t_count)
                 else:
                     # ポジション未保有（FLAT）の場合
-                    # 旧選定銘柄で既にFLATであれば、監視リストから解放
                     if sym not in selected_set:
                         discord.print_log(f"[{sym}] 旧選定銘柄ですがポジションがFLATのため、監視リストから解放します。", level="debug")
                         freed_symbols.append(sym)
                         continue
 
-                    # クジラ判定およびマクロレジーム門番判定 (PROJECT_RULES パターンA準拠)
-                    regime_info = get_regime_gate_info(sym)
                     is_regime_allowed = (regime_info.get("regime_gate") == "ALLOW")
                     is_whale_allowed = whale_sig in ("LONG_ONLY", "NEUTRAL")
                     is_long_allowed = is_regime_allowed and is_whale_allowed
 
-                    # 損切り後24時間クールダウン判定 (リベンジトレード・往復ビンタの完全防止)
-                    in_cooldown, rem_h = is_in_sl_cooldown(sym)
                     if in_cooldown:
                         discord.print_log(f"[{sym}] [COOLDOWN] 過去24h以内に損切りが発生したため冷却中 (残り {rem_h:.1f}h)。エントリー見送り。", level="debug")
                         continue
 
                     if long_signal:
-
                         if is_long_allowed:
                             valid_entry_candidates.append({
                                 "symbol": sym,
@@ -2098,17 +2213,19 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                                 "balance": balance,
                                 "lot_size": lot_size,
                                 "current_price": current_price,
-                                "whale_sig": whale_sig
+                                "whale_sig": whale_sig,
+                                "sig_reason": sig_reason,
+                                "interval": cand_interval,
                             })
                         else:
                             filter_reasons = []
                             if not is_regime_allowed:
-                                filter_reasons.append(f"レジーム門番停止 ({regime_info.get('regime_reason')}/{regime_info.get('state_name')})")
+                                filter_reasons.append(f"レジーム門番停止 ({regime_info.get('regime_reason')})")
                             if not is_whale_allowed:
                                 filter_reasons.append(f"クジラ売り優勢 ({whale_sig})")
                             discord.print_log(f"[{sym}] [FILTER] ロングシグナル検出も、{' ＆ '.join(filter_reasons)}のためエントリー見送り。", level="debug")
                     else:
-                        reg_tag = f"門番:{regime_info.get('regime_gate')}"
+                        reg_tag = f"門番:{regime_info.get('regime_gate')}({overall_regime})"
                         discord.print_log(f"[{sym}] [--] シグナルなし。エントリー見送り ({reg_tag}, クジラ:{whale_sig})。", level="debug")
 
                 await asyncio.sleep(0.1)
@@ -2161,219 +2278,160 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                 if fsym in symbol_params_map:
                     del symbol_params_map[fsym]
 
-            # 2. 既存ポジションの決済・トレーリングSL判定
+            # 2. 既存ポジションの決済・ナンピン判定 (PROJECT_RULES 準拠: check_val_poc_signals / check_rsima3_signals 連動)
             from real_trade_tracker import record_real_trade, plot_real_trading_performance, plot_exit_chart
 
-            for sym, (has_long, df, position, current_price, pnl_current) in list(active_positions.items()):
+            for sym, (has_long, df, position, current_price, pnl_current, sig_pos, t_count) in list(active_positions.items()):
                 api = symbol_apis[sym]
                 entry_px = float(position.get("buy_pos", 0)) or current_price
+                buy_qty_pos = float(position.get("buy", 0.0))
                 sym_params = symbol_params_map.get(sym, best_params)
                 whale_sig = get_whale_sentiment_info(sym).get("signal", "NEUTRAL")
+                cand_strat = str(sym_params.get("strategy", "rsima")).lower()
+                opt_inv_p = int(sym_params.get("interval", 5) or 5)
+                inv_label_p = f"{opt_inv_p}m" if opt_inv_p < 60 else f"{opt_inv_p // 60}h"
 
                 if has_long:
-                    cand_strat = sym_params.get("strategy", "rsima")
-                    longclose_sig = bool(df["longclose"].iloc[-1]) if "longclose" in df.columns else False
                     regime_info = get_regime_gate_info(sym)
-                    is_top_tighten = (regime_info.get("action") == "TIGHTEN_SL_AND_STOP_NEW_LONG")
                     overall_regime = regime_info.get("overall_regime", "NEUTRAL")
                     is_emergency_be = (overall_regime != "BUY")
 
+                    pos_action = sig_pos.get("action", "HOLD")
+                    exit_reason = sig_pos.get("reason", "HOLD")
                     closed = False
 
-                    # 0. 地合い悪化時の緊急建値撤退 (非BUY かつ entry_px > 0 かつ current_price >= entry_px * 1.0020)
-                    if is_emergency_be and entry_px > 0 and current_price >= entry_px * 1.0020:
-                        exit_reason = "Emergency_Breakeven_Exit_+0.20%"
+                    # A. 損切り判定 (STOP_LOSS: 最終建値から VA60% 割れ [3枠目以降] または設定SL到達)
+                    if pos_action == "STOP_LOSS":
                         discord.print_log(
-                            f"[{sym}] [EMERGENCY BREAKEVEN EXIT] ⚠️ 地合い非BUY ({overall_regime}) 検知により建値+0.20%早期撤退成立!\n"
-                            f"   └ 現在値: ${current_price:,.4f} >= 撤退ライン: ${entry_px * 1.0020:,.4f} (建値: ${entry_px:,.4f}) ➔ 成行決済"
+                            f"🛑 [{sym}] [{cand_strat.upper()} STOP LOSS] {exit_reason}\n"
+                            f"   └ 現在値: ${current_price:,.4f} (平均建値: ${entry_px:,.4f}) ➔ 成行損切り決済 (24hクールダウン開始)",
+                            level="warning"
+                        )
+                        from bingx5_46_2api import flatten_current_position_bingx
+                        await flatten_current_position_bingx(sym, "USDT", mode, exit_reason, force_market=True)
+                        record_sl_cooldown(sym)
+                        closed = True
+
+                    # B. 利確 / 緊急建値撤退判定 (CLOSE_ALL: VAL-VAH 60% TP / RSIMA過熱TP / 非BUY +0.20% 建値撤退)
+                    elif pos_action == "CLOSE_ALL":
+                        discord.print_log(
+                            f"🎯 [{sym}] [{cand_strat.upper()} CLOSE ALL] {exit_reason}\n"
+                            f"   └ 現在値: ${current_price:,.4f} (平均建値: ${entry_px:,.4f}) ➔ 一括成行決済"
                         )
                         from bingx5_46_2api import flatten_current_position_bingx
                         await flatten_current_position_bingx(sym, "USDT", mode, exit_reason, force_market=True)
                         closed = True
 
-                    ttp = trailing_tp_states.get(sym, {
-                        "active": False,
-                        "peak_price": entry_px,
-                        "trail_stop": entry_px * 1.001,
-                        "entry_price": entry_px,
-                        "strategy": cand_strat
-                    })
-
-                    # 利確シグナル点灯、または天井圏検知(TOP_EXHAUSTION)時のトレーリング発動（未発動の場合）
-                    if not closed and not ttp.get("active", False) and (longclose_sig or is_top_tighten) and (current_price > entry_px):
-                        ttp["active"] = True
-                        cur_high = max(current_price, float(df["high"].iloc[-1]) if "high" in df.columns else current_price)
-                        ttp["peak_price"] = cur_high
-                        ttp["entry_price"] = entry_px
-                        ttp["strategy"] = cand_strat
-                        callback_pct = 0.015  # 1.5% に適正化 (大相場追従)
-                        min_guarantee = entry_px * 1.001  # 建値+手数料0.1%保証
-                        vah_val = float(df["VAH"].iloc[-1]) if ("VAH" in df.columns and not pd.isna(df["VAH"].iloc[-1])) else 0.0
-                        vah_guard = vah_val if (vah_val > 0 and cur_high > vah_val) else 0.0
-                        ttp["trail_stop"] = max(cur_high * (1.0 - callback_pct), vah_guard, min_guarantee)
-                        trailing_tp_states[sym] = ttp
-                        save_trailing_tp_states(trailing_tp_states)
-                        vah_tag = f" | VAH防護: ${vah_guard:,.4f}" if vah_guard > 0 else ""
-                        trigger_reason = "天井圏検知(TOP_EXHAUSTION)ストップ引き上げ" if is_top_tighten and not longclose_sig else "利益確定トレーリング開始"
-                        discord.print_log(
-                            f"[{sym}] [TRAILING TP ACTIVATED] 🔥 {trigger_reason}!\n"
-                            f"   └ 現在値: ${current_price:,.4f} (建値: ${entry_px:,.4f}) | 高値: ${ttp['peak_price']:,.4f} | 利確ライン: ${ttp['trail_stop']:,.4f} (-1.5%{vah_tag})"
-                        )
-
-                    # トレーリング利確モード中の判定
-                    if not closed and ttp.get("active", False):
-                        cur_high = max(current_price, float(df["high"].iloc[-1]) if "high" in df.columns else current_price)
-                        if cur_high > ttp["peak_price"]:
-                            ttp["peak_price"] = cur_high
-                        callback_pct = 0.015
-                        min_guarantee = entry_px * 1.001
-                        vah_val = float(df["VAH"].iloc[-1]) if ("VAH" in df.columns and not pd.isna(df["VAH"].iloc[-1])) else 0.0
-                        vah_guard = vah_val if (vah_val > 0 and ttp["peak_price"] > vah_val) else 0.0
-                        ttp["trail_stop"] = max(ttp["peak_price"] * (1.0 - callback_pct), vah_guard, min_guarantee)
-                        trailing_tp_states[sym] = ttp
-                        save_trailing_tp_states(trailing_tp_states)
-
-                        if current_price < ttp["trail_stop"]:
-                            exit_reason = f"TrailingTP_{cand_strat.upper()}"
+                    # C. 段階的ナンピン判定 (ADD_ENTRY: 4重セーフティリミッター厳格適用)
+                    elif pos_action == "ADD_ENTRY":
+                        # [Guard 1] 地合い悪化時の緊急対応: 全体相場が BUY 以外ならナンピン即時凍結
+                        if is_emergency_be:
                             discord.print_log(
-                                f"[{sym}] [TRAILING TP TRIGGERED] 🎯 利確トレーリング成立!\n"
-                                f"   └ 現在値: ${current_price:,.4f} < 利確ライン: ${ttp['trail_stop']:,.4f} (最高値: ${ttp['peak_price']:,.4f} から反落) ➔ 成行利確決済"
-                            )
-                            from bingx5_46_2api import flatten_current_position_bingx
-                            await flatten_current_position_bingx(sym, "USDT", mode, exit_reason, force_market=True)
-                            closed = True
-                            trailing_tp_states.pop(sym, None)
-                            save_trailing_tp_states(trailing_tp_states)
-                        else:
-                            discord.print_log(
-                                f"[{sym}] [TRAILING TP HOLD] 🟢 利確トレーリング継続中 (現在値: ${current_price:,.4f}, ピーク: ${ttp['peak_price']:,.4f}, 利確ライン: ${ttp['trail_stop']:,.4f})",
+                                f"🛡️ [{sym}] [地合い悪化ナンピン凍結] 全体相場非BUY ({overall_regime}) のため追加ナンピンを凍結中。",
                                 level="debug"
                             )
-                            closed = False
-                    elif not closed:
-                        # 1. 戦略別スマート損切り判定 (5分足確定終値判定 Close)
-                        # 個別最適化パラメータ sl_pct を優先参照 (デフォルト: RSIMA 3.0%, VAL_POC 9.0% / 実証最適値準拠)
-                        default_sl = 0.09 if cand_strat in ("val_poc", "vp_val_gc") else 0.030
-                        sl_ratio = float(sym_params.get("sl_pct", default_sl))
-                        sl_pct_label = f"{sl_ratio * 100:.1f}%"
-                        if entry_px > 0 and (current_price < entry_px * (1.0 - sl_ratio)):
-                            exit_reason = f"Fixed_SL_{sl_pct_label}"
+                        # [Guard 2] ナンピン上限の物理ロック (最大3枠厳守)
+                        elif t_count >= MAX_TRADES_COUNT:
                             discord.print_log(
-                                f"[{sym}] [STOP LOSS TRIGGERED] 🛑 最大ストップロス ({sl_pct_label}: 終値確定) 成立!\n"
-                                f"   └ 現在値: ${current_price:,.4f} < SLライン: ${entry_px * (1.0 - sl_ratio):,.4f} (建値: ${entry_px:,.4f}) ➔ 成行損切り決済 (24hクールダウン開始)"
+                                f"🚫 [{sym}] [枠数上限ブロック] すでに最大枠数 ({t_count}/{MAX_TRADES_COUNT}枠) に到達しているため追加ナンピンを拒否しました。",
+                                level="warning"
                             )
-                            from bingx5_46_2api import flatten_current_position_bingx
-                            await flatten_current_position_bingx(sym, "USDT", mode, exit_reason, force_market=True)
-                            record_sl_cooldown(sym)
-                            closed = True
-
-                        if not closed and cand_strat in ("val_poc", "vp_val_gc"):
-                            # 2-A. VAL_POC 戦略: VAL-VAH 60%水準到達クローズ判定 (建値プラス域限定)
-                            vah_val = float(df["VAH"].iloc[-1]) if ("VAH" in df.columns and not pd.isna(df["VAH"].iloc[-1])) else 0.0
-                            val_val = float(df["VAL"].iloc[-1]) if ("VAL" in df.columns and not pd.isna(df["VAL"].iloc[-1])) else 0.0
-                            poc_val = float(df["POC"].iloc[-1]) if ("POC" in df.columns and not pd.isna(df["POC"].iloc[-1])) else 0.0
-                            target_tp = val_val + (vah_val - val_val) * 0.60 if (vah_val > val_val and val_val > 0) else poc_val
-                            cur_high = max(current_price, float(df["high"].iloc[-1]) if "high" in df.columns else current_price)
-                            if target_tp > 0 and (cur_high >= target_tp or current_price >= target_tp) and (current_price > entry_px * 1.0006):
-                                exit_reason = "VAL_VAH_60_TP"
-                                discord.print_log(
-                                    f"[{sym}] [VAL-VAH 60% TP TRIGGERED] 🎯 VAL-VAH 60%水準利確成立!\n"
-                                    f"   └ 現在値: ${current_price:,.4f} >= 目標値: ${target_tp:,.4f} (建値: ${entry_px:,.4f}) ➔ 成行利確決済"
-                                )
-                                from bingx5_46_2api import flatten_current_position_bingx
-                                await flatten_current_position_bingx(sym, "USDT", mode, exit_reason, force_market=True)
-                                closed = True
-
-                        # 2-B. 段階的ナンピン判定 (PROJECT_RULES準拠: 初期1+ナンピン最大2=計3枠, 等倍1.0x)
-                        if not closed and cand_strat in ("val_poc", "vp_val_gc", "rsima"):
-                            # 地合いが BUY の時のみナンピン許可 (NEUTRAL/BEAR時は即時凍結)
-                            can_nanpin = (overall_regime == "BUY")
-                            if not can_nanpin:
-                                discord.print_log(
-                                    f"[{sym}] [NANPIN FROZEN] ❄️ 地合いが {overall_regime} のため追加ナンピンは即時凍結されています。",
-                                    level="debug"
-                                )
-                            else:
-                                scale_state = scale_in_states.get(sym, {
-                                    "nanpin_count": 0,
-                                    "last_entry_price": entry_px,
-                                    "avg_price": entry_px,
-                                    "poc_level": float(df["POC"].iloc[-1]) if ("POC" in df.columns and not pd.isna(df["POC"].iloc[-1])) else 0.0,
-                                    "strategy": cand_strat
-                                })
-                                cur_nanpin = int(scale_state.get("nanpin_count", 0))
-                                last_px = float(scale_state.get("last_entry_price", entry_px)) or entry_px
-                                max_allowed_nanpins = 2
-                                req_drop_pct = calc_add_pct(cur_nanpin + 1, strategy=cand_strat)
-                                drop_target = last_px * (1.0 - req_drop_pct)
-                                current_pos_size = float(position.get("buy", 0))
-                                current_notional = current_pos_size * current_price
+                        else:
+                            spec_pos = api.bingx.instrument_spec or {}
+                            base_lot_add = compute_lot_size(current_price, BINGX_TARGET_POSITION_VALUE_USDT, spec_pos)
+                            nanpin_lot = base_lot_add * float(sig_pos.get("lot_multiplier", 1.0))
+                            if nanpin_lot > 0:
+                                # [Guard 3] 1銘柄あたりの最大許容ポジション金額 (ドル換算) による二重チェック
                                 max_notional_limit = BINGX_TARGET_POSITION_VALUE_USDT * 3.15
+                                current_notional = buy_qty_pos * current_price
+                                additional_notional = nanpin_lot * current_price
+                                if (current_notional + additional_notional) > max_notional_limit:
+                                    discord.print_log(
+                                        f"🚫 [{sym}] [金額上限ブロック] 追加後想定元本 (${current_notional + additional_notional:.2f}) が"
+                                        f"上限 (${max_notional_limit:.2f}) を超過するためナンピンをブロックしました。",
+                                        level="warning"
+                                    )
+                                else:
+                                    # [Guard 4] 証拠金維持率・有効レバレッジ監査 (3.0倍上限)
+                                    total_portfolio_notional = 0.0
+                                    for a_sym, (a_long, _, a_pos, a_px, _, _, _) in active_positions.items():
+                                        if a_long:
+                                            total_portfolio_notional += float(a_pos.get("buy", 0.0)) * a_px
+                                    after_portfolio_notional = total_portfolio_notional + additional_notional
+                                    account_equity = cycle_balance if cycle_balance > 0 else 1000.0
+                                    effective_leverage = after_portfolio_notional / account_equity
+                                    MAX_SAFE_EFFECTIVE_LEVERAGE = 3.0
 
-                                if cur_nanpin < max_allowed_nanpins and current_price <= drop_target:
-                                    if current_notional >= max_notional_limit:
+                                    if effective_leverage > MAX_SAFE_EFFECTIVE_LEVERAGE:
                                         discord.print_log(
-                                            f"[{sym}] [NANPIN BLOCKED] 🛑 想定元本上限ガード到達 (${current_notional:.2f} >= ${max_notional_limit:.2f}) ➔ ナンピン中止",
+                                            f"⚠️ [{sym}] [マージンセーフティブロック] 追加後有効レバレッジ ({effective_leverage:.2f}倍) が"
+                                            f"安全上限 ({MAX_SAFE_EFFECTIVE_LEVERAGE:.1f}倍) を超えるためナンピンをスキップしました。",
                                             level="warning"
                                         )
                                     else:
                                         discord.print_log(
-                                            f"[{sym}] [NANPIN TRIGGER] 📉 最後の建値(${last_px:,.4f})から-{req_drop_pct*100:.1f}%下落検出 (${current_price:,.4f} <= ${drop_target:,.4f})\n"
-                                            f"   └ ナンピン発動 ({cur_nanpin + 1}/{max_allowed_nanpins} 回目)...",
-                                            level="debug"
+                                            f"⚡ [{sym}] [{cand_strat.upper()} ナンピン追加発注>>] {exit_reason} "
+                                            f"(均等1xロット: {nanpin_lot}, 枠: {t_count + 1}/{MAX_TRADES_COUNT})"
                                         )
-                                        buy_lot = float(position.get("buy", 0))
+                                        df_add = df.copy()
+                                        df_add["long"] = True
                                         entered_add = await api.long_entry(
-                                            df, position, balance, buy_lot, max_lot,
-                                            max_stage=max_allowed_nanpins + 1, is_scale_in=True, stage_num=cur_nanpin + 2
+                                            df_add, position, cycle_balance, nanpin_lot, max_lot,
+                                            max_stage=MAX_TRADES_COUNT, is_scale_in=True, stage_num=t_count + 1
                                         )
-
                                         if entered_add:
-                                            scale_state["nanpin_count"] = cur_nanpin + 1
-                                            scale_state["last_entry_price"] = current_price
-                                            scale_state["strategy"] = cand_strat
+                                            vah_now = float(df["VAH"].iloc[-1]) if "VAH" in df.columns else current_price * 1.02
+                                            val_now = float(df["VAL"].iloc[-1]) if "VAL" in df.columns else current_price * 0.98
+                                            poc_now = float(df["POC"].iloc[-1]) if "POC" in df.columns else current_price
+                                            tp_now = val_now + (vah_now - val_now) * 0.60 if (vah_now > val_now and val_now > 0) else poc_now
+                                            scale_state = scale_in_states.get(sym, {})
+                                            scale_state.update({
+                                                "nanpin_count": t_count,
+                                                "last_entry_price": current_price,
+                                                "avg_price": entry_px,
+                                                "poc_level": poc_now,
+                                                "val_level": val_now,
+                                                "vah_level": vah_now,
+                                                "target_tp": tp_now,
+                                                "strategy": cand_strat,
+                                            })
                                             scale_in_states[sym] = scale_state
                                             save_scale_in_states(scale_in_states)
-                                            record_real_trade(sym, "LONG", "SCALE_IN", current_price, buy_lot, 0.0, f"実運用ナンピン買い増し ({cur_nanpin + 1}/{max_allowed_nanpins})")
+                                            record_real_trade(sym, "LONG", "ADD_ENTRY", current_price, nanpin_lot, 0.0, f"実運用ナンピン ({t_count}/{MAX_TRADES_COUNT - 1})")
                                             discord.print_log(
-                                                f"🚀🚀🚀 **【ナンピン買い増し約定】** 🚀🚀🚀\n"
+                                                f"🚀🚀🚀 **【ナンピン買い増し約定 [{inv_label_p}足]】** 🚀🚀🚀\n"
                                                 f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
                                                 f"📌 **銘柄 / 方向**: `{sym}` (LONG 🟢 / {cand_strat.upper()})\n"
                                                 f"💰 **約定価格**: `${current_price:.6f}`\n"
-                                                f"📦 **追加数量**: `{buy_lot:,.2f} {sym}`\n"
-                                                f"🔢 **ナンピン段階**: `{cur_nanpin + 1}/{max_allowed_nanpins} 回目` (合計 {cur_nanpin + 2}/{max_allowed_nanpins + 1} 枠)\n"
+                                                f"📦 **追加数量**: `{nanpin_lot:,.2f} {sym}` (1x均等ロット)\n"
+                                                f"🔢 **保有枠数**: `合計 {t_count + 1}/{MAX_TRADES_COUNT} 枠`\n"
                                                 f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
                                             )
-
-                        elif not closed:
-                            # 2-C. 通常戦略: Volume Profile SL (損切り/撤退) を判定
-                            closed = await api.long_close(
-                                df, position, commission=0.0,
-                                sl_margin_pct=sym_params.get("margin", 2.0),
-                                strategy_type=cand_strat,
-                            )
-                            exit_reason = "VP_Trailing"
 
                     if closed:
                         trailing_tp_states.pop(sym, None)
                         save_trailing_tp_states(trailing_tp_states)
                         scale_in_states.pop(sym, None)
                         save_scale_in_states(scale_in_states)
-                        record_real_trade(sym, "LONG", "CLOSE", current_price, float(position.get("buy", 0)), pnl_current, f"実運用決済 ({exit_reason})")
-                        discord.print_log(f"[{sym}] [CLOSE] 🟢 ロングポジション決済完了 (PnL: {pnl_current:+.2f} USDT, 理由: {exit_reason})")
+                        record_real_trade(sym, "LONG", "CLOSE", current_price, buy_qty_pos, pnl_current, f"実運用決済 ({exit_reason})")
+                        discord.print_log(f"[{sym}] [CLOSE] 🟢 ロングポジション決済完了 [{inv_label_p}足] (PnL: {pnl_current:+.2f} USDT, 理由: {exit_reason})")
                         
-                        # 1. 決済トレードチャート画像の生成 & 送信
-                        exit_chart_file = plot_exit_chart(
+                        # 1. 決済トレードチャート画像の生成 & 送信 (個別最適化採用足種で描画)
+                        exit_chart_file = await asyncio.to_thread(
+                            plot_exit_chart,
                             symbol=sym, df=df, exit_price=current_price, entry_price=entry_px,
-                            pnl=pnl_current, exit_reason=exit_reason, side="LONG", whale_signal=whale_sig
+                            pnl=pnl_current, exit_reason=exit_reason, side="LONG", whale_signal=whale_sig,
+                            interval_label=inv_label_p
                         )
                         if exit_chart_file and exit_chart_file.exists():
-                            discord.send_file(exit_chart_file, f"📊 【決済チャート】{sym} LONG 決済完了 (PnL: {pnl_current:+.2f} USDT)")
+                            discord.send_file(exit_chart_file, f"📊 【決済チャート】{sym} LONG 決済完了 [{inv_label_p}足] (PnL: {pnl_current:+.2f} USDT)")
 
-                        # 2. 累積 PnL パフォーマンスチャートの生成 & 送信
-                        chart_file = plot_real_trading_performance()
-                        if chart_file and chart_file.exists():
-                            discord.send_file(chart_file, f"📈 【実運用実績】累積損益パフォーマンス更新 (PnL: {pnl_current:+.2f} USDT)")
+                        # 2. スライディング10日間 累積 PnL パフォーマンスチャート (Clean版 & Detail版 2枚) の生成 & 送信
+                        clean_file, detail_file = await asyncio.to_thread(plot_real_trading_performance, 10, cycle_balance)
+                        if clean_file and clean_file.exists():
+                            discord.send_file(clean_file, f"📈 【実運用実績】累積損益パフォーマンス (直近10日 - Clean版 / 今回決済: {pnl_current:+.2f} USDT)")
+                        if detail_file and detail_file.exists():
+                            discord.send_file(detail_file, f"🔍 【実運用実績】累積損益パフォーマンス (直近10日 - Detail版 / 今回決済: {pnl_current:+.2f} USDT)")
                         del active_positions[sym]
 
                         # 旧選定銘柄の決済完了時は監視リストから解放
@@ -2384,12 +2442,9 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                             if sym in symbol_params_map:
                                 del symbol_params_map[sym]
                     else:
-                        ttp_info = ""
-                        if ttp.get("active", False):
-                            ttp_info = f" [利確トレーリング中: ピーク=${ttp['peak_price']:,.4f}, 撤退=${ttp['trail_stop']:,.4f}]"
                         pnl_icon = "🟢" if pnl_current >= 0 else "🔴"
                         discord.print_log(f"──────────────────────────────────────────────────────────", level="debug")
-                        discord.print_log(f"💰 【{sym} 現在の含み損益】: {pnl_current:+.2f} USDT {pnl_icon}{ttp_info} (ロング継続保有中)", level="debug")
+                        discord.print_log(f"💰 【{sym} 現在の含み損益】: {pnl_current:+.2f} USDT {pnl_icon} ({t_count}/{MAX_TRADES_COUNT}枠 保有中)", level="debug")
                         discord.print_log(f"──────────────────────────────────────────────────────────", level="debug")
 
             # 3. 新規エントリー実行 (最大同時保有ポジション数制限: MAX_ACTIVE_POSITIONS)
@@ -2398,7 +2453,6 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                 held_syms = ", ".join(active_positions.keys())
                 discord.print_log(f"[ENTRY BLOCK] 現在最大ポジション枠({current_pos_count}/{MAX_ACTIVE_POSITIONS})保有中のため新規エントリーは見送ります。(保有中: {held_syms})", level="debug")
             elif valid_entry_candidates:
-                # 既にポジション保有中の銘柄はエントリー候補から除外
                 candidates_to_enter = [c for c in valid_entry_candidates if c["symbol"] not in active_positions]
 
                 if not candidates_to_enter:
@@ -2415,7 +2469,6 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                     )
 
                     for cand_idx, best_cand in enumerate(candidates_to_enter):
-                        # 空き枠チェック（約定するたびに active_positions が増加）
                         if len(active_positions) >= MAX_ACTIVE_POSITIONS:
                             discord.print_log(
                                 f"[ENTRY LIMIT] 最大ポジション枠({MAX_ACTIVE_POSITIONS})に達したため、残りの候補エントリーを終了します。",
@@ -2431,13 +2484,18 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                         lot_size = best_cand["lot_size"]
                         current_price = best_cand["current_price"]
                         whale_sig = best_cand["whale_sig"]
+                        sig_reason_e = best_cand.get("sig_reason", "INITIAL_ENTRY")
+                        opt_inv_e = int(best_cand.get("interval", 5) or 5)
+                        inv_label_e = f"{opt_inv_e}m" if opt_inv_e < 60 else f"{opt_inv_e // 60}h"
 
-                        discord.print_log(f"[{best_sym}] [ENTRY>>] ロングエントリー試行 ({cand_idx+1}/{len(candidates_to_enter)}) (クジラ判定: {whale_sig})", level="debug")
-                        entered = await api.long_entry(df, position, balance, lot_size, max_lot)
+                        discord.print_log(f"[{best_sym}] [ENTRY>>] ロングエントリー試行 ({cand_idx+1}/{len(candidates_to_enter)}) [{inv_label_e}足] ({sig_reason_e} / クジラ: {whale_sig})", level="debug")
+                        df_entry = df.copy()
+                        df_entry["long"] = True
+                        entered = await api.long_entry(df_entry, position, balance, lot_size, max_lot)
                         if entered:
-                            active_positions[best_sym] = (True, df, position, current_price, 0.0)
+                            active_positions[best_sym] = (True, df, position, current_price, 0.0, {}, 1)
                             # 1. 実運用トレード履歴の記録
-                            record_real_trade(best_sym, "LONG", "ENTRY", current_price, lot_size, 0.0, "実運用新規エントリー")
+                            record_real_trade(best_sym, "LONG", "ENTRY", current_price, lot_size, 0.0, f"新規エントリー約定 [{inv_label_e}足]")
                             
                             # 2. 指標値・クジラ情報の取得
                             last_row = df.iloc[-1] if not df.empty else None
@@ -2445,9 +2503,9 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                             val_val = float(last_row.get("VAL", 0.0)) if last_row is not None and "VAL" in last_row else 0.0
                             poc_val = float(last_row.get("POC", 0.0)) if last_row is not None and "POC" in last_row else 0.0
 
-                            # scale_in_states の初期化
+                            # scale_in_states & active_positions_meta.json の初期化
                             best_sym_params = symbol_params_map.get(best_sym, best_params)
-                            cur_strat = best_sym_params.get("strategy", "val_poc" if FORCE_STRATEGY == "val_poc" else "rsima")
+                            cur_strat = str(best_sym_params.get("strategy", "val_poc" if FORCE_STRATEGY == "val_poc" else "rsima")).lower()
                             target_tp_val = val_val + (vah_val - val_val) * 0.60 if (vah_val > val_val and val_val > 0) else poc_val
                             scale_in_states[best_sym] = {
                                 "nanpin_count": 0,
@@ -2457,23 +2515,23 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                                 "val_level": val_val,
                                 "vah_level": vah_val,
                                 "target_tp": target_tp_val,
-                                "strategy": cur_strat
+                                "strategy": cur_strat,
+                                "interval": opt_inv_e,
                             }
                             save_scale_in_states(scale_in_states)
 
-                            
                             entry_notional = current_price * lot_size
-                            best_sym_params = symbol_params_map.get(best_sym, best_params)
-                            strat_desc = f"{best_sym_params.get('strategy', 'BREAKOUT').upper()} (MP={best_sym_params.get('mp', '-')}, ER={best_sym_params.get('er', '-')})"
+                            strat_desc = f"{cur_strat.upper()} ({inv_label_e}足 / MP={best_sym_params.get('mp', '-')})"
                             whale_info = get_whale_sentiment_info(best_sym)
                             whale_flow_val = float(whale_info.get("net_flow", 0.0)) if whale_info else 0.0
                             
                             # 3. Discord バッファをフラッシュ
                             discord.flush_all()
                             
-                            # 4. エントリーチャート画像の生成 & Discord送信
+                            # 4. エントリーチャート画像の生成 & Discord送信 (個別最適化採用足種で描画)
                             from real_trade_tracker import plot_entry_chart
-                            entry_chart_file = plot_entry_chart(
+                            entry_chart_file = await asyncio.to_thread(
+                                plot_entry_chart,
                                 symbol=best_sym,
                                 df=df,
                                 entry_price=current_price,
@@ -2482,21 +2540,25 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                                 poc=poc_val,
                                 strategy_name=strat_desc,
                                 whale_signal=whale_sig,
-                                whale_flow=whale_flow_val
+                                whale_flow=whale_flow_val,
+                                interval_label=inv_label_e,
                             )
                             
                             entry_msg = (
-                                f"🚀🚀🚀 **【新規ロングエントリー約定】** 🚀🚀🚀\n"
+                                f"🚀🚀🚀 **【新規ロングエントリー約定 [{inv_label_e}足]】** 🚀🚀🚀\n"
                                 f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                                f"📌 **銘柄 / 方向**: `{best_sym}` (LONG 🟢)\n"
+                                f"📌 **銘柄 / 方向**: `{best_sym}` (LONG 🟢 / 採用足種: `{inv_label_e}足`)\n"
+                                f"⚡ **検知トリガー**: `{sig_reason_e}`\n"
                                 f"💰 **約定価格**: `${current_price:.6f}`\n"
                                 f"📦 **発注数量**: `{lot_size:,.2f} {best_sym}` (約 `${entry_notional:,.2f} USDT`)\n"
                                 f"⚙️ **適用戦略**: `{strat_desc}`\n"
+                                f"🎯 **利確目標**: `VAL-VAH 60%水準 (${target_tp_val:.6f}) / RSI過熱利確`\n"
+                                f"📉 **ナンピン設計**: `VA 60%間隔・均等1倍ロット (最大2回追加 / 合計最大3枠)`\n"
                                 f"🐋 **クジラ判定**: `{whale_sig}` (流入: `${whale_flow_val:+,.0f}`)\n"
                                 f"📐 **Volume Profile 指標**:\n"
                                 f"  - **VAH (上値抵抗)**: `${vah_val:.6f}`\n"
                                 f"  - **POC (中心値)**  : `${poc_val:.6f}`\n"
-                                f"  - **VAL (初期SL)** : `${val_val:.6f}`\n"
+                                f"  - **VAL (下値支持)**: `${val_val:.6f}`\n"
                                 f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
                             )
                             
@@ -2506,6 +2568,23 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                                 discord.print_log(entry_msg)
                         else:
                             discord.print_log(f"[{best_sym}] [FALLTHROUGH] 約定しなかったため見送ります。次の候補銘柄へ移行します。", level="debug")
+
+            # --- ハートビート記録 (Data/bot_heartbeat.json) ---
+            try:
+                hb_file = Path(__file__).resolve().parent / "Data" / "bot_heartbeat.json"
+                hb_file.parent.mkdir(parents=True, exist_ok=True)
+                hb_data = {
+                    "timestamp": time.time(),
+                    "datetime_jst": now_jst.strftime("%Y-%m-%d %H:%M:%S"),
+                    "cycle_count": cycle_count,
+                    "monitored_symbols": list(symbol_apis.keys()),
+                    "active_positions_count": len(active_positions),
+                    "active_symbols": list(active_positions.keys()),
+                }
+                with open(hb_file, "w", encoding="utf-8") as f:
+                    json.dump(hb_data, f, indent=2, ensure_ascii=False)
+            except Exception:
+                pass
 
 
 

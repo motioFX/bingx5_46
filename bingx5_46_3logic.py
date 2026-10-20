@@ -503,7 +503,7 @@ class send_discord:
         for url in webhooks:
             self.flush_buffer(url)
             try:
-                payload = {"content": content_text}
+                payload = {"payload_json": json.dumps({"content": content_text}, ensure_ascii=False)}
                 with open(file_path, f"rb") as f:
                     files = {"file": (file_name, f, mime_type)}
                     response = requests.post(url, data=payload, files=files, timeout=30)
