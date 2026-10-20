@@ -1,96 +1,96 @@
 from __future__ import annotations
-"""Rebuild merged hourly datasets for top-volume BingX symbols.
-Generates selection scores, normalized charts, and merged CSVs.
 """
+bingx5_46_4mix_candle_Merged_Alt10.py
+BingX USDT無期限先物 20銘柄 + BTC ノーマライズ比較 ＆ 3段階全体地合い判定スクリプト (PROJECT_RULES.md 準拠)
+
+- 5分足 SSoT ストア (candle_5m_store) より高速に 1H足 / 日足 を動的生成
+- 30d, 10d, 5d ノーマライズ比較チャート（先月高安 PMH/PML 点線入り）を出力・Discord送信
+- 前半高値ピークアウト監査・レンジ半値維持補完ルールによる崩壊銘柄除外
+- 3段階全体地合い判定（BTC 2票 / 計22票制、11票以上過半数）により BULL / NEUTRAL / BEAR を算出
+- 結果を Data/market_state.json に永続化
+"""
+
 import argparse
 import asyncio
+import json
 import math
+import os
 import shutil
 import sys
 import time
-import zipfile
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
-import json
-import subprocess
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import matplotlib.dates as md
 import numpy as np
 import pandas as pd
-import pybotters
 import requests
-import aiohttp
+
 from config_loader import get_webhook_url
-from upload_registry import should_upload_file, record_file_uploaded
-from bingx5_46_3logic import RegimeFilterManager, MacroMarketDumpFilter
+from candle_5m_store import (
+    sync_all_target_symbols_5m,
+    sync_symbol_5m_candles,
+    load_5m_candles,
+    resample_from_5m,
+    get_resampled_candles,
+    normalize_symbol_name,
+    get_clean_symbol,
+)
+from monthly_key_levels import get_or_update_monthly_key_levels, compute_bounce_metrics
+from bingx5_46_3logic import evaluate_market_regime_3window, check_normalized_peak_timing
 
 if hasattr(sys.stdout, "reconfigure"):
     try:
-        sys.stdout.reconfigure(encoding="utf-8")
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     except Exception:
         pass
-
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
+if hasattr(sys.stderr, "reconfigure"):
+    try:
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
 
 if sys.platform == "win32":
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
-REST_API_URL = {
-    "bingx": "https://open-api.bingx.com",
-    "bingx_demo": "https://open-api-vst.bingx.com",
-    "coinbase": "https://api.exchange.coinbase.com",
-}
-
 JST = timezone(timedelta(hours=9))
-_now_jst = datetime.now(JST).replace(minute=0, second=0, microsecond=0)
-DEFAULT_START_JST = _now_jst - timedelta(days=30)
-DEFAULT_START_STR = DEFAULT_START_JST.isoformat()
 
-GRANULARITY_MS = {
-    "1H": 60 * 60 * 1000,
-    "2H": 2 * 60 * 60 * 1000,
-    "4H": 4 * 60 * 60 * 1000,
-    "6H": 6 * 60 * 60 * 1000,
-    "12H": 12 * 60 * 60 * 1000,
-    "1D": 24 * 60 * 60 * 1000,
-}
+def is_forex_symbol(s: str) -> bool:
+    clean = str(s).upper().replace("-", "").replace("_", "")
+    forex_pairs = {"EURUSD", "GBPUSD", "USDJPY", "AUDUSD", "USDCAD", "USDCHF", "NZDUSD"}
+    return any(clean.startswith(fp) or clean == fp for fp in forex_pairs)
 
-NormalizedWindow = Tuple[str, Optional[timedelta], Optional[int]]
-
-NORMALIZED_WINDOWS: Sequence[NormalizedWindow] = (
-    ("30d", timedelta(days=30), 30 * 24),
-    ("10d", timedelta(days=10), 10 * 24),
-    ("5d", timedelta(days=5), 5 * 24),
-)
-
-DEFAULT_PRODUCT_TYPE = "PERP"
-
-# 固定選定銘柄 (主要アルトコイン20銘柄)
-FIXED_SYMBOLS = [
+# 固定選定銘柄 (主要アルトコイン20銘柄 + BTC-USDT 計22票制 / PROJECT_RULES.md 準拠)
+FIXED_TARGET_SYMBOLS: List[str] = [
     "HYPE-USDT", "SOL-USDT", "DOGE-USDT", "XRP-USDT", "SUI-USDT",
-    "AVAX-USDT", "LINK-USDT", "APT-USDT", "NEAR-USDT", "ARB-USDT",
-    "UNI-USDT", "OP-USDT", "TIA-USDT", "RENDER-USDT", "INJ-USDT",
+    "AVAX-USDT", "LINK-USDT", "ADA-USDT", "NEAR-USDT", "APT-USDT",
+    "OP-USDT", "ARB-USDT", "TIA-USDT", "RENDER-USDT", "WIF-USDT",
     "FET-USDT", "TAO-USDT", "AAVE-USDT", "ENA-USDT", "ZEC-USDT"
 ]
+REGIME_SYMBOLS: List[str] = ["BTC-USDT"]
+ALL_SYMBOLS: List[str] = ["BTC-USDT"] + [s for s in FIXED_TARGET_SYMBOLS if s != "BTC-USDT"]
 
 
 class send_discord:
-    def __init__(self) -> None:
+    hourly_only: bool = True
+
+    def __init__(self, hourly_only: bool = True) -> None:
+        self.hourly_only = hourly_only
         self.real3_webhook = get_webhook_url("real3_bngx")
         self.test4_webhook = get_webhook_url("test4_backtest")
-        self.bingx_webhook = self.real3_webhook
-        self.win32_webhook = self.real3_webhook
-        self.default_webhook = self.real3_webhook
         self.webhook_url = self.real3_webhook or self.test4_webhook
 
     def _get_target_webhooks(self, text: str = "") -> list[str]:
-        # BingX関連はすべて #real3_bngx へ全集約
         target = self.real3_webhook or self.test4_webhook
         return [target] if target else []
 
-    def send_message(self, content: str) -> None:
+    def send_message(self, content: str, force_send: bool = True) -> None:
+        if getattr(self, "hourly_only", True) and not force_send:
+            return
         webhooks = self._get_target_webhooks(content)
         for url in webhooks:
             try:
@@ -98,7 +98,9 @@ class send_discord:
             except requests.RequestException:
                 pass
 
-    def send_file(self, file_path: Path, description: str = "") -> None:
+    def send_file(self, file_path: Path, description: str = "", force_send: bool = True) -> None:
+        if getattr(self, "hourly_only", True) and not force_send:
+            return
         webhooks = self._get_target_webhooks(description)
         for url in webhooks:
             try:
@@ -106,18 +108,11 @@ class send_discord:
                     continue
                 with file_path.open("rb") as fh:
                     files = {"file": (file_path.name, fh)}
-                    data = {"payload_json": json.dumps({"content": description})} if description else {}
-                    requests.post(url, data=data, files=files, timeout=120).raise_for_status()
+                    payload_json = json.dumps({"content": description}, ensure_ascii=False)
+                    data = {"payload_json": payload_json}
+                    requests.post(url, data=data, files=files, timeout=30).raise_for_status()
             except requests.RequestException as e:
                 print(f"[Discord Error] Failed to send file {file_path.name}: {e}")
-
-
-def to_ms(dt: datetime) -> int:
-    return int(dt.astimezone(timezone.utc).timestamp() * 1000)
-
-
-def from_ms_jst(ms: int) -> datetime:
-    return datetime.fromtimestamp(ms / 1000, tz=timezone.utc).astimezone(JST)
 
 
 def log(message: str) -> None:
@@ -130,1650 +125,290 @@ def log(message: str) -> None:
         sys.stdout.flush()
 
 
-def log_fetch_result(label: str, rows: Sequence[Any]) -> None:
-    count = len(rows) if hasattr(rows, "__len__") else 0
-    if count == 0:
-        log(f"{label}: no data returned (skip)")
-    else:
-        log(f"{label}: {count} rows")
-
-
-def ensure_columns(df: pd.DataFrame, columns: Sequence[str]) -> pd.DataFrame:
-    for col in columns:
-        if col not in df.columns:
-            df[col] = np.nan
-    return df
-
-
-def normalize_symbol(symbol: str) -> str:
-    sym = str(symbol).strip().upper()
-    if "_" in sym:
-        sym = sym.replace("_", "-")
-    if sym.endswith("-USDT"):
-        return sym
-    if sym.endswith("USDT") and "-" not in sym:
-        return f"{sym[:-4]}-USDT"
-    if sym.endswith("-USDC"):
-        return sym
-    if sym.endswith("USDC") and "-" not in sym:
-        return f"{sym[:-4]}-USDC"
-    if "-" not in sym:
-        return f"{sym}-USDT"
-    return sym
-
-
-def is_forex_symbol(symbol: str) -> bool:
-    """BingXの外国為替（FOREX）ペアを判定 (FOREXのみ除外対象、コモディティ・株価指数・個別株は許可)"""
-    sym = normalize_symbol(symbol).upper()
-    base = sym.replace("-USDT", "").replace("-USDC", "")
-    # BingXの外国為替(FX)は全て NCFX プレフィックス
-    if base.startswith("NCFX") or "FOREX" in base:
-        return True
-    return False
-
-
-def is_crypto_symbol(symbol: str) -> bool:
-    """FOREX以外の取引対象銘柄（暗号資産、コモディティ、株価指数、個別株を含む）の判定"""
-    return not is_forex_symbol(symbol)
-
-
-def fetch_bingx_tickers(product_type: str = "SWAP", mode: str = "demo", max_retries: int = 5) -> List[dict]:
-    base_url = REST_API_URL["bingx_demo"] if mode in ("paper", "demo", "testnet") else REST_API_URL["bingx"]
-    url = f"{base_url}/openApi/swap/v2/quote/ticker"
-    for attempt in range(max_retries):
-        try:
-            resp = requests.get(url, timeout=15)
-            if resp.status_code != 200:
-                time.sleep(1.0)
-                continue
-            data = resp.json()
-            if data.get("code") == 0:
-                ticker_list = data.get("data", [])
-
-                # premiumIndex から全銘柄のリアルタイム FR を取得
-                fr_map = {}
-                try:
-                    url_prem = f"{base_url}/openApi/swap/v2/quote/premiumIndex"
-                    resp_prem = requests.get(url_prem, timeout=10)
-                    if resp_prem.status_code == 200:
-                        data_prem = resp_prem.json()
-                        for p_item in data_prem.get("data", []):
-                            p_sym = normalize_symbol(p_item.get("symbol", ""))
-                            fr_val = float(p_item.get("lastFundingRate") or 0.0)
-                            fr_map[p_sym] = fr_val
-                except Exception:
-                    pass
-
-                result = []
-                for item in ticker_list:
-                    sym = normalize_symbol(item.get("symbol", ""))
-                    if not sym.endswith("-USDT"):
-                        continue
-                    if is_forex_symbol(sym):
-                        continue
-                    last_pr = float(item.get("lastPrice") or 0.0)
-                    open_pr = float(item.get("openPrice") or 0.0)
-                    vol = float(item.get("quoteVolume") or 0.0)
-                    change_24h_pct = float(item.get("priceChangePercent") or 0.0)
-                    
-                    # クジラ大口流入
-                    whale_file = Path(__file__).resolve().parent / "Data" / "whale_market_state.json"
-                    whale_net_usd = 0.0
-                    whale_long_r = 0.5
-                    if whale_file.exists():
-                        try:
-                            with open(whale_file, "r", encoding="utf-8") as wf:
-                                w_data = json.load(wf)
-                                coins_sent = w_data.get("coins_sentiment", {})
-                                raw_coin = sym.replace("-USDT", "")
-                                if raw_coin in coins_sent:
-                                    whale_net_usd = float(coins_sent[raw_coin].get("net_val_usd", 0.0))
-                                    whale_long_r = float(coins_sent[raw_coin].get("long_ratio", 0.5))
-                        except Exception:
-                            pass
-
-                    whale_impact_ratio = (whale_net_usd / vol * 100.0) if vol > 0 else 0.0
-                    fr = fr_map.get(sym, 0.0)
-
-                    result.append({
-                        "symbol": sym,
-                        "lastPr": last_pr,
-                        "prevDayPx": open_pr,
-                        "change_24h_pct": change_24h_pct,
-                        "usdtVolume": vol,
-                        "openInterestCoins": 0.0,
-                        "openInterestVal": 0.0,
-                        "funding": fr,
-                        "funding_rate_pct": fr * 100.0,
-                        "funding_annual_pct": fr * 3.0 * 365.0 * 100.0,
-                        "premium": 0.0,
-                        "whale_net_val_usd": whale_net_usd,
-                        "whale_long_ratio": whale_long_r,
-                        "whale_impact_ratio": whale_impact_ratio,
-                    })
-                return result
-        except Exception as e:
-            log(f"Failed to fetch BingX tickers (attempt {attempt+1}): {e}")
-            time.sleep(2.0)
-    return []
-
-
-def fetch_demo_available_symbols(product_type: str = "SWAP") -> set:
-    tickers = fetch_bingx_tickers()
-    symbols = {t["symbol"] for t in tickers if t.get("symbol")}
-    return symbols if symbols else {"BTC-USDT", "ETH-USDT", "SOL-USDT"}
-
-
-async def fetch_bingx_ohlcv(
-    symbol: str,
-    product_type: str,
-    granularity: str,
-    start_ms: int,
-    end_ms: int,
-    mode: str = "live",
-) -> List[List[Any]]:
-    url = f"{REST_API_URL['bingx']}/openApi/swap/v2/quote/klines"
-    interval_map = {"1M": "1m", "3M": "3m", "5M": "5m", "15M": "15m", "30M": "30m", "1H": "1h", "2H": "2h", "4H": "4h", "1D": "1d"}
-    bx_interval = interval_map.get(granularity.upper(), granularity.lower())
-    clean_sym = normalize_symbol(symbol)
-    
-    gran_sec_map = {"1M": 60, "3M": 180, "5M": 300, "15M": 900, "30M": 1800, "1H": 3600, "2H": 7200, "4H": 14400, "1D": 86400}
-    gran_sec = gran_sec_map.get(granularity.upper(), 300)
-    
-    rows = []
-    max_retries = 3
-    curr_start = start_ms
-    step_ms = 900 * gran_sec * 1000  # 900 bars per request
-    
-    import aiohttp
-    async with aiohttp.ClientSession() as session:
-        while curr_start < end_ms:
-            curr_end = min(curr_start + step_ms, end_ms)
-            params = {
-                "symbol": clean_sym,
-                "interval": bx_interval,
-                "startTime": str(curr_start),
-                "endTime": str(curr_end),
-                "limit": "1000"
-            }
-            success = False
-            for attempt in range(max_retries):
-                try:
-                    async with session.get(url, params=params, timeout=15) as res:
-                        if res.status == 200:
-                            data = await res.json()
-                            if data.get("code") == 0:
-                                items = data.get("data", [])
-                                if isinstance(items, list) and len(items) > 0:
-                                    for item in items:
-                                        t = int(item.get("time") or 0)
-                                        o = float(item.get("open") or 0.0)
-                                        h = float(item.get("high") or 0.0)
-                                        l = float(item.get("low") or 0.0)
-                                        c = float(item.get("close") or 0.0)
-                                        v = float(item.get("volume") or 0.0)
-                                        rows.append([t, o, h, l, c, v, v * c])
-                                    success = True
-                                    last_t = int(items[-1].get("time") or 0)
-                                    curr_start = last_t + 1
-                                    break
-                                else:
-                                    success = True
-                                    curr_start = curr_end + 1
-                                    break
-                            elif data.get("code") == 100410:
-                                # レート制限検知: バックオフ待機
-                                await asyncio.sleep(2.0 * (attempt + 1))
-                except Exception as e:
-                    if attempt == max_retries - 1:
-                        log(f"BingX OHLCV fetch error for {clean_sym} (attempt {attempt + 1}/{max_retries}): {e}")
-                if attempt < max_retries - 1 and not success:
-                    await asyncio.sleep(1.0)
-            if not success or curr_start >= curr_end:
-                curr_start = curr_end + 1
-
-    seen = set()
-    unique_rows = []
-    for r in rows:
-        if r[0] not in seen:
-            seen.add(r[0])
-            unique_rows.append(r)
-    unique_rows.sort(key=lambda x: x[0])
-    return unique_rows
-
-
-async def fetch_coinbase_candles_1h(start_ms: int, end_ms: int) -> List[Dict[str, Any]]:
-    url = "https://api.exchange.coinbase.com/products/BTC-USD/candles"
-    rows: List[Dict[str, Any]] = []
-    step_ms = 300 * 60 * 60 * 1000
-    cur_end = end_ms
-    headers = {"User-Agent": "Mozilla/5.0"}
-    async with pybotters.Client(headers=headers) as client:
-        while cur_end > start_ms:
-            cur_start = max(cur_end - step_ms, start_ms)
-            start_iso = datetime.fromtimestamp(cur_start / 1000, tz=timezone.utc).isoformat().replace("+00:00", "Z")
-            end_iso = datetime.fromtimestamp(cur_end / 1000, tz=timezone.utc).isoformat().replace("+00:00", "Z")
-            params = {
-                "granularity": "3600",
-                "start": start_iso,
-                "end": end_iso
-            }
-            max_retries = 3
-            success = False
-            for attempt in range(max_retries):
-                try:
-                    resp = await client.get(url, params=params)
-                    data = await resp.json()
-                    if isinstance(data, list):
-                        success = True
-                        break
-                    await asyncio.sleep(1.0)
-                except Exception:
-                    await asyncio.sleep(1.0)
-            
-            if not success:
-                cur_end = cur_start - 1
-                continue
-                
-            for it in data:
-                ts_sec = int(it[0])
-                rows.append({
-                    "timestamp": from_ms_jst(ts_sec * 1000),
-                    "coinbase_close": float(it[4])
-                })
-            cur_end = cur_start - 1
-            await asyncio.sleep(0.1)
-    rows.sort(key=lambda d: d["timestamp"])
-    return rows
-
-
-async def fetch_bingx_funding_history(
-    symbol: str,
-    start_ms: int,
-    end_ms: int,
-    mode: str = "demo",
-) -> List[Dict[str, Any]]:
-    base_url = REST_API_URL["bingx_demo"] if mode in ("paper", "demo", "testnet") else REST_API_URL["bingx"]
-    url = f"{base_url}/openApi/swap/v2/quote/fundingRate"
-    clean_sym = normalize_symbol(symbol)
-    results = []
-    params = {
-        "symbol": clean_sym,
-        "startTime": str(start_ms),
-        "endTime": str(end_ms),
-        "limit": "1000",
-    }
-    timeout = aiohttp.ClientTimeout(total=12)
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        for attempt in range(4):
-            try:
-                async with session.get(url, params=params) as resp:
-                    if resp.status == 200:
-                        data = await resp.json()
-                        if data.get("code") == 0:
-                            fr_items = data.get("data", [])
-                            if isinstance(fr_items, list) and fr_items:
-                                for fr_info in fr_items:
-                                    fr = float(fr_info.get("fundingRate") or 0.0)
-                                    t_ms = int(fr_info.get("fundingTime") or time.time() * 1000)
-                                    t_hour_ms = (t_ms // 3600000) * 3600000
-                                    dt_jst = from_ms_jst(t_hour_ms)
-                                    results.append({
-                                        "timestamp": dt_jst,
-                                        "fundingRate": fr,
-                                        "fundingRate_1h_pct": fr * 100.0,
-                                        "fundingRate_annual_pct": fr * 3.0 * 365.0 * 100.0,
-                                        "premium": 0.0,
-                                    })
-                                return results
-                    elif resp.status == 429 or (resp.status == 200 and (await resp.json()).get("code") == 100410):
-                        await asyncio.sleep(2.0 * (attempt + 1))
-                        continue
-                await asyncio.sleep(0.1)
-            except Exception as e:
-                await asyncio.sleep(1.0 * (attempt + 1))
-    return results
-
-
-async def fetch_bingx_open_interest(
-    symbol: str,
-    mode: str = "demo",
-) -> float:
-    """BingXから銘柄のリアルタイム建玉(OI)を取得"""
-    base_url = REST_API_URL["bingx_demo"] if mode in ("paper", "demo", "testnet") else REST_API_URL["bingx"]
-    url = f"{base_url}/openApi/swap/v2/quote/openInterest"
-    clean_sym = normalize_symbol(symbol)
-    timeout = aiohttp.ClientTimeout(total=10)
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        for attempt in range(4):
-            try:
-                async with session.get(url, params={"symbol": clean_sym}) as resp:
-                    if resp.status == 200:
-                        data = await resp.json()
-                        if data.get("code") == 0:
-                            oi_val = float(data.get("data", {}).get("openInterest") or 0.0)
-                            return oi_val
-                    await asyncio.sleep(0.08)
-            except Exception:
-                await asyncio.sleep(0.5 * (attempt + 1))
-    return 0.0
-
-
-async def build_merged_dataset(
-    symbol: str,
-    start_utc: datetime,
-    end_utc: datetime,
-    *,
+def generate_normalized_charts(
+    all_dfs: List[pd.DataFrame],
     out_dir: Path,
-    product_type: str = "PERP",
-    granularity: str = "1H",
-    rank: Optional[int] = None,
-    premium_dict: Optional[Dict[datetime, float]] = None,
-    ticker_info: Optional[Dict[str, Any]] = None,
-) -> Tuple[pd.DataFrame, Path]:
-    ind_dir = out_dir / "individual" if out_dir.name != "individual" else out_dir
-    ind_dir.mkdir(parents=True, exist_ok=True)
-    out_file = ind_dir / f"merged_{symbol}.csv"
-
-    clean_sym = normalize_symbol(symbol).replace("-USDT", "").replace("USDT", "")
-
-    # 1. 既存ローカルデータの探索 (individual/merged_{symbol}.csv, merged_{symbol}.csv, historical_candles)
-    existing_file = None
-    candidate_paths = [
-        out_file,
-        out_dir / f"merged_{symbol}.csv",
-        out_dir / f"merged_{clean_sym}.csv",
-        out_dir / "historical_candles" / f"{symbol}_1h.csv",
-        out_dir / "historical_candles" / f"{clean_sym}_1h.csv",
-    ]
-    for cp in candidate_paths:
-        if cp.exists():
-            existing_file = cp
-            break
-
-    df_existing = None
-    is_incremental = False
-    req_start_utc = start_utc
-
-    if existing_file and existing_file.exists():
-        try:
-            df_old = pd.read_csv(existing_file)
-            if not df_old.empty and "timestamp" in df_old.columns and len(df_old) >= 24:
-                df_old["timestamp"] = pd.to_datetime(df_old["timestamp"])
-                df_old = df_old.sort_values("timestamp").reset_index(drop=True)
-                last_ts = df_old["timestamp"].iloc[-1]
-
-                # タイムゾーンの調整 (UTC または JST)
-                if last_ts.tzinfo is None:
-                    # JSTと仮定して比較
-                    last_ts_utc = last_ts.tz_localize(JST).tz_convert(timezone.utc)
-                else:
-                    last_ts_utc = last_ts.tz_convert(timezone.utc)
-
-                diff_hours = (end_utc - last_ts_utc).total_seconds() / 3600.0
-                # 既存データが過去45日以内の有効データであれば増分（差分）フェッチ
-                if 0 <= diff_hours <= 24 * 45:
-                    is_incremental = True
-                    df_existing = df_old
-                    # 直近確定足の上書き・同期のため2時間手前（安全オーバーラップ）から取得
-                    fetch_start = last_ts_utc - timedelta(hours=2)
-                    req_start_utc = max(fetch_start, end_utc - timedelta(days=30))
-                    log(f"[Incremental Fetch] {symbol}: 既存データ {len(df_existing)}行あり (最終: {last_ts_utc.strftime('%m/%d %H:%M')} UTC)。直近差分 ({req_start_utc.strftime('%m/%d %H:%M')} 〜 {end_utc.strftime('%m/%d %H:%M')} UTC) のみ取得します。")
-        except Exception as read_err:
-            log(f"[Warning] 既存データ読込失敗 ({existing_file}): {read_err}. 全件再取得に切り替えます。")
-
-    if not is_incremental:
-        log(f"[Full Fetch] {symbol}: 初回1ヶ月分 ({start_utc.strftime('%m/%d %H:%M')} 〜 {end_utc.strftime('%m/%d %H:%M')} UTC) を全件取得します。")
-
-    start_ms = to_ms(req_start_utc)
-    end_ms = to_ms(end_utc)
-
-    # 2. OHLCV フェッチ
-    ohlcv_rows = await fetch_bingx_ohlcv(symbol, product_type, granularity, start_ms, end_ms)
-
-    if not ohlcv_rows and df_existing is None:
-        raise RuntimeError(f"No OHLCV data returned for {symbol}.")
-
-    price_records = []
-    if ohlcv_rows:
-        for it in ohlcv_rows:
-            ts = int(it[0])
-            price_records.append(
-                {
-                    "timestamp": from_ms_jst(ts),
-                    "open": float(it[1]),
-                    "high": float(it[2]),
-                    "low": float(it[3]),
-                    "close": float(it[4]),
-                    "volume": float(it[5]) if len(it) > 5 else 0.0,
-                    "qv": float(it[6]) if len(it) > 6 else 0.0,
-                }
-            )
-
-    if price_records:
-        df_new = (
-            pd.DataFrame.from_records(price_records)
-            .drop_duplicates(subset=["timestamp"])
-            .sort_values("timestamp")
-            .reset_index(drop=True)
-        )
-        df_new["timestamp"] = pd.to_datetime(df_new["timestamp"])
-
-        # 3. Funding History (FR & Premium) フェッチ & マージ
-        funding_rows = await fetch_bingx_funding_history(symbol, start_ms, end_ms)
-        fallback_fr = float(ticker_info.get("funding", 0.0)) if ticker_info else 0.0
-
-        if funding_rows:
-            df_funding = (
-                pd.DataFrame(funding_rows)
-                .drop_duplicates(subset=["timestamp"])
-                .sort_values("timestamp")
-                .reset_index(drop=True)
-            )
-            df_funding["timestamp"] = pd.to_datetime(df_funding["timestamp"])
-            df_new = pd.merge(df_new, df_funding, on="timestamp", how="left")
-        else:
-            df_new["fundingRate"] = fallback_fr
-            df_new["fundingRate_1h_pct"] = fallback_fr * 100.0
-            df_new["fundingRate_annual_pct"] = fallback_fr * 24.0 * 365.0 * 100.0
-            df_new["premium"] = 0.0
-
-        # 欠損値を前後補間、それでも残ればフォールバックFRで補完
-        df_new["fundingRate"] = df_new["fundingRate"].ffill().bfill().fillna(fallback_fr)
-        df_new["fundingRate_1h_pct"] = df_new["fundingRate"] * 100.0
-        df_new["fundingRate_annual_pct"] = df_new["fundingRate"] * 24.0 * 365.0 * 100.0
-        df_new["premium"] = df_new.get("premium", pd.Series(0.0, index=df_new.index)).ffill().bfill().fillna(0.0)
-
-        # 4. Open Interest (建玉)
-        oi_coins = float(ticker_info.get("openInterestCoins", 0.0)) if ticker_info else 0.0
-        if oi_coins <= 0.0:
-            oi_coins = await fetch_bingx_open_interest(symbol, mode="live")
-        df_new["openInterest"] = oi_coins
-        df_new["openInterestVal"] = df_new["openInterest"] * df_new["close"]
-        df_new["symbol"] = symbol
-    else:
-        df_new = pd.DataFrame()
-
-    # 5. 既存データと新規差分データのリッチなマージ
-    if df_existing is not None and not df_existing.empty:
-        if not df_new.empty:
-            df = pd.concat([df_existing, df_new], ignore_index=True)
-            df = df.drop_duplicates(subset=["timestamp"], keep="last")
-        else:
-            df = df_existing
-    else:
-        df = df_new
-
-    df["timestamp"] = pd.to_datetime(df["timestamp"])
-    df = df.sort_values("timestamp").reset_index(drop=True)
-
-    # 直近30日分以上（最低720本、最大1440本 = 2ヶ月分）を保持してローカル保存
-    if len(df) > 1440:
-        df = df.tail(1440).reset_index(drop=True)
-
-    df.to_csv(out_file, index=False, encoding="utf-8-sig")
-    log(f"Saved merged dataset for {symbol} to {out_file} ({len(df)} rows, incremental={is_incremental})")
-
-    return df, out_file
-
-
-def check_normalized_peak_timing(df: pd.DataFrame) -> Tuple[bool, List[str]]:
-    """
-    30d (720h), 10d (240h), 5d (120h) の各期間において、
-    前半に高値（ピーク）を付けて後半にかけて下落・低迷しているかを判定する。
-    """
-    windows = [
-        ("5d", 5 * 24),    # 120h
-        ("10d", 10 * 24),  # 240h
-        ("30d", 30 * 24),  # 720h
-    ]
-    reasons = []
-    is_bad = False
-
-    for w_name, w_hours in windows:
-        if len(df) < 24:
-            continue
-        sub = df.tail(w_hours).reset_index(drop=True)
-        if len(sub) < 24:
-            continue
-
-        c_series = sub["close"].astype(float)
-        base_c = c_series.iloc[0]
-        if base_c <= 0:
-            continue
-        norm_c = c_series / base_c
-        final_norm = float(norm_c.iloc[-1])
-
-        # ピーク位置の特定
-        peak_idx = int(norm_c.argmax())
-        peak_ratio = peak_idx / len(norm_c)
-        peak_val = float(norm_c.max())
-
-        # 前半・後半の高値
-        half = len(sub) // 2
-        first_half_max = float(sub["high"].iloc[:half].max()) if "high" in sub.columns else float(c_series.iloc[:half].max())
-        second_half_max = float(sub["high"].iloc[half:].max()) if "high" in sub.columns else float(c_series.iloc[half:].max())
-        curr_c = float(c_series.iloc[-1])
-
-        # 判定条件:
-        # 1. 5d または 10d で、ピークが前半 (< 50%) にあり、直近がピークから10%以上下落かつマイナス (final_norm < 1.0)
-        # 2. または、前半高値に対して後半高値が大きく切り下がっており (second_half_max < first_half_max * 0.93)、直近価格も高値から下落
-        if w_name in ("5d", "10d"):
-            if peak_ratio < 0.50 and (final_norm < peak_val * 0.90) and (final_norm < 1.0 or final_norm < peak_val * 0.80):
-                is_bad = True
-                reasons.append(f"{w_name}前半高値(peak={peak_ratio:.2f}, max={peak_val:.2f}x->{final_norm:.2f}x)")
-            elif second_half_max < first_half_max * 0.93 and curr_c < first_half_max * 0.90:
-                is_bad = True
-                reasons.append(f"{w_name}高値切り下げ(前半max={first_half_max:.4f}, 後半max={second_half_max:.4f})")
-        elif w_name == "30d":
-            # 30d でピークが最序盤 (< 30%) にあり、直近が大きく沈んでいる場合
-            if peak_ratio < 0.30 and final_norm < 0.90 and (final_norm < peak_val * 0.75):
-                is_bad = True
-                reasons.append(f"30d長期衰退(peak={peak_ratio:.2f}, max={peak_val:.2f}x->{final_norm:.2f}x)")
-
-    return is_bad, reasons
-
-
-def generate_normalized_charts(all_dfs: List[pd.DataFrame], out_dir: Path, window_name: str, hours_limit: int, save_chart: bool = False) -> Tuple[Optional[Path], float, str]:
-    """指定期間 (30d / 10d / 5d) の上位10銘柄の正規化比較を行い、地合い（Market State）を判定 (save_chart=False時は描画スキップ)"""
+    window_name: str,
+    hours_limit: int,
+    excluded_symbols: Optional[Set[str]] = None,
+) -> Tuple[Optional[Path], float, str, float]:
+    """指定期間 (30d / 10d / 5d) の指定全20銘柄の正規化比較チャートを作成し、地合いを判定"""
     if not all_dfs:
-        return None, 1.0, "NEUTRAL"
+        return None, 1.0, "NEUTRAL", 0.5
 
-    # 上位10銘柄に絞り込み
-    dfs_top10 = all_dfs[:10]
-
-    # 各銘柄の正規化パフォーマンスを収集
     plot_items = []
-    for df in dfs_top10:
+    for df in all_dfs:
         if df.empty or "close" not in df.columns or "symbol" not in df.columns:
             continue
         sym = df["symbol"].iloc[0]
+        clean_sym = normalize_symbol_name(sym)
         df_sliced = df.tail(hours_limit).reset_index(drop=True)
         if len(df_sliced) < 2:
             continue
 
         close_series = df_sliced["close"].astype(float)
         base_price = close_series.iloc[0]
-        if base_price == 0:
+        if base_price <= 0:
             continue
-            
+
         norm_series = close_series / base_price
         final_norm = float(norm_series.iloc[-1])
-        ts_series = pd.to_datetime(df_sliced["timestamp"])
+        ts_series = pd.to_datetime(df_sliced["timestamp"], utc=True)
         plot_items.append({
-            "symbol": sym,
+            "symbol": clean_sym,
+            "ticker": get_clean_symbol(clean_sym),
             "ts": ts_series,
             "norm": norm_series,
-            "final_norm": final_norm
+            "final_norm": final_norm,
+            "base_price": base_price,
+            "current_price": float(close_series.iloc[-1])
         })
 
     if not plot_items:
-        return None, 1.0, "NEUTRAL"
+        return None, 1.0, "NEUTRAL", 0.5
 
-    # 期間パフォーマンス（final_norm）の降順（ランキング順）にソート
+    # 期間パフォーマンス（final_norm）の降順にソート
     plot_items.sort(key=lambda x: x["final_norm"], reverse=True)
 
     norm_performances = [item["final_norm"] for item in plot_items]
     mean_norm = float(np.mean(norm_performances)) if norm_performances else 1.0
+    pos_count = sum(1 for fn in norm_performances if fn >= 1.0)
+    pos_ratio = (pos_count / len(norm_performances)) if norm_performances else 0.5
     market_state = "LONG" if mean_norm >= 1.0 else "SHORT"
 
-    if not save_chart:
-        return None, mean_norm, market_state
+    fig, ax = plt.subplots(figsize=(12.0, 7.0))
 
-    fig, ax = plt.subplots(figsize=(10.5, 5.2))
-    
-    # ランキング順にプロット & 凡例ラベルを設定
+    # プロット & 凡例
     for rank, item in enumerate(plot_items, 1):
         sym = item["symbol"]
+        ticker = item["ticker"]
         fn = item["final_norm"]
         pct_change = (fn - 1.0) * 100.0
         sign_str = "+" if pct_change >= 0 else ""
-        label = f"{rank:>2}. {sym:<8} ({fn:.2f}x | {sign_str}{pct_change:.1f}%)"
-        ax.plot(item["ts"], item["norm"], label=label, linewidth=2)
+        ex_tag = " [EX]" if excluded_symbols and (sym in excluded_symbols or ticker in excluded_symbols) else ""
+        label = f"{rank:>2}. {ticker:<7} ({fn:.2f}x | {sign_str}{pct_change:.1f}%){ex_tag}"
+        ax.plot(item["ts"], item["norm"], label=label, linewidth=1.8)
 
-    ax.axhline(1.0, color="black", linestyle="--", linewidth=1.2, alpha=0.6, zorder=1)
-    ax.set_title(f"BingX Top 10 Normalized Performance [{window_name}] (State: {market_state})", fontsize=12, pad=12)
+    ax.axhline(1.0, color="black", linestyle="--", linewidth=1.2, alpha=0.6, zorder=1, label="--- Base Line (1.00x)")
+
+    # 先月高安ライン (PMH / PML) の点線描画 (PROJECT_RULES.md 準拠)
+    try:
+        data_dir = out_dir if out_dir.name == "Data" else out_dir / "Data"
+        all_syms = [item["symbol"] for item in plot_items]
+        if "BTC-USDT" not in all_syms:
+            all_syms.append("BTC-USDT")
+        m_levels = get_or_update_monthly_key_levels(all_syms, data_dir)
+
+        # 1. BTC-USDT の先月高安ライン (市場全体のサポート/レジスタンス基準線 / 太い点線)
+        btc_item = next((item for item in plot_items if item["ticker"] == "BTC"), None)
+        if btc_item is not None:
+            btc_base_px = float(btc_item["base_price"])
+            btc_curr_px = float(btc_item["current_price"])
+            btc_metrics = compute_bounce_metrics("BTC-USDT", btc_base_px, btc_curr_px, m_levels)
+            if btc_metrics["pmh_norm"] > 0 and btc_metrics["pml_norm"] > 0:
+                ax.axhline(btc_metrics["pmh_norm"], color="darkorange", linestyle=":", linewidth=2.2, alpha=0.85,
+                           label=f"--- BTC Prev-M High ({btc_metrics['pmh_norm']:.2f}x)", zorder=3)
+                ax.axhline(btc_metrics["pml_norm"], color="deepskyblue", linestyle=":", linewidth=2.2, alpha=0.85,
+                           label=f"--- BTC Prev-M Low ({btc_metrics['pml_norm']:.2f}x / Bounce {btc_metrics['bounce_from_pml_pct']:+.1f}%)", zorder=3)
+
+        # 2. アルト平均の先月高安ライン (市場全体のサポート/レジスタンス基準線 / 破線)
+        all_pml_norms = []
+        all_pmh_norms = []
+        for item in plot_items:
+            if item["ticker"] == "BTC":
+                continue
+            b_px = float(item["base_price"])
+            c_px = float(item["current_price"])
+            m_met = compute_bounce_metrics(item["symbol"], b_px, c_px, m_levels)
+            if m_met["pmh_norm"] > 0:
+                all_pmh_norms.append(m_met["pmh_norm"])
+            if m_met["pml_norm"] > 0:
+                all_pml_norms.append(m_met["pml_norm"])
+
+        if all_pmh_norms and all_pml_norms:
+            avg_pmh = float(np.mean(all_pmh_norms))
+            avg_pml = float(np.mean(all_pml_norms))
+            ax.axhline(avg_pmh, color="crimson", linestyle="--", linewidth=1.4, alpha=0.6,
+                       label=f"--- Alt Avg Prev-M High ({avg_pmh:.2f}x)", zorder=2)
+            ax.axhline(avg_pml, color="limegreen", linestyle="--", linewidth=1.4, alpha=0.6,
+                       label=f"--- Alt Avg Prev-M Low ({avg_pml:.2f}x)", zorder=2)
+    except Exception as m_err:
+        log(f"[Normalized Chart] 先月高安ライン描画エラー: {m_err}")
+
+    ax.set_title(f"BingX Top 20 Symbols Normalized Performance [{window_name}] (Regime: {market_state})", fontsize=12, pad=12)
     ax.set_xlabel("Time (JST)", fontsize=10)
     ax.set_ylabel("Normalized Price (Base = 1.0)", fontsize=10)
-    ax.legend(loc="upper left", bbox_to_anchor=(1.01, 1), borderaxespad=0., fontsize=9)
+    ax.legend(loc="upper left", bbox_to_anchor=(1.01, 1), borderaxespad=0., fontsize=8, labelspacing=0.25)
     ax.grid(True, linestyle=':', alpha=0.4)
     plt.tight_layout()
 
-    charts_dir = out_dir / "charts" if out_dir.name != "charts" else out_dir
-    charts_dir.mkdir(parents=True, exist_ok=True)
-    out_file = charts_dir / f"normalized_chart_{window_name}.png"
-    plt.savefig(out_file, dpi=150, bbox_inches='tight')
-    plt.close(fig)
-
-    log(f"Normalized chart Top 10 [{window_name}] saved to {out_file} | Mean Norm: {mean_norm:.4f} -> Market State: {market_state}")
-    return out_file, mean_norm, market_state
-
-
-def generate_custom_normalized_charts(
-    all_dfs: List[pd.DataFrame],
-    target_symbols: Sequence[str],
-    out_dir: Path,
-    window_name: str,
-    hours_limit: int,
-    title: str,
-    file_prefix: str = "custom_normalized",
-    benchmark_symbol: Optional[str] = "BTC-USDT"
-) -> Optional[Path]:
-    """任意の銘柄リスト（取引高上位10や固定銘柄）を対象にノーマライズ比較チャートを作成"""
-    if not all_dfs:
-        return None
-
-    # DataFrameマップの構築
-    df_map = {}
-    for d in all_dfs:
-        if isinstance(d, pd.DataFrame) and not d.empty and "symbol" in d.columns:
-            sym_key = normalize_symbol(d["symbol"].iloc[0])
-            df_map[sym_key] = d
-
-    plot_items = []
-    for sym in target_symbols:
-        clean_sym = normalize_symbol(sym)
-        df = df_map.get(clean_sym)
-        if df is None or df.empty or "close" not in df.columns:
-            continue
-        df_sliced = df.tail(hours_limit).reset_index(drop=True)
-        if len(df_sliced) < 2:
-            continue
-
-        c_series = df_sliced["close"].astype(float)
-        base_px = c_series.iloc[0]
-        if base_px <= 0:
-            continue
-
-        norm_series = c_series / base_px
-        final_norm = float(norm_series.iloc[-1])
-        ts_series = pd.to_datetime(df_sliced["timestamp"])
-        plot_items.append({
-            "symbol": clean_sym,
-            "ts": ts_series,
-            "norm": norm_series,
-            "final_norm": final_norm,
-            "is_benchmark": (clean_sym == benchmark_symbol)
-        })
-
-    if not plot_items:
-        return None
-
-    # パフォーマンス順ソート（ベンチマークは末尾へ）
-    non_bm = [item for item in plot_items if not item["is_benchmark"]]
-    bm = [item for item in plot_items if item["is_benchmark"]]
-    non_bm.sort(key=lambda x: x["final_norm"], reverse=True)
-    sorted_items = non_bm + bm
-
-    fig, ax = plt.subplots(figsize=(11.5, 6.0), dpi=150)
-    colors = plt.cm.tab10(np.linspace(0, 1, max(1, len(non_bm))))
-    c_idx = 0
-
-    for item in sorted_items:
-        sym = item["symbol"]
-        fn = item["final_norm"]
-        pct = (fn - 1.0) * 100.0
-        sign_str = "+" if pct >= 0 else ""
-
-        if item["is_benchmark"]:
-            label = f"Ref: {sym:<8} ({fn:.2f}x | {sign_str}{pct:.1f}%)"
-            ax.plot(item["ts"], item["norm"], label=label, color="gray", linestyle="--", linewidth=1.8, alpha=0.85, zorder=2)
-        else:
-            c_idx += 1
-            label = f"{c_idx:>2}. {sym:<10} ({fn:.2f}x | {sign_str}{pct:.1f}%)"
-            color = colors[c_idx - 1]
-            ax.plot(item["ts"], item["norm"], label=label, color=color, linewidth=2.0, zorder=3)
-
-    ax.axhline(1.0, color="black", linestyle=":", linewidth=1.2, alpha=0.7, zorder=1)
-    ax.set_title(f"{title} [{window_name}] (Normalized Base = 1.0)", fontsize=13, fontweight="bold", pad=12)
-    ax.set_xlabel("Time (JST)", fontsize=10)
-    ax.set_ylabel("Normalized Price Ratio", fontsize=10)
-    ax.legend(loc="upper left", bbox_to_anchor=(1.01, 1), borderaxespad=0., fontsize=9)
-    ax.grid(True, linestyle="--", alpha=0.35)
-    plt.tight_layout()
-
-    charts_dir = out_dir / "charts" if out_dir.name != "charts" else out_dir
-    charts_dir.mkdir(parents=True, exist_ok=True)
-    out_file = charts_dir / f"{file_prefix}_{window_name}.png"
-    plt.savefig(out_file, bbox_inches="tight")
-    plt.close(fig)
-    log(f"Custom normalized chart saved to {out_file}")
-    return out_file
-
-
-def check_mtf_long_eligibility(
-    df: pd.DataFrame,
-    symbol: str,
-    windows: Sequence[Tuple[str, int]] = (("30d", 720), ("10d", 240), ("5d", 120))
-) -> Tuple[bool, Dict[str, Any]]:
-    """
-    固定銘柄のマルチタイムフレーム分析 ＆ 高値圏・底打ちサイクル適格判定 (PROJECT_RULES / TradingView 実証準拠)
-    従来の「過去5日間の前半に高値があるだけで一律除外」する過剰足切りを撤廃し、
-    TradingView勝率82.5%、PF 3.45の実証サイクル (168時間高値圏2.5%停止 & 出来高1.4倍・下ヒゲ30%底打ち再開) に基づき判定する。
-    """
-    if df is None or df.empty or len(df) < 12:
-        return False, {
-            "symbol": symbol,
-            "is_eligible": False,
-            "status": "DATA_INSUFFICIENT",
-            "rejection_reasons": ["データ不足"],
-            "window_results": {},
-            "cycle_result": {}
-        }
-
-    closes = df["close"].astype(float).values
-    highs = df["high"].astype(float).values if "high" in df.columns else closes
-    
-    total_bars = len(closes)
-    window_results = {}
-
-    for w_name, w_hours in windows:
-        bars_count = min(total_bars, w_hours)
-        if bars_count < 12:
-            window_results[w_name] = {
-                "passed": False,
-                "peak_ratio": 0.0,
-                "peak_price": 0.0,
-                "curr_price": float(closes[-1]),
-                "reason": "足数不足"
-            }
-            continue
-
-        w_highs = highs[-bars_count:]
-        w_closes = closes[-bars_count:]
-        
-        peak_idx = int(np.argmax(w_highs))
-        peak_ratio = peak_idx / float(bars_count)  # 0.0 (最古) 〜 1.0 (最新)
-        peak_price = float(w_highs[peak_idx])
-        curr_price = float(w_closes[-1])
-        
-        window_results[w_name] = {
-            "passed": True,
-            "peak_ratio": peak_ratio,
-            "peak_price": peak_price,
-            "curr_price": curr_price,
-            "drawdown_from_peak_pct": ((curr_price - peak_price) / peak_price * 100.0) if peak_price > 0 else 0.0
-        }
-
-    # TradingView実証のサイクル判定 (168時間天井停止 & 底打ち再開: 高値2〜5%、セリクラ1〜5倍、下ヒゲ15%)
-    from bingx5_46_3logic import optimize_cycle_filter
-    opt_res = optimize_cycle_filter(df, symbol=symbol, wick_ratio_req=0.15)
-    best_top_pct = opt_res.get("best_top_pct", 0.030)
-    best_vol_mult = opt_res.get("best_vol_mult", 2.5)
-
-    regime_mgr = RegimeFilterManager(
-        range_hours=168,
-        near_top_pct=best_top_pct,
-        climax_vol_mult=best_vol_mult,
-        wick_ratio_req=0.15
-    )
-    cycle_res = regime_mgr.evaluate(df, is_btc=(symbol == "BTC-USDT"))
-    cycle_res["best_top_pct"] = best_top_pct
-    cycle_res["best_vol_mult"] = best_vol_mult
-    long_allowed = cycle_res.get("long_allowed", True)
-    state_name = cycle_res.get("state_name", "NORMAL")
-    rejection_reasons = []
-
-    if not long_allowed:
-        rejection_reasons.append(f"高値圏{best_top_pct*100:.1f}%警戒中(State:{state_name})")
-        status_str = "OUT_CYCLE_TOP_STOP"
-        is_eligible = False
-    else:
-        status_str = "ELIGIBLE"
-        is_eligible = True
-
-    return is_eligible, {
-        "symbol": symbol,
-        "is_eligible": is_eligible,
-        "status": status_str,
-        "rejection_reasons": rejection_reasons,
-        "window_results": window_results,
-        "cycle_result": cycle_res
-    }
-
-
-def export_top10_gainers_csv(
-    top10_gainers: List[dict],
-    prioritized_candidates: List[dict],
-    all_dfs: List[pd.DataFrame],
-    out_dir: Path,
-    discord: Optional[send_discord] = None,
-    send_to_discord: bool = True,
-) -> Tuple[Path, Path, Path]:
-    """
-    24時間上昇率 Top 10 銘柄の分析用データを集計し、
-    1. Data/top10_24h_gainers_latest.csv (最新スナップショット)
-    2. Data/top10_24h_gainers_history.csv (時系列蓄積ログ)
-    3. Data/top10_gainers_snapshots/top10_gainers_YYYYMMDD_HHMMSS.csv (個別保存)
-    に保存し、DiscordへCSVファイルをアップロードする。
-    """
-    now_jst = datetime.now(JST)
-    now_utc = datetime.now(timezone.utc)
-    ts_jst_str = now_jst.strftime("%Y-%m-%d %H:%M:%S")
-    ts_utc_str = now_utc.strftime("%Y-%m-%dT%H:%M:%SZ")
-    file_ts_str = now_jst.strftime("%Y%m%d_%H%M%S")
-
-    # symbol -> priority rank map
-    priority_map = {t["symbol"]: idx + 1 for idx, t in enumerate(prioritized_candidates)}
-
-    # symbol -> candle DataFrame map
-    df_map = {}
-    if all_dfs:
-        for d in all_dfs:
-            if isinstance(d, pd.DataFrame) and not d.empty and "symbol" in d.columns:
-                df_map[d["symbol"].iloc[0]] = d
-
-    records = []
-    for gain_rank, t in enumerate(top10_gainers, 1):
-        sym = t.get("symbol", "")
-        last_pr = float(t.get("lastPr", 0.0))
-        prev_pr = float(t.get("prevDayPx", 0.0))
-        chg_24h = float(t.get("change_24h_pct", 0.0))
-        vol_24h = float(t.get("usdtVolume", 0.0))
-        oi_val = float(t.get("openInterestVal", 0.0))
-        oi_coins = float(t.get("openInterestCoins", 0.0))
-        funding = float(t.get("funding", 0.0))
-        fr_1h_pct = float(t.get("funding_rate_pct", funding * 100.0))
-        fr_ann_pct = float(t.get("funding_annual_pct", funding * 24.0 * 365.0 * 100.0))
-        w_usd = float(t.get("whale_net_val_usd", 0.0))
-        w_fmt = t.get("whale_net_val_fmt", "$0")
-        w_long_r = float(t.get("whale_long_ratio", 0.5))
-        w_impact = float(t.get("whale_impact_ratio", 0.0))
-        w_tier = int(t.get("tier", 2))
-        w_status = t.get("whale_status", "NEUTRAL")
-        w_tag = t.get("whale_tag", "⚪ クジラ中立")
-        p_rank = priority_map.get(sym, gain_rank)
-
-        # キャンドルデータからの短期リターン・ボラティリティ算出
-        ret_1h_pct = 0.0
-        ret_4h_pct = 0.0
-        vol_24h_pct = 0.0
-        vol_surge_ratio = 1.0
-
-        if sym in df_map:
-            df_sym = df_map[sym]
-            if len(df_sym) >= 2:
-                c_now = float(df_sym["close"].iloc[-1])
-                c_1h = float(df_sym["close"].iloc[-2])
-                ret_1h_pct = ((c_now - c_1h) / c_1h * 100.0) if c_1h > 0 else 0.0
-
-            if len(df_sym) >= 5:
-                c_now = float(df_sym["close"].iloc[-1])
-                c_4h = float(df_sym["close"].iloc[-5])
-                ret_4h_pct = ((c_now - c_4h) / c_4h * 100.0) if c_4h > 0 else 0.0
-
-            if len(df_sym) >= 24:
-                df_last24 = df_sym.tail(24)
-                h_max = float(df_last24["high"].max())
-                l_min = float(df_last24["low"].min())
-                vol_24h_pct = ((h_max - l_min) / l_min * 100.0) if l_min > 0 else 0.0
-                mean_v = float(df_last24["volume"].mean())
-                curr_v = float(df_last24["volume"].iloc[-1])
-                vol_surge_ratio = (curr_v / mean_v) if mean_v > 0 else 1.0
-
-        records.append({
-            "timestamp_jst": ts_jst_str,
-            "timestamp_utc": ts_utc_str,
-            "gain_rank": gain_rank,
-            "priority_rank": p_rank,
-            "symbol": sym,
-            "change_24h_pct": round(chg_24h, 2),
-            "current_price": last_pr,
-            "prev_day_price": prev_pr,
-            "volume_24h_usd": round(vol_24h, 2),
-            "open_interest_usd": round(oi_val, 2),
-            "open_interest_coins": round(oi_coins, 2),
-            "funding_rate_1h_pct": round(fr_1h_pct, 4),
-            "funding_rate_annual_pct": round(fr_ann_pct, 2),
-            "whale_tier": w_tier,
-            "whale_status": w_status,
-            "whale_tag": w_tag,
-            "whale_net_usd": round(w_usd, 2),
-            "whale_net_fmt": w_fmt,
-            "whale_long_ratio": round(w_long_r, 4),
-            "whale_impact_pct": round(w_impact, 2),
-            "return_1h_pct": round(ret_1h_pct, 2),
-            "return_4h_pct": round(ret_4h_pct, 2),
-            "volatility_24h_pct": round(vol_24h_pct, 2),
-            "volume_surge_ratio": round(vol_surge_ratio, 2),
-        })
-
-    df_top10 = pd.DataFrame(records)
-
-    # 1. Data/top10_24h_gainers_latest.csv の保存
-    latest_file = out_dir / "top10_24h_gainers_latest.csv"
-    df_top10.to_csv(latest_file, index=False, encoding="utf-8-sig")
-    log(f"Saved latest Top 10 gainers to {latest_file}")
-
-    # 2. Data/top10_gainers_snapshots/top10_gainers_YYYYMMDD_HHMMSS.csv の保存
-    snapshot_dir = out_dir / "top10_gainers_snapshots"
-    snapshot_dir.mkdir(parents=True, exist_ok=True)
-    snapshot_file = snapshot_dir / f"top10_gainers_{file_ts_str}.csv"
-    df_top10.to_csv(snapshot_file, index=False, encoding="utf-8-sig")
-    log(f"Saved snapshot Top 10 gainers to {snapshot_file}")
-
-    # 3. Data/top10_24h_gainers_history.csv への時系列追記蓄積
-    history_file = out_dir / "top10_24h_gainers_history.csv"
-    if history_file.exists():
-        try:
-            df_hist = pd.read_csv(history_file)
-            # 同一日時・同一銘柄の重複を除外して結合
-            df_hist = df_hist[~((df_hist["timestamp_jst"] == ts_jst_str) & (df_hist["symbol"].isin(df_top10["symbol"])))]
-            df_combined = pd.concat([df_hist, df_top10], ignore_index=True)
-            df_combined.to_csv(history_file, index=False, encoding="utf-8-sig")
-        except Exception as e:
-            log(f"[Warning] Failed to append to history CSV: {e}")
-            df_top10.to_csv(history_file, index=False, encoding="utf-8-sig")
-    else:
-        df_top10.to_csv(history_file, index=False, encoding="utf-8-sig")
-    log(f"Appended Top 10 gainers to historical archive: {history_file}")
-
-    # 4. Discord へ CSV ファイルをアップロード
-    if send_to_discord and discord:
-        try:
-            top_sym = df_top10.iloc[0]['symbol'] if not df_top10.empty else "N/A"
-            top_chg = df_top10.iloc[0]['change_24h_pct'] if not df_top10.empty else 0.0
-            prio_sym = prioritized_candidates[0]['symbol'] if prioritized_candidates else "N/A"
-            prio_tier = prioritized_candidates[0].get('tier', 2) if prioritized_candidates else 2
-            
-            upload_desc = (
-                f"📊 **[24h 上昇率 Top 10 データ集計 CSV]** ({ts_jst_str} JST)\n"
-                f"• 24h上昇率1位: **{top_sym}** ({top_chg:+.2f}%)\n"
-                f"• クジラ優先1位: **{prio_sym}** (Tier {prio_tier})\n"
-                f"検証・分析用の詳細データ (OI, FR, 大口流入, 短期リターン等) を添付しました。"
-            )
-            discord.send_file(snapshot_file, upload_desc)
-            log(f"Uploaded {snapshot_file.name} to Discord successfully.")
-        except Exception as d_err:
-            log(f"[Warning] Failed to upload Top 10 CSV to Discord: {d_err}")
-
-    return latest_file, snapshot_file, history_file
-
-
-def breakout_precursor_engine(
-    df: pd.DataFrame,
-    bb_window: int = 20,
-    bb_mult: float = 2.0,
-    gk_window: int = 24,
-    tension_window: int = 24,
-    regime_window: int = 168,
-    clv_window: int = 12
-) -> Optional[pd.DataFrame]:
-    """1時間足データからブレイクアウト前兆スコア・特徴量を算出"""
-    data = df.copy()
-    if len(data) < 30:
-        return None
-
-    # 1. Garman-Klass Volatility & Bollinger Bands
-    log_hl = np.log(data["high"] / np.where(data["low"] <= 0, 1e-9, data["low"]))
-    log_co = np.log(data["close"] / np.where(data["open"] <= 0, 1e-9, data["open"]))
-    gk_var = 0.5 * (log_hl ** 2) - (2 * np.log(2) - 1) * (log_co ** 2)
-    data["gk_vol"] = np.sqrt(np.maximum(gk_var.rolling(gk_window).mean(), 1e-12))
-
-    data["bb_mid"] = data["close"].rolling(bb_window).mean()
-    data["bb_std"] = data["close"].rolling(bb_window).std()
-    data["bb_upper"] = data["bb_mid"] + bb_mult * data["bb_std"]
-    data["bb_lower"] = data["bb_mid"] - bb_mult * data["bb_std"]
-    data["bb_width"] = (data["bb_upper"] - data["bb_lower"]) / (data["bb_mid"] + 1e-9)
-    data["pct_b"] = (data["close"] - data["bb_lower"]) / ((data["bb_upper"] - data["bb_lower"]) + 1e-9)
-
-    actual_regime = min(len(data), regime_window)
-    if actual_regime < 24:
-        return None
-
-    data["gk_vol_rank"] = data["gk_vol"].rolling(actual_regime).apply(
-        lambda x: pd.Series(x).rank(pct=True).iloc[-1] if len(x) == actual_regime else np.nan, raw=False
-    )
-    data["bb_width_rank"] = data["bb_width"].rolling(actual_regime).apply(
-        lambda x: pd.Series(x).rank(pct=True).iloc[-1] if len(x) == actual_regime else np.nan, raw=False
-    )
-
-    data["is_compressed"] = (data["gk_vol_rank"] <= 0.20) | (data["bb_width_rank"] <= 0.20)
-    data["was_compressed_6h"] = data["is_compressed"].rolling(6).max() == 1
-
-    # 2. 建玉(OI) / 出来高過密テンション指標 (Tension)
-    tr1 = data["high"] - data["low"]
-    tr2 = (data["high"] - data["close"].shift(1)).abs()
-    tr3 = (data["low"] - data["close"].shift(1)).abs()
-    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-    data["atr_pct"] = tr.rolling(tension_window).mean() / (data["close"] + 1e-9)
-
-    oi_col = next((c for c in ["openInterest", "open_interest", "oi"] if c in data.columns), None)
-    if oi_col is not None and data[oi_col].nunique() > 1:
-        oi_change = data[oi_col].diff(tension_window)
-        data["tension"] = oi_change / (data["atr_pct"] * data[oi_col].shift(tension_window) + 1e-9)
-    else:
-        data["tension"] = (data["volume"].rolling(tension_window).mean()) / (data["atr_pct"] * data["close"] + 1e-9)
-
-    data["tension_rank"] = data["tension"].rolling(actual_regime).apply(
-        lambda x: pd.Series(x).rank(pct=True).iloc[-1] if len(x) == actual_regime else np.nan, raw=False
-    )
-    data["is_fuel_loaded"] = data["tension_rank"] >= 0.70
-
-    # 3. レンジ端受容 & 張り付き (Clinging)
-    high_24 = data["high"].rolling(24).max()
-    low_24 = data["low"].rolling(24).min()
-    data["range_pos_24"] = (data["close"] - low_24) / ((high_24 - low_24) + 1e-9)
-    data["clinging_high"] = (data["range_pos_24"] >= 0.65).rolling(4).sum() >= 2
-    data["clinging_low"] = (data["range_pos_24"] <= 0.35).rolling(4).sum() >= 2
-
-    # 4. 足内プライスアクション (CLV) & Funding Rate
-    hl = data["high"] - data["low"]
-    clv = ((data["close"] - data["low"]) - (data["high"] - data["close"])) / np.where(hl == 0, 1e-9, hl)
-    data["clv_sum"] = clv.rolling(clv_window).sum()
-
-    fr_col = next((c for c in ["fundingRate_annual_pct", "fundingRate", "funding_rate"] if c in data.columns), None)
-    if fr_col is not None:
-        data["fr_short_bias"] = data[fr_col] < 0
-    else:
-        data["fr_short_bias"] = False
-
-    # 5. ブレイクアウト前兆総合シグナル
-    data["precursor_long"] = data["was_compressed_6h"] & data["clinging_high"] & (data["pct_b"] >= 0.60)
-    data["precursor_short"] = data["was_compressed_6h"] & data["clinging_low"] & (data["pct_b"] <= 0.40)
-
-    return data
-
-
-async def scan_precursor_candidates(
-    tickers: List[Dict[str, Any]],
-    whale_net_flows: Dict[str, Dict[str, Any]],
-    min_vol_usd: float = 1000000.0,
-    top_n: int = 10
-) -> List[Dict[str, Any]]:
-    """BingX全Swap(無期限先物)銘柄をスキャンし、前兆スコア順に上位候補を選出"""
-    bx_url = f"{REST_API_URL['bingx']}/openApi/swap/v2/quote/klines"
-    now_utc = datetime.now(timezone.utc)
-    end_ts = int(now_utc.timestamp() * 1000)
-    start_ts = int((now_utc - timedelta(days=8)).timestamp() * 1000)
-
-    # 1. BTC除外、非暗号資産（株式トークン等）除外および出来高フィルタ
-    candidates_to_scan = []
-    for t in tickers:
-        sym = t.get("symbol", "")
-        clean_base = sym.replace("-USDT", "").replace("USDT", "").upper()
-        if clean_base == "BTC" or "NCSK" in sym.upper() or "2USD" in sym.upper():
-            continue
-        vol_24h = float(t.get("usdtVolume", 0.0))
-        px = float(t.get("lastPr", 0.0))
-        if vol_24h < min_vol_usd or px <= 0:
-            continue
-        candidates_to_scan.append(t)
-
-    # 出来高降順にソートし、流動性上位80銘柄をスキャン対象とする（高速かつ高流動性銘柄に特化）
-    candidates_to_scan.sort(key=lambda x: float(x.get("usdtVolume", 0.0)), reverse=True)
-    scan_pool = candidates_to_scan[:80]
-
-    print(f"\n[Precursor Engine] Scanning {len(scan_pool)} high-volume BingX symbols for compression, tension, FR & precursor signals...")
-
-    import aiohttp
-    sem = asyncio.Semaphore(15)  # 同時リクエスト数制限
-
-    async def fetch_candle_for_sym(session, t):
-        sym = t.get("symbol", "")
-        params = {
-            "symbol": sym,
-            "interval": "1h",
-            "startTime": str(start_ts),
-            "endTime": str(end_ts),
-            "limit": "200"
-        }
-        async with sem:
-            for attempt in range(3):
-                try:
-                    async with session.get(bx_url, params=params, timeout=aiohttp.ClientTimeout(total=8)) as resp:
-                        if resp.status == 200:
-                            data = await resp.json()
-                            if data.get("code") == 0:
-                                items = data.get("data", [])
-                                if isinstance(items, list) and len(items) >= 30:
-                                    return t, items
-                        await asyncio.sleep(0.2)
-                except Exception:
-                    await asyncio.sleep(0.2)
-        return t, None
-
-    async with aiohttp.ClientSession() as session:
-        tasks = [fetch_candle_for_sym(session, t) for t in scan_pool]
-        results = await asyncio.gather(*tasks)
-
-    scored_candidates = []
-    for t, items in results:
-        if not items:
-            continue
-        sym = t.get("symbol", "")
-        clean_sym = sym.replace("-USDT", "").replace("USDT", "").replace("USDC", "")
-        w_info = whale_net_flows.get(clean_sym) or whale_net_flows.get(sym) or {}
-        w_usd = float(w_info.get("net_val_usd", 0.0))
-        w_fmt = w_info.get("net_val_fmt", "$0")
-        w_ratio = float(w_info.get("long_ratio", 0.5))
-
-        try:
-            df = pd.DataFrame(items)
-            for c in ["open", "high", "low", "close", "volume"]:
-                if c in df.columns:
-                    df[c] = df[c].astype(float)
-            if "time" in df.columns:
-                df["timestamp"] = pd.to_datetime(df["time"].astype(int), unit="ms")
-                df = df.sort_values("timestamp").reset_index(drop=True)
-
-            fr_annual = float(t.get("funding_annual_pct", 0.0))
-            if fr_annual == 0.0 and "fundingRate" in t:
-                fr_annual = float(t.get("fundingRate", 0.0)) * 100 * 365 * 24
-            df["fundingRate"] = fr_annual
-
-            # -------------------------------------------------------------
-            # 【下落トレンド・暴落銘柄除外フィルター (LONG ONLY 厳格除外)】
-            # -------------------------------------------------------------
-            curr_close = df["close"].iloc[-1]
-            ret_24h = (curr_close - df["close"].iloc[-24]) / df["close"].iloc[-24] if len(df) >= 24 else 0.0
-            ret_3d = (curr_close - df["close"].iloc[-72]) / df["close"].iloc[-72] if len(df) >= 72 else ret_24h
-            ret_5d = (curr_close - df["close"].iloc[-120]) / df["close"].iloc[-120] if len(df) >= 120 else ret_3d
-            
-            sma50_series = df["close"].rolling(50, min_periods=20).mean()
-            sma50 = sma50_series.iloc[-1] if not sma50_series.empty else curr_close
-            is_below_sma50 = (curr_close < sma50) if not pd.isna(sma50) else False
-
-            # 下落トレンド判定:
-            # 1. 5日間で -10% 以下 または 3日間で -7% 以下の大幅急落 (暴落ナイフ)
-            # 2. 24時間騰落率が -5% 以下
-            # 3. 24時間騰落率がマイナス かつ 中期SMA50を明確に下回っている
-            if ret_5d < -0.10 or ret_3d < -0.07 or ret_24h < -0.05 or (ret_24h < -0.02 and is_below_sma50):
-                # 下落トレンドのためロング選定から完全除外
-                continue
-
-            # 4. 【チャート前半高値除外フィルター】
-            # 直近3日(72h)または5日(120h)において前半に高値を付け、後半の高値が大きく切り下がっている下落形状を除外
-            is_peak_in_first_half = False
-            for check_w in [72, 120]:
-                if len(df) >= check_w:
-                    sub_w = df.tail(check_w).reset_index(drop=True)
-                    half = check_w // 2
-                    first_max = sub_w["high"].iloc[:half].max()
-                    second_max = sub_w["high"].iloc[half:].max()
-                    # 前半高値に対して後半高値が7%以上切り下がり、現在値も高値から10%以上下落している形状
-                    if second_max < first_max * 0.93 and curr_close < first_max * 0.90:
-                        is_peak_in_first_half = True
-                        break
-            if is_peak_in_first_half:
-                continue
-
-            df_res = breakout_precursor_engine(df)
-            if df_res is None or df_res.empty:
-                continue
-
-            last = df_res.iloc[-1]
-            gk_r = float(last.get("gk_vol_rank", 0.5)) if not pd.isna(last.get("gk_vol_rank")) else 0.5
-            bb_r = float(last.get("bb_width_rank", 0.5)) if not pd.isna(last.get("bb_width_rank")) else 0.5
-            t_r = float(last.get("tension_rank", 0.5)) if not pd.isna(last.get("tension_rank")) else 0.5
-            r_pos = float(last.get("range_pos_24", 0.5)) if not pd.isna(last.get("range_pos_24")) else 0.5
-            pct_b = float(last.get("pct_b", 0.5)) if not pd.isna(last.get("pct_b")) else 0.5
-            clv_s = float(last.get("clv_sum", 0.0)) if not pd.isna(last.get("clv_sum")) else 0.0
-
-            # 総合前兆スコア (Precursor Score) 計算
-            score = 0.0
-            # 1. 圧縮度 (下位30%以下で加点)
-            if gk_r <= 0.30: score += (0.30 - gk_r) * 600
-            if bb_r <= 0.30: score += (0.30 - bb_r) * 400
-
-            # 2. プレカーサー完全点灯ボーナス
-            if last.get("precursor_long", False): score += 300
-
-            # 3. OI / 出来高テンション
-            if t_r >= 0.70: score += (t_r - 0.70) * 400
-
-            # 4. FRマイナス (ショート踏み上げ燃料: 価格が崩れていない場合のみ加点)
-            if fr_annual < 0:
-                if ret_24h >= 0 or ret_3d >= 0:
-                    score += min(350, 150 + abs(fr_annual) * 8)
-                else:
-                    score += 50  # 下落基調でのFRマイナスは踏み上げ期待が薄いため低加点
-            elif fr_annual <= 5.0:
-                score += 50
-
-            # 5. 出来高急増 (Volume Surge)
-            vol_mean_20 = df["volume"].tail(20).mean()
-            curr_vol = df["volume"].iloc[-1]
-            vol_surge_ratio = (curr_vol / (vol_mean_20 + 1e-9)) if vol_mean_20 > 0 else 1.0
-            if vol_surge_ratio >= 1.3:
-                score += min(150, (vol_surge_ratio - 1.0) * 100)
-
-            # 6. 高値張り付き & CLV
-            if r_pos >= 0.60: score += (r_pos - 0.60) * 300
-            if pct_b >= 0.60: score += (pct_b - 0.60) * 200
-            if clv_s > 0: score += min(100, clv_s * 15)
-
-            # 7. クジラ純流入
-            if w_usd > 0: score += 100
-
-            # Tier 分類
-            if w_usd > 0:
-                tier = 1
-                w_status = "BUY"
-                w_tag = "🟢 クジラ買い越し"
-            elif w_usd == 0:
-                tier = 2
-                w_status = "NEUTRAL"
-                w_tag = "⚪ クジラ中立"
-            else:
-                tier = 3
-                w_status = "SELL"
-                w_tag = "🔴 クジラ売り越し"
-
-            item = dict(t)
-            item.update({
-                "score": round(score, 2),
-                "tier": tier,
-                "whale_status": w_status,
-                "whale_tag": w_tag,
-                "whale_net_val_usd": w_usd,
-                "whale_net_val_fmt": w_fmt,
-                "whale_long_ratio": w_ratio,
-                "gk_vol_rank": round(gk_r, 3),
-                "bb_width_rank": round(bb_r, 3),
-                "tension_rank": round(t_r, 3),
-                "range_pos_24": round(r_pos, 3),
-                "pct_b": round(pct_b, 3),
-                "clv_sum": round(clv_s, 2),
-                "fr_annual_pct": round(fr_annual, 2),
-                "precursor_long": bool(last.get("precursor_long", False)),
-                "is_compressed": bool(last.get("is_compressed", False)),
-            })
-            scored_candidates.append(item)
-
-        except Exception as scan_err:
-            continue
-
-    # クジラ適格性（ロング専用: Tier 1 買い越し > Tier 2 中立 > Tier 3 売り越し）と前兆スコアでソート
-    # Tier 1 & 2 を最優先とし、その中で前兆スコア降順
-    scored_candidates = sorted(
-        scored_candidates,
-        key=lambda x: (
-            0 if x.get("tier") in (1, 2) else 1,
-            -float(x.get("score", 0.0))
-        )
-    )
-    return scored_candidates[:top_n]
-
-
-async def main():
-    parser = argparse.ArgumentParser(description="Build mixed datasets with Precursor Engine")
-    parser.add_argument("--start", type=str, default=DEFAULT_START_STR, help="ISO start timestamp")
-    parser.add_argument("--top-n", type=int, default=15, help="Number of alt symbols to select")
-    parser.add_argument("--no-chart-send", action="store_true", help="Do not send charts to Discord")
-    parser.add_argument("--skip-zip", action="store_true", help="Skip sending 2-month zip (e.g. after 1-year download)")
+    out_file = out_dir / f"normalized_chart_{window_name.lower()}.png"
+    plt.savefig(out_file, dpi=150, bbox_inches="tight")
+    plt.close()
+    return out_file, mean_norm, market_state, pos_ratio
+
+
+async def fetch_bingx_ticker_summary() -> List[Dict[str, Any]]:
+    """BingX API から全ティッカーの最新スナップショットを取得"""
+    url = "https://open-api.bingx.com/openApi/swap/v2/quote/ticker"
+    try:
+        resp = requests.get(url, timeout=10)
+        if resp.status_code == 200:
+            data = resp.json()
+            if data.get("code") == 0:
+                return data.get("data", [])
+    except Exception as e:
+        log(f"[Ticker Fetch Error] {e}")
+    return []
+
+
+async def main() -> None:
+    parser = argparse.ArgumentParser(description="BingX 20 Symbols Merged & 3-Window Regime Screening")
+    parser.add_argument("--no-chart-send", action="store_true", help="Discordチャート送信をスキップ")
+    parser.add_argument("--skip-zip", action="store_true", help="ZIP圧縮をスキップ")
     args = parser.parse_args()
-
-    # 0. クジラ分析スクリプトを自動更新実行
-    whale_script = Path(__file__).resolve().parent / "fetch_whale_sentiment.py"
-    if whale_script.exists():
-        try:
-            print("[Whale Engine] Updating whale sentiment via fetch_whale_sentiment.py...")
-            subprocess.run([sys.executable, str(whale_script)], check=True, timeout=60)
-        except Exception as w_err:
-            print(f"[Whale Warning] Failed to run fetch_whale_sentiment.py: {w_err}")
-
-    # 1. 銘柄情報の取得 & クジラ流入データの紐付け
-    print("\n[Ranking Engine] Fetching BingX Tickers & Smart Metrics...")
-    tickers = fetch_bingx_tickers()
-    if not tickers:
-        print("[Error] Failed to fetch tickers from BingX API.")
-        return
-
-    whale_json_file = Path(__file__).resolve().parent / "Data" / "whale_market_state.json"
-    whale_net_flows = {}
-    if whale_json_file.exists():
-        try:
-            with open(whale_json_file, "r", encoding="utf-8") as f:
-                w_data = json.load(f)
-                coins_sem = w_data.get("coins_sentiment", {})
-                for c_name, c_info in coins_sem.items():
-                    whale_net_flows[c_name] = {
-                        "net_val_usd": c_info.get("net_val_usd", 0.0),
-                        "net_val_fmt": c_info.get("net_val_formatted", "$0"),
-                        "long_ratio": c_info.get("long_ratio", 0.5)
-                    }
-        except Exception as e:
-            print(f"[Warning] Failed to load whale_market_state.json: {e}")
-
-    # 2. ブレイクアウト前兆エンジン（GKボラ圧縮・OIテンション・高値張り付き・FRバイアス）による選定
-    prioritized_candidates = await scan_precursor_candidates(tickers, whale_net_flows, min_vol_usd=1000000.0, top_n=args.top_n)
 
     out_dir = Path(__file__).resolve().parent / "Data"
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # 3. symbol_selection_scores.csv の保存 (前兆スコア優先ランキング)
-    df_scores = pd.DataFrame(prioritized_candidates)
-    df_scores["priority_rank"] = df_scores.index + 1
-    scores_path = out_dir / "symbol_selection_scores.csv"
-    df_scores.to_csv(scores_path, index=False)
+    log("==================================================")
+    log("  BingX Top 20 Alts & BTC SSoT Sync & Regime Evaluation")
+    log("==================================================")
 
-    tier1_cnt = sum(1 for c in prioritized_candidates if c.get("tier") == 1)
-    tier2_cnt = sum(1 for c in prioritized_candidates if c.get("tier") == 2)
-    tier3_cnt = sum(1 for c in prioritized_candidates if c.get("tier") == 3)
-    log(f"Saved precursor selection scores to {scores_path} (Top: {', '.join([c['symbol'] for c in prioritized_candidates[:5]])} | Tier1: {tier1_cnt}, Tier2: {tier2_cnt}, Tier3: {tier3_cnt})")
+    # 1. 5分足 SSoT ストアの一括同期
+    log(f"[SSoT Sync] 全 {len(ALL_SYMBOLS)} 銘柄の 5分足時系列ストアを同期中...")
+    sync_all_target_symbols_5m(ALL_SYMBOLS, target_days=35)
 
-    # 4. 選定銘柄 (固定選定5銘柄 + BTC-USDT) の OHLCV & Funding データ取得 (過去1ヶ月分: 30日間)
-    # ユーザー指示: 大きなデータを取る作業を廃止し、選定銘柄のみの1ヶ月分データに特化
-    end_utc = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0)
-    start_utc = end_utc - timedelta(days=30)
-    target_symbols = list(dict.fromkeys(FIXED_SYMBOLS + ["BTC-USDT"]))
+    # 2. 5分足ストアから 1H足 および 日足(1D) を動的生成して Data/ に保存
+    all_dfs = []
+    symbol_1h_dict = {}
 
-    ticker_map = {t.get("symbol"): t for t in tickers}
+    for sym in ALL_SYMBOLS:
+        df_5m = load_5m_candles(sym)
+        if df_5m.empty:
+            continue
+        df_1h = resample_from_5m(df_5m, 60)
+        df_1d = resample_from_5m(df_5m, 1440)
+        df_1h["symbol"] = sym
+        df_1d["symbol"] = sym
 
-    print(f"\n[Download Engine] Downloading 30-day (1 month) OHLCV & Funding Rate for SELECTED {len(target_symbols)} symbols: {', '.join(target_symbols)}...")
+        # 個別CSV保存
+        clean_sym = normalize_symbol_name(sym)
+        ticker = get_clean_symbol(clean_sym)
+        df_1h.to_csv(out_dir / f"merged_{clean_sym}.csv", index=False)
+        df_1h.to_csv(out_dir / f"merged_{ticker}.csv", index=False)
+        df_1d.to_csv(out_dir / f"daily_{clean_sym}.csv", index=False)
+        df_1d.to_csv(out_dir / f"daily_{ticker}.csv", index=False)
 
-    sem = asyncio.Semaphore(12)
-    async def fetch_one(rank, sym):
-        async with sem:
-            try:
-                t_info = ticker_map.get(sym) or {}
-                df, _ = await build_merged_dataset(
-                    sym,
-                    start_utc,
-                    end_utc,
-                    out_dir=out_dir,
-                    rank=rank,
-                    ticker_info=t_info,
-                )
-                await asyncio.sleep(0.04)
-                return df
-            except Exception:
-                return None
+        all_dfs.append(df_1h)
+        symbol_1h_dict[clean_sym] = df_1h
+        symbol_1h_dict[ticker] = df_1h
 
-    tasks = [fetch_one(rank, sym) for rank, sym in enumerate(target_symbols, 1)]
-    results = await asyncio.gather(*tasks)
-    all_dfs = [df for df in results if df is not None and not df.empty]
-    print(f"[Download Engine] Successfully downloaded {len(all_dfs)}/{len(target_symbols)} symbols with valid data.")
+    log(f"[Resample Done] 生成完了: {len(all_dfs)} 銘柄の 1H足 & 日足データ")
 
-    # 3. チャート作成および解析処理
-    if all_dfs:
-        print(f"\n[Success] Loaded 30-day (1 month) dataset for selected symbols ({len(all_dfs)} symbols). Huge merged CSV & ZIP creation disabled as per rules.")
+    # 3. 前半高値ピークアウト監査 (check_normalized_peak_timing)
+    excluded_symbols = set()
+    exclusion_reasons = {}
 
-        # ==============================================================================
-        # 【30日・10日・5日 ノーマライズチャート前半高値除外フィルター】
-        # チャートの前半に高値を付けて後半下落している銘柄を選定ランキングから除外
-        # ==============================================================================
-        filtered_dfs = []
-        excluded_symbols = set()
+    for d in all_dfs:
+        sym_name = d["symbol"].iloc[0]
+        ticker = get_clean_symbol(sym_name)
+        if ticker == "BTC":
+            continue
 
-        for d in all_dfs:
-            sym_name = d["symbol"].iloc[0]
-            clean_name = sym_name.upper().replace("-USDT", "").replace("USDT", "").replace("USDC", "")
-            if clean_name == "BTC":
-                filtered_dfs.append(d)
-                continue
+        is_bad, bad_reasons = check_normalized_peak_timing(d)
+        if is_bad:
+            reason_str = ", ".join(bad_reasons)
+            print(f"   [Normalized Peak Drop] {ticker}: {reason_str} -> 前半高値下落型のため除外対象")
+            excluded_symbols.add(sym_name)
+            excluded_symbols.add(ticker)
+            exclusion_reasons[ticker] = reason_str
 
-            is_bad, bad_reasons = check_normalized_peak_timing(d)
-            if is_bad:
-                reason_str = ", ".join(bad_reasons)
-                print(f"   [Normalized Peak Drop] {sym_name}: {reason_str} -> 前半高値下落型のため除外します。")
-                excluded_symbols.add(sym_name)
-            else:
-                filtered_dfs.append(d)
+    # 4. 30d, 10d, 5d ノーマライズ比較チャート生成 & Discord送信
+    windows = [
+        ("30d", 30 * 24),
+        ("10d", 10 * 24),
+        ("5d", 5 * 24),
+    ]
 
-        # チャート作成・選定用データセットを健全銘柄に更新
-        plot_dfs = filtered_dfs
+    discord = send_discord()
+    window_states = []
+    ts_jst_str = datetime.now(JST).strftime("%Y-%m-%d %H:%M")
 
-        # prioritized_candidates および symbol_selection_scores.csv の更新
-        if excluded_symbols:
-            prioritized_candidates = [c for c in prioritized_candidates if c["symbol"] not in excluded_symbols]
-            df_scores = pd.DataFrame(prioritized_candidates)
-            df_scores["priority_rank"] = df_scores.index + 1
-            df_scores.to_csv(scores_path, index=False)
-            print(f"   [Scores Updated] 前半高値除外銘柄 ({', '.join(excluded_symbols)}) を除去し、ランキングを再構築しました。(残り {len(prioritized_candidates)} 銘柄)")
+    for win_label, win_hours in windows:
+        chart_file, mean_norm, market_state, pos_ratio = generate_normalized_charts(
+            all_dfs, out_dir, win_label, win_hours, excluded_symbols=excluded_symbols
+        )
+        state_icon = "🟢" if market_state == "LONG" else "🔴"
+        log(f"   └ [{win_label} Window] Mean Norm: {mean_norm:.4f} (Pos Ratio: {pos_ratio:.1%}) -> Market State: {market_state}")
+        window_states.append((win_label, market_state, mean_norm, pos_ratio))
 
-        # ① 30d, 10d, 5d の 3 期間で正規化比較チャート生成 & 地合い判定
-        windows = [
-            ("30d", 30 * 24),
-            ("10d", 10 * 24),
-            ("5d", 5 * 24),
+        if not args.no_chart_send and chart_file and chart_file.exists():
+            discord.send_file(chart_file, f"BingX Normalized Performance [{win_label}] All 20 Symbols ({market_state})")
+
+    # 5. 3段階全体地合い判定 (30d / 10d / 5d 22票制)
+    regime_eval_res = evaluate_market_regime_3window(symbol_1h_dict)
+    overall_reg = regime_eval_res.get("overall_regime", "NEUTRAL")
+    period_res = regime_eval_res.get("period_results", {})
+    recommended_syms = regime_eval_res.get("recommended_symbols", [])
+
+    if not args.no_chart_send:
+        state_label_map = {"BUY": "買い", "SELL": "売り", "NEUTRAL": "中立"}
+        regime_summary_lines = [
+            "📊 **【新・全体地合い判定サマリー（30日 / 10日 / 5日）】**",
+            "※判定基準: アルト20銘柄(各1票) + BTC-USDT(2票) = 計22票 / 11票以上で判定"
         ]
-
-        discord = send_discord()
-        window_states = []
-
-        ts_jst_str = datetime.now(JST).strftime("%Y-%m-%d %H:%M")
-        ascii_banner = (
-            "```\n"
-            " ____  _               __  __\n"
-            "| __ )(_)_ __   __ _  \\ \\/ /\n"
-            "|  _ \\| | '_ \\ / _` |  \\  / \n"
-            "| |_) | | | | | (_| |  /  \\ \n"
-            "|____/|_|_| |_|\\__, | /_/\\_\\\n"
-            "               |___/        \n"
-            "----------------------------\n"
-            " BINGX TOP 20 CYCLE SCANNER \n"
-            "----------------------------\n"
-            "```"
-        )
-        print(ascii_banner)
-        if not args.no_chart_send:
-            discord.send_message(ascii_banner)
-
-        summary_text = (
-            f"🚀 **【BingX 主要20銘柄 サイクル危険回避判定 & ノーマライズ分析】** ({ts_jst_str} JST)\n"
-            f"========================================\n"
-        )
-
-        # ② 固定選定銘柄 (主要アルトコイン20銘柄 + BTC) のノーマライズチャート (30D, 10D, 5D)
-        print("\n[Fixed Selection Charts] Generating 30d, 10d, 5d Normalized Charts...")
-        fixed_target_list = list(FIXED_SYMBOLS)
-        if "BTC-USDT" not in fixed_target_list:
-            fixed_target_list.append("BTC-USDT")
-        for win_label, win_hours in windows:
-            fixed_chart = generate_custom_normalized_charts(
-                all_dfs=all_dfs,
-                target_symbols=fixed_target_list,
-                out_dir=out_dir,
-                window_name=win_label,
-                hours_limit=win_hours,
-                title="BingX Top 20 Alts Normalized",
-                file_prefix="normalized_fixed_symbols",
-                benchmark_symbol="BTC-USDT"
+        for win_label in ["30d", "10d", "5d"]:
+            p_info = period_res.get(win_label, {})
+            p_state = p_info.get("state", "NEUTRAL")
+            b_votes = p_info.get("buy_votes", 0)
+            s_votes = p_info.get("sell_votes", 0)
+            tot_v = p_info.get("total_votes", 22)
+            s_label = state_label_map.get(p_state, p_state)
+            icon = "🟢" if p_state == "BUY" else ("🔴" if p_state == "SELL" else "⚪")
+            win_label_jp = {"30d": "30日分", "10d": "10日分", "5d": "5日分"}.get(win_label, win_label)
+            regime_summary_lines.append(
+                f"・**{win_label_jp} ({win_label})**: {icon} **{s_label}**（買い: `{b_votes}/{tot_v}`票, 売り: `{s_votes}/{tot_v}`票）"
             )
-            if not args.no_chart_send and fixed_chart and fixed_chart.exists():
-                discord.send_file(fixed_chart, f"🎯 **【主要20銘柄 ノーマライズチャート [{win_label.upper()}]】**")
 
-        # ③ 主要20銘柄 1週間高値圏 ＆ セリクラ底打ち危険回避判定レポート
-        print("\n==================================================================================")
-        print(" [Step 2: Fixed 20 Symbols 168h Top-Stop & Climax Recovery Safety Assessment]")
-        print("==================================================================================")
-        summary_text += f"\n👑 **【主要20銘柄 1週間高値＆セリクラ危険回避判定レポート】**\n"
-        
-        df_map_all = {}
-        for d in all_dfs:
-            if isinstance(d, pd.DataFrame) and not d.empty and "symbol" in d.columns:
-                df_map_all[normalize_symbol(d["symbol"].iloc[0])] = d
+        overall_icon = "🟢" if overall_reg == "BUY" else ("🔴" if overall_reg == "SELL" else "⚪")
+        overall_label = state_label_map.get(overall_reg, overall_reg)
+        regime_summary_lines.append(f"\n👉 **総合地合い判定**: {overall_icon} **{overall_label}** (3期間合致判定)")
 
-        eligible_symbols = []
-        mtf_reports = {}
-
-        for sym in FIXED_SYMBOLS:
-            clean_sym = normalize_symbol(sym)
-            df_sym = df_map_all.get(clean_sym)
-            if df_sym is None or df_sym.empty:
-                cand_file = out_dir / f"historical_candles/{clean_sym}_1h.csv"
-                if not cand_file.exists():
-                    cand_file = out_dir / "individual" / f"merged_{clean_sym}.csv"
-                if not cand_file.exists():
-                    cand_file = out_dir / f"merged_{clean_sym}.csv"
-                if not cand_file.exists():
-                    cand_file = out_dir / f"merged_{clean_sym.replace('-USDT','')}.csv"
-                if cand_file.exists():
-                    try:
-                        df_sym = pd.read_csv(cand_file)
-                    except Exception:
-                        df_sym = None
-
-            is_ok, report = check_mtf_long_eligibility(df_sym, clean_sym)
-            mtf_reports[clean_sym] = report
-
-            c_info = report.get("cycle_result", {})
-            c_state = c_info.get("state_name", "NORMAL")
-            drop_pct = c_info.get("drop_from_peak_pct", 0.0)
-            is_near = c_info.get("is_near_top", False)
-            climax_hit = c_info.get("climax_hit", False)
-            vol_ratio = c_info.get("vol_ratio", 1.0)
-            is_bull = c_info.get("is_bullish", False)
-            wick_r = c_info.get("wick_ratio", 0.0)
-
-            # ステータスバッジの細分化
-            if is_ok:
-                eligible_symbols.append(clean_sym)
-                if climax_hit:
-                    status_badge = "🟢 【トレードOK (底打ち完了✨)】"
-                else:
-                    status_badge = "🟢 【トレードOK (巡航)】"
-            else:
-                if is_near:
-                    status_badge = "🔴 【高値圏見送り⚠️】"
-                elif climax_hit:
-                    status_badge = "🟡 【セリクラ下落待機⚡】"
-                else:
-                    status_badge = "🔴 【見送り】"
-
-            best_top_pct = c_info.get("best_top_pct", 0.030)
-            best_vol_mult = c_info.get("best_vol_mult", 2.5)
-            climax_str = f"⚡急増({vol_ratio:.1f}x/{best_vol_mult:.1f}x)" if climax_hit else f"⚪通常({vol_ratio:.1f}x/{best_vol_mult:.1f}x)"
-            wick_str = f"✨陽線ヒゲ{int(wick_r*100)}%" if (is_bull and wick_r >= 0.15) else f"⚪ヒゲ{int(wick_r*100)}%"
-
-            log_line = f" • {clean_sym:10s} : {status_badge:26s} | 1週高値乖離: {drop_pct:+5.1f}% (停止幅:{best_top_pct*100:.1f}%) | 出来高: {climax_str:16s} | 反転足: {wick_str}"
-            if not is_ok and report.get("rejection_reasons"):
-                log_line += f" | 理由: {', '.join(report['rejection_reasons'])}"
-            log(log_line)
-
-            summary_text += f"• **{clean_sym}**: {status_badge} [1週高値乖離:`{drop_pct:+5.1f}%` (停止:`{best_top_pct*100:.1f}%`), 出来高:`{climax_str}`, 反転:`{wick_str}`]\n"
-
-        print("----------------------------------------------------------------------------------")
-        log(f"サイクル適格銘柄: {', '.join(eligible_symbols) if eligible_symbols else 'なし（全銘柄高値圏警戒）'}")
-
-        # trade_eligible_symbols.json に保存
-        eligible_file = out_dir / "trade_eligible_symbols.json"
-        eligible_data = {
-            "eligible_symbols": eligible_symbols,
-            "target_symbols": list(FIXED_SYMBOLS),
-            "evaluated_at": datetime.now(timezone.utc).isoformat(),
-            "reports": mtf_reports
-        }
-        with open(eligible_file, "w", encoding="utf-8") as f:
-            json.dump(eligible_data, f, indent=2, ensure_ascii=False)
-        log(f"Saved trade eligible symbols to {eligible_file}")
-
-        # ⑤ マクロ環境認識 ＆ レジームフィルター判定 (PROJECT_RULES 準拠: パターンA門番)
-        print("\n==================================================================================")
-        print(" [Step 3: Macro Regime Gate Evaluation (Pattern A: Top Stop & Bottom Recovery)]")
-        print("==================================================================================")
-        regime_mgr = RegimeFilterManager()
-
-        # BTCマクロレジーム判定
-        df_btc = df_map_all.get("BTC-USDT")
-        if df_btc is None or df_btc.empty:
-            cand_file_btc = out_dir / "individual" / "merged_BTC-USDT.csv"
-            if cand_file_btc.exists():
-                df_btc = pd.read_csv(cand_file_btc)
-
-        # ----------------------------------------------------------------------
-        # 二層構造門番アーキテクチャ判定 (PROJECT_RULES.md 準拠)
-        # ----------------------------------------------------------------------
-        # 【第1層: 市場全体 全面安フィルター (Macro Market Dump Filter)】
-        macro_dump_filter = MacroMarketDumpFilter(
-            alt_lead_down_ratio=0.90,
-            alt_lead_drop_pct=-3.0,
-            btc_dump_drop_pct=-3.0,
-            btc_dump_down_ratio=0.70,
-            alt_recovery_ratio=0.50,
-            alt_rebound_pct=1.5,
-            min_lock_hours=6,
-            cooldown_hours=4,
-            btc_stable_hours=3,
-            state_file=out_dir / "macro_dump_state.json"
-        )
-        macro_dump_eval = macro_dump_filter.evaluate(df_map_all)
-        log(f"Macro Dump Gate (Tier 1): Gate={macro_dump_eval.get('gate')} | State={macro_dump_eval.get('state_name')} | Reason={macro_dump_eval.get('reason')}")
-
-        # 【第2層: 個別銘柄 高値圏天井停止 ＆ セリクラ底打ちサイクル (Regime Filter)】
-        btc_regime = regime_mgr.evaluate(df_btc, is_btc=True) if (df_btc is not None and not df_btc.empty) else {"regime_gate": "ALLOW", "state_name": "NORMAL"}
-        log(f"BTC Macro Regime (Tier 2): Gate={btc_regime.get('regime_gate')} | State={btc_regime.get('state_name')} | Action={btc_regime.get('action')} | PeakDrop={btc_regime.get('drop_from_peak_pct')}%")
-
-        # 各選定銘柄の個別レジーム判定
-        symbol_regimes = {}
-        stop_count = 0
-        for sym in FIXED_SYMBOLS:
-            clean_sym = normalize_symbol(sym)
-            df_sym_reg = df_map_all.get(clean_sym)
-            if df_sym_reg is None or df_sym_reg.empty:
-                cand_f = out_dir / "individual" / f"merged_{clean_sym}.csv"
-                if cand_f.exists():
-                    df_sym_reg = pd.read_csv(cand_f)
-
-            if df_sym_reg is not None and not df_sym_reg.empty:
-                sym_eval = regime_mgr.evaluate(df_sym_reg, is_btc=False)
-                symbol_regimes[clean_sym] = sym_eval
-                if sym_eval.get("regime_gate") == "STOP":
-                    stop_count += 1
-            else:
-                symbol_regimes[clean_sym] = {"regime_gate": "ALLOW", "state_name": "NORMAL", "action": "NORMAL"}
-
-        # 総合判定: 第2層のBTC門番がSTOP、または選定銘柄の60%以上がSTOPなら第2層STOP
-        overall_gate = "ALLOW"
-        if btc_regime.get("regime_gate") == "STOP":
-            overall_gate = "STOP"
-            overall_reason = f"BTC_REGIME_{btc_regime.get('state_name')}"
-        elif stop_count >= len(FIXED_SYMBOLS) * 0.6:
-            overall_gate = "STOP"
-            overall_reason = f"ALTS_MAJORITY_STOP_{stop_count}/{len(FIXED_SYMBOLS)}"
+        if overall_reg == "BUY":
+            regime_summary_lines.append(f"🎯 **買いトレード推奨銘柄 ({len(recommended_syms)}銘柄)**: `{', '.join(recommended_syms) if recommended_syms else 'なし'}`")
+            regime_summary_lines.append("⚡ **アクション**: 買い推奨銘柄のバックテスト・個別最適化を実行しトレードを開始します。")
+        elif overall_reg == "SELL":
+            regime_summary_lines.append("🛡️ **アクション**: 地合い売り優勢ですが、優位性発掘のため固定銘柄の個別バックテスト・最適化を実施します（新規エントリーは暴落警戒停止）。")
         else:
-            overall_gate = "ALLOW"
-            overall_reason = "NORMAL_OR_BOTTOM_RECOVERY"
+            regime_summary_lines.append("⚡ **アクション**: 地合い中立ですが、優位性発掘のため固定銘柄の個別バックテスト・最適化を実施します（厳格基準合格銘柄のみ選定、ナンピン凍結・建値撤退モード適用）。")
 
-        gate_icon = "🟢" if overall_gate == "ALLOW" else "🛑"
-        macro_icon = "🟢" if macro_dump_eval.get("gate") == "ALLOW" else "🛑"
-        summary_text += f"\n🛡️ **[3. 二層構造マクロ門番判定 (PROJECT_RULES 準拠)]**\n"
-        summary_text += f"• **第1層 全面安フィルター**: {macro_icon} `{macro_dump_eval.get('gate')}` (ステート: `{macro_dump_eval.get('state_name')}`, 理由: `{macro_dump_eval.get('reason')}`)\n"
-        summary_text += f"• **第2層 個別高値警戒門番**: {gate_icon} `{overall_gate}` (BTC: `{btc_regime.get('state_name')}`, 制限銘柄数: `{stop_count}/{len(FIXED_SYMBOLS)}`)\n"
-        summary_text += f"========================================\n"
+        regime_eval_msg = "\n".join(regime_summary_lines)
+        discord.send_message(regime_eval_msg)
+        print(f"\n{regime_eval_msg}\n")
 
-        log(f"Overall Gate Summary: Tier1 Dump={macro_dump_eval.get('gate')} | Tier2 Regime={overall_gate} ({overall_reason})")
+    # 6. market_state.json の保存
+    final_state = "long_only" if overall_reg == "BUY" else ("short_only" if overall_reg == "SELL" else "neutral")
+    state_file = out_dir / "market_state.json"
+    state_data = {
+        "market_state": final_state,
+        "overall_regime": overall_reg,
+        "is_buy_regime": (overall_reg == "BUY"),
+        "is_sell_regime": (overall_reg == "SELL"),
+        "period_results": period_res,
+        "recommended_symbols": recommended_syms,
+        "excluded_symbols": list(excluded_symbols),
+        "exclusion_reasons": exclusion_reasons,
+        "timestamp": datetime.now(timezone.utc).isoformat()
+    }
+    with open(state_file, "w", encoding="utf-8") as f:
+        json.dump(state_data, f, indent=2, ensure_ascii=False)
+    log(f"Saved market state ({final_state} | overall={overall_reg}) to {state_file}")
 
-        if not args.no_chart_send:
-            discord.send_message(summary_text)
+    log("==================================================")
+    log("  BingX Screening & Multi-Window Analysis Completed!")
+    log("==================================================")
 
-        # market_state.json の保存
-        last_market_state = window_states[-1][1] if window_states else "LONG"
-        last_mean_norm = window_states[-1][2] if window_states else 1.0
-        final_state = "long_only" if last_market_state == "LONG" else "short_only"
-        state_file = out_dir / "market_state.json"
-        state_data = {
-            "market_state": final_state,
-            "mean_norm": last_mean_norm,
-            "regime_gate": overall_gate,
-            "regime_reason": overall_reason,
-            "macro_dump_gate": macro_dump_eval,
-            "btc_regime": {
-                "state": btc_regime.get("state", 0),
-                "state_name": btc_regime.get("state_name", "NORMAL"),
-                "action": btc_regime.get("action", "NORMAL"),
-                "drop_from_peak_pct": btc_regime.get("drop_from_peak_pct", 0.0),
-            },
-            "symbol_regimes": {
-                k: {
-                    "regime_gate": v.get("regime_gate", "ALLOW"),
-                    "state_name": v.get("state_name", "NORMAL"),
-                    "action": v.get("action", "NORMAL"),
-                    "drop_from_peak_pct": v.get("drop_from_peak_pct", 0.0),
-                } for k, v in symbol_regimes.items()
-            },
-            "timestamp": datetime.now(timezone.utc).isoformat()
-        }
-        with open(state_file, "w", encoding="utf-8") as f:
-            json.dump(state_data, f, indent=2, ensure_ascii=False)
-        log(f"Saved market state ({final_state}, Gate={overall_gate}, MacroDump={macro_dump_eval.get('gate')}) to {state_file}")
-
-    print("\n==================================================")
-    print("  Smart Selection & Multi-Window Analysis Completed!")
-    print("==================================================")
 
 if __name__ == "__main__":
     asyncio.run(main())
-

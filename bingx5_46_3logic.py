@@ -6,27 +6,33 @@ import asyncio
 import time
 import os
 import requests
-import json
 import pybotters
 import pandas as pd
 import numpy as np
 import matplotlib
 import matplotlib.pyplot as plt
 import matplotlib.dates as md
-from rich import print
 import sys
+
 if hasattr(sys.stdout, "reconfigure"):
     try:
-        sys.stdout.reconfigure(encoding="utf-8")
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     except Exception:
         pass
+if hasattr(sys.stderr, "reconfigure"):
+    try:
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
+from rich import print
 from bingx5_46_5backtest_mm import make_mm_pl, Backtest, AirExchange
 from config_loader import get_webhook_url
 
 
 def calc_add_pct(n: int, strategy: str = "val_poc") -> float:
     """Return add-on percentage based on position count.
-    VAL_POC: 3.0% (1年分実証最適値: 浅いノイズでの建玉肥大化を防ぎ損失リスク半減)
+    VAL_POC: 3.0% (BingX実証最適値: 浅いノイズでの建玉肥大化を防ぎ損失リスク半減)
     RSIMA: 0.4%〜1.0% (Pine Script RSIMA3 spec)
     """
     strat = str(strategy).lower()
@@ -38,533 +44,12 @@ def calc_add_pct(n: int, strategy: str = "val_poc") -> float:
         return 0.006  # 0.6%
     if n <= 8:
         return 0.008  # 0.8%
-    return 0.010      # 1.0%
-
-
-
-def calc_rma(series: pd.Series, length: int) -> pd.Series:
-    """Pine Script ta.rma (Wilder's Moving Average)"""
-    alpha = 1.0 / length
-    return series.ewm(alpha=alpha, adjust=False).mean()
-
-
-def calc_rsi(series: pd.Series, length: int = 9) -> pd.Series:
-    """Pine Script ta.rsi based on RMA"""
-    delta = series.diff()
-    up = delta.clip(lower=0.0)
-    down = -delta.clip(upper=0.0)
-    
-    rma_up = calc_rma(up, length)
-    rma_down = calc_rma(down, length)
-    
-    rs = rma_up / rma_down.replace(0.0, np.nan)
-    rsi_vals = np.where(rma_down == 0.0, 100.0, np.where(rma_up == 0.0, 0.0, 100.0 - (100.0 / (1.0 + rs))))
-    return pd.Series(rsi_vals, index=series.index).fillna(50.0)
+    return 0.010       # 1.0%
 
 
 def calc_ema(series: pd.Series, length: int) -> pd.Series:
     """Exponential Moving Average (EMA)"""
     return series.ewm(span=length, adjust=False).mean()
-
-
-class RegimeFilterManager:
-    """
-    高値圏ロング停止 ＆ セリクラ下ヒゲ陽線底打ちサイクル管理クラス (PROJECT_RULES / TradingView 実証準拠)
-    TradingView勝率82.5%、PF 3.45の実証ロジック完全準拠:
-      - 監視期間 (range_hours): 168時間 (7日間 / 1週間)
-      - 天井停止 (near_top_pct): 過去168時間最高値の 2.5% 以内に入ったら新規ロング停止
-      - 上放れブレイク: 天井ピークを上抜けたら即座にロング再開 (トレンド継続)
-      - セリクラ検知 (climax_vol_mult): 出来高が直近24SMAの 1.4 倍以上でセリクラ認定
-      - 底打ち反転足: セリクラ検知後、陽線 かつ 下ヒゲ比率 30% 以上の確定足でロング再開
-    状態:
-      - NORMAL (0): 通常ロング許可 (long_allowed = True)
-      - TOP_STOP (1): 天井・高値圏警戒ロング停止 (long_allowed = False, climax_hit = False)
-      - CLIMAX_BOTTOM_WAIT (2): セリクラ検知済・反転陽線待ち (long_allowed = False, climax_hit = True)
-    """
-    STATE_NAMES = {
-        0: "NORMAL",
-        1: "TOP_STOP",
-        2: "CLIMAX_BOTTOM_WAIT",
-    }
-
-    def __init__(
-        self,
-        range_hours: int = 168,
-        near_top_pct: float = 0.030,
-        climax_vol_mult: float = 2.5,
-        wick_ratio_req: float = 0.15,
-    ):
-        self.range_hours = range_hours
-        self.near_top_pct = near_top_pct
-        self.climax_vol_mult = climax_vol_mult
-        self.wick_ratio_req = wick_ratio_req
-
-    def evaluate(self, df: pd.DataFrame, is_btc: bool = False) -> Dict[str, Any]:
-        """
-        1時間足データからサイクル状態および門番許可フラグを算出する (TradingView完全準拠)
-        """
-        if df is None or len(df) < 12:
-            return {
-                "long_allowed": True,
-                "regime_gate": "ALLOW",
-                "state": 0,
-                "state_name": "NORMAL",
-                "action": "NORMAL",
-                "reason": "insufficient_data",
-                "drop_from_peak_pct": 0.0,
-                "recent_peak_price": 0.0,
-                "last_sl_price": 0.0,
-                "climax_hit": False,
-            }
-
-        df = df.copy().reset_index(drop=True)
-        n = len(df)
-
-        close = df['close'].values.astype(float)
-        open_ = df['open'].values.astype(float)
-        high = df['high'].values.astype(float)
-        low = df['low'].values.astype(float)
-        vol = df['volume'].values.astype(float)
-
-        vol_s = pd.Series(vol)
-        vol_sma24 = vol_s.rolling(24, min_periods=5).mean().values
-
-        # 状態追跡変数 (Pine Script の var 変数と同等)
-        long_allowed_arr = np.ones(n, dtype=bool)
-        state_arr = np.zeros(n, dtype=int)
-
-        long_allowed = True
-        tracked_top_peak: Optional[float] = None
-        climax_hit = False
-
-        for i in range(1, n):
-            c = close[i]
-            o = open_[i]
-            h = high[i]
-            l = low[i]
-            v = vol[i]
-            v_ma24 = vol_sma24[i] if not np.isnan(vol_sma24[i]) and vol_sma24[i] > 0 else v
-
-            # 過去 range_hours 本の最高値 (リペイント防止: 直前確定足までの高値ウィンドウ)
-            lookback_start = max(0, i - self.range_hours)
-            h1_peak_high = float(np.max(high[lookback_start:i])) if i > lookback_start else h
-
-            # 天井判定 (高値圏 2.5% 以内)
-            is_top_signal = (c >= h1_peak_high * (1.0 - self.near_top_pct))
-
-            # 1. 上放れブレイクで相場継続とみなして即解除
-            if not long_allowed and tracked_top_peak is not None and h > tracked_top_peak:
-                long_allowed = True
-                climax_hit = False
-                tracked_top_peak = None
-
-            # 2. 天井検知 -> 新規ロング停止
-            if long_allowed and is_top_signal:
-                long_allowed = False
-                tracked_top_peak = h1_peak_high
-                climax_hit = False
-
-            # 3. 下落・底打ち監視
-            if not long_allowed:
-                # セリクラ判定 (出来高が24SMAの1.4倍以上)
-                if v >= v_ma24 * self.climax_vol_mult:
-                    climax_hit = True
-
-                # 反転足判定 (陽線 & 下ヒゲ比率30%以上)
-                candle_total = h - l
-                lower_wick = min(o, c) - l
-                c_wick_ok = (candle_total > 0) and ((lower_wick / candle_total) >= self.wick_ratio_req)
-                is_bullish_h1 = (c > o) and c_wick_ok
-
-                if climax_hit and is_bullish_h1:
-                    long_allowed = True
-                    climax_hit = False
-                    tracked_top_peak = None
-
-            long_allowed_arr[i] = long_allowed
-            if long_allowed:
-                state_arr[i] = 0
-            elif climax_hit:
-                state_arr[i] = 2
-            else:
-                state_arr[i] = 1
-
-        curr_state = int(state_arr[-1])
-        curr_allowed = bool(long_allowed_arr[-1])
-        curr_peak = tracked_top_peak if tracked_top_peak is not None else float(np.max(high[max(0, n - self.range_hours):]))
-        curr_drop = float((close[-1] - curr_peak) / curr_peak) if curr_peak > 0 else 0.0
-
-        action_map = {
-            0: "NORMAL",
-            1: "STOP_NEW_LONG_NEAR_TOP",
-            2: "WAIT_RECOVERY_BULL_HAMMER",
-        }
-
-        curr_vol_ma = vol_sma24[-1] if not np.isnan(vol_sma24[-1]) and vol_sma24[-1] > 0 else vol[-1]
-        curr_vol_ratio = float(vol[-1] / curr_vol_ma) if curr_vol_ma > 0 else 1.0
-        candle_total_last = high[-1] - low[-1]
-        lower_wick_last = min(open_[-1], close[-1]) - low[-1]
-        curr_wick_ratio = float(lower_wick_last / candle_total_last) if candle_total_last > 0 else 0.0
-        is_near_top = bool(close[-1] >= curr_peak * (1.0 - self.near_top_pct))
-
-        return {
-            "long_allowed": curr_allowed,
-            "regime_gate": "ALLOW" if curr_allowed else "STOP",
-            "state": curr_state,
-            "state_name": self.STATE_NAMES.get(curr_state, "NORMAL"),
-            "action": action_map.get(curr_state, "NORMAL"),
-            "reason": f"State={self.STATE_NAMES.get(curr_state)} (Allowed={curr_allowed}, Climax={climax_hit}, Peak={curr_peak:.4f}, Drop={curr_drop*100:.1f}%)",
-            "drop_from_peak_pct": round(curr_drop * 100.0, 2),
-            "recent_peak_price": round(curr_peak, 4),
-            "last_sl_price": round(float(low[-1]), 4) if low[-1] > 0 else None,
-            "climax_hit": climax_hit,
-            "tracked_top_peak": curr_peak,
-            "is_near_top": is_near_top,
-            "vol_ratio": round(curr_vol_ratio, 2),
-            "wick_ratio": round(curr_wick_ratio, 2),
-            "is_bullish": bool(close[-1] > open_[-1]),
-        }
-
-
-class MacroMarketDumpFilter:
-    """
-    第1層: 市場全体 全面安フィルター (Macro Market Dump Filter)
-    PROJECT_RULES.md 唯一の仕様原本 ＆ 2022-2026年Binance実証最適値準拠
-    
-    【設計思想】
-      - 過去約5年間の検証で全暴落の76.1%を占める「アルト先行型」および「BTC主導型」のデュアル・トリガーにより、
-        相場急落の初動を即座に検知して全銘柄の新規買い(Long)を緊急ロック (gate="STOP")。
-      - BTCの3時間安値未更新安定化 ＆ 監視アルトの過半数(50%以上)が最安値から+1.5%自律反発して初めて安全に解除。
-      - 最低ロック6時間 ＆ 解除後クールダウン4時間により、落ちるナイフ被弾とチャタリングを完全防止。
-    """
-    STATE_NAMES = {
-        0: "NORMAL",
-        1: "DUMP_LOCKED",
-        2: "BTC_STABILIZING",
-    }
-
-    def __init__(
-        self,
-        alt_lead_down_ratio: float = 0.90,   # アルト先行: 下落比率 (90%)
-        alt_lead_drop_pct: float = -3.0,     # アルト先行: アルト平均下落率 (-3.0%)
-        btc_dump_drop_pct: float = -3.0,     # BTC主導: BTC下落率 (-3.0%)
-        btc_dump_down_ratio: float = 0.70,   # BTC主導: アルト下落比率 (70%)
-        alt_recovery_ratio: float = 0.50,    # アルト回復率: 底値から反発した銘柄の割合 (50%)
-        alt_rebound_pct: float = 1.5,        # アルト回復: 底値からの反発幅 (+1.5%)
-        min_lock_hours: int = 6,             # 最低ロック時間 (6時間: パニック売り連鎖保護)
-        cooldown_hours: int = 4,             # 再ロック禁止クールダウン (4時間)
-        btc_stable_hours: int = 3,           # BTC安定化確認期間 (3時間連続で安値未更新)
-        state_file: Optional[Path] = None,   # 状態永続化JSONファイル
-    ):
-        self.alt_lead_down_ratio = alt_lead_down_ratio
-        self.alt_lead_drop_pct = alt_lead_drop_pct
-        self.btc_dump_drop_pct = btc_dump_drop_pct
-        self.btc_dump_down_ratio = btc_dump_down_ratio
-        self.alt_recovery_ratio = alt_recovery_ratio
-        self.alt_rebound_pct = alt_rebound_pct
-        self.min_lock_hours = min_lock_hours
-        self.cooldown_hours = cooldown_hours
-        self.btc_stable_hours = btc_stable_hours
-        self.state_file = state_file or (Path(__file__).resolve().parent / "Data" / "macro_dump_state.json")
-
-    def _load_state(self) -> Dict[str, Any]:
-        """永続化JSONから状態を復元"""
-        default_state = {
-            "state": 0,
-            "trigger_type": "NONE",
-            "dump_start_time": None,
-            "btc_lowest_in_dump": None,
-            "btc_lowest_time": None,
-            "alt_lowest_in_dump": {},
-            "last_unlock_time": None,
-            "updated_at": None,
-        }
-        if self.state_file and self.state_file.exists():
-            try:
-                with open(self.state_file, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                    for k, v in default_state.items():
-                        if k not in data:
-                            data[k] = v
-                    return data
-            except Exception:
-                pass
-        return default_state
-
-    def _save_state(self, state_data: Dict[str, Any]) -> None:
-        """状態をJSONに安全に永続化"""
-        if self.state_file:
-            try:
-                self.state_file.parent.mkdir(parents=True, exist_ok=True)
-                with open(self.state_file, "w", encoding="utf-8") as f:
-                    json.dump(state_data, f, indent=2, ensure_ascii=False)
-            except Exception:
-                pass
-
-    def evaluate(self, df_map: Dict[str, pd.DataFrame]) -> Dict[str, Any]:
-        """
-        全銘柄の1時間足データ（df_map）から市場全体の急落状態を評価し、門番フラグを決定する
-        """
-        now_dt = datetime.now(timezone.utc)
-        now_iso = now_dt.isoformat()
-
-        # 1. BTCおよびアルト銘柄の直近4時間リターンを算出
-        btc_key = None
-        for k in df_map.keys():
-            if "BTC" in k.upper():
-                btc_key = k
-                break
-
-        btc_ret_4h = 0.0
-        btc_current_low = 0.0
-        btc_current_close = 0.0
-        btc_current_open = 0.0
-
-        if btc_key and df_map[btc_key] is not None and len(df_map[btc_key]) >= 5:
-            btc_df = df_map[btc_key]
-            c_now = float(btc_df["close"].iloc[-1])
-            c_4h_ago = float(btc_df["close"].iloc[-5])
-            btc_ret_4h = (c_now - c_4h_ago) / c_4h_ago * 100.0 if c_4h_ago > 0 else 0.0
-            btc_current_low = float(btc_df["low"].iloc[-1])
-            btc_current_close = c_now
-            btc_current_open = float(btc_df["open"].iloc[-1])
-
-        alt_rets_4h = []
-        alt_current_closes = {}
-        alt_current_lows = {}
-
-        for sym, df in df_map.items():
-            if "BTC" in sym.upper() or df is None or len(df) < 5:
-                continue
-            clean_sym = sym.replace("-", "").replace("_", "").upper()
-            c_now = float(df["close"].iloc[-1])
-            c_4h_ago = float(df["close"].iloc[-5])
-            r = (c_now - c_4h_ago) / c_4h_ago * 100.0 if c_4h_ago > 0 else 0.0
-            alt_rets_4h.append(r)
-            alt_current_closes[clean_sym] = c_now
-            alt_current_lows[clean_sym] = float(df["low"].iloc[-1])
-
-        total_alts = len(alt_rets_4h)
-        if total_alts == 0:
-            return {
-                "gate": "ALLOW",
-                "state": 0,
-                "state_name": "NORMAL",
-                "trigger_type": "NONE",
-                "reason": "NO_ALT_DATA",
-                "lock_hours": 0,
-                "btc_drop_pct": 0.0,
-                "alt_mean_drop_pct": 0.0,
-                "alt_down_ratio": 0.0,
-                "rebound_ratio": 0.0,
-                "updated_at": now_iso,
-            }
-
-        down_alts = sum(1 for r in alt_rets_4h if r < 0.0)
-        alt_down_ratio = down_alts / total_alts
-        alt_mean_ret = float(np.mean(alt_rets_4h))
-
-        # 2. 永続化ステートのロード
-        stored = self._load_state()
-        state = stored.get("state", 0)
-        trigger_type = stored.get("trigger_type", "NONE")
-        dump_start_time = stored.get("dump_start_time")
-        btc_lowest = stored.get("btc_lowest_in_dump")
-        btc_lowest_time = stored.get("btc_lowest_time")
-        alt_lowest = stored.get("alt_lowest_in_dump", {})
-        last_unlock_time = stored.get("last_unlock_time")
-
-        lock_hours = 0
-        hours_since_btc_lowest = 0
-        rebound_ratio = 0.0
-
-        if dump_start_time:
-            try:
-                st_dt = datetime.fromisoformat(dump_start_time)
-                lock_hours = max(0, int((now_dt - st_dt).total_seconds() / 3600))
-            except Exception:
-                lock_hours = 0
-
-        if btc_lowest_time:
-            try:
-                bl_dt = datetime.fromisoformat(btc_lowest_time)
-                hours_since_btc_lowest = max(0, int((now_dt - bl_dt).total_seconds() / 3600))
-            except Exception:
-                hours_since_btc_lowest = 0
-
-        # 3. 状態遷移マシン判定
-        # 状態 0: NORMAL (通常)
-        if state == 0:
-            cooldown_ok = True
-            if last_unlock_time:
-                try:
-                    un_dt = datetime.fromisoformat(last_unlock_time)
-                    if (now_dt - un_dt).total_seconds() < self.cooldown_hours * 3600:
-                        cooldown_ok = False
-                except Exception:
-                    pass
-
-            if cooldown_ok:
-                is_alt_lead = (alt_down_ratio >= self.alt_lead_down_ratio) and (alt_mean_ret <= self.alt_lead_drop_pct)
-                is_btc_lead = (btc_ret_4h <= self.btc_dump_drop_pct) and (alt_down_ratio >= self.btc_dump_down_ratio)
-
-                if is_alt_lead or is_btc_lead:
-                    state = 1  # DUMP_LOCKED
-                    trigger_type = "ALT_LEAD" if (is_alt_lead and not is_btc_lead) else ("BTC_LEAD" if (is_btc_lead and not is_alt_lead) else "BOTH")
-                    dump_start_time = now_iso
-                    btc_lowest = btc_current_low
-                    btc_lowest_time = now_iso
-                    alt_lowest = {k: v for k, v in alt_current_lows.items()}
-                    lock_hours = 0
-
-        # 状態 1 または 2: ロック中 (DUMP_LOCKED または BTC_STABILIZING)
-        elif state in (1, 2):
-            # BTC新安値更新チェック
-            if btc_lowest is None or (btc_current_low > 0 and btc_current_low < btc_lowest):
-                btc_lowest = btc_current_low
-                btc_lowest_time = now_iso
-                hours_since_btc_lowest = 0
-                state = 1  # 新安値更新時は急落中 (state=1) に引き戻す
-
-            # アルト各銘柄の新安値更新
-            for sym_k, low_val in alt_current_lows.items():
-                if sym_k not in alt_lowest or low_val < alt_lowest[sym_k]:
-                    alt_lowest[sym_k] = low_val
-
-            # 最低ロック時間 (min_lock_hours) 経過後に解除判定へ進行
-            if lock_hours >= self.min_lock_hours:
-                # 状態 1 -> 状態 2: BTC安定化判定
-                if state == 1:
-                    btc_rebound = (btc_current_close - btc_lowest) / btc_lowest * 100.0 if btc_lowest and btc_lowest > 0 else 0.0
-                    is_btc_green = btc_current_close > btc_current_open
-                    if (hours_since_btc_lowest >= self.btc_stable_hours) and (is_btc_green or btc_rebound >= 0.8):
-                        state = 2  # BTC_STABILIZING
-
-                # 状態 2 -> 状態 0: アルト過半数反発・ロック解除判定
-                if state == 2:
-                    rebounded_alts = 0
-                    valid_check_alts = 0
-                    for sym_k, cur_c in alt_current_closes.items():
-                        low_b = alt_lowest.get(sym_k)
-                        if low_b and low_b > 0:
-                            valid_check_alts += 1
-                            reb = (cur_c - low_b) / low_b * 100.0
-                            if reb >= self.alt_rebound_pct:
-                                rebounded_alts += 1
-                    
-                    rebound_ratio = (rebounded_alts / valid_check_alts) if valid_check_alts > 0 else 0.0
-                    if rebound_ratio >= self.alt_recovery_ratio:
-                        # 全面安フィルター解除！
-                        state = 0  # NORMAL
-                        last_unlock_time = now_iso
-                        dump_start_time = None
-                        btc_lowest = None
-                        btc_lowest_time = None
-                        alt_lowest = {}
-
-        # 4. 状態の永続化
-        stored["state"] = state
-        stored["state_name"] = self.STATE_NAMES.get(state, "NORMAL")
-        stored["trigger_type"] = trigger_type if state > 0 else "NONE"
-        stored["dump_start_time"] = dump_start_time
-        stored["btc_lowest_in_dump"] = btc_lowest
-        stored["btc_lowest_time"] = btc_lowest_time
-        stored["alt_lowest_in_dump"] = alt_lowest
-        stored["last_unlock_time"] = last_unlock_time
-        stored["updated_at"] = now_iso
-        self._save_state(stored)
-
-        # 5. 返却値作成
-        gate = "STOP" if state in (1, 2) else "ALLOW"
-        if state == 1:
-            reason = f"MACRO_DUMP_LOCKED (Trigger: {trigger_type}, Lock: {lock_hours}h, AltsDown: {alt_down_ratio*100:.0f}%, Mean: {alt_mean_ret:.1f}%)"
-        elif state == 2:
-            reason = f"BTC_STABILIZING (Awaiting Alts: {rebound_ratio*100:.0f}%/{self.alt_recovery_ratio*100:.0f}%, Lock: {lock_hours}h)"
-        else:
-            reason = "MARKET_HEALTHY (NORMAL)"
-
-        return {
-            "gate": gate,
-            "state": state,
-            "state_name": self.STATE_NAMES.get(state, "NORMAL"),
-            "trigger_type": trigger_type if state > 0 else "NONE",
-            "reason": reason,
-            "lock_hours": lock_hours,
-            "btc_drop_pct": round(btc_ret_4h, 2),
-            "alt_mean_drop_pct": round(alt_mean_ret, 2),
-            "alt_down_ratio": round(alt_down_ratio, 3),
-            "rebound_ratio": round(rebound_ratio, 3),
-            "updated_at": now_iso,
-        }
-
-
-def optimize_cycle_filter(
-    df: pd.DataFrame,
-    symbol: str = "",
-    top_pct_range: Sequence[float] = (0.020, 0.025, 0.030, 0.035, 0.040, 0.045, 0.050),
-    vol_mult_range: Sequence[float] = (1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 4.5, 5.0),
-    wick_ratio_req: float = 0.15,
-    range_hours: int = 168
-) -> Dict[str, Any]:
-    """
-    対象銘柄の1時間足データに基づき、天井警戒幅 (2%〜5%の0.5%刻み) および
-    セリクラ出来高倍率 (1.0〜5.0の0.5刻み) の最適パラメータを評価・選定する。
-    """
-    if df is None or len(df) < 24:
-        return {
-            "best_top_pct": 0.030,
-            "best_vol_mult": 2.5,
-            "best_wick_ratio": wick_ratio_req,
-            "best_eval": None
-        }
-
-    best_score = -999999.0
-    best_params = {"best_top_pct": 0.030, "best_vol_mult": 2.5, "best_wick_ratio": wick_ratio_req}
-    best_eval = None
-
-    close = df['close'].values.astype(float)
-    high = df['high'].values.astype(float)
-    n = len(df)
-
-    for top_p in top_pct_range:
-        for vol_m in vol_mult_range:
-            mgr = RegimeFilterManager(
-                range_hours=range_hours,
-                near_top_pct=top_p,
-                climax_vol_mult=vol_m,
-                wick_ratio_req=wick_ratio_req
-            )
-            ev = mgr.evaluate(df, is_btc=(symbol == "BTC-USDT"))
-            
-            # スコア評価基準:
-            # 1. 高値から2%以内の天井で新規ロングを遮断できた割合 (高値掴み防止度)
-            # 2. セリクラ後の下ヒゲ反転足で底打ち再開できた効率
-            # 3. 直近状態の安定性
-            allowed = ev.get("long_allowed", True)
-            curr_drop = ev.get("drop_from_peak_pct", 0.0)
-            
-            # 安全マージンスコア
-            score = 100.0
-            if curr_drop > -3.0 and not allowed:
-                score += 50.0  # 高値圏でしっかり停止できている
-            elif curr_drop <= -5.0 and allowed:
-                score += 30.0  # 押し目底打ちでしっかり再開できている
-                
-            if score > best_score:
-                best_score = score
-                best_params = {
-                    "best_top_pct": top_p,
-                    "best_vol_mult": vol_m,
-                    "best_wick_ratio": wick_ratio_req
-                }
-                best_eval = ev
-
-    return {
-        "best_top_pct": best_params["best_top_pct"],
-        "best_vol_mult": best_params["best_vol_mult"],
-        "best_wick_ratio": wick_ratio_req,
-        "best_eval": best_eval
-    }
 
 
 class logicinstance:
@@ -596,11 +81,10 @@ class logicinstance:
         atr = tr.ewm(span=span, adjust=False).mean()
         return round(atr, 1)
 
-    def make_market_profile(self, df, period=150, value_area_pct=0.70, num_bins=50, use_decay=True, decay_half_life=None):
+    def make_market_profile(self, df, period=100, value_area_pct=0.70, num_bins=100, use_decay=True, decay_half_life=None, tail_only=None):
         """
         最新・標準仕様に準拠した高精度マーケットプロファイル（ボリュームプロファイル）生成関数
         - 入出力は完全互換 (POC, VAH, VAL を付加して返す)
-        - 5分足直近150本 (約12.5時間)、50 bins、Value Area 70% に準拠 (TradingView VP Strategy v5仕様)
         - 実体とヒゲの出来高密度配分、サブビン重心補正、CBOT/TradingView標準Value Area探索を実装
         - デフォルトで直近重視・指数減衰型（EMA型）ボリュームプロファイルが有効 (use_decay=True)
         """
@@ -612,11 +96,17 @@ class logicinstance:
             df['VAL'] = np.nan
             return df
             
+        try:
+            period = max(10, int(period or 100))
+        except Exception:
+            period = 100
+
         poc_arr = np.full(n, np.nan)
         vah_arr = np.full(n, np.nan)
         val_arr = np.full(n, np.nan)
         
         min_required = min(5, period)
+        start_loop = max(min_required, n - int(tail_only)) if (tail_only is not None and tail_only > 0) else min_required
         
         highs = df['high'].astype(float).values
         lows = df['low'].astype(float).values
@@ -630,7 +120,11 @@ class logicinstance:
         half_life = float(decay_half_life) if decay_half_life is not None else max(5.0, period / 2.0)
         decay_factor = 0.5 ** (1.0 / half_life) if use_decay else 1.0
             
-        for i in range(min_required, n):
+        for i in range(start_loop, n):
+            # CPU負荷抑制のためのジェントルスリープ (50足ごとに2ミリ秒休止)
+            if (i - start_loop) > 0 and (i - start_loop) % 50 == 0:
+                time.sleep(0.002)
+
             start_idx = max(0, i - period + 1)
             win_len = i - start_idx + 1
             
@@ -646,6 +140,13 @@ class logicinstance:
                 weights = decay_factor ** ages
                 w_volumes = w_volumes * weights
             
+            if len(w_highs) == 0 or len(w_lows) == 0:
+                curr_c = closes[i] if i < len(closes) else 0.0
+                poc_arr[i] = curr_c
+                vah_arr[i] = curr_c
+                val_arr[i] = curr_c
+                continue
+
             p_max = w_highs.max()
             p_min = w_lows.min()
             
@@ -756,16 +257,20 @@ class logicinstance:
         
         return df
 
-    def make_logic(self, df, market_profile_period=720, er_threshold=0.3, strategy_type="range", use_decay=True, decay_half_life=None, vol_surge_mult=1.2, fr_threshold=0.00002, **kwargs):
+    def make_logic(self, df, market_profile_period=720, strategy_type="range", use_decay=True, decay_half_life=None, vol_surge_mult=1.2, fr_threshold=0.00002):
+        # パラメータ安全化ガード (0, None, 10未満を安全なデフォルト150に補正)
+        try:
+            mp_safe = int(market_profile_period) if market_profile_period is not None else 150
+        except Exception:
+            mp_safe = 150
+        if mp_safe < 10:
+            mp_safe = 150
+        market_profile_period = mp_safe
+
         atr_period = 10
         df[f'atr_{atr_period}'] = self.make_atr(df, atr_period)
         
         df = self.make_market_profile(df, period=market_profile_period, use_decay=use_decay, decay_half_life=decay_half_life)
-        
-        er_period = 10
-        direction = abs(df['close'] - df['close'].shift(er_period))
-        volatility = df['close'].diff().abs().rolling(er_period).sum()
-        df['er'] = (direction / volatility).fillna(0)
 
         # 1. 出来高急増判定 (Volume Surge: 過去20期間SMAの1.2倍以上)
         if 'volume' in df.columns:
@@ -792,108 +297,38 @@ class logicinstance:
         else:
             df['is_oi_surge'] = True
 
-        # ER条件なしの素のクロスオーバーシグナル
+        # 素のクロスオーバーシグナル
         df['long_breakout_raw'] = self.crossover(df['close'], df['VAH'])
         df['short_breakout_raw'] = self.crossunder(df['close'], df['VAL'])
         df['long_range_raw'] = self.crossover(df['close'], df['VAL'])
         df['short_range_raw'] = self.crossunder(df['close'], df['VAH'])
 
-        # ER + Squeeze条件付きシグナル (ショートスクイーズ・踏み上げブレイクアウト)
+        # Squeeze条件付きシグナル (ショートスクイーズ・踏み上げブレイクアウト)
         df['long_breakout'] = (
             df['long_breakout_raw'] & 
-            (df['er'] > er_threshold) & 
             df['is_vol_surge'] & 
             df['is_fr_favorable'] & 
             df['is_oi_surge']
         )
-        df['short_breakout'] = df['short_breakout_raw'] & (df['er'] > er_threshold)
-        df['long_range'] = df['long_range_raw'] & (df['er'] > er_threshold)
-        df['short_range'] = df['short_range_raw'] & (df['er'] > er_threshold)
+        df['short_breakout'] = df['short_breakout_raw']
+        df['long_range'] = df['long_range_raw']
+        df['short_range'] = df['short_range_raw']
         
-        # --- エンベロープ (Envelope) 戦略シグナル ---
-        env_l = int(kwargs.get('env_len', 15))
-        env_lp = float(kwargs.get('env_lower_pct', 2.0))
-        env_up = float(kwargs.get('env_upper_pct', 2.0))
-        env_ml = int(kwargs.get('env_malen', 100))
-        basis = calc_ema(df['close'], env_l)
-        mabasis = calc_ema(df['close'], env_ml) if len(df) >= env_ml else basis
-        df['basis'] = basis
-        df['mabasis'] = mabasis
-        df['env_lower'] = basis * (1.0 - env_lp / 100.0)
-        df['env_upper'] = basis * (1.0 + env_up / 100.0)
-        # 戻りエントリー: 1本前が下限バンド以下、かつ当足終値が下限バンドを上抜け復帰
-        # （反発初動確認＋3%固定SLにより、長期MAフィルターは解除して自律反発を広く捕捉）
-        df['long_envelope'] = (df['close'].shift(1) <= df['env_lower'].shift(1)) & (df['close'] > df['env_lower'])
-        df['longclose_envelope'] = df['close'] > df['basis']
-        
-        # --- RSI MA (RSIMA3) 戦略シグナル ---
-        r_len = int(kwargs.get('rsi_len', 9))
-        l_len = int(kwargs.get('lma_len', 7))
-        r_lep = float(kwargs.get('lEp', 40.0))
-        r_lcp = float(kwargs.get('lCp', 70.0))
-        rsi_series = calc_rsi(df['close'], r_len)
-        lrsiMA_series = calc_ema(rsi_series, l_len)
-        df['rsi'] = rsi_series
-        df['lrsiMA'] = lrsiMA_series
-        rsi_gc = self.crossover(df['rsi'], df['lrsiMA'])
-        df['long_rsima'] = rsi_gc & (df['lrsiMA'] < r_lep) & (df['rsi'] < r_lcp)
-        df['longclose_rsima'] = df['rsi'] > r_lcp
-
-        # --- VAL_POC 実証最適仕様 (EMA 200 + バリュー幅 >= 1.5% + VAL-VAH 60%利確) ---
-        # 1. EMA 200 トレンドフィルター (5分足 200本)
-        df['ema200'] = calc_ema(df['close'], 200)
-        # 2. バリューエリア幅フィルター (1.5%以上: スクイーズ騙し排除)
-        va_width = (df['VAH'] - df['VAL']) / df['VAL'].replace(0, np.nan)
-        df['va_width_ok'] = va_width >= 0.015
-        # 3. VALゴールデンクロス (1本前がVAL以下、かつ当足終値がVALを上抜け復帰)
-        val_gc = (df['close'].shift(1) <= df['VAL'].shift(1)) & (df['close'] > df['VAL'])
-        # 総合ロングエントリー: VAL上抜け + バリュー幅1.5%以上 + EMA200以上
-        df['long_val_gc'] = val_gc & df['va_width_ok'] & (df['close'] >= df['ema200'])
-
-        # 4. VAL-VAH 60%水準利確ターゲット
-        target_tp = df['VAL'] + (df['VAH'] - df['VAL']) * 0.60
-        df['tp_target_60'] = target_tp
-        df['longclose_val_60'] = (df['close'] >= target_tp) | (df['high'] >= target_tp)
-        # 従来のPOCクローズも参考互換として保持
-        df['longclose_poc'] = df['close'] >= df['POC']
-
-        strat_lower = str(strategy_type).lower()
-        if strat_lower == "envelope":
-            df['long'] = df['long_envelope']
-            df['short'] = False
-            df['longclose'] = df['longclose_envelope']
-            df['shortclose'] = False
-        elif strat_lower == "rsima":
-            df['long'] = df['long_rsima']
-            df['short'] = False
-            df['longclose'] = df['longclose_rsima']
-            df['shortclose'] = False
-        elif strat_lower in ("val_poc", "vp_val_gc"):
-            df['long'] = df['long_val_gc']
-            df['short'] = False
-            df['longclose'] = df['longclose_val_60']
-            df['shortclose'] = False
-
-        elif strat_lower in ("breakout", "squeeze_breakout"):
+        if strategy_type in ("breakout", "squeeze_breakout"):
             df['long'] = df['long_breakout']
             df['short'] = df['short_breakout']
-            df['longclose'] = False
-            df['shortclose'] = False
-        elif strat_lower == "adaptive":
-            df['long'] = np.where(df['er'] > er_threshold, df['long_breakout'], df['long_range_raw'])
-            df['short'] = np.where(df['er'] > er_threshold, df['short_breakout'], df['short_range_raw'])
-            df['longclose'] = False
-            df['shortclose'] = False
         else:
             df['long'] = df['long_range']
             df['short'] = df['short_range']
-            df['longclose'] = False
-            df['shortclose'] = False
         
-        df['lowest_support'] = df['low'].rolling(window=max(1, int(market_profile_period)), min_periods=1).min().ffill()
+        roll_win = max(10, int(market_profile_period))
+        df['lowest_support'] = df['low'].rolling(window=roll_win, min_periods=min(10, roll_win)).min().ffill()
+        
+        df['longclose'] = False
+        df['shortclose'] = False
 
         rows_before = len(df)
-        required_cols = [c for c in ['open', 'high', 'low', 'close', 'POC', 'VAH', 'VAL', 'er'] if c in df.columns]
+        required_cols = [c for c in ['open', 'high', 'low', 'close', 'POC', 'VAH', 'VAL'] if c in df.columns]
         df_cleaned = df.dropna(subset=required_cols) if required_cols else df.dropna()
         rows_after = len(df_cleaned)
         
@@ -912,21 +347,21 @@ class send_discord:
     _shared_lock = threading.Lock()
     _shared_buffers = {}
     _shared_timers = {}
+    hourly_only: bool = True  # 【新仕様】Discord発信は1時間に1回（毎時ステータスサマリー）に完全集約
 
-    def __init__(self):
+    def __init__(self, hourly_only: bool = True):
+        self.hourly_only = hourly_only
         self.real1_webhook = get_webhook_url("real1_bitbank")
         self.real2_webhook = get_webhook_url("real2_hype")
         self.real3_webhook = get_webhook_url("real3_bngx")
         self.test4_webhook = get_webhook_url("test4_backtest")
-
-        # 互換用エイリアス（BingX関連はすべて #real3_bngx へ全集約）
         self.bingx_webhook = self.real3_webhook
         self.win32_webhook = self.real3_webhook
         self.default_webhook = self.real3_webhook
         self.webhook_url = self.real3_webhook or self.test4_webhook
-
-        if not self.real3_webhook and not self.test4_webhook:
-            print("[WARN] Discord webhook for BingX (real3_bngx / test4_backtest) is not configured.")
+        if not self.webhook_url and not self.default_webhook and not self.win32_webhook:
+            # Fallback warning instead of crash
+            print("Discord webhook URL is not configured.")
         
         from rich.console import Console
         self.console = Console(color_system="standard", force_terminal=True, highlight=False)
@@ -935,8 +370,8 @@ class send_discord:
         self.buffers = send_discord._shared_buffers
         self.timers = send_discord._shared_timers
 
-    def _get_target_webhooks(self, text: str = "") -> list[str]:
-        # BingX関連の全通知（バックテスト・最適化・ログ・チャート含む）を #real3_bngx へ全集約
+    def _get_target_webhooks(self, text: str) -> list[str]:
+        # BingX関連はすべて #real3_bngx (フォールバック: #test4_backtest) へ全集約
         target = self.real3_webhook or self.test4_webhook
         return [target] if target else []
 
@@ -982,7 +417,7 @@ class send_discord:
         for url in urls:
             self.flush_buffer(url)
 
-    def print_log(self, text, level="info"):
+    def print_log(self, text, level="info", force_send=False):
         from rich.markup import escape
         is_balance = any(kw in text for kw in ["証拠金残高", "残高", "Account Info", "balance", "Balance"])
         if is_balance:
@@ -1005,6 +440,34 @@ class send_discord:
         
         # debugレベルのメッセージはDiscord送信しない（コンソールのみ出力）
         if level == "debug":
+            return
+
+        # 重要メッセージ（起動バナー、約定、決済、損切り、定期レポート、最適化結果、警告/エラー）は自動で即時送信
+        is_essential = (
+            force_send
+            or level in ("warning", "error", "critical")
+            or any(kw in text for kw in [
+                "AUTO TRADING SYSTEM START",
+                "BingX RSIMA3 Scalping System",
+                "【AIR/実トレード損益レポート",
+                "【実運用実績】",
+                "[ENTRY]",
+                "[CLOSE]",
+                "HARD STOP LOSS",
+                "NORMAL TP",
+                "新規エントリー",
+                "一括成行利確",
+                "成行損切り",
+                "【毎時ステータスサマリー】",
+                "★ 【銘柄別 個別最適化パラメータ一覧】",
+                "[Selection Result]",
+                "選定銘柄",
+                "定期銘柄選定時刻",
+            ])
+        )
+
+        # 【Discord 1時間に1回化】hourly_onlyが有効な場合、重要メッセージ以外はスキップ
+        if getattr(self, "hourly_only", True) and not is_essential:
             return
 
         webhooks = self._get_target_webhooks(text)
@@ -1033,38 +496,31 @@ class send_discord:
                 self.timers[url] = timer
                 timer.start()
 
-    def _send_file(self, content_text, file_path, file_name, mime_type) -> bool:
+    def _send_file(self, content_text, file_path, file_name, mime_type, force_send=True):
+        if getattr(self, "hourly_only", True) and not force_send:
+            return
         webhooks = self._get_target_webhooks(content_text)
-        if not webhooks:
-            return False
-        success = True
         for url in webhooks:
             self.flush_buffer(url)
             try:
-                data = {"payload_json": json.dumps({"content": content_text})} if content_text else {}
-                with open(file_path, "rb") as f:
+                payload = {"content": content_text}
+                with open(file_path, f"rb") as f:
                     files = {"file": (file_name, f, mime_type)}
-                    response = requests.post(url, data=data, files=files, timeout=90)
+                    response = requests.post(url, data=payload, files=files, timeout=30)
                     response.raise_for_status()
             except requests.exceptions.RequestException as e:
                 print(f"Failed to send file {file_name} to {url}:", e)
-                success = False
-        return success
+                pass
 
-    def send_file(self, file_path, description="") -> bool:
+    def send_file(self, file_path, description="", force_send=True):
+        if getattr(self, "hourly_only", True) and not force_send:
+            return
         p = Path(file_path) if not isinstance(file_path, Path) else file_path
         if not p.exists():
             print(f"[send_discord] File not found: {p}")
-            return False
-        
-        # Discord 25MB制限の安全ガード (413 Payload Too Large 防止)
-        size_mb = p.stat().st_size / (1024 * 1024)
-        if size_mb > 24.5:
-            self.print_log(f"⚠️ [Discord Skip] {p.name} ({size_mb:.2f}MB) はDiscord送信上限(25MB)を超過するため送信を安全にスキップしました。(ローカル保存済み)")
-            return False
-
+            return
         mime = "image/png" if p.suffix.lower() == ".png" else "image/jpeg" if p.suffix.lower() in (".jpg", ".jpeg") else "application/octet-stream"
-        return bool(self._send_file(description, str(p), p.name, mime))
+        self._send_file(description, str(p), p.name, mime, force_send=force_send)
 
     def plot_kline(self, symbol=""):
         df = pd.read_csv("backtest_data/klines100.csv")
@@ -1118,7 +574,7 @@ class send_discord:
             ax1.annotate(f'VAL: {latest_val:.2f}', xy=(1.01, latest_val), xycoords=('axes fraction', 'data'), fontsize=8, color='blue', va='center')
         
         ax1.legend(loc='upper left', fontsize=8)
-        ax1.set_ylabel("Price [USDT]")
+        ax1.set_ylabel("Price [USDC]")
         ax1.grid(True, alpha=0.3)
         ax1.xaxis.set_major_formatter(md.DateFormatter("%m/%d %H:%M"))
         fig.autofmt_xdate(rotation=10)
@@ -1129,7 +585,7 @@ class send_discord:
 
         self._send_file(f"{symbol} klines with Market Profile", "backtest_data/kline_img.jpg", "kline_img.jpg", "image/jpeg")
 
-    def plot_backtest(self, label="MP", csv_file="backtest_data/klines100.csv", img_file=None, symbol="", strategy_type=None):
+    def plot_backtest(self, label="MP", csv_file="backtest_data/klines100.csv", img_file=None, symbol=""):
         if symbol and not str(label).startswith(symbol):
             display_label = f"{symbol}_{label}"
             title_prefix = f"{symbol} | "
@@ -1151,69 +607,12 @@ class send_discord:
             df["dt"] = df["dt"].dt.tz_convert("Asia/Tokyo")
 
         matplotlib.rcParams["timezone"] = "Asia/Tokyo"
-        plt.rcParams['font.sans-serif'] = ['Meiryo', 'Yu Gothic', 'MS Gothic', 'DejaVu Sans']
-        plt.rcParams['axes.unicode_minus'] = False
+        fig = plt.figure(figsize=(9, 4), dpi=120)
+        fig.subplots_adjust(left=0.1, bottom=0.18, right=0.9, top=0.88)
+        ax1 = fig.add_subplot(1, 1, 1)
 
-        # 戦略タイプの自動判定
-        strat = (strategy_type or (df["strategy_name"].iloc[0] if "strategy_name" in df.columns else "") or "").upper()
-        if not strat:
-            if "ENVELOPE" in str(label).upper():
-                strat = "ENVELOPE"
-            elif "RSIMA" in str(label).upper():
-                strat = "RSIMA"
-
-        # インジケーター列の自動補完 (CSVにない場合)
-        if strat == "ENVELOPE" and "env_lower" not in df.columns:
-            b_s = calc_ema(df['close'], 10)
-            mb_s = calc_ema(df['close'], 100) if len(df) >= 100 else b_s
-            df['basis'] = b_s
-            df['mabasis'] = mb_s
-            df['env_lower'] = b_s * 0.985
-            df['env_upper'] = b_s * 1.015
-        elif strat == "RSIMA" and "rsi" not in df.columns:
-            r_s = calc_rsi(df['close'], 14)
-            lr_s = calc_ema(r_s, 5)
-            df['rsi'] = r_s
-            df['lrsiMA'] = lr_s
-            df['lEp'] = 45.0
-            df['lCp'] = 65.0
-
-        n = len(df)
-        x_indices = np.arange(n)
+        x_indices = np.arange(len(df))
         width = 0.6
-
-        # --- プロット構成の分岐 ---
-        if strat == "RSIMA":
-            # 3段構成: 上段=価格&売買, 中段=RSI/lrsiMA, 下段=累積PnL
-            fig, (ax1, ax_rsi, ax_pnl) = plt.subplots(
-                3, 1, figsize=(11, 7.5), dpi=120,
-                gridspec_kw={'height_ratios': [2.3, 1.2, 1.0]},
-                sharex=True
-            )
-            fig.patch.set_facecolor('#131722')
-            ax1.set_facecolor('#1e222d')
-            ax_rsi.set_facecolor('#1e222d')
-            ax_pnl.set_facecolor('#1e222d')
-            plt.subplots_adjust(left=0.08, bottom=0.12, right=0.92, top=0.91, hspace=0.15)
-        elif strat == "ENVELOPE":
-            # 2段構成: 上段=価格&エンベロープ, 下段=累積PnL
-            fig, (ax1, ax_pnl) = plt.subplots(
-                2, 1, figsize=(11, 6.5), dpi=120,
-                gridspec_kw={'height_ratios': [2.6, 1.0]},
-                sharex=True
-            )
-            fig.patch.set_facecolor('#131722')
-            ax1.set_facecolor('#1e222d')
-            ax_pnl.set_facecolor('#1e222d')
-            plt.subplots_adjust(left=0.08, bottom=0.12, right=0.92, top=0.91, hspace=0.15)
-        else:
-            # 従来型: 1段 + twinx
-            fig = plt.figure(figsize=(10, 4.5), dpi=120)
-            fig.subplots_adjust(left=0.08, bottom=0.18, right=0.92, top=0.88)
-            ax1 = fig.add_subplot(1, 1, 1)
-            fig.patch.set_facecolor('#131722')
-            ax1.set_facecolor('#1e222d')
-            ax_pnl = ax1.twinx()
 
         # 1. 日付区切り垂直線
         try:
@@ -1228,147 +627,123 @@ class send_discord:
                 match_indices = np.where(d_series.dt.floor("D") == day_start)[0]
                 if len(match_indices) > 0:
                     first_idx = match_indices[0]
-                    ax1.axvline(first_idx, color="#555555", linestyle=":", linewidth=0.7, alpha=0.5, zorder=1)
-                    if strat == "RSIMA":
-                        ax_rsi.axvline(first_idx, color="#555555", linestyle=":", linewidth=0.7, alpha=0.5, zorder=1)
-                    if strat in ("ENVELOPE", "RSIMA"):
-                        ax_pnl.axvline(first_idx, color="#555555", linestyle=":", linewidth=0.7, alpha=0.5, zorder=1)
+                    ax1.axvline(first_idx, color="gray", linestyle=":", linewidth=0.8, alpha=0.4, zorder=1)
         except Exception:
             pass
 
-        # 2. ローソク足描画 (ax1)
+        # 2. Market Profile (Volume Profile)
+        has_market_profile = all(col in df.columns for col in ['POC', 'VAH', 'VAL'])
+        if has_market_profile:
+            poc_plot = df['POC'].values
+            vah_plot = df['VAH'].values
+            val_plot = df['VAL'].values
+            
+            ax1.plot(x_indices, poc_plot, color='red', linestyle='-', linewidth=1.4, label='POC', alpha=0.75, zorder=2)
+            ax1.plot(x_indices, vah_plot, color='green', linestyle='--', linewidth=1.1, label='VAH', alpha=0.7, zorder=2)
+            ax1.plot(x_indices, val_plot, color='blue', linestyle='--', linewidth=1.1, label='VAL', alpha=0.7, zorder=2)
+            ax1.fill_between(x_indices, val_plot, vah_plot, alpha=0.08, color='purple', zorder=1)
+
+        # 3. ローソク足の描画
         has_ohlc = all(col in df.columns for col in ['open', 'high', 'low', 'close'])
         if has_ohlc:
-            for i, row in df.iterrows():
-                op, hi, lo, cl = float(row["open"]), float(row["high"]), float(row["low"]), float(row["close"])
-                color = "#00c076" if cl >= op else "#ff3355"
-                ax1.plot([i, i], [lo, hi], color=color, linewidth=0.8, zorder=3)
-                b_bot = min(op, cl)
-                b_h = max(abs(cl - op), (hi - lo) * 0.01 if hi != lo else 0.0001)
-                rect = plt.Rectangle((i - width / 2, b_bot), width, b_h, facecolor=color, edgecolor=color, zorder=4)
-                ax1.add_patch(rect)
-        else:
-            ax1.plot(x_indices, df['close'], "#00c076", label="close", linewidth=1.5, zorder=3)
+            if len(df) > 600:
+                ops = df["open"].astype(float).values
+                his = df["high"].astype(float).values
+                los = df["low"].astype(float).values
+                cls = df["close"].astype(float).values
+                colors = np.where(cls >= ops, "#2e7d32", "#c62828")
+                ax1.vlines(x_indices, los, his, color=colors, linewidth=0.6, alpha=0.85, zorder=3)
+                body_min = np.minimum(ops, cls)
+                body_max = np.maximum(ops, cls)
+                same_mask = (body_max - body_min) == 0
+                body_max = np.where(same_mask, body_min + np.maximum((his - los) * 0.01, 1e-6), body_max)
+                ax1.vlines(x_indices, body_min, body_max, color=colors, linewidth=1.4, zorder=4)
+            else:
+                for i, row in df.iterrows():
+                    op = float(row["open"])
+                    hi = float(row["high"])
+                    lo = float(row["low"])
+                    cl = float(row["close"])
+                    color = "#2e7d32" if cl >= op else "#c62828"  # 陽線: 緑, 陰線: 赤
 
-        # 3. インジケーター描画 (Envelope / RSIMA / Volume Profile)
-        if strat == "ENVELOPE":
-            if 'basis' in df.columns:
-                ax1.plot(x_indices, df['basis'], color='#ffbb00', label='Basis EMA', linewidth=1.2, alpha=0.9, zorder=5)
-            if 'env_lower' in df.columns:
-                ax1.plot(x_indices, df['env_lower'], color='#00d084', linestyle='--', label='Lower Band (Buy)', linewidth=1.2, zorder=5)
-            if 'env_upper' in df.columns:
-                ax1.plot(x_indices, df['env_upper'], color='#ff4d4d', linestyle='--', label='Upper Band', linewidth=1.0, zorder=5)
-            if 'mabasis' in df.columns:
-                ax1.plot(x_indices, df['mabasis'], color='#3b82f6', label='Trend EMA', linewidth=1.4, alpha=0.85, zorder=5)
-            if 'env_lower' in df.columns and 'env_upper' in df.columns:
-                ax1.fill_between(x_indices, df['env_lower'], df['env_upper'], color='#ffbb00', alpha=0.04, zorder=2)
-        elif strat == "RSIMA":
-            # 中段 ax_rsi に描画
-            if 'rsi' in df.columns and 'lrsiMA' in df.columns:
-                ax_rsi.plot(x_indices, df['rsi'], color='#ff00aa', label='RSI', linewidth=1.4, zorder=4)
-                ax_rsi.plot(x_indices, df['lrsiMA'], color='#00e5ff', label='RSI EMA', linewidth=1.2, zorder=4)
-                lep = float(df['lEp'].iloc[0]) if 'lEp' in df.columns else 40.0
-                lcp = float(df['lCp'].iloc[0]) if 'lCp' in df.columns else 60.0
-                ax_rsi.axhline(lcp, color='#ff5555', linestyle='--', linewidth=0.9, label=f'Exit (lCp={lcp:.0f})')
-                ax_rsi.axhline(lep, color='#00ff88', linestyle='--', linewidth=0.9, label=f'Entry (lEp={lep:.0f})')
-                ax_rsi.axhline(50, color='#666666', linestyle=':', linewidth=0.7)
-                
-                # GCかつ < lEp のポイント
-                r_s = df['rsi']
-                ma_s = df['lrsiMA']
-                gc_cond = (r_s > ma_s) & (r_s.shift(1) <= ma_s.shift(1)) & (ma_s < lep) & (r_s < lcp)
-                if gc_cond.any():
-                    gc_x = x_indices[gc_cond]
-                    gc_y = r_s[gc_cond]
-                    ax_rsi.scatter(gc_x, gc_y, color='#00ff88', s=50, marker='o', edgecolors='black', label='Entry GC', zorder=6)
-                
-                ax_rsi.set_ylim(0, 100)
-                ax_rsi.set_ylabel("RSI (0-100)", color='white', fontsize=8)
-                ax_rsi.tick_params(colors='#888888', labelsize=8)
-                ax_rsi.grid(True, linestyle=':', alpha=0.25, color='#444444')
-                ax_rsi.legend(loc='upper left', facecolor='#2a2e39', edgecolor='#444444', labelcolor='white', fontsize=7, ncol=3)
+                    # ヒゲ
+                    ax1.plot([i, i], [lo, hi], color=color, linewidth=1.0, zorder=3)
+                    # 実体
+                    body_bottom = min(op, cl)
+                    body_height = abs(cl - op)
+                    if body_height == 0:
+                        body_height = (hi - lo) * 0.01 if hi != lo else 0.0001
+                    rect = plt.Rectangle((i - width / 2, body_bottom), width, body_height,
+                                         facecolor=color, edgecolor=color, zorder=4)
+                    ax1.add_patch(rect)
         else:
-            # Volume Profile
-            if all(c in df.columns for c in ['POC', 'VAH', 'VAL']):
-                ax1.plot(x_indices, df['POC'], color='red', linestyle='-', linewidth=1.4, label='POC', alpha=0.75, zorder=2)
-                ax1.plot(x_indices, df['VAH'], color='green', linestyle='--', linewidth=1.1, label='VAH', alpha=0.7, zorder=2)
-                ax1.plot(x_indices, df['VAL'], color='blue', linestyle='--', linewidth=1.1, label='VAL', alpha=0.7, zorder=2)
-                ax1.fill_between(x_indices, df['VAL'], df['VAH'], alpha=0.08, color='purple', zorder=1)
+            ax1.plot(x_indices, df['close'], "C0", label="close", linewidth=1.5, zorder=3)
 
-        # 4. 売買マーカー
+        # 4. 売買マーカー (exec buy: 鮮やかブルー / exec sell: 鮮やかマゼンタ、黒フチ付き)
         if 'exec_buy_price' in df.columns:
             buy_mask = df['exec_buy_price'].notna()
             if buy_mask.any():
-                ax1.scatter(x_indices[buy_mask], df.loc[buy_mask, 'exec_buy_price'],
-                            marker='^', color='#00e676', edgecolors='black', linewidths=1.0,
-                            label='BUY Entry', zorder=7, s=80)
+                ax1.scatter(
+                    x_indices[buy_mask],
+                    df.loc[buy_mask, 'exec_buy_price'],
+                    marker='^',
+                    color='#0091ea',  # エレクトリックブルー (ローソク足の緑/赤と完全差別化)
+                    edgecolors='black',
+                    linewidths=1.0,
+                    label='exec buy',
+                    zorder=6,
+                    s=70,
+                )
         if 'exec_sell_price' in df.columns:
             sell_mask = df['exec_sell_price'].notna()
             if sell_mask.any():
-                ax1.scatter(x_indices[sell_mask], df.loc[sell_mask, 'exec_sell_price'],
-                            marker='v', color='#ff1744', edgecolors='black', linewidths=1.0,
-                            label='SELL Exit', zorder=7, s=80)
+                ax1.scatter(
+                    x_indices[sell_mask],
+                    df.loc[sell_mask, 'exec_sell_price'],
+                    marker='v',
+                    color='#d500f9',  # ネオンマゼンタ (ローソク足の緑/赤と完全差別化)
+                    edgecolors='black',
+                    linewidths=1.0,
+                    label='exec sell',
+                    zorder=6,
+                    s=70,
+                )
 
-        ax1.set_ylabel("Price [USDT]", color='white', fontsize=9)
-        ax1.tick_params(colors='#888888', labelsize=8)
-        ax1.grid(True, axis='y', linestyle=':', alpha=0.25, color='#444444')
+        ax1.set_ylabel("close [USDC]", fontsize=9)
+        ax1.grid(True, axis='y', linestyle=':', alpha=0.3)
 
-        # 5. PnL 描画
-        pnl_series = df['pnl'] if 'pnl' in df.columns else np.zeros(len(df))
-        final_pnl = pnl_series.iloc[-1] if not pnl_series.empty else 0.0
-        
-        if strat in ("ENVELOPE", "RSIMA"):
-            # 独立サブプロット
-            pnl_vals = pnl_series.values - 100.0 if (len(pnl_series) > 0 and pnl_series.iloc[0] >= 90.0) else pnl_series.values
-            ax_pnl.plot(x_indices, pnl_vals, color='#00d084' if pnl_vals[-1] >= 0 else '#ff4d4d', linewidth=1.6, label='PnL [USDT]')
-            ax_pnl.fill_between(x_indices, 0, pnl_vals, where=(pnl_vals >= 0), color='#00d084', alpha=0.15)
-            ax_pnl.fill_between(x_indices, 0, pnl_vals, where=(pnl_vals < 0), color='#ff4d4d', alpha=0.15)
-            ax_pnl.axhline(0, color='#888888', linestyle='--', linewidth=0.7)
-            
-            # ドローダウン
-            peak_val = np.maximum.accumulate(pnl_vals)
-            dd_val = peak_val - pnl_vals
-            ax_pnl_dd = ax_pnl.twinx()
-            ax_pnl_dd.fill_between(x_indices, -dd_val, 0, color='#ff3355', alpha=0.2, label='Drawdown')
-            ax_pnl_dd.set_ylabel("DD [USDT (%)]", color='#ff8888', fontsize=8)
-            ax_pnl_dd.tick_params(colors='#ff8888', labelsize=7)
-            ax_pnl_dd.set_ylim(-max(15, float(dd_val.max()) * 1.4), 0)
-            
-            ax_pnl.set_ylabel("PnL [USDT]", color='white', fontsize=8)
-            ax_pnl.tick_params(colors='#888888', labelsize=8)
-            ax_pnl.grid(True, linestyle=':', alpha=0.25, color='#444444')
-            ax_pnl.legend(loc='upper left', facecolor='#2a2e39', edgecolor='#444444', labelcolor='white', fontsize=7)
-            
-            # X軸目盛り
-            step = max(1, len(df) // 6)
-            tick_idx = list(range(0, len(df), step))
-            if len(tick_idx) > 1 and ((len(df) - 1) - tick_idx[-1] < step * 0.5):
-                tick_idx[-1] = len(df) - 1
-            elif (len(df) - 1) not in tick_idx:
-                tick_idx.append(len(df) - 1)
-            tick_lbl = [df.iloc[i]["dt"].strftime("%m/%d %H:%M") for i in tick_idx]
-            ax_pnl.set_xticks(tick_idx)
-            ax_pnl.set_xticklabels(tick_lbl, rotation=15, ha="right", fontsize=8, color='#888888')
+        # 5. 右軸 (twinx): 累積 PnL
+        ax2 = ax1.twinx()
+        b_plot = df['pnl'] if 'pnl' in df.columns else np.zeros(len(df))
+        ax2.plot(x_indices, b_plot, "C1", label="pl", linewidth=1.5)
+        ax2.set_ylabel("pnl [USDC]", fontsize=9)
+        ax2.grid(False)
+
+        # 6. X軸目盛り設定 (日付表示)
+        step = max(1, len(df) // 8)
+        tick_indices = list(range(0, len(df), step))
+        if (len(df) - 1) not in tick_indices:
+            tick_indices.append(len(df) - 1)
+        tick_labels = [df.iloc[idx]["dt"].strftime("%Y-%m-%d %H:%M") for idx in tick_indices]
+        ax1.set_xticks(tick_indices)
+        ax1.set_xticklabels(tick_labels, rotation=15, ha="right", fontsize=8)
+
+        final_pnl = df['pnl'].iloc[-1] if 'pnl' in df.columns else 0.0
+        first_pnl = df['pnl'].iloc[0] if 'pnl' in df.columns and len(df) > 0 else 0.0
+        if first_pnl >= 50.0:
+            net_profit = final_pnl - first_pnl
+            title_text = f"{title_prefix}{label} | Equity: ${final_pnl:.2f} (Net: {net_profit:+.2f} USDC)"
         else:
-            ax_pnl.plot(x_indices, pnl_series, "#ff9800", label="PnL", linewidth=1.5)
-            ax_pnl.set_ylabel("pnl [USDT]", fontsize=9, color='#ff9800')
-            ax_pnl.tick_params(colors='#ff9800', labelsize=8)
-            step = max(1, len(df) // 6)
-            tick_idx = list(range(0, len(df), step))
-            if len(tick_idx) > 1 and ((len(df) - 1) - tick_idx[-1] < step * 0.5):
-                tick_idx[-1] = len(df) - 1
-            elif (len(df) - 1) not in tick_idx:
-                tick_idx.append(len(df) - 1)
-            tick_lbl = [df.iloc[i]["dt"].strftime("%m/%d %H:%M") for i in tick_idx]
-            ax1.set_xticks(tick_idx)
-            ax1.set_xticklabels(tick_lbl, rotation=15, ha="right", fontsize=8, color='#888888')
+            title_text = f"{title_prefix}{label} | Final PnL: {final_pnl:+.2f} USDC"
+        ax1.set_title(title_text, fontsize=10, pad=10)
 
-        max_dd_val = float(dd_val.max()) if 'dd_val' in locals() and len(dd_val) > 0 else 0.0
-        ax1.set_title(f"{title_prefix}{display_label} | PnL: {final_pnl:+.2f} USDT | MaxDD: -{max_dd_val:.2f} USDT (-{max_dd_val:.1f}%)", fontsize=11, color='white', pad=8, fontweight='bold')
-        ax1.legend(loc='upper left', facecolor='#2a2e39', edgecolor='#444444', labelcolor='white', fontsize=8)
+        # 7. 凡例統合
+        h1, l1 = ax1.get_legend_handles_labels()
+        h2, l2 = ax2.get_legend_handles_labels()
+        ax1.legend(h1 + h2, l1 + l2, loc='lower left', fontsize=8)
 
         os.makedirs(os.path.dirname(img_file) if os.path.dirname(img_file) else "backtest_data", exist_ok=True)
-        plt.savefig(img_file, format='jpg', dpi=110, facecolor=fig.get_facecolor(), bbox_inches='tight')
+        plt.savefig(img_file, format='jpg', dpi=100)
         plt.close(fig)
         plt.close('all')
         import gc
@@ -1403,7 +778,7 @@ class send_discord:
             optimal_lot_usdt = optimal_lot * price
 
         onhand_amount_usdt = onhand_amount * price
-        self.print_log(f"best lot : {optimal_lot_usdt:.2f} USDT, onhand_amount : {onhand_amount_usdt:.2f} USDT")
+        self.print_log(f"best lot : {optimal_lot_usdt:.2f} USDC, onhand_amount : {onhand_amount_usdt:.2f} USDC")
         time.sleep(1)
         self.print_log("-----------------------------------------")
         time.sleep(1)
@@ -1425,67 +800,66 @@ class PnLCalculator:
         self.symbol = symbol
 
     async def calculate_pnl(self, days_back=30, symbol='BTC', symbols=None):
-        fills = await self.get_bingx_trade_history(self.apis, days_back=days_back)
+        fills = await self.get_hyperliquid_trade_history(self.apis, days_back=days_back)
         if not fills:
             discord.print_log("BingX取引履歴が見つかりませんでした（新規口座、または最近の取引がない可能性があります）")
             return None
             
         df = pd.DataFrame(fills)
-        combined = self.calculate_bingx_pnl_from_df(df)
+        combined = self.calculate_hyperliquid_pnl_from_df(df)
         return combined
 
-    async def get_bingx_trade_history(self, apis_bx, days_back=30):
+    async def get_hyperliquid_trade_history(self, apis_hl, days_back=30):
+        cred_key = 'hyperliquid_testnet' if self.mode in ('paper', 'demo', 'testnet') else 'hyperliquid'
+        creds = apis_hl.get(cred_key) or apis_hl.get('hyperliquid_demo') or {}
+        if isinstance(creds, list):
+            creds = {}
+        account_address = creds.get("account_address", "")
+        if not account_address or account_address.startswith("0x000"):
+            return []
+
+        base_url = "https://api.hyperliquid-testnet.xyz" if self.mode in ('paper', 'demo') else "https://api.hyperliquid.xyz"
+
         try:
-            from bingx5_46_2api import sign_bingx, RestAPI_url
-            cred_key = 'bingx_demo' if self.mode in ('paper', 'demo', 'testnet') else 'bingx'
-            creds = apis_bx.get(cred_key) or {}
-            if isinstance(creds, list):
-                creds = {}
-            api_key = creds.get("api_key", "")
-            secret_key = creds.get("secret_key", "")
-            if not api_key or not secret_key:
-                return []
-            base_url = RestAPI_url.get(cred_key, 'https://open-api.bingx.com')
-            timestamp = int(time.time() * 1000)
-            query_str = f"timestamp={timestamp}"
-            sign = sign_bingx(secret_key, query_str)
-            headers = {"X-BX-APIKEY": api_key}
-            resp = requests.get(
-                f"{base_url}/openApi/swap/v2/trade/allOrders?{query_str}&signature={sign}",
-                headers=headers,
+            resp = requests.post(
+                f"{base_url}/info",
+                json={"type": "userFills", "user": account_address},
                 timeout=15
             )
-            if resp.status_code == 200:
-                data = resp.json()
-                if data.get("code") == 0:
-                    orders = data.get("data", {}).get("orders", [])
-                    if isinstance(orders, list):
-                        return orders
+            data = resp.json()
+            if isinstance(data, list):
+                return data
         except Exception as e:
             discord.print_log(f"BingX trade history fetch error: {e}")
         return []
 
-    def calculate_bingx_pnl_from_df(self, df):
+
+    def calculate_hyperliquid_pnl_from_df(self, df):
         if df.empty:
             return None
         df = df.copy()
-        time_col = 'updateTime' if 'updateTime' in df.columns else ('time' if 'time' in df.columns else None)
-        if time_col:
-            df['execTime'] = pd.to_datetime(pd.to_numeric(df[time_col]), unit='ms')
+        if 'time' in df.columns:
+            df['execTime'] = pd.to_datetime(pd.to_numeric(df['time']), unit='ms')
         else:
             return None
         df = df.sort_values('execTime')
         
-        for col in ('price', 'avgPrice', 'executedQty', 'fee', 'profit'):
+        if 'sz' in df.columns:
+            df['size'] = df['sz']
+        if 'px' in df.columns:
+            df['price'] = df['px']
+        if 'fee' not in df.columns:
+            df['fee'] = 0.0
+
+        for col in ('price', 'size', 'fee', 'closedPnl'):
             if col in df.columns:
                 df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0.0)
                 
         df['realized_pnl'] = 0.0
         df['cumulative_pnl'] = 0.0
         
-        if 'profit' in df.columns:
-            fee_val = df['fee'] if 'fee' in df.columns else 0.0
-            df['realized_pnl'] = df['profit'] - fee_val
+        if 'closedPnl' in df.columns:
+            df['realized_pnl'] = df['closedPnl'] - df['fee']
             df['cumulative_pnl'] = df['realized_pnl'].cumsum()
             return df
             
@@ -1533,13 +907,12 @@ class MPStrategy(Backtest):
         }
         return fibolot_dict.get(n, 0)
 
-    def __init__(self, air_exchange, df, size, columns, side_mode="long", atr_period=10, atr_tp_multi=3, er_threshold=0.3, strategy_type="range", sl_margin_pct=1.0):
+    def __init__(self, air_exchange, df, size, columns, side_mode="long", atr_period=10, atr_tp_multi=3, strategy_type="range", sl_margin_pct=1.0):
         super().__init__(air_exchange=air_exchange, df=df, columns=columns)
         self.size = size
         self.side_mode = side_mode
         self.atr_period = atr_period
         self.atr_tp_multi = atr_tp_multi
-        self.er_threshold = er_threshold
         self.strategy_type = strategy_type
         self.sl_margin_pct = sl_margin_pct
         self.mean_prices = []
@@ -1558,6 +931,8 @@ class MPStrategy(Backtest):
         self.mean_prices.append(mean)
 
         close = self.array[self.column_dic["close"]]
+        high = self.array[self.column_dic["high"]] if "high" in self.column_dic else close
+        low = self.array[self.column_dic["low"]] if "low" in self.column_dic else close
         vah = self.array[self.column_dic["VAH"]]
         val = self.array[self.column_dic["VAL"]]
         poc = self.array[self.column_dic["POC"]]
@@ -1581,19 +956,36 @@ class MPStrategy(Backtest):
                     self.crossed_val = False
                     margin_pct = getattr(self, 'sl_margin_pct', 1.0)
                     self.current_sl = vah * (1.0 + margin_pct / 100.0)
+                    self.risk_r = max(self.current_sl - self.entry_price, self.entry_price * 0.005)
+                    self.tp1 = self.entry_price - self.risk_r * 1.0
+                    self.tp2 = self.entry_price - self.risk_r * 2.0
+                    self.lock_sl = self.entry_price - self.risk_r * 1.2
+                    self.bt_step = 0
 
                 be_price = self.entry_price * (1.0 - 0.0005)
-                is_profitable = close <= be_price
+                strat_type = str(getattr(self, 'strategy_type', 'range')).lower()
 
-                if is_profitable:
-                    if getattr(self, 'strategy_type', 'range') == 'breakout':
-                        base_line = val
+                if strat_type == 'breakout':
+                    # 実運用(VPTrailingManager)と完全一致: 段階的リスクリワード・トレイリング
+                    if low <= getattr(self, 'tp2', -float('inf')) or getattr(self, 'bt_step', 0) >= 2:
+                        self.bt_step = max(getattr(self, 'bt_step', 0), 2)
+                        self.current_sl = min(getattr(self, 'current_sl', self.lock_sl), self.lock_sl, be_price)
+                        trail_candidate = min(vah, poc)
+                        if trail_candidate < self.current_sl and trail_candidate > close:
+                            self.bt_step = 3
+                            self.current_sl = trail_candidate
+                    elif low <= getattr(self, 'tp1', -float('inf')) or getattr(self, 'bt_step', 0) >= 1:
+                        self.bt_step = max(getattr(self, 'bt_step', 0), 1)
+                        self.current_sl = min(getattr(self, 'current_sl', be_price), be_price)
                     else:
+                        pass
+                else:
+                    is_profitable = close <= be_price
+                    if is_profitable:
                         if close < val:
                             self.crossed_val = True
                         base_line = val if getattr(self, 'crossed_val', False) else poc
-                    # 実運用(VPTrailingManager)と完全一致: ラチェット更新（切り上げ禁止）
-                    self.current_sl = min(getattr(self, 'current_sl', be_price), be_price, base_line)
+                        self.current_sl = min(getattr(self, 'current_sl', be_price), be_price, base_line)
 
                 if close > getattr(self, 'current_sl', float('inf')):
                     stshortclose = True
@@ -1603,11 +995,13 @@ class MPStrategy(Backtest):
                     self.initial_sl_line = None
                     self.current_sl = None
                     self.crossed_val = False
+                    self.bt_step = 0
             else:
                 self.entry_price = None
                 self.initial_sl_line = None
                 self.current_sl = None
                 self.crossed_val = False
+                self.bt_step = 0
 
             if not stshortclose:
                 if position == 0:
@@ -1619,7 +1013,12 @@ class MPStrategy(Backtest):
                         self.initial_sl_line = vah
                         margin_pct = getattr(self, 'sl_margin_pct', 1.0)
                         self.current_sl = vah * (1.0 + margin_pct / 100.0)
+                        self.risk_r = max(self.current_sl - self.entry_price, self.entry_price * 0.005)
+                        self.tp1 = self.entry_price - self.risk_r * 1.0
+                        self.tp2 = self.entry_price - self.risk_r * 2.0
+                        self.lock_sl = self.entry_price - self.risk_r * 1.2
                         self.crossed_val = False
+                        self.bt_step = 0
         else:
             if position > 0:
                 if not hasattr(self, 'entry_price') or self.entry_price is None:
@@ -1628,20 +1027,36 @@ class MPStrategy(Backtest):
                     self.crossed_vah = False
                     margin_pct = getattr(self, 'sl_margin_pct', 1.0)
                     self.current_sl = val * (1.0 - margin_pct / 100.0)
+                    self.risk_r = max(self.entry_price - self.current_sl, self.entry_price * 0.005)
+                    self.tp1 = self.entry_price + self.risk_r * 1.0
+                    self.tp2 = self.entry_price + self.risk_r * 2.0
+                    self.lock_sl = self.entry_price + self.risk_r * 1.2
+                    self.bt_step = 0
 
                 be_price = self.entry_price * (1.0 + 0.0005)
-                # ロング含み益か否か（建値＋手数料カバー価格以上か）
-                is_profitable = close >= be_price
+                strat_type = str(getattr(self, 'strategy_type', 'range')).lower()
 
-                if is_profitable:
-                    if getattr(self, 'strategy_type', 'range') == 'breakout':
-                        base_line = vah
+                if strat_type == 'breakout':
+                    # 実運用(VPTrailingManager)と完全一致: 段階的リスクリワード・トレイリング
+                    if high >= getattr(self, 'tp2', float('inf')) or getattr(self, 'bt_step', 0) >= 2:
+                        self.bt_step = max(getattr(self, 'bt_step', 0), 2)
+                        self.current_sl = max(getattr(self, 'current_sl', self.lock_sl), self.lock_sl, be_price)
+                        trail_candidate = max(val, poc)
+                        if trail_candidate > self.current_sl and trail_candidate < close:
+                            self.bt_step = 3
+                            self.current_sl = trail_candidate
+                    elif high >= getattr(self, 'tp1', float('inf')) or getattr(self, 'bt_step', 0) >= 1:
+                        self.bt_step = max(getattr(self, 'bt_step', 0), 1)
+                        self.current_sl = max(getattr(self, 'current_sl', be_price), be_price)
                     else:
+                        pass
+                else:
+                    is_profitable = close >= be_price
+                    if is_profitable:
                         if close > vah:
                             self.crossed_vah = True
                         base_line = vah if getattr(self, 'crossed_vah', False) else poc
-                    # 実運用(VPTrailingManager)と完全一致: ラチェット更新（切り下げ禁止）
-                    self.current_sl = max(getattr(self, 'current_sl', be_price), be_price, base_line)
+                        self.current_sl = max(getattr(self, 'current_sl', be_price), be_price, base_line)
 
                 if close < getattr(self, 'current_sl', -float('inf')):
                     stlongclose = True
@@ -1651,11 +1066,13 @@ class MPStrategy(Backtest):
                     self.initial_sl_line = None
                     self.current_sl = None
                     self.crossed_vah = False
+                    self.bt_step = 0
             else:
                 self.entry_price = None
                 self.initial_sl_line = None
                 self.current_sl = None
                 self.crossed_vah = False
+                self.bt_step = 0
 
             if not stlongclose:
                 if position == 0:
@@ -1667,7 +1084,12 @@ class MPStrategy(Backtest):
                         self.initial_sl_line = val
                         margin_pct = getattr(self, 'sl_margin_pct', 1.0)
                         self.current_sl = val * (1.0 - margin_pct / 100.0)
+                        self.risk_r = max(self.entry_price - self.current_sl, self.entry_price * 0.005)
+                        self.tp1 = self.entry_price + self.risk_r * 1.0
+                        self.tp2 = self.entry_price + self.risk_r * 2.0
+                        self.lock_sl = self.entry_price + self.risk_r * 1.2
                         self.crossed_vah = False
+                        self.bt_step = 0
 
         self.stlong.append(stlong)
         self.stlongclose.append(stlongclose)
@@ -1693,7 +1115,7 @@ class MPStrategy(Backtest):
         })
 
 class backtester:
-    def run_backtest(self, df, lot, data_equity, side_mode="long", mp_period=120, atr_tp_multi=3, er_threshold=0.3, bybit_exec_history=None, bybit_lot_size=None, strategy_type="range", sl_margin_pct=1.0):
+    def run_backtest(self, df, lot, data_equity, side_mode="long", mp_period=120, atr_tp_multi=3, bybit_exec_history=None, bybit_lot_size=None, strategy_type="range", sl_margin_pct=1.0):
         if df is None or df.empty:
             print("エラー: データフレームが空です。APIからデータを取得できませんでした。")
             discord.print_log("バックテスト失敗: ローソク足データが取得できませんでした。")
@@ -1746,11 +1168,10 @@ class backtester:
                 air_exchange=air_exchange, 
                 df=df_sorted, 
                 size=size_in_usdt,
-                columns=["open", "atr_10", "POC", "VAH", "VAL", "long", "short", "er", "lowest_support", "close"],
+                columns=["open", "high", "low", "atr_10", "POC", "VAH", "VAL", "long", "short", "lowest_support", "close"],
                 side_mode=side_mode,
                 atr_period=10,
                 atr_tp_multi=atr_tp_multi,
-                er_threshold=er_threshold,
                 strategy_type=strategy_type,
                 sl_margin_pct=sl_margin_pct,
             )
@@ -1791,7 +1212,7 @@ class backtester:
         # 各ローソク足時点での時価評価 (Mark-to-Market) による資産曲線・PnL算出
         initial_capital = float(data_equity) if (data_equity is not None and data_equity > 0) else 100.0
         maker_fee = 0.0002
-        taker_fee = 0.0006
+        taker_fee = 0.0005
 
         execs_by_ts = {}
         if self.exec_history:
@@ -1926,12 +1347,21 @@ class backtester:
 
 
 def resample_candles(df, interval_minutes):
-    if interval_minutes <= 60:
-        return df.copy()
+    if df is None or df.empty or interval_minutes <= 5:
+        return df.copy() if df is not None else df
     
     df_copy = df.copy()
-    df_copy['timestamp'] = pd.to_datetime(df_copy['timestamp'])
+    df_copy['timestamp'] = pd.to_datetime(df_copy['timestamp'], utc=True)
     df_copy = df_copy.sort_values('timestamp').reset_index(drop=True)
+    
+    # 元データの時間間隔（分）を自動判定し、同間隔以下ならそのまま返す
+    if len(df_copy) >= 2:
+        try:
+            base_diff_min = (df_copy['timestamp'].iloc[-1] - df_copy['timestamp'].iloc[-2]).total_seconds() / 60.0
+            if interval_minutes <= base_diff_min + 0.5:
+                return df_copy
+        except Exception:
+            pass
     
     rule = f'{interval_minutes}min'
     df_copy = df_copy.set_index('timestamp')
@@ -2008,204 +1438,2040 @@ def compute_dynamic_center_margin(df: pd.DataFrame, strategy_type: str = "breako
     return round(float(center_margin), 1)
 
 
-def simulate_envelope_strategy(
-    df: pd.DataFrame,
-    length: int = 15,
-    lower_pct: float = 2.0,
-    upper_pct: float = 2.0,
-    malen: int = 100,
-    max_trades: int = 1,
-    initial_equity: float = 100.0,
-    fee_rate: float = 0.0006,
-    callback_pct: float = 0.015,
-    sl_pct: float = 0.03,
-    use_trend_filter: bool = False
-) -> dict:
-    closes = df["close"].values
-    highs = df["high"].values if "high" in df.columns else closes
-    lows = df["low"].values if "low" in df.columns else closes
-    vahs = df["VAH"].values if "VAH" in df.columns else None
-    n = len(closes)
-    if n < max(length, 10):
-        return {"final_pnl": 0.0, "trade_count": 0, "win_rate": 0.0, "DD_max": 0.0, "max_unrealized_loss": 0.0}
 
-    close_s = pd.Series(closes)
-    basis = calc_ema(close_s, length).values
-    mabasis = calc_ema(close_s, malen).values if malen <= n else basis
-    
-    lower = basis * (1.0 - lower_pct / 100.0)
-    upper = basis * (1.0 + upper_pct / 100.0)
-    
+def make_market_profile_dual_va(
+    df: pd.DataFrame,
+    period: int = 100,
+    num_bins: int = 100,
+    step: int = 1,
+    use_decay: bool = True,
+    decay_half_life: Optional[float] = None
+) -> Dict[str, np.ndarray]:
+    """1パスの出来高ビン集計で VA 70% と VA 80% の両方の VAL/VAH を一挙算出する関数 (指数減衰・step間引き対応)"""
+    n = len(df)
+    min_required = min(max(10, period // 2), period)
+    highs = df['high'].astype(float).values
+    lows = df['low'].astype(float).values
+    closes = df['close'].astype(float).values
+    opens = df['open'].astype(float).values if 'open' in df.columns else closes
+    volumes = df['volume'].astype(float).values if 'volume' in df.columns else np.ones(n)
+    if np.all(volumes <= 0):
+        volumes = np.ones(n)
+
+    half_life = float(decay_half_life) if decay_half_life is not None else max(5.0, period / 2.0)
+    decay_factor = 0.5 ** (1.0 / half_life) if use_decay else 1.0
+    full_weights = (decay_factor ** np.arange(period - 1, -1, -1)) if use_decay else np.ones(period)
+
+    val_70 = np.full(n, np.nan)
+    vah_70 = np.full(n, np.nan)
+    val_80 = np.full(n, np.nan)
+    vah_80 = np.full(n, np.nan)
+    poc_arr = np.full(n, np.nan)
+
+    last_poc = np.nan
+    last_v70 = np.nan
+    last_vh70 = np.nan
+    last_v80 = np.nan
+    last_vh80 = np.nan
+    calc_count = 0
+
+    for i in range(min_required, n):
+        # step間引き: 直前計算値のフォワードフィル (計算量を1/stepに削減)
+        if step > 1 and (i - min_required) % step != 0 and not np.isnan(last_poc):
+            poc_arr[i] = last_poc
+            val_70[i] = last_v70
+            vah_70[i] = last_vh70
+            val_80[i] = last_v80
+            vah_80[i] = last_vh80
+            continue
+
+        calc_count += 1
+        # CPU負荷を20〜30%以下に抑えるためのジェントルスリープ
+        if calc_count % 40 == 0:
+            time.sleep(0.015)
+
+        start_idx = max(0, i - period + 1)
+        win_len = i - start_idx + 1
+        w_highs = highs[start_idx:i+1]
+        w_lows = lows[start_idx:i+1]
+        w_closes = closes[start_idx:i+1]
+        w_opens = opens[start_idx:i+1]
+        w_volumes = volumes[start_idx:i+1] * full_weights[-win_len:]
+
+        if len(w_highs) == 0 or len(w_lows) == 0:
+            curr_c = closes[i] if i < len(closes) else 0.0
+            last_poc = last_v70 = last_vh70 = last_v80 = last_vh80 = curr_c
+            poc_arr[i] = val_70[i] = vah_70[i] = val_80[i] = vah_80[i] = curr_c
+            continue
+
+        p_max = w_highs.max()
+        p_min = w_lows.min()
+        curr_c = closes[i]
+
+        if p_max <= p_min or np.isnan(p_max) or np.isnan(p_min):
+            last_poc = last_v70 = last_vh70 = last_v80 = last_vh80 = curr_c
+            poc_arr[i] = val_70[i] = vah_70[i] = val_80[i] = vah_80[i] = curr_c
+            continue
+
+        price_bins = np.linspace(p_min, p_max, num_bins + 1)
+        bin_centers = (price_bins[:-1] + price_bins[1:]) / 2
+        bin_lows_2d = price_bins[:-1][np.newaxis, :]
+        bin_highs_2d = price_bins[1:][np.newaxis, :]
+
+        body_lows = np.minimum(w_opens, w_closes)
+        body_highs = np.maximum(w_opens, w_closes)
+        w_h_2d = w_highs[:, np.newaxis]
+        w_l_2d = w_lows[:, np.newaxis]
+        w_bh_2d = body_highs[:, np.newaxis]
+        w_bl_2d = body_lows[:, np.newaxis]
+        w_v_2d = w_volumes[:, np.newaxis]
+
+        full_overlap = np.maximum(0.0, np.minimum(w_h_2d, bin_highs_2d) - np.maximum(w_l_2d, bin_lows_2d))
+        full_range = np.maximum(w_h_2d - w_l_2d, 1e-12)
+        full_ratio = full_overlap / full_range
+
+        body_overlap = np.maximum(0.0, np.minimum(w_bh_2d, bin_highs_2d) - np.maximum(w_bl_2d, bin_lows_2d))
+        body_range = np.maximum(w_bh_2d - w_bl_2d, 1e-12)
+        body_ratio = body_overlap / body_range
+
+        has_body_2d = ((body_highs - body_lows) > 1e-12)[:, np.newaxis]
+        eff_ratio = np.where(has_body_2d, 0.60 * body_ratio + 0.40 * full_ratio, full_ratio)
+        vol_profile = (w_v_2d * eff_ratio).sum(axis=0)
+
+        total_vol = vol_profile.sum()
+        if total_vol <= 0:
+            last_poc = last_v70 = last_vh70 = last_v80 = last_vh80 = curr_c
+            poc_arr[i] = val_70[i] = vah_70[i] = val_80[i] = vah_80[i] = curr_c
+            continue
+
+        poc_idx = int(np.argmax(vol_profile))
+        idx_start = max(0, poc_idx - 1)
+        idx_end = min(num_bins, poc_idx + 2)
+        local_vols = vol_profile[idx_start:idx_end]
+        local_centers = bin_centers[idx_start:idx_end]
+        local_sum = local_vols.sum()
+        last_poc = (local_vols * local_centers).sum() / local_sum if local_sum > 0 else bin_centers[poc_idx]
+        poc_arr[i] = last_poc
+
+        target_vol_70 = total_vol * 0.70
+        target_vol_80 = total_vol * 0.80
+        curr_va_vol = vol_profile[poc_idx]
+        upper_idx = poc_idx
+        lower_idx = poc_idx
+        found_70 = False
+
+        while upper_idx < num_bins - 1 or lower_idx > 0:
+            if not found_70 and curr_va_vol >= target_vol_70:
+                last_v70 = price_bins[lower_idx]
+                last_vh70 = price_bins[upper_idx + 1]
+                found_70 = True
+            if curr_va_vol >= target_vol_80:
+                break
+
+            can_up = upper_idx < num_bins - 1
+            can_down = lower_idx > 0
+            up_vol = vol_profile[upper_idx + 1] if can_up else -1.0
+            down_vol = vol_profile[lower_idx - 1] if can_down else -1.0
+
+            if can_up and can_down:
+                if up_vol > down_vol:
+                    upper_idx += 1
+                    curr_va_vol += vol_profile[upper_idx]
+                elif down_vol > up_vol:
+                    lower_idx -= 1
+                    curr_va_vol += vol_profile[lower_idx]
+                else:
+                    upper_idx += 1
+                    curr_va_vol += vol_profile[upper_idx]
+                    if curr_va_vol < target_vol_80 and lower_idx > 0:
+                        lower_idx -= 1
+                        curr_va_vol += vol_profile[lower_idx]
+            elif can_up:
+                upper_idx += 1
+                curr_va_vol += vol_profile[upper_idx]
+            elif can_down:
+                lower_idx -= 1
+                curr_va_vol += vol_profile[lower_idx]
+
+        if not found_70:
+            last_v70 = price_bins[lower_idx]
+            last_vh70 = price_bins[upper_idx + 1]
+        last_v80 = price_bins[lower_idx]
+        last_vh80 = price_bins[upper_idx + 1]
+
+        val_70[i] = last_v70
+        vah_70[i] = last_vh70
+        val_80[i] = last_v80
+        vah_80[i] = last_vh80
+
+    return {
+        'poc': poc_arr,
+        'val_70': val_70, 'vah_70': vah_70,
+        'val_80': val_80, 'vah_80': vah_80
+    }
+
+
+def simulate_val_poc_fast(
+    closes: np.ndarray,
+    highs: np.ndarray,
+    lows: np.ndarray,
+    vals: np.ndarray,
+    vahs: np.ndarray,
+    pocs: np.ndarray,
+    ma_filter: np.ndarray,
+    initial_equity: float = 100.0,
+    max_trades: int = 3,
+    nanpin_drop_pct: float = 0.030,
+    sl_pct: float = 0.090,
+    target_ratio: float = 0.60,
+    cooldown_bars: int = 96,
+    fee_rate: float = 0.0006,
+    maker_fee: float = 0.0002,
+    record_chart: bool = False
+) -> Dict[str, Any]:
+    """VAL_POC 高速バックテストシミュレータ (VA 60%連動ナンピン・最終建値-60%損切り・最大3枠対応)"""
+    n = len(closes)
+    trade_size = initial_equity / max_trades
     pos_qty = 0.0
     pos_cost = 0.0
     avg_price = 0.0
     pos_count = 0
-    
-    trailing_tp_active = False
-    trail_peak = 0.0
-
-    cum_realized_pnl = 0.0
-    cum_fees = 0.0
+    last_entry = 0.0
+    cooldown_until = -1
+    pending_limit = -1.0
+    cum_pnl = 0.0
     trades = []
-    equity_curve = [initial_equity]
-    unrealized_list = [0.0]
-    exec_history = []
-    
-    trade_size_usdt = initial_equity / max_trades
-    
+    peak_eq = initial_equity
+    max_dd = 0.0
+
+    if record_chart:
+        exec_buy = np.full(n, np.nan)
+        exec_sell = np.full(n, np.nan)
+        pnl_curve = np.full(n, initial_equity, dtype=float)
+    else:
+        exec_buy = None
+        exec_sell = None
+        pnl_curve = None
+
     for i in range(1, n):
         c = closes[i]
         h = highs[i]
         l = lows[i]
-        b = basis[i]
-        low_band = lower[i]
-        ts = df["timestamp"].iloc[i] if "timestamp" in df.columns else i
-        
-        # 決済チェック
+        val = vals[i]
+        vah = vahs[i]
+
+        # 0. 指値約定チェック
+        if pending_limit > 0:
+            if l <= pending_limit:
+                px = pending_limit
+                qty = trade_size / px
+                fee = trade_size * maker_fee
+                pos_cost += trade_size + fee
+                pos_qty += qty
+                avg_price = pos_cost / pos_qty
+                last_entry = px
+                pos_count += 1
+                if record_chart and exec_buy is not None:
+                    exec_buy[i] = px
+            pending_limit = -1.0
+
+        # 1. 決済チェック
         if pos_qty > 0:
-            # 1. 損切り (Stop Loss) チェック
-            if sl_pct > 0 and l < avg_price * (1.0 - sl_pct):
-                sl_price = avg_price * (1.0 - sl_pct)
-                sell_val = pos_qty * sl_price
+            va_diff = (vah - val) if (not np.isnan(val) and not np.isnan(vah) and vah > val) else 0.0
+            va_spacing = va_diff * target_ratio if va_diff > 0 else (last_entry * nanpin_drop_pct)
+            drop_dist = max(last_entry * 0.010, va_spacing) if last_entry > 0 else 0.0
+
+            # 損切り: 最終建値(最大枠到達後)から (VAH - VAL) * 0.60 割れ (確定足終値判定)
+            sl_price = last_entry - drop_dist
+            if pos_count >= max_trades and sl_price > 0 and c <= sl_price:
+                sell_val = pos_qty * c
                 fee = sell_val * fee_rate
                 pnl = sell_val - pos_cost - fee
-                cum_realized_pnl += pnl
-                cum_fees += fee
+                cum_pnl += pnl
                 trades.append(pnl)
-                exec_history.append({"timestamp": ts, "price": sl_price, "size": -pos_qty, "type": "STOP_LOSS"})
+                if record_chart and exec_sell is not None:
+                    exec_sell[i] = c
                 pos_qty = 0.0
                 pos_cost = 0.0
                 avg_price = 0.0
                 pos_count = 0
-                trailing_tp_active = False
-                trail_peak = 0.0
+                last_entry = 0.0
+                cooldown_until = i + cooldown_bars
             else:
-                # 2. 利確 (Trailing Take-Profit) チェック
-                if not trailing_tp_active:
-                    if c > b and c > avg_price:
-                        trailing_tp_active = True
-                        trail_peak = max(c, h)
-                
-                if trailing_tp_active:
-                    trail_peak = max(trail_peak, h)
-                    vah_val = float(vahs[i]) if (vahs is not None and i < len(vahs) and not np.isnan(vahs[i])) else 0.0
-                    vah_guard = vah_val if (vah_val > 0 and trail_peak > vah_val) else 0.0
-                    trail_stop = max(trail_peak * (1.0 - callback_pct), vah_guard, avg_price * (1.0 + fee_rate))
-                    if c < trail_stop:
-                        sell_val = pos_qty * c
+                # 利確 (VAL-VAH 60%水準 到達かつ建値プラス域)
+                target_tp = val + va_spacing if va_spacing > 0 else pocs[i]
+                if (h >= target_tp or c >= target_tp) and target_tp > 0:
+                    exit_px = max(c, target_tp) if h >= target_tp else c
+                    if exit_px > avg_price * (1.0 + fee_rate):
+                        sell_val = pos_qty * exit_px
                         fee = sell_val * fee_rate
                         pnl = sell_val - pos_cost - fee
-                        cum_realized_pnl += pnl
-                        cum_fees += fee
+                        cum_pnl += pnl
                         trades.append(pnl)
-                        exec_history.append({"timestamp": ts, "price": c, "size": -pos_qty, "type": "SELL"})
+                        if record_chart and exec_sell is not None:
+                            exec_sell[i] = exit_px
                         pos_qty = 0.0
                         pos_cost = 0.0
                         avg_price = 0.0
                         pos_count = 0
-                        trailing_tp_active = False
-                        trail_peak = 0.0
+                        last_entry = 0.0
 
-                
-        # エントリーチェック (戻りエントリー: 前足がバンド以下で今足終値がバンド内に復帰)
-        if pos_count < max_trades:
-            can_enter = False
-            trend_ok = (c > mabasis[i]) if use_trend_filter else True
-            if trend_ok:
-                rebound_condition = (closes[i-1] <= lower[i-1]) and (c > low_band)
-                if pos_count == 0:
-                    if rebound_condition:
-                        can_enter = True
-                else:
-                    add_pct = calc_add_pct(pos_count)
-                    if rebound_condition and c < avg_price * (1.0 - add_pct):
-                        can_enter = True
+        # 2. エントリー / ナンピン判定
+        if pending_limit < 0:
+            if pos_count == 0 and i >= cooldown_until:
+                if not np.isnan(val) and not np.isnan(vals[i-1]):
+                    val_gc = (closes[i-1] <= vals[i-1]) and (c > val)
+                    va_width = (vah - val) / val if val > 0 else 0.0
+                    if val_gc and (va_width >= 0.015) and ma_filter[i]:
+                        pending_limit = c * 0.9998
+            elif 1 <= pos_count < max_trades:
+                va_diff = (vah - val) if (not np.isnan(val) and not np.isnan(vah) and vah > val) else 0.0
+                va_spacing = va_diff * target_ratio if va_diff > 0 else (last_entry * nanpin_drop_pct)
+                drop_dist = max(last_entry * 0.010, va_spacing) if last_entry > 0 else 0.0
+                drop_target = last_entry - drop_dist
+                if c <= drop_target or l <= drop_target:
+                    pending_limit = c * 0.9998
 
-                        
-            if can_enter:
-                buy_val = trade_size_usdt
-                qty = buy_val / c
-                fee = buy_val * fee_rate
-                cum_fees += fee
-                pos_cost += buy_val
-                pos_qty += qty
-                avg_price = pos_cost / pos_qty
-                pos_count += 1
-                exec_history.append({"timestamp": ts, "price": c, "size": qty, "type": "BUY"})
-                
-        unrealized = (pos_qty * c - pos_cost) if pos_qty > 0 else 0.0
-        unrealized_list.append(unrealized)
-        current_eq = initial_equity + cum_realized_pnl + unrealized - cum_fees
-        equity_curve.append(current_eq)
-        
-    eq_series = pd.Series(equity_curve)
-    peak = eq_series.cummax()
-    dd = peak - eq_series
-    dd_max = float(dd.max()) if not dd.empty else 0.0
-    
+        if pos_qty > 0:
+            unrealized = pos_qty * c - pos_cost
+            cur_eq = initial_equity + cum_pnl + unrealized
+            if cur_eq > peak_eq:
+                peak_eq = cur_eq
+            cur_dd = peak_eq - cur_eq
+            if cur_dd > max_dd:
+                max_dd = cur_dd
+        else:
+            cur_eq = initial_equity + cum_pnl
+            if cur_eq > peak_eq:
+                peak_eq = cur_eq
+        if record_chart and pnl_curve is not None:
+            pnl_curve[i] = initial_equity + cum_pnl
+
     trade_cnt = len(trades)
     win_cnt = sum(1 for t in trades if t > 0)
     win_rate = (win_cnt / trade_cnt * 100.0) if trade_cnt > 0 else 0.0
-    final_pnl = float(equity_curve[-1]) - initial_equity
-    min_unrealized = float(min(unrealized_list)) if unrealized_list else 0.0
-    
-    return {
-        "final_pnl": final_pnl,
-        "trade_count": trade_cnt,
-        "win_rate": win_rate,
-        "DD_max": dd_max,
-        "max_unrealized_loss": min_unrealized,
-        "strategy": "envelope",
-        "equity_curve": equity_curve,
-        "exec_history": exec_history,
-        "params": {
-            "length": length,
-            "lower_pct": lower_pct,
-            "upper_pct": upper_pct,
-            "malen": malen,
-            "max_trades": max_trades,
-            "sl_pct": sl_pct
-        }
+    res_dict: Dict[str, Any] = {
+        'final_pnl': float(cum_pnl),
+        'trade_count': trade_cnt,
+        'win_rate': win_rate,
+        'DD_max': float(max_dd)
+    }
+    if record_chart:
+        res_dict['exec_buy_price'] = exec_buy
+        res_dict['exec_sell_price'] = exec_sell
+        res_dict['pnl_curve'] = pnl_curve
+    return res_dict
+
+
+def _touch_bot_heartbeat():
+    """最適化ループ中も死活監視 (check_and_restart.sh) がハングアップと誤認しないようハートビートを更新"""
+    try:
+        hb_path = os.path.join("Data", "bot_heartbeat.json")
+        if os.path.exists(hb_path):
+            os.utime(hb_path, None)
+    except Exception:
+        pass
+
+
+def optimize_rsima3_fast(
+    closes: np.ndarray,
+    highs: np.ndarray,
+    lows: np.ndarray,
+    rsi: np.ndarray,
+    rsi_ma: np.ndarray,
+    initial_equity: float = 100.0,
+    max_trades: int = 3,
+    min_trades: int = 10,
+    val_arr: Optional[np.ndarray] = None,
+    vah_arr: Optional[np.ndarray] = None,
+    default_sl_pct: float = 0.05
+) -> Dict[str, Any]:
+    """RSIMA 9通り (EP 30,35,40 × CP 60,65,70, ナンピン/SL: (VAH-VAL)*0.60) 超高速最適化 (MIN_TRADES=10)"""
+    n = len(closes)
+    trade_size = initial_equity / max_trades
+    maker_fee = 0.0002
+    taker_fee = 0.0006
+
+    eps = [30.0, 35.0, 40.0]
+    cps = [60.0, 65.0, 70.0]
+
+    # ゴールデンクロス判定を事前ベクトル計算してフラット時の無駄なループ処理をスキップ
+    gc_arr = np.zeros(n, dtype=bool)
+    if n > 2:
+        gc_arr[1:] = (rsi[1:] > rsi_ma[1:]) & (rsi[:-1] <= rsi_ma[:-1])
+
+    best_pnl = -float('inf')
+    best_res: Optional[Dict[str, Any]] = None
+    fallback_pnl = -float('inf')
+    fallback_res: Dict[str, Any] = {
+        'l_ep': 40.0, 'l_cp': 60.0, 'sl_pct': default_sl_pct,
+        'final_pnl': 0.0, 'trade_count': 0, 'win_rate': 0.0, 'DD_max': 0.0
     }
 
+    use_va = (val_arr is not None and vah_arr is not None and len(val_arr) == n)
 
-def simulate_rsima_strategy(
+    for ep in eps:
+        ep_sig = gc_arr.copy()
+        if n > 2:
+            ep_sig[1:] = gc_arr[1:] & ((rsi_ma[1:] < ep) | (rsi_ma[:-1] < ep))
+        ep_indices = np.flatnonzero(ep_sig[2:]) + 2
+        n_ep = len(ep_indices)
+
+        for cp in cps:
+            pos_qty = 0.0
+            pos_cost = 0.0
+            avg_px = 0.0
+            last_entry_px = 0.0
+            pos_cnt = 0
+            cum_pnl = 0.0
+            trades_cnt = 0
+            wins_cnt = 0
+            pending_px = -1.0
+            cooldown_until = -1
+            peak_eq = initial_equity
+            max_dd = 0.0
+
+            i = 2
+            ep_ptr = 0
+            while i < n:
+                if pos_qty == 0.0 and pending_px < 0.0:
+                    target_i = i if i >= cooldown_until else cooldown_until
+                    while ep_ptr < n_ep and ep_indices[ep_ptr] < target_i:
+                        ep_ptr += 1
+                    if ep_ptr >= n_ep:
+                        break
+                    i = int(ep_indices[ep_ptr])
+                    pending_px = closes[i] * 0.9998
+                    i += 1
+                    continue
+
+                c = closes[i]
+                l = lows[i]
+
+                if pending_px > 0:
+                    if l <= pending_px:
+                        px = pending_px
+                        qty = trade_size / px
+                        pos_cost += trade_size + trade_size * maker_fee
+                        pos_qty += qty
+                        last_entry_px = px
+                        avg_px = pos_cost / pos_qty
+                        pos_cnt += 1
+                    pending_px = -1.0
+
+                if pos_qty > 0:
+                    # 損切り判定: 最大枠(3枠)到達後に (VAH - VAL) * 0.60 割れ (確定足終値判定)
+                    is_sl = False
+                    if pos_cnt >= max_trades:
+                        if use_va and not np.isnan(val_arr[i]) and not np.isnan(vah_arr[i]) and vah_arr[i] > val_arr[i]:
+                            va_width = vah_arr[i] - val_arr[i]
+                            sl_price = last_entry_px - va_width * 0.60
+                            is_sl = (c < sl_price)
+                        else:
+                            is_sl = (c < avg_px * (1.0 - default_sl_pct))
+
+                    if is_sl:
+                        sell_val = pos_qty * c
+                        fee = sell_val * taker_fee
+                        pnl = sell_val - pos_cost - fee
+                        cum_pnl += pnl
+                        trades_cnt += 1
+                        if pnl > 0:
+                            wins_cnt += 1
+                        pos_qty = 0.0
+                        pos_cost = 0.0
+                        avg_px = 0.0
+                        last_entry_px = 0.0
+                        pos_cnt = 0
+                        cooldown_until = i + 288
+                        cur_eq = initial_equity + cum_pnl
+                        if cur_eq > peak_eq:
+                            peak_eq = cur_eq
+                        cur_dd = peak_eq - cur_eq
+                        if cur_dd > max_dd:
+                            max_dd = cur_dd
+                    elif rsi[i] > cp and c >= avg_px * 1.004:
+                        # 利確判定: RSI > cp かつ 平均建値以上プラス
+                        sell_val = pos_qty * c
+                        fee = sell_val * taker_fee
+                        pnl = sell_val - pos_cost - fee
+                        cum_pnl += pnl
+                        trades_cnt += 1
+                        if pnl > 0:
+                            wins_cnt += 1
+                        pos_qty = 0.0
+                        pos_cost = 0.0
+                        avg_px = 0.0
+                        last_entry_px = 0.0
+                        pos_cnt = 0
+                        cur_eq = initial_equity + cum_pnl
+                        if cur_eq > peak_eq:
+                            peak_eq = cur_eq
+                    else:
+                        # ナンピン判定: 直近約定価格から (VAH - VAL) * 0.60 下落 (最大3枠)
+                        if pending_px < 0 and 1 <= pos_cnt < max_trades:
+                            if use_va and not np.isnan(val_arr[i]) and not np.isnan(vah_arr[i]) and vah_arr[i] > val_arr[i]:
+                                dip_req = (vah_arr[i] - val_arr[i]) * 0.60
+                                is_dip = (c <= last_entry_px - dip_req)
+                            else:
+                                is_dip = (c < avg_px * 0.994)
+                            if ep_sig[i] and is_dip:
+                                pending_px = c * 0.9998
+                        cur_eq = initial_equity + cum_pnl + (pos_qty * c - pos_cost)
+                        if cur_eq > peak_eq:
+                            peak_eq = cur_eq
+                        cur_dd = peak_eq - cur_eq
+                        if cur_dd > max_dd:
+                            max_dd = cur_dd
+                elif pending_px < 0 and ep_sig[i] and i >= cooldown_until:
+                    pending_px = c * 0.9998
+
+                i += 1
+
+            win_rt = (wins_cnt / trades_cnt * 100.0) if trades_cnt > 0 else 0.0
+            cand_entry = {
+                'l_ep': float(ep),
+                'l_cp': float(cp),
+                'sl_pct': float(default_sl_pct),
+                'final_pnl': float(cum_pnl),
+                'trade_count': int(trades_cnt),
+                'win_rate': float(win_rt),
+                'DD_max': float(max_dd)
+            }
+            if trades_cnt >= min_trades and cum_pnl > best_pnl:
+                best_pnl = cum_pnl
+                best_res = cand_entry
+            elif trades_cnt >= 5 and cum_pnl > fallback_pnl:
+                fallback_pnl = cum_pnl
+                fallback_res = cand_entry
+
+    return best_res if best_res is not None else fallback_res
+
+
+def build_rsima3_chart_df(
+    df_5m: pd.DataFrame,
+    rsi: np.ndarray,
+    rsi_ma: np.ndarray,
+    ep: float,
+    cp: float,
+    sl: float,
+    initial_equity: float = 100.0,
+    max_trades: int = 5
+) -> pd.DataFrame:
+    """RSIMA3 最良パラメータでの売買マーカー・累積損益曲線付きDataFrameを生成"""
+    out_df = df_5m.copy().reset_index(drop=True)
+    n = len(out_df)
+    closes = out_df['close'].astype(float).values
+    lows = out_df['low'].astype(float).values if 'low' in out_df.columns else closes
+    trade_size = initial_equity / max_trades
+    maker_fee = 0.0002
+    taker_fee = 0.0006
+
+    exec_buy = np.full(n, np.nan)
+    exec_sell = np.full(n, np.nan)
+    pnl_curve = np.full(n, initial_equity, dtype=float)
+
+    pos_qty = 0.0
+    pos_cost = 0.0
+    avg_px = 0.0
+    pos_cnt = 0
+    cum_pnl = 0.0
+    pending_px = -1.0
+    cooldown_until = -1
+
+    for i in range(2, n):
+        c = closes[i]
+        l = lows[i]
+
+        if pending_px > 0:
+            if l <= pending_px:
+                px = pending_px
+                qty = trade_size / px
+                pos_cost += trade_size + trade_size * maker_fee
+                pos_qty += qty
+                avg_px = pos_cost / pos_qty
+                pos_cnt += 1
+                exec_buy[i] = px
+            pending_px = -1.0
+
+        if pos_qty > 0:
+            if sl > 0 and c < avg_px * (1.0 - sl):
+                sell_val = pos_qty * c
+                fee = sell_val * taker_fee
+                pnl = sell_val - pos_cost - fee
+                cum_pnl += pnl
+                exec_sell[i] = c
+                pos_qty = 0.0
+                pos_cost = 0.0
+                avg_px = 0.0
+                pos_cnt = 0
+                cooldown_until = i + 288
+            elif rsi[i] > cp and c >= avg_px * 1.006:
+                sell_val = pos_qty * c
+                fee = sell_val * taker_fee
+                pnl = sell_val - pos_cost - fee
+                cum_pnl += pnl
+                exec_sell[i] = c
+                pos_qty = 0.0
+                pos_cost = 0.0
+                avg_px = 0.0
+                pos_cnt = 0
+
+        if pending_px < 0:
+            gc = (rsi[i] > rsi_ma[i]) and (rsi[i-1] <= rsi_ma[i-1])
+            if pos_cnt == 0 and i >= cooldown_until:
+                if gc and (rsi_ma[i] < ep or rsi_ma[i-1] < ep):
+                    pending_px = c * 0.9998
+            elif 1 <= pos_cnt < max_trades:
+                if gc and (rsi_ma[i] < ep or rsi_ma[i-1] < ep) and c < avg_px * 0.994:
+                    pending_px = c * 0.9998
+
+        pnl_curve[i] = initial_equity + cum_pnl
+
+    out_df['exec_buy_price'] = exec_buy
+    out_df['exec_sell_price'] = exec_sell
+    out_df['pnl'] = pnl_curve
+    return out_df
+
+
+def run_interval_comparison(df_5m: pd.DataFrame, lot: float = 1.0, data_equity: float = 100.0, side_mode: str = "long", symbol: str = "", force_strategy: Optional[str] = None, prefer_breakout: bool = False):
+    """
+    【新仕様】基本戦略二本立て (VAL_POC 36通り [超高速・過学習排除スリム仕様] vs RSIMA 9〜36通り) 低負荷ジェントル最適化
+    - 評価データ: 5分足 直近30日分 (8,640本 = 30d × 24h × 12) フル活用
+    - 最低取引回数フィルター: MIN_TRADES = 10回以上 (再現性の低い一発屋・過学習を完全排除)
+    - VAL_POC: 5m/15m/30m/60m (4種) × MP 100〜500 (9種) × bins=50固定 × VA=70%固定 × EMA(200) close_above固定 ＝ 36通り
+    - RSIMA: EP 30,35,40 × CP 60,65,70
+    """
+    results: Dict[str, Any] = {}
+    fixed_initial_equity = float(data_equity) if data_equity > 0 else 100.0
+    MIN_TRADES = 10
+    os.makedirs("backtest_data", exist_ok=True)
+    _touch_bot_heartbeat()
+
+    if df_5m is None or df_5m.empty:
+        discord.print_log(f"[{symbol}] 最適化エラー: データが空です。")
+        return results, "val_poc", 5, 200, 0.0, 9.0
+
+    # 1H足が渡された場合の互換性フォールバック（タイムスタンプ間隔が50分以上の場合は1H足と判定）
+    is_1h = False
+    if len(df_5m) >= 2 and 'timestamp' in df_5m.columns:
+        try:
+            diff_min = (pd.to_datetime(df_5m['timestamp'].iloc[-1], utc=True) - pd.to_datetime(df_5m['timestamp'].iloc[-2], utc=True)).total_seconds() / 60.0
+            if diff_min >= 45:
+                is_1h = True
+        except Exception:
+            pass
+
+    # 評価データ: 5分足は直近30日分（8,640本 = 30d × 24h × 12）をフル活用して堅牢性を確保
+    if len(df_5m) > 8640:
+        df_5m = df_5m.tail(8640).reset_index(drop=True)
+
+    discord.print_log(f"\n====== 🌿 [{symbol}] 基本戦略二本立て 低負荷ジェントル最適化 (5m足 {len(df_5m)}本 [30日分] / 最低取引{MIN_TRADES}回以上) ======")
+
+    # ==============================================================================
+    # 1. VAL_POC 最適化 (4足種 × MP 9種 × Bins=50固定 × VA=70%固定 × EMA200_close_above固定 ＝ 36通り)
+    # ==============================================================================
+    intervals = [5, 15, 30, 60] if not is_1h else [60]
+    mp_periods = [100, 150, 200, 250, 300, 350, 400, 450, 500] if not is_1h else [24, 48, 72, 96]
+    bins_fixed = 50
+    va_pct_fixed = 0.70
+    va_name_fixed = '70%'
+    ma_type_fixed = 'EMA'
+    cond_name_fixed = 'close_above'
+
+    best_vp_pnl = -float('inf')
+    best_vp_cfg: Optional[Dict[str, Any]] = None
+    fallback_vp_pnl = -float('inf')
+    fallback_vp_cfg: Dict[str, Any] = {
+        'interval': 5, 'mp_period': 200, 'num_bins': bins_fixed, 'va': va_name_fixed, 'value_area_pct': va_pct_fixed,
+        'ma_type': ma_type_fixed, 'condition': cond_name_fixed,
+        'pnl': 0.0, 'trade_count': 0, 'win_rate': 0.0, 'DD_max': 0.0
+    }
+    vp_eval_count = 0
+    inv_dfs: Dict[int, pd.DataFrame] = {}
+
+    for inv in intervals:
+        _touch_bot_heartbeat()
+        df_inv = resample_candles(df_5m, inv) if inv > 5 else df_5m.copy()
+        if df_inv is None or len(df_inv) < 120:
+            continue
+        inv_dfs[inv] = df_inv
+
+        c_inv = df_inv['close'].astype(float).values
+        h_inv = df_inv['high'].astype(float).values if 'high' in df_inv.columns else c_inv
+        l_inv = df_inv['low'].astype(float).values if 'low' in df_inv.columns else c_inv
+
+        # トレンドフィルター: EMA(200) close_above に完全固定
+        ema200 = calc_ema(df_inv['close'].astype(float), 200).values
+        ma_filter = (c_inv >= ema200)
+
+        cd_bars = max(10, 288 // (inv // 5)) if not is_1h else 24
+        calc_step = 8 if inv == 5 else (3 if inv == 15 else (2 if inv == 30 else 1))
+
+        for mp in mp_periods:
+            if len(df_inv) < mp + 100:
+                continue
+            _touch_bot_heartbeat()
+            # Bins=50 固定で Market Profile 生成
+            mp_res = make_market_profile_dual_va(df_inv, period=mp, num_bins=bins_fixed, step=calc_step, use_decay=True)
+            pocs = mp_res['poc']
+            val_arr = mp_res['val_70']
+            vah_arr = mp_res['vah_70']
+
+            # 【第1段階】シングルポジション (1枠固定: max_trades=1) でシミュレーション
+            sim_single = simulate_val_poc_fast(
+                c_inv, h_inv, l_inv, val_arr, vah_arr, pocs, ma_filter,
+                initial_equity=fixed_initial_equity, max_trades=1, cooldown_bars=cd_bars
+            )
+            vp_eval_count += 1
+
+            # 【第2段階】シングルポジションで健全 (取引>=MIN_TRADES かつ PnL>0) ならナンピン(3枠)シミュレーションを実行
+            if sim_single['trade_count'] >= MIN_TRADES and sim_single['final_pnl'] > 0:
+                sim_nanpin = simulate_val_poc_fast(
+                    c_inv, h_inv, l_inv, val_arr, vah_arr, pocs, ma_filter,
+                    initial_equity=fixed_initial_equity, max_trades=3, cooldown_bars=cd_bars
+                )
+                sim = sim_nanpin
+            else:
+                sim = sim_single
+
+            sim['single_pnl'] = sim_single['final_pnl']
+            sim['single_trades'] = sim_single['trade_count']
+            sim['single_win_rate'] = sim_single['win_rate']
+
+            label = f"VAL_POC_{inv}m_MP{mp}_B{bins_fixed}_VA{va_name_fixed}_{ma_type_fixed}_{cond_name_fixed}"
+            results[label] = {
+                'strategy_type': 'val_poc',
+                'df': pd.DataFrame(),
+                'final_pnl': fixed_initial_equity + sim['final_pnl'],
+                'interval': inv,
+                'mp_period': mp,
+                'num_bins': bins_fixed,
+                'value_area_pct': va_pct_fixed,
+                'ma_type': ma_type_fixed,
+                'ma_condition': cond_name_fixed,
+                'atr_multi': 0.0,
+                'sl_center_margin': 9.0,
+                'DD_max': sim['DD_max'],
+                'win_rate': sim['win_rate'],
+                'trade_count': sim['trade_count'],
+                'single_pnl': sim['single_pnl'],
+                'single_trades': sim['single_trades'],
+                'single_win_rate': sim['single_win_rate']
+            }
+
+            cand_cfg = {
+                'interval': inv, 'mp_period': mp, 'num_bins': bins_fixed, 'va': va_name_fixed,
+                'value_area_pct': va_pct_fixed, 'ma_type': ma_type_fixed, 'condition': cond_name_fixed,
+                'pnl': sim['final_pnl'], 'trade_count': sim['trade_count'],
+                'win_rate': sim['win_rate'], 'DD_max': sim['DD_max'],
+                'single_pnl': sim['single_pnl'], 'single_trades': sim['single_trades'],
+                'single_win_rate': sim['single_win_rate']
+            }
+            if sim['trade_count'] >= MIN_TRADES and sim['final_pnl'] > best_vp_pnl:
+                best_vp_pnl = sim['final_pnl']
+                best_vp_cfg = cand_cfg
+            elif sim['trade_count'] >= 5 and sim['final_pnl'] > fallback_vp_pnl:
+                fallback_vp_pnl = sim['final_pnl']
+                fallback_vp_cfg = cand_cfg
+
+        print(f"   [{symbol}] VAL_POC {inv}m足 ({len(df_inv)}本) 検証完了 (累計 {vp_eval_count} パターン評価済)", flush=True)
+
+    if best_vp_cfg is None:
+        best_vp_cfg = fallback_vp_cfg
+
+    # ==============================================================================
+    # 2. RSIMA 最適化 (4足種 × EP 3種 × CP 3種 ＝ 36 通り: (VAH-VAL)*0.60 ナンピン/SL)
+    # ==============================================================================
+    best_rsi_pnl = -float('inf')
+    best_rsi_cfg: Optional[Dict[str, Any]] = None
+    fallback_rsi_pnl = -float('inf')
+    fallback_rsi_cfg: Dict[str, Any] = {
+        'interval': 5, 'l_ep': 40.0, 'l_cp': 60.0, 'sl_pct': 0.05,
+        'final_pnl': 0.0, 'trade_count': 0, 'win_rate': 0.0, 'DD_max': 0.0, 'chart_df': pd.DataFrame()
+    }
+
+    for r_inv in intervals:
+        _touch_bot_heartbeat()
+        df_r_inv = inv_dfs.get(r_inv)
+        if df_r_inv is None:
+            df_r_inv = resample_candles(df_5m, r_inv) if r_inv > 5 else df_5m.copy()
+            if df_r_inv is None or len(df_r_inv) < 50:
+                continue
+
+        r_rsi, r_rsi_ma = calc_rsi_ema(df_r_inv['close'].astype(float), rsi_period=9, ma_period=7)
+        c_r = df_r_inv['close'].astype(float).values
+        h_r = df_r_inv['high'].astype(float).values if 'high' in df_r_inv.columns else c_r
+        l_r = df_r_inv['low'].astype(float).values if 'low' in df_r_inv.columns else c_r
+
+        # 直近 VAL/VAH の取得（step間引きで高速取得）
+        val_arr_r, vah_arr_r = None, None
+        try:
+            r_step = max(1, len(df_r_inv) // 100)
+            mp_tmp = make_market_profile_dual_va(df_r_inv, period=100, num_bins=50, step=r_step, use_decay=True)
+            val_arr_r = mp_tmp['val_70']
+            vah_arr_r = mp_tmp['vah_70']
+        except Exception:
+            pass
+
+        # 【第1段階】シングルポジション (1枠固定: max_trades=1) で最適探索
+        res_r_single = optimize_rsima3_fast(
+            c_r, h_r, l_r, r_rsi.values, r_rsi_ma.values,
+            initial_equity=fixed_initial_equity, max_trades=1, min_trades=MIN_TRADES,
+            val_arr=val_arr_r, vah_arr=vah_arr_r
+        )
+
+        # 【第2段階】シングルポジションで健全 (取引>=MIN_TRADES かつ PnL>0) ならナンピン(3枠)シミュレーションを実行
+        if res_r_single['trade_count'] >= MIN_TRADES and res_r_single['final_pnl'] > 0:
+            res_r_nanpin = optimize_rsima3_fast(
+                c_r, h_r, l_r, r_rsi.values, r_rsi_ma.values,
+                initial_equity=fixed_initial_equity, max_trades=3, min_trades=MIN_TRADES,
+                val_arr=val_arr_r, vah_arr=vah_arr_r
+            )
+            res_r = res_r_nanpin
+        else:
+            res_r = res_r_single
+
+        res_r['single_pnl'] = res_r_single['final_pnl']
+        res_r['single_trades'] = res_r_single['trade_count']
+        res_r['single_win_rate'] = res_r_single['win_rate']
+
+        rsima_key = f"RSIMA_{r_inv}m_EP{int(res_r['l_ep'])}_CP{int(res_r['l_cp'])}"
+        results[rsima_key] = {
+            'strategy_type': 'rsima',
+            'df': pd.DataFrame(),
+            'final_pnl': fixed_initial_equity + res_r['final_pnl'],
+            'interval': r_inv,
+            'mp_period': 100,
+            'num_bins': 50,
+            'value_area_pct': 0.70,
+            'ma_type': 'NONE',
+            'ma_condition': 'NONE',
+            'atr_multi': 0.0,
+            'sl_center_margin': 0.0,
+            'l_ep': res_r['l_ep'],
+            'l_cp': res_r['l_cp'],
+            'sl_pct': res_r['sl_pct'],
+            'DD_max': res_r['DD_max'],
+            'win_rate': res_r['win_rate'],
+            'trade_count': res_r['trade_count'],
+            'single_pnl': res_r['single_pnl'],
+            'single_trades': res_r['single_trades'],
+            'single_win_rate': res_r['single_win_rate']
+        }
+
+        r_cand = {**res_r, 'interval': r_inv, 'df_inv': df_r_inv, 'rsi_s': r_rsi, 'rsi_ma_s': r_rsi_ma}
+        if res_r['trade_count'] >= MIN_TRADES and res_r['final_pnl'] > best_rsi_pnl:
+            best_rsi_pnl = res_r['final_pnl']
+            best_rsi_cfg = r_cand
+        elif res_r['trade_count'] >= 5 and res_r['final_pnl'] > fallback_rsi_pnl:
+            fallback_rsi_pnl = res_r['final_pnl']
+            fallback_rsi_cfg = r_cand
+
+    if best_rsi_cfg is None:
+        best_rsi_cfg = fallback_rsi_cfg
+
+    # ==============================================================================
+    # 3. 基本戦略二本立て 直接比較 & 動的採用決定 (最低取引回数フィルター考慮)
+    # ==============================================================================
+    pnl_vp = float(best_vp_cfg['pnl'])
+    cnt_vp = int(best_vp_cfg['trade_count'])
+    win_vp = float(best_vp_cfg['win_rate'])
+
+    pnl_rsi = float(best_rsi_cfg['final_pnl'])
+    cnt_rsi = int(best_rsi_cfg['trade_count'])
+    win_rsi = float(best_rsi_cfg['win_rate'])
+
+    discord.print_log(f"\n📊 【基本戦略二本立て 最適化結果直接比較】 ({symbol})")
+    discord.print_log(
+        f"🔹 [VAL_POC ({best_vp_cfg['interval']}m/MP{best_vp_cfg['mp_period']}/B{best_vp_cfg['num_bins']}/VA{best_vp_cfg['va']}/{best_vp_cfg['ma_type']}_{best_vp_cfg['condition']})]: "
+        f"純利益 = {pnl_vp:+.2f} USDC (取引: {cnt_vp}回, 勝率: {win_vp:.1f}%)"
+    )
+    discord.print_log(
+        f"🔸 [RSIMA ({best_rsi_cfg['interval']}m/EP{int(best_rsi_cfg['l_ep'])}/CP{int(best_rsi_cfg['l_cp'])})]: "
+        f"純利益 = {pnl_rsi:+.2f} USDC (取引: {cnt_rsi}回, 勝率: {win_rsi:.1f}%)"
+    )
+
+    vp_valid = cnt_vp >= MIN_TRADES
+    rsi_valid = cnt_rsi >= MIN_TRADES
+    if rsi_valid and not vp_valid:
+        use_rsima = True
+    elif vp_valid and not rsi_valid:
+        use_rsima = False
+    else:
+        use_rsima = (pnl_rsi > pnl_vp)
+
+    if use_rsima:
+        best_strategy = "rsima"
+        best_interval = int(best_rsi_cfg['interval'])
+        best_mp = 100
+        best_margin = best_rsi_cfg.get('sl_pct', 0.05) * 100.0
+        df_chart_base = best_rsi_cfg.get('df_inv', df_5m)
+        chart_df = build_rsima3_chart_df(
+            df_chart_base, best_rsi_cfg['rsi_s'].values, best_rsi_cfg['rsi_ma_s'].values,
+            best_rsi_cfg['l_ep'], best_rsi_cfg['l_cp'], best_rsi_cfg.get('sl_pct', 0.05),
+            initial_equity=fixed_initial_equity
+        )
+        best_params = {
+            'strategy': 'rsima',
+            'interval': best_interval,
+            'mp': 100,
+            'l_ep': best_rsi_cfg['l_ep'],
+            'l_cp': best_rsi_cfg['l_cp'],
+            'sl_pct': best_rsi_cfg.get('sl_pct', 0.05),
+            'margin': best_margin,
+            'pnl': pnl_rsi,
+            'trade_count': cnt_rsi,
+            'win_rate': win_rsi,
+            'DD_max': best_rsi_cfg['DD_max'],
+            'single_pnl': best_rsi_cfg.get('single_pnl', pnl_rsi),
+            'single_trades': best_rsi_cfg.get('single_trades', cnt_rsi),
+            'single_win_rate': best_rsi_cfg.get('single_win_rate', win_rsi),
+            'chart_df': chart_df
+        }
+        s_p = best_params['single_pnl']
+        s_c = best_params['single_trades']
+        s_w = best_params['single_win_rate']
+        discord.print_log(f"🏆 [{symbol}] 採用戦略: 【RSIMA ({best_interval}m)】を動的採用！ (純利益: {pnl_rsi:+.2f} USDC [ナンピン{cnt_rsi}回/{win_rsi:.1f}%] vs シングル: {s_p:+.2f} USDC [{s_c}回/{s_w:.1f}%])")
+    else:
+        best_strategy = "val_poc"
+        best_interval = int(best_vp_cfg['interval'])
+        best_mp = int(best_vp_cfg['mp_period'])
+        best_margin = 9.0
+
+        # 最良VAL_POC設定でのチャート用DataFrameを生成
+        df_best_inv = inv_dfs.get(best_interval)
+        if df_best_inv is None:
+            df_best_inv = resample_candles(df_5m, best_interval) if best_interval > 5 else df_5m.copy()
+        df_chart = df_best_inv.copy().reset_index(drop=True)
+        c_b = df_chart['close'].astype(float).values
+        h_b = df_chart['high'].astype(float).values if 'high' in df_chart.columns else c_b
+        l_b = df_chart['low'].astype(float).values if 'low' in df_chart.columns else c_b
+        step_b = 6 if best_interval == 5 else (2 if best_interval == 15 else 1)
+        mp_b = make_market_profile_dual_va(df_chart, period=best_mp, num_bins=int(best_vp_cfg['num_bins']), step=step_b, use_decay=True)
+        val_b = mp_b['val_70'] if best_vp_cfg['va'] == '70%' else mp_b['val_80']
+        vah_b = mp_b['vah_70'] if best_vp_cfg['va'] == '70%' else mp_b['vah_80']
+        poc_b = mp_b['poc']
+        if best_vp_cfg['ma_type'] == 'SMA':
+            ma_b = df_chart['close'].astype(float).rolling(200, min_periods=1).mean().values
+        else:
+            ma_b = calc_ema(df_chart['close'].astype(float), 200).values
+        ma_r_b = np.concatenate([[True], ma_b[1:] > ma_b[:-1]])
+        if best_vp_cfg['condition'] == 'ma_rising':
+            mf_b = ma_r_b
+        elif best_vp_cfg['condition'] == 'both':
+            mf_b = (c_b >= ma_b) & ma_r_b
+        else:
+            mf_b = (c_b >= ma_b)
+        cd_b = max(10, 288 // (best_interval // 5)) if not is_1h else 24
+        sim_b = simulate_val_poc_fast(
+            c_b, h_b, l_b, val_b, vah_b, poc_b, mf_b,
+            initial_equity=fixed_initial_equity, cooldown_bars=cd_b, record_chart=True
+        )
+        df_chart['POC'] = pd.Series(poc_b).ffill().bfill().values
+        df_chart['VAH'] = pd.Series(vah_b).ffill().bfill().values
+        df_chart['VAL'] = pd.Series(val_b).ffill().bfill().values
+        df_chart['exec_buy_price'] = sim_b['exec_buy_price']
+        df_chart['exec_sell_price'] = sim_b['exec_sell_price']
+        df_chart['pnl'] = sim_b['pnl_curve']
+
+        best_params = {
+            'strategy': 'val_poc',
+            'interval': best_interval,
+            'mp': best_mp,
+            'num_bins': best_vp_cfg['num_bins'],
+            'value_area_pct': best_vp_cfg['value_area_pct'],
+            'ma_type': best_vp_cfg['ma_type'],
+            'ma_condition': best_vp_cfg['condition'],
+            'margin': 9.0,
+            'pnl': pnl_vp,
+            'trade_count': cnt_vp,
+            'win_rate': win_vp,
+            'DD_max': best_vp_cfg['DD_max'],
+            'single_pnl': best_vp_cfg.get('single_pnl', pnl_vp),
+            'single_trades': best_vp_cfg.get('single_trades', cnt_vp),
+            'single_win_rate': best_vp_cfg.get('single_win_rate', win_vp),
+            'chart_df': df_chart
+        }
+        s_p = best_params['single_pnl']
+        s_c = best_params['single_trades']
+        s_w = best_params['single_win_rate']
+        discord.print_log(f"🏆 [{symbol}] 採用戦略: 【VAL_POC ({best_interval}m)】を動的採用！ (純利益: {pnl_vp:+.2f} USDC [ナンピン{cnt_vp}回/{win_vp:.1f}%] vs シングル: {s_p:+.2f} USDC [{s_c}回/{s_w:.1f}%])")
+
+    results["_best_params_"] = best_params
+    return results, best_strategy, best_interval, best_mp, best_margin
+
+
+
+class VPTrailingManager:
+    """ボリュームプロファイル（VAL / POC / VAH）に基づく階層型リスクリワード＆ステップトレーリング管理クラス"""
+    def __init__(
+        self,
+        side: str,
+        entry_price: float,
+        fee_margin_pct: float = 0.0005,      # 手数料カバーマージン (0.05%)
+        initial_margin_pct: float = 0.0005,  # VAL/VAH 初期マージン (0.05%)
+        strategy_type: str = "range",        # 戦略タイプ ('range' または 'breakout')
+        entry_val: Optional[float] = None,   # エントリー時の VAL（固定初期SL基準）
+        entry_vah: Optional[float] = None,   # エントリー時の VAH（固定初期SL基準）
+        max_hard_sl_pct: float = 0.035,      # 最大ハードストップ率 (デフォルト3.5%に厳格制限)
+        initial_tight_sl_pct: Optional[float] = 0.020  # 初動タイトストップ率 (急落時の即死ガード: 2.0%)
+    ):
+        self.side = side.upper()
+        self.entry_price = float(entry_price)
+        self.fee_margin_pct = float(fee_margin_pct)
+        self.initial_margin_pct = float(initial_margin_pct)
+        self.strategy_type = str(strategy_type).lower()
+        self.max_hard_sl_pct = float(max_hard_sl_pct)
+        self.initial_tight_sl_pct = float(initial_tight_sl_pct) if initial_tight_sl_pct is not None else None
+        # レンジ戦略はエントリーがVAL/VAH付近なので、初期マージンを2倍に拡大
+        if self.strategy_type == "range":
+            self.initial_margin_pct = self.initial_margin_pct * 2
+        
+        self.step = 0
+        if self.strategy_type == "breakout":
+            self.step_names = {
+                0: "INITIAL(TIGHT_SL)" if self.initial_tight_sl_pct else ("INITIAL(VAL)" if self.side == "LONG" else "INITIAL(VAH)"),
+                1: "BREAKEVEN(+1R)",
+                2: "TARGET_LOCK(+2R)",
+                3: "RUNNER_TRAIL"
+            }
+        else:
+            self.step_names = {
+                0: "INITIAL",
+                1: "POC",
+                2: "VAH" if self.side == "LONG" else "VAL"
+            }
+        
+        # エントリー時のVAL/VAHに基づく初期ストップとリスク幅Rの算出（最大損失を -3.5% に厳格制限、初動タイトストップ適用）
+        if self.side == "LONG":
+            base_val = float(entry_val) if (entry_val is not None and entry_val > 0) else (self.entry_price * 0.99)
+            val_stop = base_val * (1.0 - self.initial_margin_pct)
+            hard_stop = self.entry_price * (1.0 - self.max_hard_sl_pct)
+            base_stop = max(val_stop, hard_stop)
+            if self.initial_tight_sl_pct is not None:
+                tight_stop = self.entry_price * (1.0 - self.initial_tight_sl_pct)
+                self.current_stop = max(base_stop, tight_stop)
+            else:
+                self.current_stop = base_stop
+            # 初期リスク幅 R (最低でも価格の0.5%を保証)
+            self.risk_r = max(self.entry_price - self.current_stop, self.entry_price * 0.005)
+            self.tp1 = self.entry_price + self.risk_r * 1.0       # +1.0R (建値移動ライン)
+            self.tp2 = self.entry_price + self.risk_r * 2.0       # +2.0R (目標利益到達ライン)
+            self.lock_sl = self.entry_price + self.risk_r * 1.2   # +1.2R (利益確定ロック水準)
+            self.be_price = self.entry_price * (1.0 + self.fee_margin_pct)
+        else:
+            base_vah = float(entry_vah) if (entry_vah is not None and entry_vah > 0) else (self.entry_price * 1.01)
+            vah_stop = base_vah * (1.0 + self.initial_margin_pct)
+            hard_stop = self.entry_price * (1.0 + self.max_hard_sl_pct)
+            base_stop = min(vah_stop, hard_stop)
+            if self.initial_tight_sl_pct is not None:
+                tight_stop = self.entry_price * (1.0 + self.initial_tight_sl_pct)
+                self.current_stop = min(base_stop, tight_stop)
+            else:
+                self.current_stop = base_stop
+            self.risk_r = max(self.current_stop - self.entry_price, self.entry_price * 0.005)
+            self.tp1 = self.entry_price - self.risk_r * 1.0       # +1.0R
+            self.tp2 = self.entry_price - self.risk_r * 2.0       # +2.0R
+            self.lock_sl = self.entry_price - self.risk_r * 1.2   # +1.2R
+            self.be_price = self.entry_price * (1.0 - self.fee_margin_pct)
+
+    def update(
+        self,
+        current_price: float,
+        close_price: float,
+        val: float,
+        poc: float,
+        vah: float,
+        high_price: Optional[float] = None,
+        low_price: Optional[float] = None
+    ) -> Tuple[bool, str, Dict[str, Any]]:
+        """現在の価格情報を受け取り、トレーリング撤退ラインの更新と決済判定を返却
+
+        Returns:
+            Tuple[bool, str, Dict[str, Any]]:
+                - should_close (bool): 成行クローズすべきか
+                - reason (str): クローズ理由または現状維持メッセージ
+                - info (dict): 現在のステータス情報
+        """
+        cur_px = float(current_price)
+        cls_px = float(close_price)
+        val_px = float(val)
+        poc_px = float(poc)
+        vah_px = float(vah)
+        hi_px = float(high_price) if high_price is not None else cur_px
+        lo_px = float(low_price) if low_price is not None else cur_px
+
+        if self.side == "LONG":
+            current_r = (cur_px - self.entry_price) / self.risk_r if self.risk_r > 0 else 0.0
+
+            if self.strategy_type == "breakout":
+                # ブレイクアウト戦略: 段階的リスクリワード・トレイリング
+                if hi_px >= self.tp2 or self.step >= 2:
+                    if self.step < 2:
+                        self.step = 2
+                    # 最低でも +1.2R にロック
+                    self.current_stop = max(self.current_stop, self.lock_sl, self.be_price)
+                    # さらなる上昇追従: 直下サポート(val_px または poc_px)がロックラインを上回り、かつ現在価格未満なら追従
+                    trail_candidate = max(val_px, poc_px)
+                    if trail_candidate > self.current_stop and trail_candidate < cur_px:
+                        self.step = 3
+                        self.current_stop = trail_candidate
+                elif hi_px >= self.tp1 or self.step >= 1:
+                    self.step = max(self.step, 1)
+                    self.current_stop = max(self.current_stop, self.be_price)
+                else:
+                    # +1.0R未満の間は初期VALストップを厳格維持（ノイズ・押し目を耐える）
+                    pass
+            else:
+                # レンジ戦略: 従来のPOC/VAHラチェット
+                is_profitable = cur_px >= self.be_price
+                if is_profitable:
+                    if cur_px > vah_px:
+                        self.step = 2
+                        self.current_stop = max(self.current_stop, self.be_price, vah_px)
+                    elif cur_px > poc_px or self.step >= 1:
+                        self.step = max(self.step, 1)
+                        target_sl = max(self.be_price, poc_px)
+                        self.current_stop = max(self.current_stop, target_sl)
+                else:
+                    if self.step > 0:
+                        self.current_stop = max(self.current_stop, self.be_price)
+
+            # クローズ条件（終値判定）
+            should_close = cls_px < self.current_stop
+            step_name = self.step_names.get(self.step, f"STEP_{self.step}")
+            reason = f"LONG_VP_{step_name}_BREAK" if should_close else "HOLD"
+
+        else:  # SHORT
+            current_r = (self.entry_price - cur_px) / self.risk_r if self.risk_r > 0 else 0.0
+
+            if self.strategy_type == "breakout":
+                # ブレイクアウト戦略: 段階的リスクリワード・トレイリング
+                if lo_px <= self.tp2 or self.step >= 2:
+                    if self.step < 2:
+                        self.step = 2
+                    # 最低でも +1.2R (entry - 1.2R) にロック
+                    self.current_stop = min(self.current_stop, self.lock_sl, self.be_price)
+                    # さらなる下落追従: 直上レジスタンス(vah_px または poc_px)がロックラインを下回り、かつ現在価格超なら追従
+                    trail_candidate = min(vah_px, poc_px)
+                    if trail_candidate < self.current_stop and trail_candidate > cur_px:
+                        self.step = 3
+                        self.current_stop = trail_candidate
+                elif lo_px <= self.tp1 or self.step >= 1:
+                    self.step = max(self.step, 1)
+                    self.current_stop = min(self.current_stop, self.be_price)
+                else:
+                    pass
+            else:
+                is_profitable = cur_px <= self.be_price
+                if is_profitable:
+                    if cur_px < val_px:
+                        self.step = 2
+                        self.current_stop = min(self.current_stop, self.be_price, val_px) if self.current_stop > 0 else min(self.be_price, val_px)
+                    elif cur_px < poc_px or self.step >= 1:
+                        self.step = max(self.step, 1)
+                        target_sl = min(self.be_price, poc_px)
+                        self.current_stop = min(self.current_stop, target_sl) if self.current_stop > 0 else target_sl
+                else:
+                    if self.step > 0:
+                        self.current_stop = min(self.current_stop, self.be_price) if self.current_stop > 0 else self.be_price
+
+            should_close = cls_px > self.current_stop
+            step_name = self.step_names.get(self.step, f"STEP_{self.step}")
+            reason = f"SHORT_VP_{step_name}_BREAK" if should_close else "HOLD"
+
+        info = {
+            "step": self.step,
+            "step_name": self.step_names.get(self.step, f"STEP_{self.step}"),
+            "current_stop": self.current_stop,
+            "close_price": cls_px,
+            "current_price": cur_px,
+            "current_r": current_r,
+            "risk_r": self.risk_r,
+            "tp1": self.tp1,
+            "tp2": self.tp2,
+            "lock_sl": self.lock_sl,
+            "be_price": self.be_price
+        }
+        return should_close, reason, info
+
+
+def check_5m_breakout_signal(
+    df_5m: pd.DataFrame,
+    df_1h: Optional[pd.DataFrame] = None,
+    vol_surge_threshold: float = 1.8,
+    lookback_high_bars: int = 12
+) -> Tuple[bool, str, Dict[str, Any]]:
+    """5分足データに基づくリアルタイム・ブレイクアウト判定
+
+    判定条件:
+    1. 5分足の出来高急増（直近20本の平均出来高に対して vol_surge_threshold 倍以上）
+    2. 直近レンジ高値（lookback_high_bars = 12本: 過去1時間分の最高値）突破、または 1H VAH 突破
+    3. 5分足が陽線（close > open）かつ短期モメンタム確認（EMA9 > EMA21）
+
+    Returns:
+        (is_signal: bool, reason: str, metrics: Dict[str, Any])
+    """
+    if df_5m is None or df_5m.empty or len(df_5m) < 25:
+        return False, "5M_DATA_INSUFFICIENT", {}
+
+    c = df_5m["close"].astype(float)
+    o = df_5m["open"].astype(float)
+    h = df_5m["high"].astype(float)
+    l = df_5m["low"].astype(float)
+    v = df_5m["volume"].astype(float)
+
+    curr_c = float(c.iloc[-1])
+    curr_o = float(o.iloc[-1])
+    curr_v = float(v.iloc[-1])
+
+    # 1. 出来高スパイク判定 (直近20本の平均に対して)
+    vol_ma20 = float(v.iloc[-21:-1].mean()) if len(v) >= 21 else float(v.mean())
+    vol_ratio = (curr_v / vol_ma20) if vol_ma20 > 0 else 1.0
+    has_vol_surge = vol_ratio >= vol_surge_threshold
+
+    # 2. 直近高値ブレイク判定
+    h_slice = h.iloc[-(lookback_high_bars + 1):-1]
+    recent_high = float(h_slice.max()) if len(h_slice) > 0 else curr_c
+    breaks_recent_high = curr_c > recent_high
+
+    # 1H VAH がある場合はそれも参照
+    vah_1h = None
+    breaks_vah = False
+    if df_1h is not None and not df_1h.empty and "VAH" in df_1h.columns:
+        vah_1h = float(df_1h["VAH"].iloc[-1])
+        breaks_vah = curr_c > vah_1h
+
+    # 3. 陽線判定
+    is_bullish = curr_c > curr_o
+
+    # 4. 短期EMA判定
+    ema9 = float(c.ewm(span=9, adjust=False).mean().iloc[-1])
+    ema21 = float(c.ewm(span=21, adjust=False).mean().iloc[-1])
+    ema_bullish = ema9 >= ema21
+
+    is_breakout = (breaks_recent_high or breaks_vah) and has_vol_surge and is_bullish and ema_bullish
+
+    metrics = {
+        "curr_price": curr_c,
+        "recent_high": recent_high,
+        "vah_1h": vah_1h,
+        "vol_ratio": vol_ratio,
+        "vol_ma20": vol_ma20,
+        "ema9": ema9,
+        "ema21": ema21,
+        "is_bullish": is_bullish,
+        "has_vol_surge": has_vol_surge,
+        "breaks_recent_high": breaks_recent_high,
+        "breaks_vah": breaks_vah,
+    }
+
+    if is_breakout:
+        trig_type = "VAH_AND_HIGH" if (breaks_vah and breaks_recent_high) else ("VAH" if breaks_vah else "LOCAL_HIGH")
+        reason = f"5M_BREAKOUT_{trig_type}(Vol={vol_ratio:.1f}x, Px={curr_c:.4f} > High={recent_high:.4f})"
+        return True, reason, metrics
+
+    return False, "NO_SIGNAL", metrics
+
+
+def check_5m_range_signal(
+    df_5m: pd.DataFrame,
+    df_1h: Optional[pd.DataFrame] = None,
+    vol_surge_threshold: float = 1.4,
+    val_proximity_pct: float = 0.015,
+) -> Tuple[bool, str, Dict[str, Any]]:
+    """5分足データに基づくレンジ戦略（RANGE LONG）用安値・下限反発スナイプ判定
+
+    1時間足の環境認識:
+    - 価格が 1H の VAL（出来高集中帯下限）付近、または下回る押し目ゾーンにあること (curr_c <= VAL * (1 + val_proximity_pct))
+    - レンジ上限（VAH）近辺でのロングは完全禁止 (curr_c >= VAH * 0.985 は即NG)
+
+    5分足の反発トリガー:
+    1. 陽線（close > open）
+    2. 出来高急増（直近20本平均の vol_surge_threshold 倍以上）または下ヒゲ反発（下ヒゲ長 >= 実体長 * 1.2）
+    3. 安値切り上げ（直近数本の最安値から反発して close が上回っている）
+
+    Returns:
+        (is_signal: bool, reason: str, metrics: Dict[str, Any])
+    """
+    if df_5m is None or df_5m.empty or len(df_5m) < 25:
+        return False, "5M_DATA_INSUFFICIENT", {}
+
+    c = df_5m["close"].astype(float)
+    o = df_5m["open"].astype(float)
+    h = df_5m["high"].astype(float)
+    l = df_5m["low"].astype(float)
+    v = df_5m["volume"].astype(float)
+
+    curr_c = float(c.iloc[-1])
+    curr_o = float(o.iloc[-1])
+    curr_h = float(h.iloc[-1])
+    curr_l = float(l.iloc[-1])
+    curr_v = float(v.iloc[-1])
+
+    # 1. 1時間足の環境認識
+    val_1h = None
+    vah_1h = None
+    poc_1h = None
+    in_val_zone = False
+    too_high_near_vah = False
+
+    if df_1h is not None and not df_1h.empty:
+        if "VAL" in df_1h.columns:
+            val_1h = float(df_1h["VAL"].iloc[-1])
+        if "VAH" in df_1h.columns:
+            vah_1h = float(df_1h["VAH"].iloc[-1])
+        if "POC" in df_1h.columns:
+            poc_1h = float(df_1h["POC"].iloc[-1])
+
+    if val_1h is not None and val_1h > 0:
+        # VAL から +val_proximity_pct 以内、またはそれ以下（安値圏）
+        in_val_zone = curr_c <= (val_1h * (1.0 + val_proximity_pct))
+    else:
+        # 1H VAH/VALがない場合は直近48本の5分足（4時間分）の下位25%圏を判定
+        lookback_4h = min(len(df_5m), 48)
+        l_slice = l.iloc[-lookback_4h:]
+        h_slice = h.iloc[-lookback_4h:]
+        low_4h = float(l_slice.min()) if len(l_slice) > 0 else curr_c
+        high_4h = float(h_slice.max()) if len(h_slice) > 0 else curr_c
+        rng = high_4h - low_4h
+        val_1h = low_4h + rng * 0.25
+        vah_1h = high_4h - rng * 0.25
+        in_val_zone = curr_c <= val_1h
+
+    if vah_1h is not None and vah_1h > 0:
+        # VAHから1.5%以内の高値圏はレンジ天井なので絶対にロング禁止
+        too_high_near_vah = curr_c >= (vah_1h * 0.985)
+
+    # 2. 5分足の反発判定
+    is_bullish = curr_c > curr_o
+    body = abs(curr_c - curr_o)
+    lower_wick = (curr_o - curr_l) if is_bullish else (curr_c - curr_l)
+    has_hammer_wick = (lower_wick >= body * 1.2) if body > 0 else (lower_wick > 0)
+
+    vol_ma20 = float(v.iloc[-21:-1].mean()) if len(v) >= 21 else float(v.mean())
+    vol_ratio = (curr_v / vol_ma20) if vol_ma20 > 0 else 1.0
+    has_vol_surge = vol_ratio >= vol_surge_threshold
+
+    # 直近3本の安値更新ストップ判定
+    recent_min_low = float(l.iloc[-4:-1].min()) if len(l) >= 4 else curr_l
+    holding_low = curr_c >= recent_min_low
+
+    is_range_signal = in_val_zone and (not too_high_near_vah) and is_bullish and (has_vol_surge or has_hammer_wick) and holding_low
+
+    metrics = {
+        "curr_price": curr_c,
+        "val_1h": val_1h,
+        "vah_1h": vah_1h,
+        "poc_1h": poc_1h,
+        "in_val_zone": in_val_zone,
+        "too_high_near_vah": too_high_near_vah,
+        "vol_ratio": vol_ratio,
+        "vol_ma20": vol_ma20,
+        "is_bullish": is_bullish,
+        "has_vol_surge": has_vol_surge,
+        "has_hammer_wick": has_hammer_wick,
+    }
+
+    if is_range_signal:
+        trig_type = "VAL_SURGE" if has_vol_surge else "VAL_HAMMER"
+        val_str = f"${val_1h:.4f}" if val_1h else "N/A"
+        reason = f"5M_RANGE_{trig_type}(Vol={vol_ratio:.1f}x, Px={curr_c:.4f} near VAL={val_str})"
+        return True, reason, metrics
+
+    return False, "NO_SIGNAL", metrics
+
+
+def check_1h_crossover_condition(
+    df_1h: Optional[pd.DataFrame],
+    curr_price: float,
+    strategy_type: str = "breakout",
+    val_proximity_pct: float = 0.015
+) -> Tuple[bool, str, Dict[str, Any]]:
+    """1時間足の出来高プロファイル（VAL / VAH）に対するクロスオーバー判定
+
+    - RANGE戦略: VALクロスオーバー（直近足がVAL以下から、現在価格がVAL以上へ反発上抜け）
+      ※ レンジ上限（VAH）近辺（VAH * 0.985以上）での天井買いは100%ブロック。
+    - BREAKOUT戦略: VAHクロスオーバー（直近足がVAH以下から、現在価格がVAHを上抜けブレイク）
+    """
+    if df_1h is None or df_1h.empty or len(df_1h) < 2:
+        return False, "1H_DATA_INSUFFICIENT", {}
+
+    val_1h = float(df_1h["VAL"].iloc[-1]) if "VAL" in df_1h.columns else None
+    vah_1h = float(df_1h["VAH"].iloc[-1]) if "VAH" in df_1h.columns else None
+    poc_1h = float(df_1h["POC"].iloc[-1]) if "POC" in df_1h.columns else None
+
+    # 直近足（確定前足）
+    prev_c = float(df_1h["close"].iloc[-2]) if len(df_1h) >= 2 else curr_price
+    prev_l = float(df_1h["low"].iloc[-2]) if len(df_1h) >= 2 else curr_price
+    prev_h = float(df_1h["high"].iloc[-2]) if len(df_1h) >= 2 else curr_price
+
+    strat = str(strategy_type).lower().strip()
+    metrics = {
+        "val_1h": val_1h, "vah_1h": vah_1h, "poc_1h": poc_1h,
+        "curr_price": curr_price, "prev_close": prev_c, "prev_low": prev_l
+    }
+
+    if "range" in strat:
+        if val_1h is None:
+            return False, "RANGE_NO_VAL", metrics
+        # 天井ブロック: VAH近辺でのロングは完全禁止
+        if vah_1h is not None and curr_price >= (vah_1h * 0.985):
+            return False, "RANGE_BLOCK_NEAR_VAH_CEILING", metrics
+
+        # VALクロスオーバー判定: 直近足の安値/終値がVAL以下、かつ現在価格がVAL以上（反発）
+        is_val_rebound = (prev_l <= val_1h * (1.0 + val_proximity_pct)) and (curr_price >= val_1h * 0.998)
+        # またはVAL直下〜直上（+1.5%以内）の下限ゾーンで推移
+        is_in_val_zone = (curr_price <= val_1h * (1.0 + val_proximity_pct)) and (curr_price >= val_1h * 0.97)
+
+        if is_val_rebound or is_in_val_zone:
+            reason = f"1H_RANGE_VAL_CROSSOVER(Px={curr_price:.4f} >= VAL={val_1h:.4f}, PrevLow={prev_l:.4f})"
+            return True, reason, metrics
+        return False, "RANGE_NOT_AT_VAL", metrics
+
+    else:
+        # BREAKOUT戦略
+        if vah_1h is None:
+            return False, "BREAKOUT_NO_VAH", metrics
+        # VAHクロスオーバー判定: 直近足がVAH以下、かつ現在価格がVAHを突破
+        is_vah_breakout = (prev_c <= vah_1h * 1.002) and (curr_price > vah_1h)
+        # または直近高値更新
+        recent_1h_high = float(df_1h["high"].iloc[-13:-1].max()) if len(df_1h) >= 13 else vah_1h
+        is_high_breakout = (prev_c <= recent_1h_high) and (curr_price > recent_1h_high)
+
+        if is_vah_breakout or is_high_breakout:
+            reason = f"1H_BREAKOUT_VAH_CROSSOVER(Px={curr_price:.4f} > VAH={vah_1h:.4f})"
+            return True, reason, metrics
+        return False, "BREAKOUT_NOT_AT_VAH", metrics
+
+
+def check_5m_momentum_trigger(
+    df_5m: pd.DataFrame,
+    vol_surge_threshold: float = 1.0,
+    check_oi: bool = True
+) -> Tuple[bool, str, Dict[str, Any]]:
+    """5分足データに基づく勢い（モメンタム・流動性）の確認トリガー
+
+    判定条件:
+    1. 5分足が陽線 (close > open)
+    2. 出来高が直近20本平均以上 (vol >= vol_ma20 * vol_surge_threshold)
+    3. 短期モメンタム確認 (EMA9 >= EMA21 または 直近高値更新)
+    4. OI（Open Interest）の増加（データが存在する場合）
+    """
+    if df_5m is None or df_5m.empty or len(df_5m) < 20:
+        return False, "5M_DATA_INSUFFICIENT", {}
+
+    c = df_5m["close"].astype(float)
+    o = df_5m["open"].astype(float)
+    h = df_5m["high"].astype(float)
+    l = df_5m["low"].astype(float)
+    v = df_5m["volume"].astype(float)
+
+    curr_c = float(c.iloc[-1])
+    curr_o = float(o.iloc[-1])
+    curr_v = float(v.iloc[-1])
+
+    is_bullish = curr_c > curr_o
+
+    vol_ma20 = float(v.iloc[-21:-1].mean()) if len(v) >= 21 else float(v.mean())
+    vol_ratio = (curr_v / vol_ma20) if vol_ma20 > 0 else 1.0
+    has_vol = vol_ratio >= vol_surge_threshold
+
+    ema9 = float(c.ewm(span=9, adjust=False).mean().iloc[-1])
+    ema21 = float(c.ewm(span=21, adjust=False).mean().iloc[-1])
+    ema_bullish = ema9 >= ema21
+
+    # 直近3本の高値更新
+    recent_high_3 = float(h.iloc[-4:-1].max()) if len(h) >= 4 else curr_c
+    making_higher_high = curr_c >= recent_high_3 * 0.999
+
+    # OI判定（カラムがある場合）
+    oi_bullish = True
+    oi_col = next((col for col in ["openInterest", "open_interest", "oi"] if col in df_5m.columns), None)
+    if check_oi and oi_col:
+        try:
+            curr_oi = float(df_5m[oi_col].iloc[-1])
+            prev_oi = float(df_5m[oi_col].iloc[-2]) if len(df_5m) >= 2 else curr_oi
+            if curr_oi < prev_oi * 0.999:
+                oi_bullish = False  # OI減少（買い手の撤退）ならブロック
+        except Exception:
+            pass
+
+    has_momentum = is_bullish and has_vol and (ema_bullish or making_higher_high) and oi_bullish
+
+    metrics = {
+        "curr_price": curr_c,
+        "is_bullish": is_bullish,
+        "vol_ratio": vol_ratio,
+        "vol_ma20": vol_ma20,
+        "ema_bullish": ema_bullish,
+        "making_higher_high": making_higher_high,
+        "oi_bullish": oi_bullish
+    }
+
+    if has_momentum:
+        reason = f"5M_MOMENTUM_CONFIRMED(Vol={vol_ratio:.1f}x, BullishCandle, EMA={ema_bullish})"
+        return True, reason, metrics
+
+    return False, "5M_LACKS_MOMENTUM", metrics
+
+
+def check_mtf_execution_signal(
+    df_5m: pd.DataFrame,
+    df_1h: Optional[pd.DataFrame],
+    strategy_type: str = "breakout",
+    vol_surge_threshold: float = 1.0
+) -> Tuple[bool, str, Dict[str, Any]]:
+    """1時間足クロスオーバー（大前提）× 5分足勢い確認（執行トリガー）の統合判定"""
+    if df_5m is None or df_5m.empty:
+        return False, "NO_5M_DATA", {}
+
+    curr_px = float(df_5m["close"].iloc[-1])
+
+    # 1. 1時間足の節目クロスオーバー判定
+    is_1h_crossover, reason_1h, metrics_1h = check_1h_crossover_condition(
+        df_1h=df_1h, curr_price=curr_px, strategy_type=strategy_type
+    )
+    if not is_1h_crossover:
+        return False, reason_1h, metrics_1h
+
+    # 2. 5分足の勢い確認トリガー
+    is_5m_momentum, reason_5m, metrics_5m = check_5m_momentum_trigger(
+        df_5m=df_5m, vol_surge_threshold=vol_surge_threshold
+    )
+    if not is_5m_momentum:
+        return False, f"{reason_1h} BUT {reason_5m}", {**metrics_1h, **metrics_5m}
+
+    strat_upper = str(strategy_type).upper()
+    full_reason = f"MTF_{strat_upper}_SNIPE: {reason_1h} & {reason_5m}"
+    combined_metrics = {**metrics_1h, **metrics_5m, "curr_price": curr_px}
+    return True, full_reason, combined_metrics
+
+
+def check_5m_fast_exit_condition(
+    df_5m: pd.DataFrame,
+    df_1h: Optional[pd.DataFrame],
+    curr_price: float,
+    entry_price: float,
+    strategy_type: str = "breakout",
+    current_stop_price: Optional[float] = None
+) -> Tuple[bool, str, Dict[str, Any]]:
+    """5分足データに基づく急落・早期クローズ判定（下げの勢いが強い時の即時終了）
+
+    判定条件:
+    1. 防衛ライン（BREAKOUT: VAH割れ / RANGE: VAL割れまたはPOC達成後のPOC割れ / またはTrailing Stop割れ）
+    2. 5分足で下げの勢いが強い:
+       - 5分足が陰線 (close < open)
+       - かつ 出来高急増（直近20本平均の 1.2倍以上の売り浴びせ）
+       - または 大陰線（実体長が直近平均レンジの1.2倍以上）
+
+    Returns:
+        (should_exit: bool, reason: str, metrics: Dict[str, Any])
+    """
+    if df_5m is None or df_5m.empty or len(df_5m) < 10:
+        return False, "5M_DATA_INSUFFICIENT", {}
+
+    c = df_5m["close"].astype(float)
+    o = df_5m["open"].astype(float)
+    v = df_5m["volume"].astype(float)
+
+    curr_c = float(c.iloc[-1])
+    curr_o = float(o.iloc[-1])
+    curr_v = float(v.iloc[-1])
+
+    # 1. 防衛ラインの特定
+    val_1h = float(df_1h["VAL"].iloc[-1]) if (df_1h is not None and not df_1h.empty and "VAL" in df_1h.columns) else None
+    vah_1h = float(df_1h["VAH"].iloc[-1]) if (df_1h is not None and not df_1h.empty and "VAH" in df_1h.columns) else None
+    poc_1h = float(df_1h["POC"].iloc[-1]) if (df_1h is not None and not df_1h.empty and "POC" in df_1h.columns) else None
+
+    strat = str(strategy_type).lower().strip()
+    defense_line = None
+    line_name = "TRAILING_STOP"
+
+    if "breakout" in strat and vah_1h is not None:
+        # ブレイクアウト銘柄: VAHそのものではなく、健全な押し目（リテスト）を許容するバッファ（-0.8%）を付与して早漏損切りを防止
+        defense_line = vah_1h * 0.992
+        line_name = "VAH_DEFENSE(BUFFERED)"
+    elif "range" in strat:
+        if poc_1h is not None and curr_price > poc_1h:
+            defense_line = poc_1h * 0.995
+            line_name = "POC_DEFENSE"
+        elif val_1h is not None:
+            defense_line = val_1h * 0.992
+            line_name = "VAL_DEFENSE"
+
+    if current_stop_price is not None and current_stop_price > 0:
+        if defense_line is None or current_stop_price > defense_line:
+            defense_line = current_stop_price
+            line_name = "TRAILING_SL_DEFENSE"
+
+    if defense_line is None:
+        defense_line = entry_price * 0.98  # フォールバック: -2.0%
+
+    # 防衛ラインを下回っているか（クロスアンダー）
+    is_under_defense = curr_c < defense_line
+
+    # 2. 5分足の下げの勢い判定（通常ノイズを除外し、明確な売り浴びせのみ検知して利確を伸ばす）
+    is_bearish = curr_c < curr_o
+    body = abs(curr_c - curr_o)
+    vol_ma20 = float(v.iloc[-21:-1].mean()) if len(v) >= 21 else float(v.mean())
+    vol_ratio = (curr_v / vol_ma20) if vol_ma20 > 0 else 1.0
+    # 出来高比率を 1.2倍 -> 2.0倍 に引き上げ（明確な売り浴びせのみ検知）
+    has_heavy_sell_vol = vol_ratio >= 2.0
+
+    # 平均レンジ（直近10本の実体）
+    recent_bodies = (c.iloc[-11:-1] - o.iloc[-11:-1]).abs()
+    avg_body = float(recent_bodies.mean()) if len(recent_bodies) > 0 else body
+    # 大陰線判定を 1.2倍 -> 1.8倍 に引き上げ
+    is_large_red = is_bearish and (body >= avg_body * 1.8)
+
+    strong_downward_momentum = is_bearish and (has_heavy_sell_vol or is_large_red)
+
+    # さらに確認に確認を重ねる: 直前の確定5分足（iloc[-2]）も陰線または高値切り下げ傾向であることを確認
+    prev_weak = (float(c.iloc[-2]) <= float(o.iloc[-2])) if len(c) >= 2 else True
+    should_exit = is_under_defense and strong_downward_momentum and prev_weak
+
+    metrics = {
+        "curr_price": curr_c,
+        "defense_line": defense_line,
+        "line_name": line_name,
+        "is_under_defense": is_under_defense,
+        "is_bearish": is_bearish,
+        "vol_ratio": vol_ratio,
+        "has_heavy_sell_vol": has_heavy_sell_vol,
+        "is_large_red": is_large_red,
+    }
+
+    if should_exit:
+        reason = f"5M_FAST_EXIT: {line_name}割れ (${curr_c:.4f} < ${defense_line:.4f}) ＋ 強い下げ勢い(Vol={vol_ratio:.1f}x, 大陰線)"
+        return True, reason, metrics
+
+    return False, "HOLD_SAFE", metrics
+
+
+# 後方互換性エイリアス
+check_5m_entry_signal = check_mtf_execution_signal
+
+
+# ==============================================================================
+# 【TradingView完全移植】RSIMA3_MaxGambleMoon
+# ==============================================================================
+
+# ロット倍率 (ユーザー指示: ロット倍率撤廃、全て1倍固定)
+FIBO_LOT_MULTIPLIERS = [1] * 11
+
+def get_tv_fibo_lot(opentrades: int, base_lot: float) -> float:
+    """ナンピンロット計算（全て1倍固定）"""
+    return base_lot * 1.0
+
+
+def get_tv_add_pct(position_count: int, pct1: float = 0.004, pct2: float = 0.006, pct3: float = 0.008, pct4: float = 0.010) -> float:
+    """TradingView get_add_pct(strategy.position_size) と完全一致するナンピン間隔（2倍化: 0.4%〜1.0%）"""
+    n = int(position_count)
+    if n <= 3:
+        return pct1  # 0.004 (0.4%)
+    elif n <= 5:
+        return pct2  # 0.006 (0.6%)
+    elif n <= 8:
+        return pct3  # 0.008 (0.8%)
+    else:
+        return pct4  # 0.010 (1.0%)
+
+
+def calc_rsi(series: pd.Series, period: int = 9) -> pd.Series:
+    """TradingView ta.rsi(close, 9) と完全一致する Wilder's Smoothing RSI
+    
+    TradingViewの実装:
+    up = ta.rma(math.max(ta.change(src), 0), len)
+    down = ta.rma(-math.min(ta.change(src), 0), len)
+    rsi = down == 0 ? 100 : up == 0 ? 0 : 100 - (100 / (1 + up / down))
+    """
+    delta = series.diff()
+    gain = delta.clip(lower=0.0)
+    loss = -delta.clip(upper=0.0)
+
+    # ta.rma は alpha = 1 / period の 指数平滑化
+    avg_gain = gain.ewm(alpha=1.0 / period, min_periods=period, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1.0 / period, min_periods=period, adjust=False).mean()
+
+    # ゼロ除算対策
+    rs = avg_gain / avg_loss.replace(0.0, np.nan)
+    rsi = 100.0 - (100.0 / (1.0 + rs))
+
+    # down == 0 ? 100 : up == 0 ? 0
+    rsi = rsi.where(avg_loss > 0.0, 100.0)
+    rsi = rsi.where(avg_gain > 0.0, 0.0)
+    return rsi.fillna(50.0)
+
+
+def calc_rsi_ema(
+    series: pd.Series,
+    rsi_period: int = 9,
+    ma_period: int = 7
+) -> Tuple[pd.Series, pd.Series]:
+    """TradingView lrsiMA = ma(rsi, 7, 'EMA') と完全一致する RSI & RSI-EMA"""
+    rsi = calc_rsi(series, period=rsi_period)
+    lrsi_ma = rsi.ewm(span=ma_period, adjust=False).mean()
+    return rsi, lrsi_ma
+
+
+def check_rsima3_signals(
+    df_5m: pd.DataFrame,
+    current_pos_qty: float,
+    current_trades_count: int,
+    avg_entry_price: float,
+    current_price: float,
+    rsi_len: int = 9,
+    ema_len: int = 7,
+    l_ep: float = 40.0,
+    l_cp: float = 60.0,
+    sl_pct: float = 0.090,
+    max_trades: int = 3,
+    last_entry_price: Optional[float] = None,
+    val_price: Optional[float] = None,
+    vah_price: Optional[float] = None,
+    is_emergency_breakeven: bool = False
+) -> Dict[str, Any]:
+    """TradingView『RSIMA3_MaxGambleMoon』の完全移植判定 (新仕様最適化完全連動)
+    
+    Returns:
+        dict:
+            action: 'INITIAL_ENTRY' | 'ADD_ENTRY' | 'CLOSE_ALL' | 'STOP_LOSS' | 'HOLD' | 'NONE'
+            reason: str
+            lot_multiplier: float
+            metrics: dict
+    """
+    if df_5m is None or df_5m.empty or len(df_5m) < rsi_len + ema_len + 5:
+        return {"action": "NONE", "reason": "5M_DATA_INSUFFICIENT", "lot_multiplier": 1.0, "metrics": {}}
+
+    c = df_5m["close"].astype(float)
+    rsi, lrsi_ma = calc_rsi_ema(c, rsi_period=rsi_len, ma_period=ema_len)
+
+    curr_rsi = float(rsi.iloc[-1])
+    prev_rsi = float(rsi.iloc[-2])
+    curr_ma = float(lrsi_ma.iloc[-1])
+    prev_ma = float(lrsi_ma.iloc[-2])
+
+    prev_close = float(c.iloc[-2]) if len(c) >= 2 else current_price
+
+    # 1. ゴールデンクロス判定: LE = ta.crossover(rsi, lrsiMA)
+    is_crossover_curr = (curr_rsi > curr_ma) and (prev_rsi <= prev_ma)
+    prev2_rsi = float(rsi.iloc[-3]) if len(rsi) >= 3 else prev_rsi
+    prev2_ma = float(lrsi_ma.iloc[-3]) if len(lrsi_ma) >= 3 else prev_ma
+    is_crossover_prev = (prev_rsi > prev_ma) and (prev2_rsi <= prev2_ma) and (curr_rsi >= curr_ma)
+
+    LE = is_crossover_curr or is_crossover_prev
+
+    # 2. 水準判定: LC = lrsiMA < lEp and strategy.opentrades < op_len (最大3枠: 初期1本+ナンピン2回)
+    LC = (curr_ma < l_ep or prev_ma < l_ep) and (current_trades_count < max_trades)
+
+    lpo = (current_pos_qty > 0)
+    poz = (current_pos_qty <= 0)
+
+    # ナンピン幅判定 (ユーザー新指示: 直近の約定価格から (VAH - VAL) * 0.60 以上下落)
+    last_ep = last_entry_price if (last_entry_price is not None and last_entry_price > 0) else avg_entry_price
+    if val_price is not None and vah_price is not None and vah_price > val_price and last_ep > 0:
+        va_dip_req = (vah_price - val_price) * 0.60
+        longadd = (prev_close <= last_ep - va_dip_req) or (current_price <= last_ep - va_dip_req)
+        # 利確用の add_pct (+0.4%〜+1.0%) とナンピン幅を分離
+        tp_add_pct = get_tv_add_pct(max(current_trades_count, 1))
+    else:
+        va_dip_req = last_ep * 0.010 if last_ep > 0 else 0.0
+        tp_add_pct = get_tv_add_pct(max(current_trades_count, 1))
+        longadd = (prev_close < avg_entry_price * (1.0 - tp_add_pct)) if (avg_entry_price > 0 and lpo) else True
+
+    # shortadd = avg_price ? close[1] > strategy.position_avg_price * (1 + addPct) : true
+    shortadd = (prev_close > avg_entry_price * (1.0 + tp_add_pct)) if (avg_entry_price > 0 and lpo) else False
+    shortadd_realtime = (current_price > avg_entry_price * (1.0 + tp_add_pct)) if (avg_entry_price > 0 and lpo) else False
+
+    # LRS = rsi > lCp (rsi > 60)
+    LRS = (curr_rsi > l_cp)
+
+    # base_long_exit = avg_price ? LRS and shortadd : LRS
+    base_long_exit = LRS and (shortadd or shortadd_realtime)
+
+    metrics = {
+        "curr_price": current_price,
+        "prev_close": prev_close,
+        "avg_entry_price": avg_entry_price,
+        "last_entry_price": last_ep,
+        "tp_add_pct": tp_add_pct,
+        "va_dip_req": va_dip_req,
+        "rsi": curr_rsi,
+        "lrsi_ma": curr_ma,
+        "prev_rsi": prev_rsi,
+        "prev_ma": prev_ma,
+        "LE": LE,
+        "LC": LC,
+        "opentrades": current_trades_count,
+        "longadd": longadd,
+        "shortadd": shortadd or shortadd_realtime,
+        "LRS": LRS,
+        "is_emergency_breakeven": is_emergency_breakeven,
+    }
+
+    # === [0] 損切り判定 (最終建値から (VAH - VAL) * 0.60 割れ / 最大枠到達後) ===
+    # PROJECT_RULES: 最終建値から (VAH - VAL) * 0.60 割れ (確定足終値判定) で全決済し、24時間クールダウン発動
+    if lpo and current_trades_count >= max_trades and last_ep > 0:
+        sl_price = last_ep - va_dip_req if va_dip_req > 0 else (avg_entry_price * (1.0 - sl_pct))
+        if current_price < sl_price or prev_close < sl_price:
+            loss_pct = (current_price - avg_entry_price) / avg_entry_price if avg_entry_price > 0 else 0.0
+            reason = f"RSIMA3_STOP_LOSS: 価格(${current_price:.4f}) < 最終建値-VA60%SL(${sl_price:.4f}, 損失{loss_pct:.2%})"
+            return {"action": "STOP_LOSS", "reason": reason, "lot_multiplier": 1.0, "metrics": metrics}
+
+    # === [1-0] 地合い悪化時の緊急建値撤退判定 (全体地合い非BUY時: 平均建値 +0.20% で早期撤退) ===
+    if lpo and is_emergency_breakeven and avg_entry_price > 0:
+        breakeven_target = avg_entry_price * 1.0020  # +0.20% (往復手数料+スリップ考慮で確実にプラス)
+        if current_price >= breakeven_target or prev_close >= breakeven_target:
+            pnl_pct = (current_price - avg_entry_price) / avg_entry_price
+            reason = f"RSIMA3_EMERGENCY_BREAKEVEN_TP: 地合い悪化(非BUY)に伴う緊急建値撤退 (目標: ${breakeven_target:.4f}, PnL: {pnl_pct:+.2%})"
+            return {"action": "CLOSE_ALL", "reason": reason, "lot_multiplier": 1.0, "metrics": metrics}
+
+    # === [1] エグジット判定 (一括利確: strategy.close_all) ===
+    # ロング保有中に、RSI > l_cp かつ 平均建値から +tp_add_pct 以上で全決済
+    if lpo and base_long_exit:
+        pnl_pct = (current_price - avg_entry_price) / avg_entry_price if avg_entry_price > 0 else 0.0
+        reason = f"RSIMA3_NORMAL_TP: RSI({curr_rsi:.1f} > {l_cp:.0f}) & PnL(+{pnl_pct:.2%} >= +{tp_add_pct:.2%})"
+        return {"action": "CLOSE_ALL", "reason": reason, "lot_multiplier": 1.0, "metrics": metrics}
+
+    # === [2] 新規エントリー判定 (if LE and LC and poz) ===
+    if poz and LE and LC:
+        lot_m = 1.0  # 全部1倍 (ユーザー指示: ロット倍率撤廃)
+        reason = f"RSIMA3_INITIAL_ENTRY: GC(RSI={curr_rsi:.1f} > MA={curr_ma:.1f} < {l_ep:.0f})"
+        return {"action": "INITIAL_ENTRY", "reason": reason, "lot_multiplier": float(lot_m), "metrics": metrics}
+
+    # === [3] ナンピン追加エントリー判定 (if LE and LC and lpo and longadd) ===
+    # 地合い悪化時 (is_emergency_breakeven=True) は追加ナンピンを即時凍結 (ADD禁止)
+    if lpo and not is_emergency_breakeven and LE and LC and longadd and (current_trades_count < max_trades):
+        lot_m = 1.0  # 全部1倍 (ユーザー指示: ロット倍率撤廃)
+        diff_pct = (current_price - last_ep) / last_ep if last_ep > 0 else 0.0
+        dip_target_pct = (va_dip_req / last_ep) if last_ep > 0 else tp_add_pct
+        reason = f"RSIMA3_ADD_ENTRY (Trade #{current_trades_count+1}, 1x): GC & Dip({diff_pct:.2%} <= -{dip_target_pct:.2%})"
+        return {"action": "ADD_ENTRY", "reason": reason, "lot_multiplier": float(lot_m), "metrics": metrics}
+
+    if lpo:
+        return {"action": "HOLD", "reason": "RSIMA3_HOLD", "lot_multiplier": 1.0, "metrics": metrics}
+
+    return {"action": "NONE", "reason": "RSIMA3_WAIT", "lot_multiplier": 1.0, "metrics": metrics}
+
+
+# 後方互換性エイリアス
+def check_5m_rsi_scalp_entry(df_5m, rsi_period=9, ma_period=7, max_rsima_threshold=40.0):
+    sig = check_rsima3_signals(df_5m, current_pos_qty=0.0, current_trades_count=0, avg_entry_price=0.0, current_price=float(df_5m["close"].iloc[-1]) if df_5m is not None and not df_5m.empty else 0.0, rsi_len=rsi_period, ema_len=ma_period, l_ep=max_rsima_threshold)
+    is_ok = sig["action"] == "INITIAL_ENTRY"
+    return is_ok, sig["reason"], sig["metrics"]
+
+def check_5m_rsi_scalp_exit(df_5m, curr_price, entry_price, rsi_period=9, ma_period=7, min_rsi_exit=60.0):
+    sig = check_rsima3_signals(df_5m, current_pos_qty=1.0, current_trades_count=1, avg_entry_price=entry_price, current_price=curr_price, rsi_len=rsi_period, ema_len=ma_period, l_cp=min_rsi_exit)
+    is_exit = sig["action"] == "CLOSE_ALL"
+    return is_exit, sig["reason"], sig["metrics"]
+
+
+# ==============================================================================
+# 【BingX実証黄金最適化】ボリュームプロファイル VAL_POC ＋ EMA 200 戦略
+# ==============================================================================
+
+def check_val_poc_signals(
+    df_5m: pd.DataFrame,
+    current_pos_qty: float,
+    current_trades_count: int,
+    avg_entry_price: float,
+    last_entry_price: float,
+    current_price: float,
+    vp_period: int = 150,
+    num_bins: int = 50,
+    value_area_pct: float = 0.70,
+    ma_type: str = "EMA",
+    ma_condition: str = "close_above",
+    max_trades: int = 3,
+    target_ratio: float = 0.60,
+    min_va_width: float = 0.015,
+    nanpin_drop_pct: float = 0.030,
+    sl_pct: float = 0.090,
+    is_cooldown_active: bool = False,
+    is_emergency_breakeven: bool = False,
+) -> Dict[str, Any]:
+    """VAL_POC ＋ 200期間MA (EMA/SMA) トレンドフィルター戦略 リアルタイム判定 (新仕様最適化完全連動)
+    1. エントリー: VALゴールデンクロス (クロスオーバー) ＆ 200期間MA条件 ＆ バリュー幅>=1.5% ＆ クールダウン解除済
+    2. 利確: VAL-VAH中間値50%〜最適化60%水準 (VAL + (VAH-VAL)*target_ratio, デフォルト60%) 到達かつ建値プラス域
+    3. ナンピン: 最後の建値から (VAH-VAL)*0.60 下落 (最大2回追加、初期1本＋ナンピン2回＝計3枠)
+    4. 損切り: 最終建値から (VAH-VAL)*0.60 割れ (5分足終値確定判定) ＋ 24時間クールダウン
+    5. 緊急建値撤退: 全体地合い非BUY時、平均建値+0.20%到達で即座に早期撤退 (ナンピンは即時凍結)
+    """
+    if df_5m is None or df_5m.empty or len(df_5m) < 20:
+        return {"action": "NONE", "reason": "5M_DATA_INSUFFICIENT", "lot_multiplier": 1.0, "metrics": {}}
+
+    c = df_5m["close"].astype(float)
+    h = df_5m["high"].astype(float) if "high" in df_5m.columns else c
+    l = df_5m["low"].astype(float) if "low" in df_5m.columns else c
+
+    # 1. 200期間 MA (EMA または SMA) 算出
+    if str(ma_type).upper() == "SMA":
+        ma200 = c.rolling(200, min_periods=1).mean()
+    else:
+        ma200 = calc_ema(c, 200)
+    curr_ma200 = float(ma200.iloc[-1])
+    prev_ma200 = float(ma200.iloc[-2]) if len(ma200) >= 2 else curr_ma200
+
+    # 2. Market Profile 算出 (VAL, VAH, POC: リアルタイム監視では直近2本のみ算出して高速化)
+    if "VAL" not in df_5m.columns or "POC" not in df_5m.columns or "VAH" not in df_5m.columns or df_5m["VAL"].isna().all():
+        logic = logicinstance()
+        df_mp = logic.make_market_profile(df_5m, period=vp_period, num_bins=num_bins, value_area_pct=value_area_pct, tail_only=2)
+        val_s = df_mp["VAL"]
+        vah_s = df_mp["VAH"]
+        poc_s = df_mp["POC"]
+    else:
+        val_s = df_5m["VAL"]
+        vah_s = df_5m["VAH"]
+        poc_s = df_5m["POC"]
+
+    curr_val = float(val_s.iloc[-1])
+    prev_val = float(val_s.iloc[-2]) if len(val_s) >= 2 else curr_val
+    curr_vah = float(vah_s.iloc[-1])
+    curr_poc = float(poc_s.iloc[-1])
+
+    curr_c = float(c.iloc[-1])
+    prev_c = float(c.iloc[-2]) if len(c) >= 2 else curr_c
+    curr_h = float(h.iloc[-1])
+    curr_l = float(l.iloc[-1])
+
+    va_width_pct = ((curr_vah - curr_val) / curr_val) if curr_val > 0 else 0.0
+    val_gc = (prev_c <= prev_val) and (curr_c > curr_val)
+
+    # トレンド条件判定: close_above / ma_rising / both
+    cond = str(ma_condition).lower()
+    if cond == "ma_rising":
+        trend_ok = (curr_ma200 > prev_ma200)
+    elif cond == "both":
+        trend_ok = (curr_c >= curr_ma200) and (curr_ma200 > prev_ma200)
+    else:  # "close_above" (デフォルト)
+        trend_ok = (curr_c >= curr_ma200) if not np.isnan(curr_ma200) else True
+
+    # 利確目標価格: VAL + (VAH - VAL) * 0.60
+    va_diff = (curr_vah - curr_val) if (curr_vah > curr_val and curr_val > 0) else 0.0
+    va_spacing = va_diff * target_ratio if va_diff > 0 else 0.0
+    target_tp = curr_val + va_spacing if va_spacing > 0 else curr_poc
+
+    ref_last_px = last_entry_price if last_entry_price > 0 else avg_entry_price
+    # 安全下限ガード (最低 1.0%)
+    drop_dist = max(ref_last_px * 0.010, va_spacing) if (ref_last_px > 0 and va_spacing > 0) else (ref_last_px * nanpin_drop_pct)
+    # 最終建値から (VAH - VAL) * 0.60 割れ
+    sl_price = ref_last_px - drop_dist if ref_last_px > 0 else 0.0
+    nanpin_target = ref_last_px - drop_dist if ref_last_px > 0 else 0.0
+
+    lpo = (current_pos_qty > 0)
+    poz = (current_pos_qty <= 0)
+
+    metrics = {
+        "curr_price": current_price,
+        "curr_c": curr_c,
+        "prev_c": prev_c,
+        "val": curr_val,
+        "prev_val": prev_val,
+        "vah": curr_vah,
+        "poc": curr_poc,
+        "ema200": curr_ma200,
+        "ma200": curr_ma200,
+        "va_width_pct": va_width_pct,
+        "val_gc": val_gc,
+        "trend_ok": trend_ok,
+        "target_tp": target_tp,
+        "sl_price": sl_price,
+        "nanpin_target": nanpin_target,
+        "drop_dist": drop_dist,
+        "avg_entry_price": avg_entry_price,
+        "last_entry_price": last_entry_price,
+        "trades_count": current_trades_count,
+        "is_emergency_breakeven": is_emergency_breakeven,
+    }
+
+    # === [1] 損切り判定 (最終建値から (VAH - VAL) * 0.60 割れ / 確定足終値判定: 最大枠到達後) ===
+    if lpo and current_trades_count >= max_trades and ref_last_px > 0 and sl_price > 0 and curr_c <= sl_price:
+        loss_pct = (curr_c - avg_entry_price) / avg_entry_price if avg_entry_price > 0 else 0.0
+        reason = f"VAL_POC_STOP_LOSS: 終値(${curr_c:.4f}) <= 最終建値-VA60%SL(${sl_price:.4f}, 損失{loss_pct:.2%})"
+        return {"action": "STOP_LOSS", "reason": reason, "lot_multiplier": 1.0, "metrics": metrics}
+
+    # === [1-0] 地合い悪化時の緊急建値撤退判定 (全体地合い非BUY時: 平均建値 +0.20% で早期撤退) ===
+    if lpo and is_emergency_breakeven and avg_entry_price > 0:
+        breakeven_target = avg_entry_price * 1.0020  # +0.20% (往復手数料+スリップ考慮で確実にプラス)
+        if (curr_h >= breakeven_target) or (curr_c >= breakeven_target) or (current_price >= breakeven_target):
+            pnl_pct = (current_price - avg_entry_price) / avg_entry_price
+            reason = f"VAL_POC_EMERGENCY_BREAKEVEN_TP: 地合い悪化(非BUY)に伴う緊急建値撤退 (目標: ${breakeven_target:.4f}, PnL: {pnl_pct:+.2%})"
+            return {"action": "CLOSE_ALL", "reason": reason, "lot_multiplier": 1.0, "metrics": metrics}
+
+    # === [2] 利確判定 (VAL-VAH 60%水準 到達かつ建値プラス域) ===
+    if lpo and target_tp > 0:
+        is_tp_hit = (curr_h >= target_tp) or (curr_c >= target_tp) or (current_price >= target_tp)
+        is_profit = (current_price > avg_entry_price * 1.0006)
+        if is_tp_hit and is_profit:
+            pnl_pct = (current_price - avg_entry_price) / avg_entry_price if avg_entry_price > 0 else 0.0
+            reason = f"VAL_POC_60_TP: 目標(${target_tp:.4f})到達 & 建値プラス(PnL={pnl_pct:+.2%})"
+            return {"action": "CLOSE_ALL", "reason": reason, "lot_multiplier": 1.0, "metrics": metrics}
+
+    # === [3] 新規エントリー判定 (VALゴールデンクロス ＆ MA200 ＆ バリュー幅>=1.5% ＆ クールダウン解除) ===
+    if poz and not is_cooldown_active:
+        if val_gc and (va_width_pct >= min_va_width) and trend_ok:
+            reason = f"VAL_POC_INITIAL_ENTRY: VALブレイク(${curr_c:.4f} > ${curr_val:.4f}) & {ma_type}200(${curr_ma200:.4f})条件OK & 幅({va_width_pct:.1%}>=1.5%)"
+            return {"action": "INITIAL_ENTRY", "reason": reason, "lot_multiplier": 1.0, "metrics": metrics}
+
+    # === [4] ナンピン判定 (最終建値から (VAH - VAL) * 0.60 下落、最大2回追加 = 計3枠) ===
+    # 地合い悪化時 (is_emergency_breakeven=True) は追加ナンピンを即時凍結 (ADD禁止)
+    if lpo and not is_emergency_breakeven and (1 <= current_trades_count < max_trades) and ref_last_px > 0 and nanpin_target > 0:
+        if (curr_c <= nanpin_target) or (curr_l <= nanpin_target) or (current_price <= nanpin_target):
+            drop_pct = (current_price - ref_last_px) / ref_last_px
+            va_pct_drop = (drop_dist / ref_last_px) * 100.0
+            reason = f"VAL_POC_ADD_ENTRY (Trade #{current_trades_count+1}, 1x): 最終建値(${ref_last_px:.4f})からVA60%下落({drop_pct:.2%} <= -{va_pct_drop:.1f}%)"
+            return {"action": "ADD_ENTRY", "reason": reason, "lot_multiplier": 1.0, "metrics": metrics}
+
+    if lpo:
+        return {"action": "HOLD", "reason": "VAL_POC_HOLD", "lot_multiplier": 1.0, "metrics": metrics}
+
+    return {"action": "NONE", "reason": "VAL_POC_WAIT", "lot_multiplier": 1.0, "metrics": metrics}
+
+
+def simulate_rsima3_strategy(
     df: pd.DataFrame,
     rsi_len: int = 9,
-    lma_len: int = 7,
-    lEp: float = 40.0,
-    lCp: float = 70.0,
+    ema_len: int = 7,
+    l_ep: float = 40.0,
+    l_cp: float = 60.0,
     max_trades: int = 5,
     initial_equity: float = 100.0,
+    sl_pct: float = 0.090,
     fee_rate: float = 0.0006,
-    callback_pct: float = 0.015,
-    sl_pct: float = 0.030
 ) -> dict:
+    """
+    RSIMA3 モメンタムスキャルピング戦略 (LONG ONLY) バックテストシミュレーション (PROJECT_RULES 第3項準拠)
+    - エントリー: RSI(9)が RSI-EMA(7)を下から上にゴールデンクロス かつ 水準 < 40
+    - ナンピン: 保有中かつ最大5枠未満、再度GCかつ水準<40、前足終値が平均建値から -addPct(0.4%〜0.6%)下落
+    - 利確: RSI > 60 かつ 平均建値から +addPct(0.4%〜1.0%)以上プラス浮上で全保有数量を一括成行決済
+    - 損切り: 平均建値から -9.0% (終値確定判定) ＋ 24時間クールダウン
+    """
+    if df is None or df.empty or len(df) < rsi_len + ema_len + 10:
+        return {"final_pnl": 0.0, "trade_count": 0, "win_rate": 0.0, "DD_max": 0.0, "max_unrealized_loss": 0.0, "strategy": "rsima"}
+
     closes = df["close"].values
     highs = df["high"].values if "high" in df.columns else closes
     lows = df["low"].values if "low" in df.columns else closes
-    vahs = df["VAH"].values if "VAH" in df.columns else None
     n = len(closes)
-    if n < max(rsi_len, lma_len) + 5:
-        return {"final_pnl": 0.0, "trade_count": 0, "win_rate": 0.0, "DD_max": 0.0, "max_unrealized_loss": 0.0}
 
-    close_s = pd.Series(closes)
-    rsi_s = calc_rsi(close_s, rsi_len)
-    lrsiMA_s = calc_ema(rsi_s, lma_len)
-    
-    rsi = rsi_s.values
-    lrsiMA = lrsiMA_s.values
-    
+    rsi, lrsi_ma = calc_rsi_ema(df["close"].astype(float), rsi_period=rsi_len, ma_period=ema_len)
+    rsi_vals = rsi.values
+    ma_vals = lrsi_ma.values
+
+    total_max_stages = max_trades
+    trade_size_usdt = initial_equity / total_max_stages
+
     pos_qty = 0.0
     pos_cost = 0.0
     avg_price = 0.0
     pos_count = 0
-    
-    pending_entry = None  # PROJECT_RULES準拠: 終値-0.1%指値待機用
-    maker_fee_rate = 0.0002  # Maker指値手数料 0.02%
-    
-    trailing_tp_active = False
-    trail_peak = 0.0
+    last_entry_price = 0.0
+    sl_cooldown_until = -1
+
+    pending_entry = None
+    maker_fee_rate = 0.0002
 
     cum_realized_pnl = 0.0
     cum_fees = 0.0
@@ -2213,23 +3479,19 @@ def simulate_rsima_strategy(
     equity_curve = [initial_equity]
     unrealized_list = [0.0]
     exec_history = []
-    
-    trade_size_usdt = initial_equity / max_trades
-    
-    for i in range(1, n):
+
+    for i in range(2, n):
         c = closes[i]
         h = highs[i]
         l = lows[i]
-        r = rsi[i]
-        r_prev = rsi[i-1]
-        ma_val = lrsiMA[i]
-        ma_prev = lrsiMA[i-1]
+        curr_rsi = rsi_vals[i]
+        prev_rsi = rsi_vals[i-1]
+        curr_ma = ma_vals[i]
+        prev_ma = ma_vals[i-1]
+        prev_close = closes[i-1]
         ts = df["timestamp"].iloc[i] if "timestamp" in df.columns else i
-        
-        # ゴールデンクロス判定: rsi > lrsiMA かつ 前足では rsi <= lrsiMA
-        gc = (r > ma_val) and (r_prev <= ma_prev)
-        
-        # 0. 前足で配置されたエントリー指値の約定チェック (PROJECT_RULES準拠: 終値-0.1%指値 ➔ 次足安値タッチで約定)
+
+        # 0. 前足で配置されたエントリー/ナンピン指値の約定チェック
         if pending_entry is not None:
             limit_px = pending_entry["limit_price"]
             if l <= limit_px:
@@ -2240,15 +3502,15 @@ def simulate_rsima_strategy(
                 cum_fees += fee
                 pos_cost += buy_val
                 pos_qty += qty
+                last_entry_price = exec_price
                 avg_price = pos_cost / pos_qty
                 pos_count += 1
                 exec_history.append({"timestamp": ts, "price": exec_price, "size": qty, "type": pending_entry["entry_type"]})
-            # 1足で届かなければ未約定キャンセル (PROJECT_RULES準拠)
             pending_entry = None
 
-        # 1. 決済チェック (保有ポジションがある場合、確定足Closeでの成行決済)
+        # 1. 決済チェック (保有ポジションがある場合)
         if pos_qty > 0:
-            # 1. 損切り (Stop Loss) チェック: 5分確定足終値判定 (Close) -2.5%
+            # A. 損切り判定 (sl_pct)
             if sl_pct > 0 and c < avg_price * (1.0 - sl_pct):
                 sl_price = c
                 sell_val = pos_qty * sl_price
@@ -2257,82 +3519,72 @@ def simulate_rsima_strategy(
                 cum_realized_pnl += pnl
                 cum_fees += fee
                 trades.append(pnl)
-                exec_history.append({"timestamp": ts, "price": sl_price, "size": -pos_qty, "type": "STOP_LOSS", "pnl": pnl})
+                exec_history.append({"timestamp": ts, "price": sl_price, "size": -pos_qty, "type": "RSIMA_STOP_LOSS", "pnl": pnl})
                 pos_qty = 0.0
                 pos_cost = 0.0
                 avg_price = 0.0
                 pos_count = 0
-                trailing_tp_active = False
-                trail_peak = 0.0
+                last_entry_price = 0.0
+                sl_cooldown_until = i + 288
             else:
-                # 2. 利確 (Trailing Take-Profit) チェック
-                if not trailing_tp_active:
-                    if r > lCp and c > avg_price:
-                        trailing_tp_active = True
-                        trail_peak = max(c, h)
-                
-                if trailing_tp_active:
-                    trail_peak = max(trail_peak, h)
-                    vah_val = float(vahs[i]) if (vahs is not None and i < len(vahs) and not np.isnan(vahs[i])) else 0.0
-                    vah_guard = vah_val if (vah_val > 0 and trail_peak > vah_val) else 0.0
-                    trail_stop = max(trail_peak * (1.0 - callback_pct), vah_guard, avg_price * (1.0 + fee_rate))
-                    if c < trail_stop:
-                        sell_val = pos_qty * c
-                        fee = sell_val * fee_rate
-                        pnl = sell_val - pos_cost - fee
-                        cum_realized_pnl += pnl
-                        cum_fees += fee
-                        trades.append(pnl)
-                        exec_history.append({"timestamp": ts, "price": c, "size": -pos_qty, "type": "SELL", "pnl": pnl})
-                        pos_qty = 0.0
-                        pos_cost = 0.0
-                        avg_price = 0.0
-                        pos_count = 0
-                        trailing_tp_active = False
-                        trail_peak = 0.0
+                # B. 利確判定 (RSI > 60 かつ +addPct 以上浮上)
+                add_pct = get_tv_add_pct(max(pos_count, 1))
+                if curr_rsi > l_cp and c >= avg_price * (1.0 + add_pct):
+                    exit_price = c
+                    sell_val = pos_qty * exit_price
+                    fee = sell_val * fee_rate
+                    pnl = sell_val - pos_cost - fee
+                    cum_realized_pnl += pnl
+                    cum_fees += fee
+                    trades.append(pnl)
+                    exec_history.append({"timestamp": ts, "price": exit_price, "size": -pos_qty, "type": "RSIMA_TP", "pnl": pnl})
+                    pos_qty = 0.0
+                    pos_cost = 0.0
+                    avg_price = 0.0
+                    pos_count = 0
+                    last_entry_price = 0.0
 
-        # 2. エントリー / ナンピン指値の発注判定
-        if pos_count < max_trades and pending_entry is None:
-            can_enter = False
-            entry_type = None
+        # 2. エントリー / ナンピン判定
+        if pending_entry is None and not np.isnan(curr_rsi) and not np.isnan(curr_ma):
+            is_crossover = (curr_rsi > curr_ma) and (prev_rsi <= prev_ma)
+            is_level_ok = (curr_ma < l_ep or prev_ma < l_ep)
+
+            # 初期エントリー
             if pos_count == 0:
-                # 初回エントリー: GC かつ ma_val < lEp かつ r < lCp
-                if gc and (ma_val < lEp) and (r < lCp):
-                    can_enter = True
-                    entry_type = "ENTRY_RSIMA_GC"
-            else:
-                # ナンピン (ピラミッディング): 平均建値からの段階的下落率 (1〜3回目: 0.2%, 4〜5回目: 0.3%, 6〜8回目: 0.4%)
-                add_pct = calc_add_pct(pos_count)
-                if c <= avg_price * (1.0 - add_pct):
-                    can_enter = True
-                    entry_type = f"NANPIN_RSIMA_{pos_count}"
-                    
-            if can_enter:
-                # PROJECT_RULES準拠: 終値の0.1%下に指値を配置し、次足で約定判定
-                limit_price = c * (1.0 - 0.001)
-                pending_entry = {
-                    "limit_price": limit_price,
-                    "pos_count": pos_count,
-                    "entry_type": entry_type,
-                    "placed_ts": ts
-                }
-                    
+                if i >= sl_cooldown_until and is_crossover and is_level_ok:
+                    limit_price = c * (1.0 - 0.001)
+                    pending_entry = {
+                        "limit_price": limit_price,
+                        "entry_type": "ENTRY_RSIMA_GC",
+                        "placed_ts": ts
+                    }
+            # ナンピン追加
+            elif 1 <= pos_count < total_max_stages:
+                add_pct = get_tv_add_pct(pos_count)
+                if is_crossover and is_level_ok and (prev_close < avg_price * (1.0 - add_pct)):
+                    limit_price = c * (1.0 - 0.001)
+                    pending_entry = {
+                        "limit_price": limit_price,
+                        "entry_type": f"NANPIN_RSIMA_{pos_count}",
+                        "placed_ts": ts
+                    }
+
         unrealized = (pos_qty * c - pos_cost) if pos_qty > 0 else 0.0
         unrealized_list.append(unrealized)
         current_eq = initial_equity + cum_realized_pnl + unrealized - cum_fees
         equity_curve.append(current_eq)
-        
+
     eq_series = pd.Series(equity_curve)
     peak = eq_series.cummax()
     dd = peak - eq_series
     dd_max = float(dd.max()) if not dd.empty else 0.0
-    
+
     trade_cnt = len(trades)
     win_cnt = sum(1 for t in trades if t > 0)
     win_rate = (win_cnt / trade_cnt * 100.0) if trade_cnt > 0 else 0.0
     final_pnl = float(equity_curve[-1]) - initial_equity
     min_unrealized = float(min(unrealized_list)) if unrealized_list else 0.0
-    
+
     return {
         "final_pnl": final_pnl,
         "trade_count": trade_cnt,
@@ -2344,11 +3596,10 @@ def simulate_rsima_strategy(
         "exec_history": exec_history,
         "params": {
             "rsi_len": rsi_len,
-            "lma_len": lma_len,
-            "lEp": lEp,
-            "lCp": lCp,
-            "max_trades": max_trades,
-            "sl_pct": sl_pct
+            "ema_len": ema_len,
+            "l_ep": l_ep,
+            "l_cp": l_cp,
+            "max_trades": total_max_stages,
         }
     }
 
@@ -2357,18 +3608,20 @@ def simulate_val_poc_strategy(
     df: pd.DataFrame,
     vp_period: int = 150,
     num_bins: int = 50,
-    max_nanpin: int = 2,
-    nanpin_drop_pct: float = 0.030,
+    max_nanpin: int = 4,
+    nanpin_drop_pct: Optional[float] = 0.030,
     initial_equity: float = 100.0,
+    sl_pct: float = 0.090,
     fee_rate: float = 0.0006,
-    sl_pct: float = 0.09
+    target_ratio: float = 0.60,
 ) -> dict:
     """
-    VAL ゴールデンクロス ＆ EMA200 ＆ バリュー幅>=1.5% ＆ VAL-VAH 60%利確 ＆ -3%ナンピン最大2回 (VAL_POC 実証最適仕様)
-    - EMA 200 トレンドフィルター: close >= EMA(close, 200)
+    VAL ゴールデンクロス ＆ EMA200 ＆ バリュー幅>=1.5% ＆ VAL-VAH 中間値50〜60%利確 ＆ -3%ナンピン最大4回 (VAL_POC 最適仕様)
+    - エントリー: VALクロスオーバー (close > VAL かつ prev_close <= prev_VAL)
+    - トレンドフィルター: close >= EMA(close, 200)
     - バリュー幅フィルター: (VAH - VAL) / VAL >= 1.5%
-    - 利確: VAL + (VAH - VAL) * 0.60 (60%水準) かつ 建値以上
-    - ナンピン: 直近建値から -3.0% 下落ごと、最大2回 (初期1 + ナンピン2 = 計3枠)
+    - 利確: POCが下すぎる問題を解消するため、VAL-VAH中間値50%〜最適化60%水準 (VAL + (VAH - VAL) * target_ratio) 到達かつ建値プラス域
+    - ナンピン: 直近建値から -3.0% 下落ごと、最大4回 (初期1 + ナンピン4 = 計5枠)
     - 損切り: 9.0% (5分足確定終値判定) ＋ 24時間 (288本) クールダウン
     """
     closes = df["close"].values
@@ -2378,7 +3631,7 @@ def simulate_val_poc_strategy(
 
     # 1. EMA 200 算出
     ema200 = calc_ema(df["close"], 200).values
-    
+
     # 2. Market Profile 算出
     if "VAL" not in df.columns or "POC" not in df.columns or "VAH" not in df.columns or df["VAL"].isna().all():
         logic = logicinstance()
@@ -2394,7 +3647,7 @@ def simulate_val_poc_strategy(
     if n < 10:
         return {"final_pnl": 0.0, "trade_count": 0, "win_rate": 0.0, "DD_max": 0.0, "max_unrealized_loss": 0.0}
 
-    total_max_stages = max_nanpin + 1  # 初期1 + ナンピン2 = 計3枠
+    total_max_stages = max_nanpin + 1  # 初期1 + ナンピン4 = 計5枠
     trade_size_usdt = initial_equity / total_max_stages
 
     pos_qty = 0.0
@@ -2460,9 +3713,9 @@ def simulate_val_poc_strategy(
                 pos_count = 0
                 last_entry_price = 0.0
                 sl_cooldown_until = i + 288  # 24時間 (288足) クールダウン発動
-            # B. VAL-VAH 60%水準 利確クローズ (高値または終値が target_tp に到達かつ建値以上)
+            # B. VAL-VAH 中間値50%〜最適化60%水準 利確クローズ (高値または終値が target_tp に到達かつ建値以上)
             else:
-                target_tp = val + (vah - val) * 0.60 if (vah > val and val > 0) else poc
+                target_tp = val + (vah - val) * target_ratio if (vah > val and val > 0) else poc
                 if not np.isnan(target_tp) and (h >= target_tp or c >= target_tp):
                     exit_price = max(c, target_tp) if h >= target_tp else c
                     if exit_price > avg_price * (1.0 + fee_rate):
@@ -2494,7 +3747,7 @@ def simulate_val_poc_strategy(
                             "entry_type": "ENTRY_VAL_GC",
                             "placed_ts": ts
                         }
-            # ナンピン: 最後の建値から -3.0% 下落、最大2回追加 (初期1+ナンピン2=計3枠)
+            # ナンピン: 最後の建値から -3.0% 下落、最大4回追加 (初期1+ナンピン4=計5枠)
             elif 1 <= pos_count < total_max_stages:
                 drop_pct = nanpin_drop_pct or 0.030
                 if (c <= last_entry_price * (1.0 - drop_pct)) or (l <= last_entry_price * (1.0 - drop_pct)):
@@ -2539,310 +3792,380 @@ def simulate_val_poc_strategy(
     }
 
 
-def optimize_symbol_strategy(
-    df: pd.DataFrame,
-    symbol: str = "",
-    max_trades: int = 3,
-    initial_equity: float = 100.0,
-    force_strategy: Optional[str] = None
-) -> Tuple[str, Dict[str, Any], Dict[str, Any], list]:
-    """
-    対象銘柄に対して Envelope 戦略、RSI MA 戦略、および VAL_POC 戦略のグリッドサーチを実行し、
-    PnLが最大となる戦略と最適パラメータを決定する。
-    """
-    results = {}
-    
-    # 1. RSIMA 戦略グリッドサーチ (オシレーター反転)
-    if force_strategy is None or force_strategy.lower() == "rsima":
-        # PROJECT_RULES準拠: RSI=9, MALen=7, EMA固定。lEp(30〜50)およびlCp(60〜80)を最適化
-        rsi_lengths = [9]
-        lma_lengths = [7]
-        lEps = [30, 35, 40, 45, 50]
-        lCps = [60, 65, 70, 75, 80]
-        sl_pcts = [0.020, 0.025, 0.030, 0.035, 0.040]  # 中心値3.0%、0.5%刻み (2.0%〜4.0%、最適値3.0%)
-        
-        for rl in rsi_lengths:
-            for ml in lma_lengths:
-                for ep in lEps:
-                    for cp in lCps:
-                        for sl in sl_pcts:
-                            res = simulate_rsima_strategy(
-                                df, rsi_len=rl, lma_len=ml, lEp=ep, lCp=cp,
-                                max_trades=5, initial_equity=initial_equity,
-                                sl_pct=sl
-                            )
-                            label = f"RSIMA_R{rl}_M{ml}_Ep{ep}_Cp{cp}_SL{sl*100:.1f}"
-                            results[label] = res
 
-    # 2. VAL_POC 戦略 (出来高構造リバウンド ＆ EMA200 ＆ バリュー幅>=1.5% ＆ 60%利確 ＆ -3%ナンピン最大2回 ＆ SL 9.0%)
-    if force_strategy is None or force_strategy.lower() in ("val_poc", "vp_val_gc"):
-        vp_sl_pcts = [0.085, 0.090, 0.095]  # 1年分実証最適値 9.0% (±0.5%)
-        for sl in vp_sl_pcts:
-            res_val_poc = simulate_val_poc_strategy(
-                df, vp_period=150, num_bins=50, max_nanpin=2, nanpin_drop_pct=0.030,
-                initial_equity=initial_equity, sl_pct=sl
-            )
-            label = f"VAL_POC_N3_SL{sl*100:.1f}"
-            results[label] = res_val_poc
+# 【新戦略】固定20銘柄 + BTC単独地合い監視 + 日足押し目 + 1H VPブレイク + 5M動的決済
+# ==============================================================================
 
-    if not results:
-        default_res = {
-            "strategy": "rsima",
-            "final_pnl": 0.0,
-            "trade_count": 0,
-            "win_rate": 0.0,
-            "DD_max": 0.0,
-            "max_unrealized_loss": 0.0,
-            "params": {"rsi_len": 9, "lma_len": 7, "lEp": 40.0, "lCp": 70.0, "max_trades": 5, "sl_pct": 0.030}
+def check_normalized_peak_timing(df: pd.DataFrame) -> Tuple[bool, List[str]]:
+    """
+    【PROJECT_RULES 第2項準拠】3期間ノーマライズ前半高値検出規約 (ピークアウト除外フィルター)
+    対象期間: 5d (120h) / 10d (240h) / 30d (720h) 全期間統一基準
+    判定条件: 最高値(Max)が「前半50%以内」に位置している場合、
+             現在値が期間レンジの半値ライン (Min + (Max - Min) * 0.5) を維持できているか検証。
+    除外基準: 前半ピーク かつ 現在値がレンジ半値未満（維持率50%未満）に沈んでいる銘柄は、
+             「ピークアウト（行って来い崩壊）または長期衰退中で反発力なし」とみなして除外。
+             ※一度大きく下落しても、現在値がレンジ半値以上まで買い戻されて盛り上がっている銘柄はセーフ。
+    """
+    windows = [
+        ("5d", 5 * 24),    # 120h
+        ("10d", 10 * 24),  # 240h
+        ("30d", 30 * 24),  # 720h
+    ]
+    reasons = []
+    is_bad = False
+
+    for w_name, w_hours in windows:
+        if len(df) < 24:
+            continue
+        sub = df.tail(w_hours).reset_index(drop=True)
+        if len(sub) < 24:
+            continue
+
+        c_series = sub["close"].astype(float)
+        base_c = c_series.iloc[0]
+        if base_c <= 0:
+            continue
+        norm_c = c_series / base_c
+        final_norm = float(norm_c.iloc[-1])
+        c_min = float(norm_c.min())
+        c_max = float(norm_c.max())
+        half_level = c_min + (c_max - c_min) * 0.5
+
+        peak_idx = int(norm_c.argmax())
+        peak_ratio = peak_idx / len(norm_c)
+
+        if peak_ratio < 0.50:
+            if final_norm < half_level:
+                is_bad = True
+                reasons.append(
+                    f"{w_name}前半ピーク半値割れ(peak={peak_ratio:.2f}, max={c_max:.2f}x, curr={final_norm:.2f}x < half={half_level:.2f}x)"
+                )
+
+    return is_bad, reasons
+
+
+def evaluate_market_regime_3window(
+    symbol_1h_dfs: Dict[str, pd.DataFrame]
+) -> Dict[str, Any]:
+    """
+    【PROJECT_RULES 第2項準拠】新・全体地合い判定規約
+    30d / 10d / 5d の 3期間ノーマライズ比較チャート（20銘柄＋BTC 2票＝計22票）を用いて
+    各期間の買い/売り票（前半高値・安値の半値維持監査）を集計し、
+    3期間すべてが買い判定なら総合地合い「BUY」および買い推奨銘柄を返す。
+    3期間すべてが売り判定なら総合地合い「SELL」を返す。
+    それ以外は総合地合い「NEUTRAL」（トレードなし）。
+    """
+    windows = [
+        ("30d", 30 * 24),  # 720h
+        ("10d", 10 * 24),  # 240h
+        ("5d", 5 * 24),    # 120h
+    ]
+
+    period_results = {}
+    eligible_buy_by_window = {}
+    eligible_sell_by_window = {}
+
+    for w_name, w_hours in windows:
+        buy_votes = 0
+        sell_votes = 0
+        buy_passed = set()
+        sell_passed = set()
+        total_votes = 0
+
+        for sym, df in symbol_1h_dfs.items():
+            if df is None or df.empty or len(df) < 24:
+                continue
+            sub = df.tail(w_hours).reset_index(drop=True)
+            if len(sub) < 24:
+                continue
+
+            c_series = sub["close"].astype(float)
+            base_c = c_series.iloc[0]
+            if base_c <= 0:
+                continue
+            norm_c = c_series / base_c
+            final_norm = float(norm_c.iloc[-1])
+            c_min = float(norm_c.min())
+            c_max = float(norm_c.max())
+            half_level = c_min + (c_max - c_min) * 0.5
+
+            peak_idx = int(norm_c.argmax())
+            peak_ratio = peak_idx / len(norm_c)
+            trough_idx = int(norm_c.argmin())
+            trough_ratio = trough_idx / len(norm_c)
+
+            votes = 2 if sym.upper().replace("-USDT", "").replace("USDT", "") == "BTC" else 1
+            total_votes += votes
+
+            # 買い候補判定 (プラスかつ前半高値半値維持)
+            if final_norm >= 1.0:
+                if peak_ratio >= 0.50 or final_norm >= half_level:
+                    buy_votes += votes
+                    buy_passed.add(sym)
+
+            # 売り候補判定 (マイナスかつ前半安値半値維持)
+            if final_norm < 1.0:
+                if trough_ratio >= 0.50 or final_norm <= half_level:
+                    sell_votes += votes
+                    sell_passed.add(sym)
+
+        # 判定基準: 半分以上 (11票以上 / 22票)
+        state = "NEUTRAL"
+        if buy_votes >= 11:
+            state = "BUY"
+        elif sell_votes >= 11:
+            state = "SELL"
+
+        period_results[w_name] = {
+            "state": state,
+            "buy_votes": buy_votes,
+            "sell_votes": sell_votes,
+            "total_votes": total_votes,
+            "buy_passed": list(buy_passed),
+            "sell_passed": list(sell_passed)
         }
-        return "rsima", default_res["params"], default_res, []
+        eligible_buy_by_window[w_name] = buy_passed
+        eligible_sell_by_window[w_name] = sell_passed
 
-    active_results = {k: v for k, v in results.items() if v.get("trade_count", 0) > 0}
-    eval_pool = active_results if active_results else results
+    # 総合地合い判定 (3期間すべてが一致しているか)
+    states = [period_results[w]["state"] for w in ["30d", "10d", "5d"]]
+    recommended_symbols = []
 
-    best_key = max(eval_pool.keys(), key=lambda k: eval_pool[k]["final_pnl"])
-    best_res = eval_pool[best_key]
-    best_strat = best_res["strategy"]
-    best_params = best_res["params"]
+    if states == ["BUY", "BUY", "BUY"]:
+        overall_regime = "BUY"
+        common_buy = set.intersection(*(eligible_buy_by_window[w] for w in ["30d", "10d", "5d"]))
+        recommended_symbols = sorted([s for s in common_buy if s.upper().replace("-USDT", "").replace("USDT", "") != "BTC"])
+    elif states == ["SELL", "SELL", "SELL"]:
+        overall_regime = "SELL"
+        common_sell = set.intersection(*(eligible_sell_by_window[w] for w in ["30d", "10d", "5d"]))
+        recommended_symbols = sorted([s for s in common_sell if s.upper().replace("-USDT", "").replace("USDT", "") != "BTC"])
+    else:
+        overall_regime = "NEUTRAL"
+        recommended_symbols = []
 
-    sorted_results = sorted(results.items(), key=lambda x: x[1]["final_pnl"], reverse=True)
-    top10 = sorted_results[:10]
+    return {
+        "overall_regime": overall_regime,
+        "is_buy_regime": (overall_regime == "BUY"),
+        "is_sell_regime": (overall_regime == "SELL"),
+        "period_results": period_results,
+        "recommended_symbols": recommended_symbols,
+        "timestamp": datetime.now(timezone.utc).isoformat()
+    }
 
-    return best_strat, best_params, best_res, top10
 
-
-def run_interval_comparison(df_60m, lot=1.0, data_equity=100.0, side_mode="long", symbol="", force_strategy=None, prefer_breakout=False, max_trades=5):
+def check_market_regime_safe(
+    df_btc_1h: Optional[pd.DataFrame] = None,
+    max_24h_drop_pct: float = -0.035,
+    market_state_info: Optional[Dict[str, Any]] = None,
+    *args,
+    **kwargs,
+) -> Tuple[bool, str, Dict[str, Any]]:
+    """【PROJECT_RULES 第2項準拠】市場全体地合い判定
+    総合地合い判定 (market_state_info 連携):
+       - 3期間 (30d/10d/5d) すべてが「買い (BUY)」であれば安全（新規エントリー可）。
+       - 買い (BUY) でなければ新規ロングを即座にブロック（ノーポジ待機）。
+       ※BTC単独パニック急落チェックは3期間ノーマライズ判定（BTC 2票/計22票）に統合され不要のため廃止。
     """
-    2大戦略（RSIMA ＆ VAL_POC）の網羅的グリッドサーチを実行し、
-    各銘柄のPnLが最大となる戦略と最適パラメータを選定する。
+    metrics: Dict[str, Any] = {}
+
+    # 全体地合い判定 (SELL時は暴落危険のため新規エントリー完全停止、BUYおよびNEUTRAL時はエントリー許可)
+    if market_state_info and isinstance(market_state_info, dict):
+        overall = market_state_info.get("overall_regime")
+        metrics["overall_regime"] = overall
+        if overall == "SELL":
+            return False, f"REGIME_SELL_BLOCKED(overall_regime={overall})", metrics
+        if overall == "BUY":
+            return True, f"REGIME_BUY_SAFE(overall_regime={overall})", metrics
+        if overall == "NEUTRAL":
+            return True, f"REGIME_NEUTRAL_SAFE(overall_regime={overall})", metrics
+
+    return True, "REGIME_SAFE(DEFAULT)", metrics
+
+
+def check_daily_pullback_condition(
+    df_daily: Optional[pd.DataFrame],
+    curr_price: float,
+    min_pullback_pct: float = 0.015,
+    max_pullback_pct: float = 0.120,
+) -> Tuple[bool, str, Dict[str, Any]]:
+    """日足（1D）データに基づく「上昇トレンド中の健全な押し目（Dip）」判定。
+
+    判定条件:
+    1. 上昇トレンド維持: 日足EMA50以上、または直近の日足EMA20がEMA50以上
+    2. 直近高値からの健全な調整（押し目）:
+       過去14〜30日の最高値から -1.5% 〜 -12% の押し目ゾーンにあること
+       （過熱状態の高値掴みを避け、かつ暴落ナイフは除外）
+    3. サポート反発・下げ止まり気配:
+       現在値が直近日足安値から反発している、または日足EMA20近辺で下支え
     """
-    logic = logicinstance()
-    os.makedirs("backtest_data", exist_ok=True)
-    fixed_initial_equity = float(data_equity) if (data_equity is not None and data_equity > 0) else 100.0
+    if df_daily is None or df_daily.empty or len(df_daily) < 10:
+        # 日足データ蓄積中のフォールバック（初期化時）
+        return True, "DAILY_WARMUP_PASS", {}
+
+    c = df_daily["close"].astype(float)
+    h = df_daily["high"].astype(float)
+    l = df_daily["low"].astype(float)
+
+    # 1. 日足EMAの計算
+    span_short = min(20, len(c))
+    span_mid = min(50, len(c))
+    ema20 = float(c.ewm(span=span_short, adjust=False).mean().iloc[-1])
+    ema50 = float(c.ewm(span=span_mid, adjust=False).mean().iloc[-1])
+
+    # 上昇トレンド判定: 現在価格がEMA50以上、またはEMA20 >= EMA50
+    is_uptrend = (curr_price >= ema50 * 0.98) or (ema20 >= ema50)
+
+    # 2. 直近高値（過去14日〜30日）と押し目率
+    lookback = min(len(df_daily), 30)
+    recent_high = float(h.tail(lookback).max())
+    recent_low = float(l.tail(lookback).min())
+
+    pullback_pct = (recent_high - curr_price) / recent_high if recent_high > 0 else 0.0
+    # 健全な押し目範囲内か
+    is_sound_pullback = min_pullback_pct <= pullback_pct <= max_pullback_pct
+
+    # また、直近2〜3日の安値から反発しているか（下げ止まり確認）
+    short_low = float(l.tail(3).min())
+    is_rebounding = curr_price >= short_low * 1.005  # 最安値から+0.5%以上反発
+
+    metrics = {
+        "curr_price": curr_price,
+        "recent_high": recent_high,
+        "pullback_pct": pullback_pct,
+        "ema20": ema20,
+        "ema50": ema50,
+        "is_uptrend": is_uptrend,
+        "is_sound_pullback": is_sound_pullback,
+        "is_rebounding": is_rebounding,
+    }
+
+    if not is_uptrend:
+        return False, f"DAILY_NOT_UPTREND(Px={curr_price:.4f} < EMA50={ema50:.4f})", metrics
+
+    if pullback_pct < min_pullback_pct:
+        # 高値圏すぎる（過熱感あり）
+        # ただしEMA20近辺で新高値トライ中の場合は条件付き許可
+        if curr_price >= recent_high * 0.99:
+            return True, f"DAILY_HIGH_MOMENTUM(HighBreak {pullback_pct:.1%})", metrics
+        return False, f"DAILY_TOO_CLOSE_TO_PEAK(Pullback={pullback_pct:.1%} < {min_pullback_pct:.1%})", metrics
+
+    if pullback_pct > max_pullback_pct:
+        # 下落しすぎ（暴落リスク）
+        return False, f"DAILY_DEEP_DROP_RISK(Pullback={pullback_pct:.1%} > {max_pullback_pct:.1%})", metrics
+
+    if is_sound_pullback and is_rebounding:
+        reason = f"DAILY_SOUND_PULLBACK(High={recent_high:.4f}, Dip={pullback_pct:.1%}, Rebound=True)"
+        return True, reason, metrics
+
+    # 押し目ゾーン内なら許容
+    return True, f"DAILY_PULLBACK_ZONE(Dip={pullback_pct:.1%})", metrics
+
+
+def check_1h_vp_breakout(
+    df_1h: Optional[pd.DataFrame],
+    curr_price: float
+) -> Tuple[bool, str, Dict[str, Any]]:
+    """1時間足の出来高プロファイル（VAH）または直近レンジ高値のブレイクアウト判定。"""
+    if df_1h is None or df_1h.empty or len(df_1h) < 5:
+        return False, "1H_DATA_INSUFFICIENT", {}
+
+    vah_1h = float(df_1h["VAH"].iloc[-1]) if "VAH" in df_1h.columns else None
+    poc_1h = float(df_1h["POC"].iloc[-1]) if "POC" in df_1h.columns else None
+    val_1h = float(df_1h["VAL"].iloc[-1]) if "VAL" in df_1h.columns else None
+
+    prev_c = float(df_1h["close"].iloc[-2]) if len(df_1h) >= 2 else curr_price
+    recent_high = float(df_1h["high"].iloc[-13:-1].max()) if len(df_1h) >= 13 else curr_price
+
+    metrics = {
+        "curr_price": curr_price,
+        "vah_1h": vah_1h,
+        "poc_1h": poc_1h,
+        "val_1h": val_1h,
+        "prev_close": prev_c,
+        "recent_high": recent_high,
+    }
+
+    # 1. VAHクロスオーバー上抜け
+    if vah_1h is not None:
+        if (prev_c <= vah_1h * 1.003) and (curr_price > vah_1h):
+            reason = f"1H_VAH_BREAKOUT(Px={curr_price:.4f} > VAH={vah_1h:.4f})"
+            return True, reason, metrics
+
+    # 2. 直近12時間レンジ高値ブレイクアウト
+    if (prev_c <= recent_high * 1.002) and (curr_price > recent_high):
+        reason = f"1H_RANGE_HIGH_BREAKOUT(Px={curr_price:.4f} > High={recent_high:.4f})"
+        return True, reason, metrics
+
+    return False, "1H_NO_BREAKOUT", metrics
+
+
+def evaluate_dynamic_close_vs_hold(
+    df_5m: Optional[pd.DataFrame],
+    curr_price: float,
+    stop_price: float,
+    target_price: Optional[float] = None,
+    entry_price: Optional[float] = None,
+) -> Tuple[str, str, Dict[str, Any]]:
+    """CLOSEシグナル（利確やトレイリングストップ）点灯時に、5分足WebSocketで直前の勢いを動的判定。
     
-    discord.print_log(f"\n====== [{symbol}] 2大戦略（RSIMA ＆ VAL_POC）個別最適化（PnL最大化）開始 ======")
-    best_strat, best_params, best_res, top10 = optimize_symbol_strategy(
-        df=df_60m,
-        symbol=symbol,
-        max_trades=max_trades,
-        initial_equity=fixed_initial_equity,
-        force_strategy=force_strategy
-    )
-    
-    # 探索結果辞書の再フォーマット（呼び出し元互換用）
-    results = {}
-    for label, data in top10:
-        results[label] = {
-            'strategy_type': data['strategy'],
-            'final_pnl': data['final_pnl'],
-            'interval': 60,
-            'mp_period': data['params'].get('malen', data['params'].get('lma_len', 7)),
-            'er_threshold': data['params'].get('lower_pct', data['params'].get('lEp', 40)),
-            'atr_multi': 1.5,
-            'sl_center_margin': data['params'].get('lower_pct', 2.0),
-            'DD_max': data.get('DD_max', 0.0),
-            'max_unrealized_loss': data.get('max_unrealized_loss', 0.0),
-            'win_rate': data.get('win_rate', 0.0),
-            'trade_count': data.get('trade_count', 0),
-            'params': data['params']
-        }
-    
-    discord.print_log("【個別最適化バックテスト結果 (Top 10)】")
-    header = f"{'設定':<35} {'PnL [USDT]':>12} {'最大DD [USDT(%)]':>16} {'勝率':>7} {'取引':>6}"
-    separator = "-" * 81
-    all_rows = []
-    for label, data in top10:
-        row_disp = f"{symbol}_{label}" if (symbol and not str(label).startswith(symbol)) else label
-        dd_val = data['DD_max']
-        dd_pct = (dd_val / fixed_initial_equity) * 100.0
-        dd_str = f"{dd_val:.2f} ({dd_pct:.1f}%)"
-        all_rows.append(f"{row_disp:<35} {data['final_pnl']:>+12.4f} {dd_str:>16} {data['win_rate']:>6.1f}% {data['trade_count']:>6}")
-    table_lines = ["```", header, separator] + all_rows + ["```"]
-    discord.print_log("\n".join(table_lines))
-    
-    best_disp = f"{symbol}_{best_strat.upper()}"
-    best_dd_val = best_res['DD_max']
-    best_dd_pct = (best_dd_val / fixed_initial_equity) * 100.0
-    discord.print_log(f"★ PnL最大選定: {best_disp} -> 純利益: {best_res['final_pnl']:+.4f} USDT (勝率: {best_res['win_rate']:.1f}%, 取引: {best_res['trade_count']}回, 最大DD: {best_dd_val:.2f} USDT ({best_dd_pct:.1f}%))")
-    discord.print_log(f"   └ 採用パラメータ: {best_params}")
+    - 反発・下ヒゲ・買い支えが確認できる場合 ➔ 'HOLD'（利を最大限に伸ばす）
+    - 大陰線・失速・売り浴びせが確認できる場合 ➔ 'CLOSE'（安全に確定手仕舞い）
+    """
+    metrics: Dict[str, Any] = {
+        "curr_price": curr_price,
+        "stop_price": stop_price,
+        "target_price": target_price,
+    }
 
-    # バックテストチャートの生成
-    try:
-        df_chart = df_60m.copy()
-        df_chart['timestamp'] = pd.to_datetime(df_chart['timestamp'])
-        if 'equity_curve' in best_res and len(best_res['equity_curve']) == len(df_chart):
-            df_chart['pnl'] = best_res['equity_curve']
-            df_chart['PL_graph'] = best_res['equity_curve']
-        else:
-            df_chart['pnl'] = fixed_initial_equity + best_res['final_pnl']
-            df_chart['PL_graph'] = fixed_initial_equity + best_res['final_pnl']
-            
-        df_chart['exec_buy_price'] = np.nan
-        df_chart['exec_sell_price'] = np.nan
-        for ex in best_res.get('exec_history', []):
-            ex_ts = pd.to_datetime(ex['timestamp'])
-            mask = df_chart['timestamp'] == ex_ts
-            if mask.any():
-                if ex['size'] > 0:
-                    df_chart.loc[mask, 'exec_buy_price'] = ex['price']
-                else:
-                    df_chart.loc[mask, 'exec_sell_price'] = ex['price']
-                    
-        # 戦略別インジケーター列の付与
-        if best_strat == "envelope":
-            el = int(best_params.get("length", 15))
-            elp = float(best_params.get("lower_pct", 2.0))
-            eup = float(best_params.get("upper_pct", 2.0))
-            eml = int(best_params.get("malen", 100))
-            b_series = calc_ema(df_chart['close'], el)
-            mb_series = calc_ema(df_chart['close'], eml) if len(df_chart) >= eml else b_series
-            df_chart['basis'] = b_series
-            df_chart['mabasis'] = mb_series
-            df_chart['env_lower'] = b_series * (1.0 - elp / 100.0)
-            df_chart['env_upper'] = b_series * (1.0 + eup / 100.0)
-            df_chart['strategy_name'] = "ENVELOPE"
-        elif best_strat == "rsima":
-            rl = int(best_params.get("rsi_len", 9))
-            ll = int(best_params.get("lma_len", 7))
-            lep = float(best_params.get("lEp", 40.0))
-            lcp = float(best_params.get("lCp", 60.0))
-            r_s = calc_rsi(df_chart['close'], rl)
-            lr_s = calc_ema(r_s, ll)
-            df_chart['rsi'] = r_s
-            df_chart['lrsiMA'] = lr_s
-            df_chart['lEp'] = lep
-            df_chart['lCp'] = lcp
-            df_chart['strategy_name'] = "RSIMA"
+    # ストップ価格を大幅（-1.0%以上）に割り込んでいる場合は安全最優先で即CLOSE
+    if stop_price > 0 and curr_price < stop_price * 0.990:
+        return "CLOSE", f"DYNAMIC_EXIT: ストップ大幅割れ (${curr_price:.4f} < ${stop_price:.4f})", metrics
 
-        eval_bars_10d = min(len(df_chart), 240)
-        chart_10d_df = df_chart.tail(eval_bars_10d).reset_index(drop=True)
-        bg_csv = f"backtest_data/klines100_{symbol}_bingx.csv"
-        chart_10d_df.to_csv(bg_csv, index=False)
-        discord.plot_backtest(label=f"BingX_{symbol}_{best_strat.upper()}", csv_file=bg_csv, symbol=symbol, strategy_type=best_strat)
-    except Exception as ch_err:
-        print(f"[Chart Error] {symbol}: {ch_err}")
+    if df_5m is None or df_5m.empty or len(df_5m) < 5:
+        # 5Mデータがない場合は安全側に倒して通常CLOSE
+        return "CLOSE", "DYNAMIC_EXIT: 5Mデータ不足のため安全CLOSE", metrics
 
-    # PROJECT_RULES準拠: ボリュームプロファイル(VP)期間は戦略パラメータ(lma_len等)から独立させ、標準48時間(48本)とする
-    cand_mp = 48
-    cand_er = best_params.get('lower_pct', best_params.get('lEp', 40))
-    cand_margin = 1.0
-    return results, best_strat, 60, cand_mp, cand_er, cand_margin
+    c = df_5m["close"].astype(float)
+    o = df_5m["open"].astype(float)
+    h = df_5m["high"].astype(float)
+    l = df_5m["low"].astype(float)
+    v = df_5m["volume"].astype(float)
 
+    curr_c = float(c.iloc[-1])
+    curr_o = float(o.iloc[-1])
+    curr_h = float(h.iloc[-1])
+    curr_l = float(l.iloc[-1])
+    curr_v = float(v.iloc[-1])
 
-class VPTrailingManager:
-    """ボリュームプロファイル（VAL / POC / VAH）に基づく階層型ステップトレーリング管理クラス"""
-    def __init__(
-        self,
-        side: str,
-        entry_price: float,
-        fee_margin_pct: float = 0.0010,      # 手数料カバーマージン (0.10% 往復手数料を確実にカバー)
-        initial_margin_pct: float = 0.010,   # VAL/VAH 初期マージン (1.0%)
-        strategy_type: str = "range",        # 戦略タイプ（range時はマージン拡大）
-        entry_val: Optional[float] = None,   # エントリー時の VAL（固定初期SL基準）
-        entry_vah: Optional[float] = None    # エントリー時の VAH（固定初期SL基準）
-    ):
-        self.side = side.upper()
-        self.entry_price = float(entry_price)
-        self.fee_margin_pct = float(fee_margin_pct)
-        self.initial_margin_pct = float(initial_margin_pct)
-        self.strategy_type = strategy_type
-        # レンジ戦略はエントリーがVAL/VAH付近なので、初期マージンを2倍に拡大
-        if strategy_type == "range":
-            self.initial_margin_pct = self.initial_margin_pct * 2
-        
-        self.step = 0  # 0: INITIAL (VAL/VAH-margin), 1: POC, 2: VAH/VAL
-        self.step_names = {0: "INITIAL", 1: "POC", 2: "VAH" if self.side == "LONG" else "VAL"}
-        
-        # エントリー時のVAL/VAHに基づく初期ストップの完全固定（相場変動で勝手に切り上がらないようにする）
-        if self.side == "LONG":
-            base_val = float(entry_val) if (entry_val is not None and entry_val > 0) else (self.entry_price * 0.99)
-            self.current_stop = base_val * (1.0 - self.initial_margin_pct)
-        else:
-            base_vah = float(entry_vah) if (entry_vah is not None and entry_vah > 0) else (self.entry_price * 1.01)
-            self.current_stop = base_vah * (1.0 + self.initial_margin_pct)
+    # 足の長さとヒゲの計算
+    candle_range = curr_h - curr_l
+    body = abs(curr_c - curr_o)
+    is_bullish = curr_c >= curr_o
+    lower_wick = (min(curr_c, curr_o) - curr_l) if candle_range > 0 else 0.0
 
-    def update(
-        self,
-        current_price: float,
-        close_price: float,
-        val: float,
-        poc: float,
-        vah: float
-    ) -> Tuple[bool, str, Dict[str, Any]]:
-        """現在の価格情報を受け取り、トレーリング撤退ラインの更新と決済判定を返却
+    vol_ma = float(v.tail(10).mean()) if len(v) >= 10 else curr_v
+    vol_ratio = curr_v / vol_ma if vol_ma > 0 else 1.0
 
-        Returns:
-            Tuple[bool, str, Dict[str, Any]]:
-                - should_close (bool): 成行クローズすべきか
-                - reason (str): クローズ理由または現状維持メッセージ
-                - info (dict): 現在のステータス情報
-        """
-        cur_px = float(current_price)
-        cls_px = float(close_price)
-        val_px = float(val)
-        poc_px = float(poc)
-        vah_px = float(vah)
+    metrics.update({
+        "is_bullish": is_bullish,
+        "vol_ratio": vol_ratio,
+        "lower_wick_ratio": (lower_wick / candle_range) if candle_range > 0 else 0.0,
+    })
 
-        if self.side == "LONG":
-            be_price = self.entry_price * (1.0 + self.fee_margin_pct)
-            is_profitable = cur_px >= be_price
+    # 【HOLD判定条件 (反発・利伸ばし)】
+    # 1. 5分足が陽線で反発中、または顕著な下ヒゲ（下ヒゲが全体の40%以上）で買い支えられている
+    # 2. 直近安値（curr_l）から現在値がしっかり戻している
+    has_strong_lower_wick = candle_range > 0 and (lower_wick / candle_range) >= 0.40
+    is_rebounding_now = is_bullish and (curr_c > curr_l * 1.002)
 
-            # 1. 段階ごとの引き上げ・ステップアップ判定
-            # 【重要】建値＋手数料カバー価格以上の含み益の時のみ引き上げを許可
-            if is_profitable:
-                # Step 2 (VAH) への昇格チェック
-                if cur_px > vah_px:
-                    self.step = 2
-                    self.current_stop = max(self.current_stop, be_price, vah_px)
-                # Step 1 (POC) への昇格チェック
-                elif cur_px > poc_px or self.step >= 1:
-                    self.step = max(self.step, 1)
-                    target_sl = max(be_price, poc_px)
-                    self.current_stop = max(self.current_stop, target_sl)
-            else:
-                # 含み損の間は初期ストップラインから絶対に引き上げない (step 0 を維持)
-                if self.step == 0:
-                    pass
-                else:
-                    # 既に昇格済みの場合は建値(手数料込)を下回らないように維持
-                    self.current_stop = max(self.current_stop, be_price)
+    # また、直前の確定足（iloc[-2]）が陽線でサポートされている
+    prev_bullish = (float(c.iloc[-2]) > float(o.iloc[-2])) if len(c) >= 2 else False
 
-            # 2. クローズ条件（終値判定）
-            should_close = cls_px < self.current_stop
-            reason = f"LONG_VP_{self.step_names[self.step]}_BREAK" if should_close else "HOLD"
+    if (has_strong_lower_wick or is_rebounding_now or prev_bullish) and curr_price >= stop_price * 0.996:
+        reason = f"DYNAMIC_HOLD: 5分足で反発・買い支え検知 (陽線={is_bullish}, 下ヒゲ={lower_wick/candle_range if candle_range>0 else 0:.1%}, Vol={vol_ratio:.1f}x) ➔ 利益を伸ばします"
+        return "HOLD", reason, metrics
 
-        else:  # SHORT
-            be_price = self.entry_price * (1.0 - self.fee_margin_pct)
-            is_profitable = cur_px <= be_price
-
-            # 1. 段階ごとの引き下げ・ステップアップ判定
-            if is_profitable:
-                # Step 2 (VAL) への昇格チェック
-                if cur_px < val_px:
-                    self.step = 2
-                    self.current_stop = min(self.current_stop, be_price, val_px) if self.current_stop > 0 else min(be_price, val_px)
-                # Step 1 (POC) への昇格チェック
-                elif cur_px < poc_px or self.step >= 1:
-                    self.step = max(self.step, 1)
-                    target_sl = min(be_price, poc_px)
-                    self.current_stop = min(self.current_stop, target_sl) if self.current_stop > 0 else target_sl
-            else:
-                if self.step == 0:
-                    pass
-                else:
-                    self.current_stop = min(self.current_stop, be_price) if self.current_stop > 0 else be_price
-
-            # 2. クローズ条件（終値判定）
-            should_close = cls_px > self.current_stop
-            reason = f"SHORT_VP_{self.step_names[self.step]}_BREAK" if should_close else "HOLD"
-
-        info = {
-            "step": self.step,
-            "step_name": self.step_names[self.step],
-            "current_stop": self.current_stop,
-            "close_price": cls_px,
-            "current_price": cur_px
-        }
-        return should_close, reason, info
-
-
+    # 【CLOSE判定条件 (失速・手仕舞い)】
+    # 陰線で戻り売りが先行している、または大陰線
+    reason = f"DYNAMIC_CLOSE: 5分足で下落・失速検知 (陰線, Vol={vol_ratio:.1f}x) ➔ 安全手仕舞い"
+    return "CLOSE", reason, metrics

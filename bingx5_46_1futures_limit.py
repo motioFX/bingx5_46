@@ -12,7 +12,38 @@ if hasattr(sys.stdout, "reconfigure"):
         pass
 
 import re
+import unicodedata
 from typing import Any, Dict, List, Optional, Sequence, Tuple
+from candle_5m_store import (
+    load_5m_candles,
+    sync_symbol_5m_candles,
+    resample_from_5m,
+    get_clean_symbol,
+    normalize_symbol_name,
+)
+
+
+def _display_width(text: str) -> int:
+    w = 0
+    for ch in str(text):
+        ea = unicodedata.east_asian_width(ch)
+        w += 2 if ea in ('F', 'W', 'A') else 1
+    return w
+
+
+def _pad_display(text: str, width: int, align: str = 'left') -> str:
+    text_str = str(text)
+    dw = _display_width(text_str)
+    pad = max(0, width - dw)
+    if align == 'right':
+        return ' ' * pad + text_str
+    elif align == 'center':
+        left = pad // 2
+        right = pad - left
+        return ' ' * left + text_str + ' ' * right
+    else:
+        return text_str + ' ' * pad
+
 
 # Automatic Dual Logging: Output to both Terminal and Data/bot_output.log
 class TeeLogger:
@@ -79,21 +110,21 @@ BINGX_IS_LIVE = False
 #       True  = AIRモード (--air または --mock 引数指定時のみ仮想シミュレーション)
 BINGX_IS_AIR = ("--air" in sys.argv or "--mock" in sys.argv)
 
-# [ 3 ] ポジション・ロット設定
-BINGX_TARGET_POSITION_VALUE_USDT = 75.0  # 証拠金 $7.5 × レバレッジ10倍 (1年分実証最適値)
+# [ 3 ] ポジション・ロット設定 (PROJECT_RULES.md 準拠)
+BINGX_TARGET_POSITION_VALUE_USDT = 15.0  # 目標投資額 $15.0 USDT (1枠基準)
 TARGET_POSITION_VALUE_USDT = BINGX_TARGET_POSITION_VALUE_USDT
 LEVERAGE_FACTOR = 10.0
 MAX_ACTIVE_POSITIONS: int = 2  # 最大同時保有ポジション数 (資金効率と分散を最適化)
-MAX_SELECTED_SYMBOLS: int = 10  # 最大選定・監視銘柄数 (合格銘柄のうち最大10銘柄を5分足監視)
+MAX_SELECTED_SYMBOLS: int = 10  # 最大選定・監視銘柄数
 
-# [ 4 ] ナンピン数設定 (Pyramiding / Scale-in count: 初期1回 + ナンピン最大2回 = 最大3枠)
+# [ 4 ] ナンピン数設定 (初期1回 + ナンピン最大2回 = 最大3枠厳守)
 MAX_TRADES_COUNT: int = 3
 
-# [ 5 ] 固定選定銘柄 (主要アルトコイン20銘柄)
+# [ 5 ] 固定選定銘柄 (主要アルトコイン20銘柄 / PROJECT_RULES.md 準拠)
 FIXED_SYMBOLS: List[str] = [
     "HYPE-USDT", "SOL-USDT", "DOGE-USDT", "XRP-USDT", "SUI-USDT",
-    "AVAX-USDT", "LINK-USDT", "APT-USDT", "NEAR-USDT", "ARB-USDT",
-    "UNI-USDT", "OP-USDT", "TIA-USDT", "RENDER-USDT", "INJ-USDT",
+    "AVAX-USDT", "LINK-USDT", "ADA-USDT", "NEAR-USDT", "APT-USDT",
+    "OP-USDT", "ARB-USDT", "TIA-USDT", "RENDER-USDT", "WIF-USDT",
     "FET-USDT", "TAO-USDT", "AAVE-USDT", "ENA-USDT", "ZEC-USDT"
 ]
 
@@ -471,66 +502,54 @@ def get_whale_sentiment_info(symbol: str) -> Dict[str, Any]:
 
 
 def get_regime_gate_info(symbol: str) -> Dict[str, Any]:
-    """Data/market_state.json より二層構造マクロ門番情報（第1層: 全面安フィルター、第2層: 個別高値警戒門番）を取得 (PROJECT_RULES 準拠)"""
+    """Data/market_state.json より3段階全体地合い情報（BULL / NEUTRAL / BEAR）および個別前半ピークアウト除外判定を取得 (PROJECT_RULES.md 準拠)"""
     state_file = MIX_SCRIPT_PATH.parent / "Data" / "market_state.json"
+    clean_sym = symbol.upper()
+    ticker = clean_sym.replace("-USDT", "").replace("USDT", "")
+
     default_res = {
         "regime_gate": "ALLOW",
         "regime_reason": "DEFAULT",
         "action": "NORMAL",
-        "state_name": "NORMAL",
-        "btc_state": "NORMAL",
-        "macro_dump_gate": "ALLOW",
-        "macro_dump_state": "NORMAL",
-        "macro_dump_reason": "NORMAL",
+        "overall_regime": "NEUTRAL",
+        "is_buy_regime": False,
+        "is_sell_regime": False,
+        "is_peak_dropped": False,
     }
     if not state_file.exists():
         return default_res
     try:
         with open(state_file, "r", encoding="utf-8") as f:
             data = json.load(f)
-            
-            # 第1層: 市場全体 全面安フィルター (Macro Market Dump Filter)
-            macro_dump = data.get("macro_dump_gate", {})
-            macro_gate = macro_dump.get("gate", "ALLOW")
-            macro_state = macro_dump.get("state_name", "NORMAL")
-            macro_reason = macro_dump.get("reason", "NORMAL")
 
-            # 第2層: 個別高値警戒門番
-            overall_gate = data.get("regime_gate", "ALLOW")
-            overall_reason = data.get("regime_reason", "NORMAL")
-            btc_info = data.get("btc_regime", {})
-            sym_regimes = data.get("symbol_regimes", {})
+        overall_reg = data.get("overall_regime", "NEUTRAL")
+        is_buy = (overall_reg == "BUY")
+        is_sell = (overall_reg == "SELL")
+        excluded = data.get("excluded_symbols", [])
+        is_peak_dropped = (clean_sym in excluded or ticker in excluded)
 
-            clean_sym = symbol.upper()
-            sym_info = sym_regimes.get(clean_sym, {})
-            sym_gate = sym_info.get("regime_gate", overall_gate)
+        if is_sell:
+            effective_gate = "STOP"
+            effective_reason = "OVERALL_REGIME_BEAR"
+            effective_action = "STOP_BEAR_REGIME"
+        elif is_peak_dropped:
+            effective_gate = "STOP"
+            effective_reason = "PEAK_OUT_DROPPED"
+            effective_action = "STOP_PEAK_DROP"
+        else:
+            effective_gate = "ALLOW"
+            effective_reason = f"REGIME_{overall_reg}"
+            effective_action = "NORMAL" if is_buy else "CAUTION"
 
-            # 二層構造判定:
-            # 1. 第1層（全面安）がSTOPなら無条件で最優先STOP
-            if macro_gate == "STOP":
-                effective_gate = "STOP"
-                effective_reason = f"MACRO_DUMP_LOCKED ({macro_reason})"
-                effective_action = "STOP_MARKET_DUMP"
-            # 2. 第2層（個別高値警戒・全体レジーム）がSTOPならSTOP
-            elif overall_gate == "STOP" or sym_gate == "STOP":
-                effective_gate = "STOP"
-                effective_reason = overall_reason if overall_gate == "STOP" else f"{clean_sym}_{sym_info.get('state_name')}"
-                effective_action = sym_info.get("action", btc_info.get("action", "NORMAL"))
-            else:
-                effective_gate = "ALLOW"
-                effective_reason = "NORMAL_OR_BOTTOM_RECOVERY"
-                effective_action = "NORMAL"
-
-            return {
-                "regime_gate": effective_gate,
-                "regime_reason": effective_reason,
-                "action": effective_action,
-                "state_name": sym_info.get("state_name", "NORMAL"),
-                "btc_state": btc_info.get("state_name", "NORMAL"),
-                "macro_dump_gate": macro_gate,
-                "macro_dump_state": macro_state,
-                "macro_dump_reason": macro_reason,
-            }
+        return {
+            "regime_gate": effective_gate,
+            "regime_reason": effective_reason,
+            "action": effective_action,
+            "overall_regime": overall_reg,
+            "is_buy_regime": is_buy,
+            "is_sell_regime": is_sell,
+            "is_peak_dropped": is_peak_dropped,
+        }
     except Exception:
         return default_res
 
@@ -922,105 +941,203 @@ async def load_local_or_api_candles(symbol: str, limit: int = 1440) -> pd.DataFr
 
 async def validate_profitable_candidates(trade_side: str, mode: str, base_symbol: str, interval: str = "60") -> Tuple[List[str], Dict[str, Dict[str, Any]], Dict[str, Any]]:
     """
-    クジラ優先上位候補銘柄に対して個別最適化（MTF/MP/ER比較バックテスト）を実行し、
-    各銘柄自身の最適パラメータでプラス成績（PnL > 100 USDT かつ 取引数 > 0）となる上位3銘柄を選定。
-    銘柄ごとの個別最適化パラメータ辞書 (symbol_params_map) を生成・返却する。
+    【PROJECT_RULES 準拠】2段階72通り個別最適化 (4足種×18通り: VAL_POC 36 + RSIMA 36)
+    - 第1段階: シングルポジション(max_trades=1)で trade_count >= 10 かつ PnL > 0 を満たす自力優良パラメータのみ選抜
+    - 第2段階: 厳選パラメータに対してのみ3枠ナンピン検証
+    - 成績最優秀銘柄の資産曲線チャート (MaxDD USDT/% 併記) を 1 枚出力
     """
     from bingx5_46_2api import api_bingx
     from bingx5_46_3logic import run_interval_comparison, logicinstance, resample_candles
 
-    discord.print_log("👑 【固定20銘柄 サイクル適格判定(168h高値停止/底打ち再開) ＆ 2大戦略 個別最適化】を開始します...")
-    
-    # 1. trade_eligible_symbols.json から サイクル適格判定合格銘柄をロード
-    eligible_file = Path(__file__).resolve().parent / "Data" / "trade_eligible_symbols.json"
-    target_cands = []
-    if eligible_file.exists():
+    market_state_file = MIX_SCRIPT_PATH.parent / "Data" / "market_state.json"
+    market_state_info = {}
+    if market_state_file.exists():
         try:
-            with open(eligible_file, "r", encoding="utf-8") as ef:
-                el_data = json.load(ef)
-                target_cands = el_data.get("eligible_symbols", [])
-                discord.print_log(f"   [サイクル判定済] トレード適格銘柄: {', '.join(target_cands) if target_cands else 'なし (全銘柄高値圏警戒見送り)'}")
-        except Exception as e:
-            discord.print_log(f"   [Warning] eligible_symbols 読込失敗: {e}")
-            target_cands = list(FIXED_SYMBOLS)
+            with open(market_state_file, "r", encoding="utf-8") as f:
+                market_state_info = json.load(f)
+        except Exception:
+            market_state_info = {}
+
+    overall_reg = market_state_info.get("overall_regime", "NEUTRAL")
+    recommended_symbols = market_state_info.get("recommended_symbols", [])
+
+    default_best_params: Dict[str, Any] = {
+        "strategy": "rsima",
+        "interval": 5,
+        "mp": 200,
+        "margin": 1.0,
+        "params": {"rsi_len": 9, "lma_len": 7, "lEp": 40.0, "lCp": 60.0, "max_trades": MAX_TRADES_COUNT}
+    }
+
+    # 候補銘柄の選定:
+    # 総合地合いが BUY の場合は 3期間買い推奨銘柄を優先。
+    # 総合地合いが非BUY (NEUTRAL / SELL) の場合でもバックテスト完全スキップは行わず、
+    # この過酷な相場環境下でも利益を出せる銘柄を発掘するため、固定選定銘柄に対してバックテスト・最適化を実行する。
+    if overall_reg == "BUY" and recommended_symbols:
+        all_candidates = [s for s in recommended_symbols if get_clean_symbol(s) != "BTC"]
+        discord.print_log(
+            f"【全体地合い判定: BUY】3期間買い推奨銘柄（計 {len(all_candidates)} 銘柄: {', '.join(all_candidates)}）"
+            f"の個別パラメータ最適化＆バックテスト検証を開始します..."
+        )
     else:
-        target_cands = list(FIXED_SYMBOLS)
-        discord.print_log(f"   [初期デフォルト採用] trade_eligible_symbols.json 未生成のため固定20銘柄を対象に設定: {', '.join(target_cands)}")
+        # 非BUY時: 3期間のいずれかで買い票を獲得した銘柄を優先しつつ固定銘柄全体をテスト
+        period_res = market_state_info.get("period_results", {})
+        any_buy_passed = set()
+        for w_info in period_res.values():
+            for s in w_info.get("buy_passed", []):
+                cl_s = get_clean_symbol(s)
+                if cl_s != "BTC":
+                    any_buy_passed.add(cl_s)
+
+        prioritized = [s for s in FIXED_SYMBOLS if get_clean_symbol(s) in any_buy_passed]
+        others = [s for s in FIXED_SYMBOLS if get_clean_symbol(s) not in any_buy_passed and get_clean_symbol(s) != "BTC"]
+        all_candidates = prioritized + others
+
+        discord.print_log(
+            f"【全体地合い判定: {overall_reg}】この相場状況下でも優位性のある銘柄を発掘するため、"
+            f"固定選定銘柄（計 {len(all_candidates)} 銘柄: {', '.join(all_candidates)}）"
+            f"の個別パラメータ最適化＆バックテスト検証を開始します..."
+        )
+
+    if not all_candidates:
+        discord.print_log("【全体地合い判定】候補銘柄が 0 件のためバックテストを待機します。")
+        return [], {}, default_best_params
 
     profitable_cands = []
     symbol_params_map: Dict[str, Dict[str, Any]] = {}
-    default_best_params: Dict[str, Any] = {
-        "strategy": "rsima",
-        "interval": 60,
-        "mp": 48,
-        "er": 40.0,
-        "margin": 1.0,
-        "params": {"rsi_len": 9, "lma_len": 7, "lEp": 40.0, "lCp": 70.0, "max_trades": MAX_TRADES_COUNT}
-    }
+    raw_dfs: Dict[str, pd.DataFrame] = {}
 
-    for cand_idx, cand in enumerate(target_cands):
-        cand_whale_info = get_whale_sentiment_info(cand)
-        cand_whale_sig = cand_whale_info.get("signal", "NEUTRAL")
-        if cand_whale_sig == "SHORT_ONLY":
-            discord.print_log(f"   [スキップ] {cand}: クジラ判定が売り優勢 ({cand_whale_sig}) のため選定対象から除外。")
+    for cand_idx, cand in enumerate(all_candidates):
+        cand_clean = get_clean_symbol(cand)
+        if cand_clean == "BTC":
             continue
 
-        cand_df = await load_local_or_api_candles(cand, limit=1440)
-        discord.print_log(f"個別最適化中: {cand} (直近2ヶ月分/{len(cand_df) if cand_df is not None else 0}本, ナンピン数: {MAX_TRADES_COUNT}) ...")
-        
-        if cand_df is not None and not cand_df.empty and len(cand_df) > 20:
+        cand_whale_info = get_whale_sentiment_info(cand)
+        cand_whale_sig = cand_whale_info.get("signal", "NEUTRAL")
+
+        # 1. SSoT 5分足時系列ストアから取得
+        cand_df_5m = load_5m_candles(cand)
+        if cand_df_5m.empty or len(cand_df_5m) < 500:
+            cand_df_5m = await asyncio.to_thread(sync_symbol_5m_candles, cand, 35)
+
+        # 2. 1H足トレンド判定用データを 5分足から数学的完全整合リサンプリング
+        if not cand_df_5m.empty and len(cand_df_5m) >= 60:
+            cand_df = resample_from_5m(cand_df_5m, 60)
+        else:
+            cand_df = await load_local_or_api_candles(cand, limit=768)
+
+        if cand_df is not None and not cand_df.empty:
+            raw_dfs[cand] = cand_df
+
+        discord.print_log(f"個別最適化中: {cand} (Rank #{cand_idx+1}) ...")
+
+        if cand_df_5m is not None and not cand_df_5m.empty and len(cand_df_5m) >= 120:
             try:
-                results, cand_strat, cand_inv, cand_mp, cand_er, cand_margin = run_interval_comparison(
-                    df_60m=cand_df, lot=1.0, data_equity=100.0, side_mode=trade_side, symbol=cand,
-                    max_trades=MAX_TRADES_COUNT, force_strategy=FORCE_STRATEGY
+                results, cand_strat, cand_inv, cand_mp, cand_margin = await asyncio.to_thread(
+                    run_interval_comparison,
+                    df_5m=cand_df_5m, lot=1.0, data_equity=100.0, side_mode=trade_side, symbol=cand
                 )
-                
-                # 有効な最良結果を抽出
-                active_results = {k: v for k, v in results.items() if v.get('trade_count', 0) > 0}
-                if active_results:
-                    best_key = max(active_results.keys(), key=lambda x: active_results[x]['final_pnl'])
-                    best_res = active_results[best_key]
-                    cand_pnl = float(best_res.get('final_pnl', 0.0))
-                    trade_cnt = int(best_res.get('trade_count', 0))
-                    win_rt = float(best_res.get('win_rate', 0.0))
-                    max_dd = float(best_res.get('DD_max', 0.0))
-                    cand_p = best_res.get('params', {})
-                else:
-                    cand_pnl = 0.0
-                    trade_cnt = 0
-                    win_rt = 0.0
-                    max_dd = 0.0
-                    cand_p = {}
+
+                best_params_dict = results.get("_best_params_", {})
+                cand_pnl = float(best_params_dict.get("pnl", 0.0))
+                trade_cnt = int(best_params_dict.get("trade_count", 0))
+                win_rt = float(best_params_dict.get("win_rate", 0.0))
+                max_dd = float(best_params_dict.get("DD_max", 0.0))
 
                 cand_params = {
                     "strategy": cand_strat,
-                    "interval": 60,
+                    "interval": cand_inv,
                     "mp": cand_mp,
-                    "er": cand_er,
                     "margin": cand_margin,
+                    "num_bins": best_params_dict.get("num_bins", 50),
+                    "value_area_pct": best_params_dict.get("value_area_pct", 0.70),
+                    "ma_type": best_params_dict.get("ma_type", "EMA"),
+                    "ma_condition": best_params_dict.get("ma_condition", "close_above"),
+                    "l_ep": best_params_dict.get("l_ep", 40.0),
+                    "l_cp": best_params_dict.get("l_cp", 60.0),
+                    "sl_pct": best_params_dict.get("sl_pct", 0.090),
                     "pnl": cand_pnl,
                     "trade_count": trade_cnt,
                     "win_rate": win_rt,
                     "max_dd": max_dd,
-                    "params": cand_p
+                    "single_pnl": best_params_dict.get("single_pnl", cand_pnl),
+                    "single_trades": best_params_dict.get("single_trades", trade_cnt),
+                    "single_win_rate": best_params_dict.get("single_win_rate", win_rt),
+                    "chart_df": best_params_dict.get("chart_df"),
+                    "params": best_params_dict,
                 }
                 symbol_params_map[cand] = cand_params
 
-                if cand_pnl > 0 and trade_cnt > 0:
+                # プラス収支かつ最低取引回数(10回以上)クリアで合格
+                if cand_pnl > 0 and trade_cnt >= 10:
+                    if cand_strat == "val_poc":
+                        detail_str = f"MP={cand_mp}, Bins={cand_params['num_bins']}, VA={int(cand_params['value_area_pct']*100)}%, {cand_params['ma_type']}_{cand_params['ma_condition']}"
+                    else:
+                        detail_str = f"EP={int(cand_params['l_ep'])}, CP={int(cand_params['l_cp'])}, SL={cand_params['sl_pct']*100:.1f}%"
+                    s_pnl = cand_params.get('single_pnl', cand_pnl)
+                    s_cnt = cand_params.get('single_trades', trade_cnt)
+                    s_win = cand_params.get('single_win_rate', win_rt)
                     discord.print_log(
-                        f"   [合格 🟢] {cand}: 戦略={cand_strat.upper()} | "
-                        f"純利益: +${cand_pnl:.2f} USDT (取引: {trade_cnt}回, 勝率: {win_rt:.1f}%, DD: {max_dd:.2f} USDT ({max_dd:.1f}%))"
+                        f"   [合格 🟢] {cand}: 戦略={cand_strat.upper()} ({cand_inv}m / {detail_str}) -> "
+                        f"純利益: +${cand_pnl:.2f} USDT (取引: {trade_cnt}回, 勝率: {win_rt:.1f}%, DD: {max_dd:.2f} USDT ({max_dd:.1f}%)) "
+                        f"[シングル1枠: +${s_pnl:.2f} / {s_cnt}回 / {s_win:.1f}%]"
                     )
                     profitable_cands.append(cand)
                 else:
-                    discord.print_log(f"   [不合格 🔴] {cand}: PnL = ${cand_pnl:.2f} (取引: {trade_cnt}回)")
+                    discord.print_log(f"   [不合格 🔴] {cand}: PnL = ${cand_pnl:+.2f} USDT (取引: {trade_cnt}回 < 最低10回基準またはマイナス)")
 
             except Exception as opt_err:
                 discord.print_log(f"   [最適化エラー] {cand}: {opt_err}")
 
-        await asyncio.sleep(0.05)
+        await asyncio.sleep(0.1)
 
+    # 1ヶ月間バックテスト 最優秀成績銘柄 チャート1枚出力 (PROJECT_RULES.md 準拠)
+    best_sym = None
     if profitable_cands:
+        best_sym = max(profitable_cands, key=lambda s: symbol_params_map[s].get("pnl", 0.0))
+    elif symbol_params_map:
+        best_sym = max(symbol_params_map.keys(), key=lambda s: symbol_params_map[s].get("pnl", 0.0))
+
+    if best_sym and best_sym in symbol_params_map:
+        try:
+            best_p = symbol_params_map[best_sym]
+            best_strat = best_p["strategy"]
+            best_inv = best_p.get("interval", 5)
+            best_mp = best_p.get("mp", 200)
+            best_pnl = float(best_p.get("pnl", 0.0))
+            best_cnt = int(best_p.get("trade_count", 0))
+            best_win = float(best_p.get("win_rate", 0.0))
+            best_dd = float(best_p.get("max_dd", 0.0))
+
+            bg_csv = f"backtest_data/klines100_{get_clean_symbol(best_sym)}_bingx.csv"
+            Path("backtest_data").mkdir(parents=True, exist_ok=True)
+            chart_df = best_p.get("chart_df")
+
+            if isinstance(chart_df, pd.DataFrame) and not chart_df.empty:
+                chart_df.to_csv(bg_csv, index=False)
+            elif best_sym in raw_dfs:
+                cand_df = raw_dfs[best_sym]
+                cand_df.tail(min(len(cand_df), 720)).reset_index(drop=True).to_csv(bg_csv, index=False)
+
+            strat_tag = "RSIMA3" if best_strat in ["rsima", "rsima3"] else "VAL_POC"
+            chart_label = f"Best1Month_{strat_tag}_{best_inv}m"
+            discord.print_log(
+                f"🏆 **【バックテスト 最優秀成績銘柄 (1ヶ月間)】**\n"
+                f"・銘柄: `{best_sym}` (採用足種: `{best_inv}m足` / 戦略: `{strat_tag}`)\n"
+                f"・純利益: `+${best_pnl:.2f} USDT` (取引: {best_cnt}回, 勝率: {best_win:.1f}%, MaxDD: `-${best_dd:.2f} USDT (-{best_dd:.1f}%)`)\n"
+                f"・最優秀成績チャート1枚を出力します。"
+            )
+            discord.plot_backtest(label=chart_label, csv_file=bg_csv, symbol=best_sym)
+        except Exception as ch_err:
+            print(f"Best cand chart error {best_sym}: {ch_err}")
+
+    # チャート出力完了後はメモリ解放
+    for sym_k in symbol_params_map:
+        symbol_params_map[sym_k].pop("chart_df", None)
+
+    if best_sym:
+        default_best_params = symbol_params_map.get(best_sym, default_best_params)
+    elif profitable_cands:
         first_sym = profitable_cands[0]
         default_best_params = symbol_params_map.get(first_sym, default_best_params)
     elif symbol_params_map:
@@ -1030,64 +1147,45 @@ async def validate_profitable_candidates(trade_side: str, mode: str, base_symbol
     return profitable_cands, symbol_params_map, default_best_params
 
 
-async def select_top_bingx_symbols(top_n: int = 10, mode: str = 'demo') -> List[Dict[str, Any]]:
-    """Data/symbol_selection_scores.csv が存在しない場合は自動再計算し、スコアから上位銘柄を選定"""
-    scores_file = Path(__file__).resolve().parent / "Data" / "symbol_selection_scores.csv"
-    
-    # スコアファイルが存在しない場合は、銘柄選定スクリプトを自動発注・再計算
-    if not scores_file.exists():
-        print("[Symbol Selection] symbol_selection_scores.csv が見つかりません。最新データを自動スクリーニング・生成します...")
-        mix_script = Path(__file__).resolve().parent / "bingx5_46_4mix_candle_Merged_Alt10.py"
-        if mix_script.exists():
-            try:
-                import subprocess
-                subprocess.run([sys.executable, str(mix_script)], check=True)
-            except Exception as sub_err:
-                print(f"[Symbol Selection Error] 銘柄選定スクリプト実行エラー: {sub_err}")
-            
-    tickers = []
-    if scores_file.exists():
-        print(f"[Symbol Selection] {scores_file.name} からクジラ優先銘柄を選定中...")
+async def select_top_bingx_symbols(top_n: int = 20, mode: str = 'demo') -> List[Dict[str, Any]]:
+    """固定選定20銘柄および market_state.json の推奨銘柄に基づいて選定候補を返す"""
+    state_file = Path(__file__).resolve().parent / "Data" / "market_state.json"
+    target_symbols = list(FIXED_SYMBOLS)
+
+    # 1. market_state.json が存在する場合は推奨銘柄を優先配置
+    if state_file.exists():
         try:
-            df_scores = pd.read_csv(scores_file)
-            # priority_rank または score の降順でソート
-            if "priority_rank" in df_scores.columns:
-                df_scores = df_scores.sort_values("priority_rank", ascending=True)
-            elif "score" in df_scores.columns:
-                df_scores = df_scores.sort_values("score", ascending=False)
-            tickers = df_scores.to_dict(orient="records")
-        except Exception as e:
-            print(f"[Symbol Selection Error] {e}")
-            from bingx5_46_4mix_candle_Merged_Alt10 import fetch_bingx_tickers
-            tickers = fetch_bingx_tickers()
-    else:
-        from bingx5_46_4mix_candle_Merged_Alt10 import fetch_bingx_tickers
-        tickers = fetch_bingx_tickers()
+            with open(state_file, "r", encoding="utf-8") as f:
+                st = json.load(f)
+            rec_syms = st.get("recommended_symbols", [])
+            if rec_syms:
+                # 推奨銘柄を先頭にし、残りの固定銘柄を後ろに配置
+                combined = []
+                for s in rec_syms:
+                    if s in FIXED_SYMBOLS and s not in combined:
+                        combined.append(s)
+                for s in FIXED_SYMBOLS:
+                    if s not in combined:
+                        combined.append(s)
+                target_symbols = combined
+        except Exception as st_err:
+            print(f"[Symbol Selection Warning] market_state.json 読み込み失敗: {st_err}")
 
-    if not tickers:
-        print("[Symbol Selection] 銘柄情報の取得に失敗。デフォルト銘柄を使用します。")
-        return [{"symbol": "ETH-USDT", "lastPr": 2500.0, "usdtVolume": 1e8}, {"symbol": "SOL-USDT", "lastPr": 105.0, "usdtVolume": 1e8}]
-    
-    # BTCおよび為替FX（FOREX）を除外して優先順序通りに抽出（コモディティ・株・指数は許容）
-    from bingx5_46_4mix_candle_Merged_Alt10 import is_forex_symbol
-    def _is_btc_sym(s: str) -> bool:
-        clean = str(s).upper().replace("-", "").replace("_", "").replace("USDT", "").replace("USDC", "")
-        return clean == "BTC"
-
-    sorted_tickers = [t for t in tickers if not _is_btc_sym(t.get("symbol", "")) and not is_forex_symbol(t.get("symbol", ""))]
-
-    # 取引所の universe に存在する銘柄のみにフィルタリング
+    # 2. 取引所 universe 存在チェック
+    valid_symbols = target_symbols
     try:
         from bingx5_46_2api import get_bingx_universe_symbols
         valid_universe = get_bingx_universe_symbols(mode=mode)
         if valid_universe:
-            filtered = [t for t in sorted_tickers if normalize_symbol(t.get("symbol", "")).upper() in valid_universe]
+            filtered = [s for s in target_symbols if normalize_symbol(s).upper() in valid_universe]
             if filtered:
-                sorted_tickers = filtered
+                valid_symbols = filtered
     except Exception as filter_err:
         print(f"[Symbol Selection Warning] Universe フィルタエラー: {filter_err}")
 
-    return sorted_tickers[:top_n]
+    results = [{"symbol": s, "lastPr": 1.0, "usdtVolume": 1e8} for s in valid_symbols[:top_n]]
+    print(f"[Symbol Selection] 候補銘柄選定完了 ({len(results)}銘柄): {', '.join([r['symbol'] for r in results])}")
+    return results
 
 
 TRAILING_TP_FILE = Path(__file__).resolve().parent / "Data" / "trailing_tp_state.json"
@@ -1297,6 +1395,26 @@ async def wait_until_next_candle(
                     cur_nanpin = int(scale_state.get("nanpin_count", 0))
                     strat_type = scale_state.get("strategy", "val_poc")
 
+                    # 地合いディフェンス判定取得 (3段階: BULL / NEUTRAL / BEAR)
+                    regime_info = get_regime_gate_info(sym)
+                    overall_regime = regime_info.get("overall_regime", "NEUTRAL")
+
+                    # 地合い悪化（NEUTRAL / BEAR）時の緊急建値撤退 (+0.20% 到達で即時成行決済)
+                    if overall_regime != "BUY" and entry_px > 0 and cur_px >= entry_px * 1.0020:
+                        exit_reason = "Emergency_Breakeven_Exit_+0.20%"
+                        pnl_est = (cur_px - entry_px) * buy_qty
+                        discord.print_log(
+                            f"[{sym}] [EMERGENCY BREAKEVEN EXIT] ⚠️ 地合い非BUY ({overall_regime}) 検知により建値+0.20%早期撤退成立!\n"
+                            f"   └ 現在値: ${cur_px:,.4f} >= 撤退ライン: ${entry_px * 1.0020:,.4f} (建値: ${entry_px:,.4f}) | 概算PnL: {pnl_est:+.2f} USDT ➔ 成行決済"
+                        )
+                        from bingx5_46_2api import flatten_current_position_bingx
+                        await flatten_current_position_bingx(sym, "USDT", mode, exit_reason, force_market=True)
+                        from real_trade_tracker import record_real_trade
+                        record_real_trade(sym, "LONG", "CLOSE", cur_px, buy_qty, pnl_est, f"実運用決済 ({exit_reason})")
+                        scale_in_states.pop(sym, None)
+                        save_scale_in_states(scale_in_states)
+                        continue
+
                     # A. リアルタイム VAL-VAH 60% 利確判定 (Only Exit Above Avg Price: 建値プラス域限定)
                     target_tp = float(scale_state.get("target_tp", 0.0)) or poc_val
                     if strat_type in ("val_poc", "vp_val_gc") and target_tp > 0 and cur_px >= target_tp and cur_px > entry_px * 1.0006:
@@ -1314,11 +1432,25 @@ async def wait_until_next_candle(
                         save_scale_in_states(scale_in_states)
                         continue
 
-                    # B. リアルタイム 段階的ナンピン判定 (VAL_POC: -3.0%下落, 初期1+ナンピン最大2=計3枠)
-                    max_allowed_nanpins = 2 if strat_type in ("val_poc", "vp_val_gc") else 4
+                    # B. リアルタイム 段階的ナンピン判定 (PROJECT_RULES準拠: 初期1+ナンピン最大2=計3枠, 等倍1.0x)
+                    # 地合いが BUY の時のみナンピン許可 (NEUTRAL/BEAR時は即時凍結)
+                    if overall_regime != "BUY":
+                        continue
+
+                    max_allowed_nanpins = 2
                     req_drop_pct = calc_add_pct(cur_nanpin + 1, strategy=strat_type)
                     drop_target = last_px * (1.0 - req_drop_pct)
+                    cur_notional = buy_qty * cur_px
+                    max_notional_limit = BINGX_TARGET_POSITION_VALUE_USDT * 3.15
+
                     if cur_nanpin < max_allowed_nanpins and cur_px <= drop_target:
+                        if cur_notional >= max_notional_limit:
+                            discord.print_log(
+                                f"[{sym}] [NANPIN BLOCKED] 🛑 想定元本上限ガード到達 (${cur_notional:.2f} >= ${max_notional_limit:.2f}) ➔ ナンピン中止",
+                                level="warning"
+                            )
+                            continue
+
                         discord.print_log(
                             f"[{sym}] [REALTIME NANPIN] 📉 最後の建値(${last_px:,.4f})から-{req_drop_pct*100:.1f}%下落検出 (${cur_px:,.4f} <= ${drop_target:,.4f})\n"
                             f"   └ ナンピン発動 ({cur_nanpin + 1}/{max_allowed_nanpins} 回目)...",
@@ -1629,30 +1761,18 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
     else:
         print("[Banner Skipped by --no-banner]")
 
-    # ========== 【トレード前準備 ステップ2】: 全銘柄1時間足データ（1年分）古い順小分けDiscord送信 ==========
-    skip_history = ("--skip-history" in sys.argv or "--no-history" in sys.argv)
-    if not skip_history:
-        discord.print_log("\n📦 【トレード前準備: ステップ2】 全銘柄1時間足データ（過去1年分: 365日）を古い順に小分けZIP送信します...")
-        download_script = Path(__file__).resolve().parent / "download_historical_candles.py"
-        if download_script.exists():
-            try:
-                # 過去1年分 (365日、30日チャンク) を古い順で取得・Discord送信 (チャートは次ステップで生成するためスキップ)
-                cmd_hist = [
-                    sys.executable, str(download_script),
-                    "--days", "365",
-                    "--chunk-days", "30",
-                    "--skip-charts"
-                ]
-                subprocess.run(cmd_hist, check=True)
-                discord.print_log("✅ 全銘柄1時間足データ（過去1年分）の小分け送信が正常に完了しました。（直近データが最後に到着）")
-            except Exception as dl_err:
-                discord.print_log(f"⚠️ 全銘柄1年分データ取得で警告が発生しました (後続準備を継続): {dl_err}")
-    else:
-        print("[History Download Skipped by --skip-history]")
+    # ========== 【トレード前準備 ステップ2】: 5分足 SSoT 永続ストア同期 (巨大ZIP/全市場DLは完全廃止) ==========
+    from candle_5m_store import sync_all_target_symbols_5m
+    discord.print_log("\n📦 【トレード前準備: ステップ2】 固定選定20銘柄 + BTC-USDT の 5分足 SSoT 同期を実行します...")
+    try:
+        sync_all_target_symbols_5m(lookback_days=35)
+        discord.print_log("✅ 5分足 SSoT ストアの同期が正常に完了しました。")
+    except Exception as sync_err:
+        discord.print_log(f"⚠️ 5分足 SSoT 同期で警告が発生しました (後続処理を継続): {sync_err}")
 
     # ========== 【トレード前準備 ステップ3 & 4 & 5】: チャート出力 ➔ MTF乖離判定＆ブレイクアウトTop10 ➔ 個別最適化 ==========
     trade_side, symbol_params_map, best_params, selected_symbols = await run_screening_and_optimization(
-        mode, send_charts=True, skip_zip=(not skip_history)
+        mode, send_charts=True, skip_zip=True
     )
 
     # 各銘柄の api インスタンスを保持（トレーリングSL状態を維持するため）
@@ -2005,27 +2125,34 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
             )
 
             if hourly_summary_rows:
-                rem_min = 5 - (now_jst.minute % 5)
-                if rem_min == 0:
-                    rem_min = 5
-                next_candle_dt = (now_jst + timedelta(minutes=rem_min)).replace(second=2, microsecond=0)
-                next_candle_str = next_candle_dt.strftime('%H:%M:%S')
+                tbl_header = f"{_pad_display('銘柄', 6)} {_pad_display('現在価格', 8, 'right')} {_pad_display('ポジション', 16)} {_pad_display('クジラ', 6)}"
+                tbl_divider = "────────────────────────────────────────"
+                acct_mode_str = "Live Account" if BINGX_IS_LIVE else "VST Demo Mode"
                 summary_lines = [
-                    f"⏱ [Cycle #{cycle_count}] {now_jst.strftime('%H:%M')} JST (5分足) | 残高: ${cycle_balance:.2f}",
-                    "───────────────────────────────────",
-                    "銘柄     現在値    保有   シグナル  大口",
-                    "───────────────────────────────────",
+                    f"⏰ **【BingX 毎時ステータスサマリー ({now_jst.strftime('%H:00')} JST)】**",
+                    f"💰 残高: ${cycle_balance:,.2f} ({acct_mode_str}) | 監視体制: 5分足 WebSocketリアルタイム稼働中",
+                    "```text",
+                    tbl_header,
+                    tbl_divider,
                 ]
                 for r in hourly_summary_rows:
                     px = r["price"]
                     px_str = f"${px:,.4f}" if px < 10 else (f"${px:,.2f}" if px < 1000 else f"${px:,.1f}")
-                    summary_lines.append(f"{r['sym']:<6s} {px_str:>9s}  {r['pos']:<6s}  {r['sig']:^6s}  {r['whale']}")
-                summary_lines.append("───────────────────────────────────")
-                summary_lines.append(f"次回確定: {next_candle_str} JST")
-                summary_formatted = "```text\n" + "\n".join(summary_lines) + "\n```"
+                    clean_sym = r["sym"].replace("-USDT", "").replace("USDT", "")
+                    pos_str = r["pos"]
+                    if pos_str in ("FLAT", "--", "None", ""):
+                        pos_str = "ノーポジ"
+                    summary_lines.append(
+                        f"{_pad_display(clean_sym, 6)} {_pad_display(px_str, 8, 'right')} {_pad_display(pos_str, 16)} {_pad_display(r['whale'], 6)}"
+                    )
+                summary_lines.append(tbl_divider)
+                next_hour_jst = (now_jst.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)).strftime('%H:00')
+                summary_lines.append(f"次回定期更新: {next_hour_jst} JST (1時間ごとに定期配信中)")
+                summary_lines.append("```")
+                summary_formatted = "\n".join(summary_lines)
 
                 if is_hourly_report_due:
-                    discord.print_log(summary_formatted)
+                    discord.print_log(summary_formatted, force_send=True)
                     last_summary_hour_slot = current_hour_slot
                 else:
                     discord.print_log(summary_formatted, level="debug")
@@ -2051,6 +2178,21 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                     longclose_sig = bool(df["longclose"].iloc[-1]) if "longclose" in df.columns else False
                     regime_info = get_regime_gate_info(sym)
                     is_top_tighten = (regime_info.get("action") == "TIGHTEN_SL_AND_STOP_NEW_LONG")
+                    overall_regime = regime_info.get("overall_regime", "NEUTRAL")
+                    is_emergency_be = (overall_regime != "BUY")
+
+                    closed = False
+
+                    # 0. 地合い悪化時の緊急建値撤退 (非BUY かつ entry_px > 0 かつ current_price >= entry_px * 1.0020)
+                    if is_emergency_be and entry_px > 0 and current_price >= entry_px * 1.0020:
+                        exit_reason = "Emergency_Breakeven_Exit_+0.20%"
+                        discord.print_log(
+                            f"[{sym}] [EMERGENCY BREAKEVEN EXIT] ⚠️ 地合い非BUY ({overall_regime}) 検知により建値+0.20%早期撤退成立!\n"
+                            f"   └ 現在値: ${current_price:,.4f} >= 撤退ライン: ${entry_px * 1.0020:,.4f} (建値: ${entry_px:,.4f}) ➔ 成行決済"
+                        )
+                        from bingx5_46_2api import flatten_current_position_bingx
+                        await flatten_current_position_bingx(sym, "USDT", mode, exit_reason, force_market=True)
+                        closed = True
 
                     ttp = trailing_tp_states.get(sym, {
                         "active": False,
@@ -2061,7 +2203,7 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                     })
 
                     # 利確シグナル点灯、または天井圏検知(TOP_EXHAUSTION)時のトレーリング発動（未発動の場合）
-                    if not ttp.get("active", False) and (longclose_sig or is_top_tighten) and (current_price > entry_px):
+                    if not closed and not ttp.get("active", False) and (longclose_sig or is_top_tighten) and (current_price > entry_px):
                         ttp["active"] = True
                         cur_high = max(current_price, float(df["high"].iloc[-1]) if "high" in df.columns else current_price)
                         ttp["peak_price"] = cur_high
@@ -2082,7 +2224,7 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                         )
 
                     # トレーリング利確モード中の判定
-                    if ttp.get("active", False):
+                    if not closed and ttp.get("active", False):
                         cur_high = max(current_price, float(df["high"].iloc[-1]) if "high" in df.columns else current_price)
                         if cur_high > ttp["peak_price"]:
                             ttp["peak_price"] = cur_high
@@ -2093,7 +2235,6 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                         ttp["trail_stop"] = max(ttp["peak_price"] * (1.0 - callback_pct), vah_guard, min_guarantee)
                         trailing_tp_states[sym] = ttp
                         save_trailing_tp_states(trailing_tp_states)
-
 
                         if current_price < ttp["trail_stop"]:
                             exit_reason = f"TrailingTP_{cand_strat.upper()}"
@@ -2112,8 +2253,7 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                                 level="debug"
                             )
                             closed = False
-                    else:
-                        closed = False
+                    elif not closed:
                         # 1. 戦略別スマート損切り判定 (5分足確定終値判定 Close)
                         # 個別最適化パラメータ sl_pct を優先参照 (デフォルト: RSIMA 3.0%, VAL_POC 9.0% / 実証最適値準拠)
                         default_sl = 0.09 if cand_strat in ("val_poc", "vp_val_gc") else 0.030
@@ -2147,49 +2287,66 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                                 await flatten_current_position_bingx(sym, "USDT", mode, exit_reason, force_market=True)
                                 closed = True
 
-                        # 2-B. 段階的ナンピン判定 (VAL_POC: -3.0%下落, 初期1+ナンピン最大2=計3枠)
+                        # 2-B. 段階的ナンピン判定 (PROJECT_RULES準拠: 初期1+ナンピン最大2=計3枠, 等倍1.0x)
                         if not closed and cand_strat in ("val_poc", "vp_val_gc", "rsima"):
-                            scale_state = scale_in_states.get(sym, {
-                                "nanpin_count": 0,
-                                "last_entry_price": entry_px,
-                                "avg_price": entry_px,
-                                "poc_level": float(df["POC"].iloc[-1]) if ("POC" in df.columns and not pd.isna(df["POC"].iloc[-1])) else 0.0,
-                                "strategy": cand_strat
-                            })
-                            cur_nanpin = int(scale_state.get("nanpin_count", 0))
-                            last_px = float(scale_state.get("last_entry_price", entry_px)) or entry_px
-                            max_allowed_nanpins = 2 if cand_strat in ("val_poc", "vp_val_gc") else 4
-                            req_drop_pct = calc_add_pct(cur_nanpin + 1, strategy=cand_strat)
-                            drop_target = last_px * (1.0 - req_drop_pct)
-
-                            if cur_nanpin < max_allowed_nanpins and current_price <= drop_target:
+                            # 地合いが BUY の時のみナンピン許可 (NEUTRAL/BEAR時は即時凍結)
+                            can_nanpin = (overall_regime == "BUY")
+                            if not can_nanpin:
                                 discord.print_log(
-                                    f"[{sym}] [NANPIN TRIGGER] 📉 最後の建値(${last_px:,.4f})から-{req_drop_pct*100:.1f}%下落検出 (${current_price:,.4f} <= ${drop_target:,.4f})\n"
-                                    f"   └ ナンピン発動 ({cur_nanpin + 1}/{max_allowed_nanpins} 回目)...",
+                                    f"[{sym}] [NANPIN FROZEN] ❄️ 地合いが {overall_regime} のため追加ナンピンは即時凍結されています。",
                                     level="debug"
                                 )
-                                buy_lot = float(position.get("buy", 0))
-                                entered_add = await api.long_entry(
-                                    df, position, balance, buy_lot, max_lot,
-                                    max_stage=max_allowed_nanpins + 1, is_scale_in=True, stage_num=cur_nanpin + 2
-                                )
+                            else:
+                                scale_state = scale_in_states.get(sym, {
+                                    "nanpin_count": 0,
+                                    "last_entry_price": entry_px,
+                                    "avg_price": entry_px,
+                                    "poc_level": float(df["POC"].iloc[-1]) if ("POC" in df.columns and not pd.isna(df["POC"].iloc[-1])) else 0.0,
+                                    "strategy": cand_strat
+                                })
+                                cur_nanpin = int(scale_state.get("nanpin_count", 0))
+                                last_px = float(scale_state.get("last_entry_price", entry_px)) or entry_px
+                                max_allowed_nanpins = 2
+                                req_drop_pct = calc_add_pct(cur_nanpin + 1, strategy=cand_strat)
+                                drop_target = last_px * (1.0 - req_drop_pct)
+                                current_pos_size = float(position.get("buy", 0))
+                                current_notional = current_pos_size * current_price
+                                max_notional_limit = BINGX_TARGET_POSITION_VALUE_USDT * 3.15
 
-                                if entered_add:
-                                    scale_state["nanpin_count"] = cur_nanpin + 1
-                                    scale_state["last_entry_price"] = current_price
-                                    scale_state["strategy"] = cand_strat
-                                    scale_in_states[sym] = scale_state
-                                    save_scale_in_states(scale_in_states)
-                                    record_real_trade(sym, "LONG", "SCALE_IN", current_price, buy_lot, 0.0, f"実運用ナンピン買い増し ({cur_nanpin + 1}/4)")
-                                    discord.print_log(
-                                        f"🚀🚀🚀 **【ナンピン買い増し約定】** 🚀🚀🚀\n"
-                                        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                                        f"📌 **銘柄 / 方向**: `{sym}` (LONG 🟢 / {cand_strat.upper()})\n"
-                                        f"💰 **約定価格**: `${current_price:.6f}`\n"
-                                        f"📦 **追加数量**: `{buy_lot:,.2f} {sym}`\n"
-                                        f"🔢 **ナンピン段階**: `{cur_nanpin + 1}/4 回目` (合計 {cur_nanpin + 2}/5 枠)\n"
-                                        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-                                    )
+                                if cur_nanpin < max_allowed_nanpins and current_price <= drop_target:
+                                    if current_notional >= max_notional_limit:
+                                        discord.print_log(
+                                            f"[{sym}] [NANPIN BLOCKED] 🛑 想定元本上限ガード到達 (${current_notional:.2f} >= ${max_notional_limit:.2f}) ➔ ナンピン中止",
+                                            level="warning"
+                                        )
+                                    else:
+                                        discord.print_log(
+                                            f"[{sym}] [NANPIN TRIGGER] 📉 最後の建値(${last_px:,.4f})から-{req_drop_pct*100:.1f}%下落検出 (${current_price:,.4f} <= ${drop_target:,.4f})\n"
+                                            f"   └ ナンピン発動 ({cur_nanpin + 1}/{max_allowed_nanpins} 回目)...",
+                                            level="debug"
+                                        )
+                                        buy_lot = float(position.get("buy", 0))
+                                        entered_add = await api.long_entry(
+                                            df, position, balance, buy_lot, max_lot,
+                                            max_stage=max_allowed_nanpins + 1, is_scale_in=True, stage_num=cur_nanpin + 2
+                                        )
+
+                                        if entered_add:
+                                            scale_state["nanpin_count"] = cur_nanpin + 1
+                                            scale_state["last_entry_price"] = current_price
+                                            scale_state["strategy"] = cand_strat
+                                            scale_in_states[sym] = scale_state
+                                            save_scale_in_states(scale_in_states)
+                                            record_real_trade(sym, "LONG", "SCALE_IN", current_price, buy_lot, 0.0, f"実運用ナンピン買い増し ({cur_nanpin + 1}/{max_allowed_nanpins})")
+                                            discord.print_log(
+                                                f"🚀🚀🚀 **【ナンピン買い増し約定】** 🚀🚀🚀\n"
+                                                f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                                                f"📌 **銘柄 / 方向**: `{sym}` (LONG 🟢 / {cand_strat.upper()})\n"
+                                                f"💰 **約定価格**: `${current_price:.6f}`\n"
+                                                f"📦 **追加数量**: `{buy_lot:,.2f} {sym}`\n"
+                                                f"🔢 **ナンピン段階**: `{cur_nanpin + 1}/{max_allowed_nanpins} 回目` (合計 {cur_nanpin + 2}/{max_allowed_nanpins + 1} 枠)\n"
+                                                f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+                                            )
 
                         elif not closed:
                             # 2-C. 通常戦略: Volume Profile SL (損切り/撤退) を判定
