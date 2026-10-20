@@ -45,12 +45,34 @@ def normalize_sym(s: str) -> str:
     return sym
 
 
+def cleanup_invalid_oi_files() -> None:
+    """1文字のティッカーなど誤って生成された不正な CSV ファイルをクリーンアップ"""
+    if not OI_STORE_DIR.exists():
+        return
+    for f in OI_STORE_DIR.glob("*_oi.csv"):
+        name_part = f.name.replace("_oi.csv", "").replace("-USDT", "").strip()
+        if len(name_part) <= 1:
+            try:
+                f.unlink(missing_ok=True)
+            except Exception:
+                pass
+
+
 def fetch_bingx_oi_fr_snapshot_sync(
     symbols: Optional[List[str]] = None,
     timeout: int = 10
 ) -> Dict[str, Dict[str, float]]:
     """指定銘柄群（デフォルト: 固定20銘柄 + BTC-USDT）の最新 OI / FR / MarkPrice スナップショットを取得"""
-    target_syms = [normalize_sym(s) for s in (symbols or FIXED_TARGET_SYMBOLS)]
+    if isinstance(symbols, str):
+        # 万一 "DEMO" や単一文字列が渡された場合の型防御
+        clean_s = symbols.strip().upper()
+        if clean_s in ("DEMO", "REAL", "AIR", "MOCK", "LIVE") or len(clean_s) <= 4:
+            symbols = None
+        else:
+            symbols = [clean_s]
+
+    valid_syms = symbols if symbols is not None else FIXED_TARGET_SYMBOLS
+    target_syms = [normalize_sym(s) for s in valid_syms if len(str(s).strip()) >= 2]
     results: Dict[str, Dict[str, float]] = {}
 
     # 1. 全銘柄の premiumIndex (markPrice, lastFundingRate) を一括取得
@@ -111,6 +133,7 @@ def save_oi_snapshot(oi_data: Dict[str, Dict[str, float]], target_ts_ms: Optiona
     dt_jst_str = datetime.fromtimestamp(target_ts_ms / 1000, tz=timezone.utc).astimezone(JST).strftime("%Y-%m-%d %H:%M:%S")
 
     OI_STORE_DIR.mkdir(parents=True, exist_ok=True)
+    cleanup_invalid_oi_files()
     saved_count = 0
 
     for sym, item in oi_data.items():

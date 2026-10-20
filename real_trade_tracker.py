@@ -112,10 +112,26 @@ def record_real_trade(symbol: str, side: str, action: str, price: float, qty: fl
     return trade_entry
 
 
-def get_real_trading_summary(current_balance: Optional[float] = None) -> Dict[str, Any]:
-    """実トレード履歴の通算統計サマリーを取得（後方互換用）"""
+def get_real_trading_summary(days: Optional[int] = None, current_balance: Optional[float] = None) -> Dict[str, Any]:
+    """実トレード履歴の統計サマリーを取得（days指定時は直近days日間スライディング、未指定時は全期間）"""
     trades = load_real_trades()
     closes = [t for t in trades if t.get("action") == "CLOSE"]
+
+    if days is not None and days > 0 and closes:
+        cutoff_dt = datetime.now(timezone.utc) - timedelta(days=days)
+        filtered_closes = []
+        for t in closes:
+            ts_val = t.get("timestamp")
+            if ts_val:
+                try:
+                    t_dt = pd.to_datetime(ts_val, utc=True)
+                    if t_dt >= cutoff_dt:
+                        filtered_closes.append(t)
+                except Exception:
+                    filtered_closes.append(t)
+            else:
+                filtered_closes.append(t)
+        closes = filtered_closes
     pnls = [float(t.get("pnl", 0.0)) for t in closes]
     wins = [x for x in pnls if x > 0]
     losses = [x for x in pnls if x < 0]

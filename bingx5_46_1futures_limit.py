@@ -1961,7 +1961,7 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                 # BingX 全対象銘柄の建玉(OI)＆FRスナップショット自動蓄積 (PROJECT_RULES 準拠)
                 try:
                     from bingx_oi_collector import collect_and_save_oi_snapshot
-                    await asyncio.to_thread(collect_and_save_oi_snapshot, mode)
+                    await asyncio.to_thread(collect_and_save_oi_snapshot)
                 except Exception as oi_err:
                     discord.print_log(f"[OI Collector Warning] 建玉スナップショット保存警告: {oi_err}", level="debug")
 

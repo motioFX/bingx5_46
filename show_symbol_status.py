@@ -286,9 +286,32 @@ def format_status_table_console(summary_data: Dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def shorten_reason_for_discord(reason: str) -> str:
+    """Discord表示用に長大な理由テキストを簡潔に要約"""
+    if not reason:
+        return ""
+    if "前半ピーク半値割れ" in reason:
+        matched_wins = []
+        for w in ["5d", "10d", "30d"]:
+            if f"{w}前半ピーク" in reason:
+                matched_wins.append(w)
+        win_str = "/".join(matched_wins) if matched_wins else "3期間"
+        bt_part = ""
+        if "BT" in reason:
+            import re
+            m = re.search(r"\((?:参考BT|BT不合格):[^)]+\)", reason)
+            if m:
+                bt_part = f" {m.group(0)}"
+        return f"{win_str}前半ピーク警戒{bt_part}"
+
+    if len(reason) > 50:
+        return reason[:47] + "..."
+    return reason
+
+
 def format_status_table_discord(summary_data: Dict[str, Any]) -> str:
     """
-    Discord（スマホ表示）に最適化した整形テキスト
+    Discord（スマホ表示）に最適化した整形テキスト（2000文字以内厳守）
     """
     counts = summary_data.get("counts", {})
     symbols = summary_data.get("symbols", [])
@@ -322,13 +345,14 @@ def format_status_table_discord(summary_data: Dict[str, Any]) -> str:
         lines.append("\n🔴 **【前半ピーク半値割れ除外 (ピークアウト警戒)】**")
         for s in peak_list:
             sym_clean = s["symbol"].replace("-USDT", "")
-            lines.append(f"• **{sym_clean}**: `{s['detail_reason']}`")
+            s_reason = shorten_reason_for_discord(s.get("detail_reason", ""))
+            lines.append(f"• **{sym_clean}**: `{s_reason}`")
 
     if whale_list:
         lines.append("\n🔴 **【大口売り優勢 (Whale除外)】**")
         for s in whale_list:
             sym_clean = s["symbol"].replace("-USDT", "")
-            lines.append(f"• **{sym_clean}**: クジラ判定売り偏重 (SHORT_ONLY)")
+            lines.append(f"• **{sym_clean}**: `クジラ判定売り偏重 (SHORT_ONLY)`")
 
     lines.append("\n📱 **【全20銘柄 コンパクト一覧】**")
     lines.append("```text")
@@ -371,6 +395,49 @@ def safe_print(text: str) -> None:
             pass
 
 
+def send_discord_text_safely(webhook_url: str, text: str, max_chunk: int = 1800) -> None:
+    """Discordの2000文字上限を確実に守るため、必要に応じて行単位で分割送信"""
+    import requests
+    if len(text) <= max_chunk:
+        res = requests.post(webhook_url, json={"content": text}, timeout=10)
+        res.raise_for_status()
+        return
+
+    # 行単位で分割
+    chunks = []
+    current_lines = []
+    current_len = 0
+    in_code_block = False
+
+    for line in text.split("\n"):
+        line_len = len(line) + 1
+        if "```" in line:
+            in_code_block = not in_code_block
+
+        if current_len + line_len > max_chunk:
+            if in_code_block:
+                current_lines.append("```")
+            chunks.append("\n".join(current_lines))
+            current_lines = []
+            if in_code_block:
+                current_lines.append("```text")
+                current_len = 8
+            else:
+                current_len = 0
+
+        current_lines.append(line)
+        current_len += line_len
+
+    if current_lines:
+        chunks.append("\n".join(current_lines))
+
+    for c in chunks:
+        if c.strip():
+            res = requests.post(webhook_url, json={"content": c}, timeout=10)
+            res.raise_for_status()
+            time.sleep(0.5)
+
+
 def display_and_send_symbols_status(
     selected_symbols: Optional[List[str]] = None,
     symbol_params_map: Optional[Dict[str, Any]] = None,
@@ -387,13 +454,11 @@ def display_and_send_symbols_status(
     if send_to_discord:
         try:
             from config_loader import get_webhook_url
-            import requests
 
             webhook_url = get_webhook_url(webhook_name) or get_webhook_url("test4_backtest")
             if webhook_url:
                 discord_text = format_status_table_discord(summary)
-                res = requests.post(webhook_url, json={"content": discord_text}, timeout=10)
-                res.raise_for_status()
+                send_discord_text_safely(webhook_url, discord_text)
                 safe_print(f"[Discord] {webhook_name} 宛にステータス通知を正常送信しました。")
             else:
                 safe_print(f"[Discord Warning] Webhook URL ({webhook_name}) が見つかりません。")
