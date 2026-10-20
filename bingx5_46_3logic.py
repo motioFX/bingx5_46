@@ -3866,6 +3866,13 @@ def evaluate_market_regime_3window(
     eligible_buy_by_window = {}
     eligible_sell_by_window = {}
 
+    # 銘柄の重複キーを排除（ティッカー単位でユニーク化して計22票を厳格保証）
+    unique_symbol_dfs = {}
+    for k_sym, k_df in symbol_1h_dfs.items():
+        k_ticker = k_sym.upper().replace('-USDT', '').replace('USDT', '')
+        if k_ticker not in unique_symbol_dfs:
+            unique_symbol_dfs[k_ticker] = (k_sym, k_df)
+
     for w_name, w_hours in windows:
         buy_votes = 0
         sell_votes = 0
@@ -3873,7 +3880,7 @@ def evaluate_market_regime_3window(
         sell_passed = set()
         total_votes = 0
 
-        for sym, df in symbol_1h_dfs.items():
+        for ticker, (sym, df) in unique_symbol_dfs.items():
             if df is None or df.empty or len(df) < 24:
                 continue
             sub = df.tail(w_hours).reset_index(drop=True)

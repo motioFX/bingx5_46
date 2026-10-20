@@ -313,7 +313,6 @@ async def main() -> None:
 
         all_dfs.append(df_1h)
         symbol_1h_dict[clean_sym] = df_1h
-        symbol_1h_dict[ticker] = df_1h
 
     log(f"[Resample Done] 生成完了: {len(all_dfs)} 銘柄の 1H足 & 日足データ")
 
