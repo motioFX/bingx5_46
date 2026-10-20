@@ -257,7 +257,7 @@ class logicinstance:
         
         return df
 
-    def make_logic(self, df, market_profile_period=720, strategy_type="range", use_decay=True, decay_half_life=None, vol_surge_mult=1.2, fr_threshold=0.00002):
+    def make_logic(self, df, market_profile_period=720, strategy_type="range", use_decay=True, decay_half_life=None, vol_surge_mult=1.2, fr_threshold=0.00002, **kwargs):
         # パラメータ安全化ガード (0, None, 10未満を安全なデフォルト150に補正)
         try:
             mp_safe = int(market_profile_period) if market_profile_period is not None else 150
