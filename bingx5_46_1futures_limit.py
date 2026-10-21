@@ -1947,6 +1947,7 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
 
     tracked_active_positions: Set[str] = set()
     pending_entry_orders: Dict[str, Dict[str, Any]] = {}
+    trade_counts: Dict[str, int] = {}
     last_candle_sync_minute: int = -1
     last_trade_time: Dict[str, float] = {}
     last_nanpin_time: Dict[str, float] = {}
