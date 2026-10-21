@@ -123,16 +123,16 @@ BINGX_TARGET_POSITION_VALUE_USDT = 15.0  # 目標投資額 $15.0 USDT (1枠基�
 TARGET_POSITION_VALUE_USDT = BINGX_TARGET_POSITION_VALUE_USDT
 LEVERAGE_FACTOR = 10.0
 MAX_ACTIVE_POSITIONS: int = 2  # 最大同時保有ポジション数 (資金効率と分散を最適化)
-MAX_SELECTED_SYMBOLS: int = 10  # 最大選定・監視銘柄数
+MAX_SELECTED_SYMBOLS: int = 20  # 最大選定・監視銘柄数 (Hyperliquid完全統一: バックテスト合格全銘柄を同時監視)
 
 # [ 4 ] ナンピン数設定 (初期1回 + ナンピン最大2回 = 最大3枠厳守)
 MAX_TRADES_COUNT: int = 3
 
-# [ 5 ] 固定選定銘柄 (主要アルトコイン20銘柄 / PROJECT_RULES.md 準拠)
+# [ 5 ] 固定選定銘柄 (主要アルトコイン20銘柄 / Hyperliquid hype5_45 完全統一)
 FIXED_SYMBOLS: List[str] = [
     "HYPE-USDT", "SOL-USDT", "DOGE-USDT", "XRP-USDT", "SUI-USDT",
-    "AVAX-USDT", "LINK-USDT", "ADA-USDT", "NEAR-USDT", "APT-USDT",
-    "OP-USDT", "ARB-USDT", "TIA-USDT", "RENDER-USDT", "WIF-USDT",
+    "AVAX-USDT", "LINK-USDT", "APT-USDT", "NEAR-USDT", "ARB-USDT",
+    "UNI-USDT", "OP-USDT", "TIA-USDT", "RENDER-USDT", "INJ-USDT",
     "FET-USDT", "TAO-USDT", "AAVE-USDT", "ENA-USDT", "ZEC-USDT"
 ]
 
@@ -1759,6 +1759,103 @@ async def send_periodic_performance_report(symbol_apis: Dict[str, Any], mode: st
         discord.print_log(f"[Performance Report Error] 実績レポート送信失敗: {e}")
 
 
+async def _async_post_entry_reporting(
+    sym: str,
+    entry_px: float,
+    lot_size: float,
+    entry_full_reason: str,
+    df_chart: pd.DataFrame,
+    vah_val: float,
+    val_val: float,
+    poc_val: float,
+    strat_desc: str,
+    whale_sig: str,
+    whale_flow_val: float,
+    interval_label: str = "5m"
+):
+    """新規エントリー約定後のトレード記録・チャート生成・Discord画像送信を完全非同期実行する"""
+    try:
+        from real_trade_tracker import record_real_trade, plot_entry_chart
+        record_real_trade(sym, "LONG", "ENTRY", entry_px, lot_size, 0.0, f"新規エントリー約定 [{interval_label}足]")
+
+        entry_notional = entry_px * lot_size
+        target_tp_val = val_val + (vah_val - val_val) * 0.60 if (vah_val > val_val and val_val > 0) else poc_val
+
+        entry_msg = (
+            f"🚀🚀🚀 **【新規ロングエントリー約定 [{interval_label}足]】** 🚀🚀🚀\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"📌 **銘柄 / 方向**: `{sym}` (LONG 🟢 / 採用足種: `{interval_label}足`)\n"
+            f"⚡ **検知トリガー**: `{entry_full_reason}`\n"
+            f"💰 **約定価格**: `${entry_px:.6f}`\n"
+            f"📦 **発注数量**: `{lot_size:,.2f} {sym}` (約 `${entry_notional:,.2f} USDT`)\n"
+            f"⚙️ **適用戦略**: `{strat_desc}`\n"
+            f"🎯 **利確目標**: `VAL-VAH 60%水準 (${target_tp_val:.6f}) / RSI過熱利確`\n"
+            f"📉 **ナンピン設計**: `VA 60%間隔・均等1倍ロット (最大2回追加 / 合計最大3枠)`\n"
+            f"🛑 **損切り仕様**: `最終建値から VA 60%割れ (確定足終値判定) ＋ 24hクールダウン`\n"
+            f"🐋 **クジラ判定**: `{whale_sig}` (流入: `${whale_flow_val:+,.0f}`)\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        )
+
+        entry_chart_file = await asyncio.to_thread(
+            plot_entry_chart,
+            symbol=sym,
+            df=df_chart,
+            entry_price=entry_px,
+            vah=vah_val,
+            val=val_val,
+            poc=poc_val,
+            strategy_name=strat_desc,
+            whale_signal=whale_sig,
+            whale_flow=whale_flow_val,
+            interval_label=interval_label,
+        )
+        if entry_chart_file and Path(entry_chart_file).exists():
+            discord.send_file(entry_chart_file, description=entry_msg)
+        else:
+            discord.print_log(entry_msg)
+    except Exception as e:
+        discord.print_log(f"⚠️ [{sym}] エントリーレポート非同期タスクエラー: {e}", level="warning")
+
+
+async def _async_post_exit_reporting(
+    sym: str,
+    side: str,
+    close_qty: float,
+    reported_exit_px: float,
+    entry_px: float,
+    pnl: float,
+    exit_reason: str,
+    df_chart: pd.DataFrame,
+    whale_sig: str,
+    cycle_balance: float,
+    interval_label: str = "5m"
+):
+    """決済完了後のトレード記録・チャート生成・Discord画像送信をメインループから隔離して完全非同期実行する"""
+    try:
+        from real_trade_tracker import record_real_trade, plot_real_trading_performance, plot_exit_chart
+        record_real_trade(sym, side, "CLOSE", reported_exit_px, close_qty, pnl, f"実運用決済 ({exit_reason})")
+        discord.print_log(f"[{sym}] [CLOSE] 🟢 ロングポジション決済完了 [{interval_label}足] (PnL: {pnl:+.2f} USDT, 理由: {exit_reason})")
+
+        # 1. 決済トレードチャート画像の生成 & 送信
+        exit_chart_file = await asyncio.to_thread(
+            plot_exit_chart,
+            symbol=sym, df=df_chart, exit_price=reported_exit_px, entry_price=entry_px,
+            pnl=pnl, exit_reason=exit_reason, side=side, whale_signal=whale_sig,
+            interval_label=interval_label
+        )
+        if exit_chart_file and Path(exit_chart_file).exists():
+            discord.send_file(exit_chart_file, f"📊 【決済チャート】{sym} LONG 決済完了 [{interval_label}足] (PnL: {pnl:+.2f} USDT)")
+
+        # 2. スライディング10日間 累積 PnL パフォーマンスチャート (Clean版 & Detail版 2枚)
+        clean_file, detail_file = await asyncio.to_thread(plot_real_trading_performance, 10, cycle_balance)
+        if clean_file and Path(clean_file).exists():
+            discord.send_file(clean_file, f"📈 【実運用実績】累積損益パフォーマンス (直近10日 - Clean版 / 今回決済: {pnl:+.2f} USDT)")
+        if detail_file and Path(detail_file).exists():
+            discord.send_file(detail_file, f"🔍 【実運用実績】累積損益パフォーマンス (直近10日 - Detail版 / 今回決済: {pnl:+.2f} USDT)")
+    except Exception as e:
+        discord.print_log(f"⚠️ [{sym}] 決済レポート非同期タスクエラー: {e}", level="warning")
+
+
 async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60'):
     from bingx5_46_2api import (
         api_bingx,
@@ -1846,32 +1943,25 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
     trailing_tp_states = load_trailing_tp_states()
     scale_in_states = load_scale_in_states()
 
-    discord.print_log(f"[Phase B] 5分足エントリー/クローズループ（pybotters WebSocket連動）を開始します。新選定銘柄: {', '.join(selected_symbols)} (全監視: {', '.join(symbol_apis.keys())})")
+    discord.print_log(f"[Phase B] 固定20銘柄 + BTC単独地合い リアルタイム監視ループを開始します (30秒インターバル省エネ仕様 / 監視銘柄: {', '.join(selected_symbols)})")
 
-    # ========== フェーズB: 5分足ループ (WebSocket リアルタイム価格監視 & 5分確定足同期) ==========
+    tracked_active_positions: Set[str] = set()
+    pending_entry_orders: Dict[str, Dict[str, Any]] = {}
+    last_candle_sync_minute: int = -1
+    last_trade_time: Dict[str, float] = {}
+    last_nanpin_time: Dict[str, float] = {}
+    cached_5m_dfs: Dict[str, pd.DataFrame] = {}
+    previous_hourly_oi: Dict[str, float] = {}
+    last_hourly_slot = None
+
+    # ========== フェーズB: MTFリアルタイム監視ループ (30秒サイクル省エネ運用) ==========
     while True:
         cycle_count += 1
         now_jst = datetime.now(JST)
 
-        # 初回サイクルでも、5分確定直後（00秒〜15秒の確定直後安全枠）でない限り、
-        # 確定足と完全に同期するため次の5分足確定（毎時XX分02秒）まで待機する
-        if cycle_count == 1:
-            if "--loop" in sys.argv and not (now_jst.minute % 5 == 0 and now_jst.second < 15):
-                discord.print_log(f"[Sync] 初回起動時刻: {now_jst.strftime('%H:%M:%S')} JST。確定足と同期するため次の5分足確定まで待機します。")
-                await wait_until_next_candle(symbol_apis=symbol_apis, trailing_tp_states=trailing_tp_states, scale_in_states=scale_in_states, mode=mode, interval_minutes=5, ws_mgr=ws_mgr)
-                now_jst = datetime.now(JST)
-        else:
-            await wait_until_next_candle(symbol_apis=symbol_apis, trailing_tp_states=trailing_tp_states, scale_in_states=scale_in_states, mode=mode, interval_minutes=5, ws_mgr=ws_mgr)
-            now_jst = datetime.now(JST)
-
-        # --loop フラグがない場合は1サイクルのみ実行
-        if cycle_count > 1 and "--loop" not in sys.argv:
-            print("\n==================================================")
-            print("  [Success] 1サイクルの選定・最適化・トレード判定が完走しました。")
-            print("==================================================")
-            break
-
-        # ========== フェーズC: 定期銘柄選定 & Graceful Exit 管理 & スロットリセット ==========
+        # -------------------------------------------------------------
+        # [フェーズ C] 8時間ごと定期銘柄選定 & スロットリセット
+        # -------------------------------------------------------------
         today_date = now_jst.date()
         current_slot = (today_date, now_jst.hour)
         is_periodic_reset_time = (
@@ -1922,7 +2012,7 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                         api.update_instrument_spec(spec)
                     symbol_apis[sym] = api
 
-            # 3. 口座全体の全ポジションをスキャンし、選定外でも保有中の銘柄はGraceful Exitとして引き継ぐ（強制成行決済は廃止）
+            # 3. 口座全体の全ポジションをスキャンし、選定外でも保有中の銘柄はGraceful Exitとして引き継ぐ
             symbol_apis, symbol_params_map = await audit_and_retain_positions(
                 selected_symbols, symbol_apis, symbol_params_map, best_params, mode, old_apis=old_apis, old_params=old_params
             )
@@ -1931,25 +2021,37 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                 for sym in symbol_params_map:
                     symbol_params_map[sym]["strategy"] = FORCE_STRATEGY
 
-            # 4. ポジションのない旧選定銘柄のインスタンスをメモリ破棄
+            # 4. ポジションのない旧選定銘柄のメモリ破棄 ＆ 未約定指値キャンセル
             for old_sym in list(old_apis.keys()):
                 if old_sym not in symbol_apis:
+                    if old_sym in pending_entry_orders:
+                        old_api = old_apis.get(old_sym)
+                        if old_api:
+                            try:
+                                await old_api.active_order_cancel()
+                                discord.print_log(f"[{old_sym}] スクリーニング除外に伴い、未約定指値を安全にキャンセルしました。")
+                            except Exception:
+                                pass
+                        pending_entry_orders.pop(old_sym, None)
                     old_apis[old_sym] = None
             gc.collect()
 
             # 5. WebSocket 購読銘柄を最新の symbol_apis に更新
             await ws_mgr.update_symbols(list(symbol_apis.keys()))
+            cached_5m_dfs.clear()
 
             last_screening_slot = current_slot
-            logic = logicinstance()
             discord.print_log(f"[Periodic Reset Complete] 新しい選定銘柄 (LONG ONLY): {', '.join(selected_symbols)} | 現在の全監視対象: {', '.join(symbol_apis.keys())}")
-            # continue を廃止: リセット完了直後も当足 (01/09/17時) のポジション決済・エントリー判定を漏れなく実行
 
-            # 8時間ごとの実運用トレード実績（直近PnLチャート画像 ＆ 現在の証拠金残高）をDiscordへ定期送信
+            # 8時間ごとの実運用トレード実績レポート
             await send_periodic_performance_report(symbol_apis, mode, label="8時間定期レポート")
 
-        # ========== 毎時00分: クジラセンチメント更新 ＆ 自前OI/FRスナップショット蓄積 ＆ 日次・月次チェック ==========
-        if cycle_count > 1 and now_jst.minute < 5:
+        # -------------------------------------------------------------
+        # [フェーズ B1] 毎時タスク (正時00:05 JST: クジラ更新 & OI蓄積 & 毎時サマリー送信)
+        # -------------------------------------------------------------
+        is_new_hour = (now_jst.hour != last_hourly_slot)
+        if is_new_hour and now_jst.minute < 5:
+            last_hourly_slot = now_jst.hour
             try:
                 whale_script = Path(__file__).resolve().parent / "fetch_whale_sentiment.py"
                 if whale_script.exists():
@@ -1958,7 +2060,7 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                     except Exception:
                         pass
 
-                # BingX 全対象銘柄の建玉(OI)＆FRスナップショット自動蓄積 (PROJECT_RULES 準拠)
+                # BingX 全対象銘柄の建玉(OI)＆FRスナップショット自動蓄積
                 try:
                     from bingx_oi_collector import collect_and_save_oi_snapshot
                     await asyncio.to_thread(collect_and_save_oi_snapshot)
@@ -1975,176 +2077,219 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                     except Exception as m_err:
                         discord.print_log(f"[Monthly Check Warning] 月次処理警告: {m_err}", level="debug")
 
-                # 保有中ポジションの確認
-                held_symbols = set()
-                for sym, api in symbol_apis.items():
-                    pos = await api.get_positions()
-                    if float(pos.get("buy", 0)) > 0:
-                        held_symbols.add(sym)
+                # 毎時ステータスサマリーテーブルの作成 & Discord送信
+                hourly_summary_rows = []
+                first_api = next(iter(symbol_apis.values())) if symbol_apis else None
+                h_balance = await first_api.get_account() if first_api else 1000.0
 
-                # 銘柄リストは日次最適化結果を維持（ポジション保有中の銘柄が消えないようにする）
-                updated_symbols = list(held_symbols)
-                for sym in selected_symbols:
-                    if sym not in updated_symbols:
-                        updated_symbols.append(sym)
+                for h_sym, h_api in symbol_apis.items():
+                    h_pos = await h_api.get_positions()
+                    h_qty = float(h_pos.get("buy", 0.0))
+                    h_has_long = h_qty > 0
+                    h_pnl = float(h_pos.get("profit", 0.0))
+                    h_px = ws_mgr.get_latest_price(h_sym) or float(h_pos.get("buy_pos", 0.0)) or 1.0
+                    h_whale_info = get_whale_sentiment_info(h_sym)
+                    h_whale_sig = h_whale_info.get("signal", "NEUTRAL")
+                    h_whale_tag = "🟢買い" if h_whale_sig == "LONG_ONLY" else ("🔴売り" if h_whale_sig == "SHORT_ONLY" else "⚪中立")
 
-                # symbol_apis の同期更新
-                new_symbol_apis = {}
-                for sym in updated_symbols:
-                    if sym in symbol_apis:
-                        new_symbol_apis[sym] = symbol_apis[sym]
+                    if h_has_long:
+                        h_sign = "+" if h_pnl >= 0 else "-"
+                        h_t_cnt = trade_counts.get(h_sym, 1)
+                        h_pos_tag = f"保有({h_sign}${abs(h_pnl):.2f}/{h_t_cnt}本)"
+                    elif h_sym in pending_entry_orders:
+                        p_px = pending_entry_orders[h_sym].get("price", 0.0)
+                        h_pos_tag = f"指値(${p_px:.4f})" if p_px < 10 else f"指値(${p_px:.2f})"
                     else:
-                        api = api_bingx(symbol=sym, mode=mode)
-                        spec = fetch_instrument_spec_bingx(sym, mode)
-                        if spec:
-                            api.update_instrument_spec(spec)
-                        new_symbol_apis[sym] = api
-                symbol_apis = new_symbol_apis
+                        h_pos_tag = "ノーポジ"
 
-            except Exception as rot_err:
-                discord.print_log(f"[Hourly Update Error] クジラセンチメント更新エラー: {rot_err}")
+                    hourly_summary_rows.append({
+                        "sym": h_sym,
+                        "price": h_px,
+                        "pos": h_pos_tag,
+                        "whale": h_whale_tag,
+                    })
 
-        # ========== 各銘柄のトレード判定 (LONG ONLY) ==========
-        discord.print_log(f"\n[Cycle #{cycle_count}] {now_jst.strftime('%Y-%m-%d %H:%M')} JST | 対象: {', '.join(symbol_apis.keys())}", level="debug")
+                if hourly_summary_rows:
+                    tbl_header = f"{_pad_display('銘柄', 6)} {_pad_display('現在価格', 8, 'right')} {_pad_display('ポジション', 16)} {_pad_display('クジラ', 6)}"
+                    tbl_divider = "────────────────────────────────────────"
+                    acct_mode_str = "Live Account" if BINGX_IS_LIVE else "VST Demo Mode"
+                    summary_lines = [
+                        f"⏰ **【BingX 毎時ステータスサマリー ({now_jst.strftime('%H:00')} JST)】**",
+                        f"💰 残高: ${h_balance:,.2f} ({acct_mode_str}) | 監視体制: 5分足 WebSocketリアルタイム稼働中",
+                        "```text",
+                        tbl_header,
+                        tbl_divider,
+                    ]
+                    for r in hourly_summary_rows:
+                        px = r["price"]
+                        px_str = f"${px:,.4f}" if px < 10 else (f"${px:,.2f}" if px < 1000 else f"${px:,.1f}")
+                        clean_sym = r["sym"].replace("-USDT", "").replace("USDT", "")
+                        summary_lines.append(
+                            f"{_pad_display(clean_sym, 6)} {_pad_display(px_str, 8, 'right')} {_pad_display(r['pos'], 16)} {_pad_display(r['whale'], 6)}"
+                        )
+                    summary_lines.append(tbl_divider)
+                    next_hour_jst = (now_jst.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)).strftime('%H:00')
+                    summary_lines.append(f"次回定期更新: {next_hour_jst} JST (1時間ごとに定期配信中)")
+                    summary_lines.append("```")
+                    discord.print_log("\n".join(summary_lines), force_send=True)
+            except Exception as hourly_err:
+                discord.print_log(f"[Hourly Update Error] 毎時タスクエラー: {hourly_err}", level="warning")
 
-        try:
-            active_positions = {}
-            valid_entry_candidates = []
-            selected_set = set(selected_symbols)
-            freed_symbols = []
+        # -------------------------------------------------------------
+        # [フェーズ B0] リアルタイム (30秒ごと): 全体地合い状態の判定
+        # -------------------------------------------------------------
+        regime_info = get_regime_gate_info("BTC-USDT")
+        overall_regime = regime_info.get("overall_regime", "NEUTRAL")
+        is_emergency_be = (overall_regime != "BUY")
+        is_regime_safe = (regime_info.get("regime_gate") == "ALLOW")
 
-            # 1. 全銘柄のリアルタイム資金調達率(FR)と建玉(OI)を一括取得
-            all_asset_ctxs = await fetch_all_asset_contexts(mode=mode, target_symbols=list(symbol_apis.keys()))
+        # -------------------------------------------------------------
+        # [フェーズ B2] リアルタイム (30秒ごと): ポジション監視 & 決済判定
+        # -------------------------------------------------------------
+        active_positions = {}
+        first_api = next(iter(symbol_apis.values())) if symbol_apis else None
+        cycle_balance = await first_api.get_account() if first_api else 1000.0
 
-            # 口座総残高をサイクル開始時に1回取得
-            first_api = next(iter(symbol_apis.values())) if symbol_apis else None
-            cycle_balance = await first_api.get_account() if first_api else 1000.0
-            hourly_summary_rows = []
+        for sym, api in list(symbol_apis.items()):
+            try:
+                pos = await api.get_positions()
+                buy_qty = float(pos.get("buy", 0.0))
+                has_long = buy_qty > 0
+                entry_px = float(pos.get("buy_pos", 0.0))
+                pnl_current = float(pos.get("profit", 0.0))
 
-            # 2. 全銘柄のポジション状況とシグナル判定を一括評価 (5分足 SSoT ➔ 最適化採用足リサンプリング)
-            for sym, api in list(symbol_apis.items()):
-                df = await fetch_bingx_candles(sym, "5m", limit=3200, mode=mode)
-                if df.empty or len(df) < 20:
-                    discord.print_log(f"[{sym}] ローソク足データ不足 (rows={len(df)}). スキップ。", level="debug")
+                if not has_long:
+                    if sym in tracked_active_positions:
+                        tracked_active_positions.discard(sym)
+                        trade_counts[sym] = 0
+                        last_nanpin_time.pop(sym, None)
+                        last_trade_time[sym] = time.time()
+                        discord.print_log(f"⚠️ [{sym}] 取引所側でのポジション解消（外部決済または清算）を検知しました。", level="warning")
+                    if sym in pending_entry_orders:
+                        try:
+                            orders = await api.get_open_orders()
+                            if not orders:
+                                pending_entry_orders.pop(sym, None)
+                        except Exception:
+                            pass
                     continue
 
-                # リアルタイム FR / OI の付与
-                ctx = all_asset_ctxs.get(sym, {})
-                funding_val = ctx.get("funding", 0.0)
-                curr_oi_val = ctx.get("openInterest", 0.0)
-                df["funding"] = funding_val
-                df["openInterest"] = curr_oi_val
+                # 保有中: 出しっぱなし指値の約定検知！
+                if sym in pending_entry_orders:
+                    p_order = pending_entry_orders.pop(sym)
+                    trade_counts[sym] = 1
+                    last_trade_time[sym] = time.time()
+                    last_nanpin_time[sym] = time.time()
+                    tracked_active_positions.add(sym)
+                    entry_reason_val = p_order.get("reason", "指値約定")
+                    opt_inv_p = p_order.get("interval", 5)
+                    inv_label_p = f"{opt_inv_p}m" if opt_inv_p < 60 else f"{opt_inv_p // 60}h"
 
-                # OI変化率の計算 (前時間比)
-                prev_oi = previous_hourly_oi.get(sym, curr_oi_val)
-                oi_delta_pct = ((curr_oi_val - prev_oi) / prev_oi * 100.0) if prev_oi > 0 else 0.0
-                previous_hourly_oi[sym] = curr_oi_val
+                    # 余剰指値キャンセル
+                    try:
+                        await api.active_order_cancel()
+                    except Exception:
+                        pass
 
-                # 各銘柄の個別最適化パラメータを取得
+                    # エントリー後非同期レポーティング
+                    vah_val = getattr(api, "entry_vah", entry_px * 1.02)
+                    val_val = getattr(api, "entry_val", entry_px * 0.98)
+                    poc_val = (vah_val + val_val) / 2.0
+                    whale_info = get_whale_sentiment_info(sym)
+                    whale_sig = whale_info.get("signal", "NEUTRAL")
+                    whale_flow_val = float(whale_info.get("net_flow", 0.0)) if whale_info else 0.0
+                    sym_params = symbol_params_map.get(sym, best_params)
+                    cur_strat = str(sym_params.get("strategy", "rsima")).upper()
+                    strat_desc = f"{cur_strat} ({inv_label_p}足 / MP={sym_params.get('mp', '-')})"
+
+                    df_report = cached_5m_dfs.get(sym, pd.DataFrame())
+                    asyncio.create_task(_async_post_entry_reporting(
+                        sym=sym, entry_px=entry_px, lot_size=buy_qty, entry_full_reason=entry_reason_val,
+                        df_chart=df_report, vah_val=vah_val, val_val=val_val, poc_val=poc_val,
+                        strat_desc=strat_desc, whale_sig=whale_sig, whale_flow_val=whale_flow_val,
+                        interval_label=inv_label_p
+                    ))
+
+                tracked_active_positions.add(sym)
+                active_positions[sym] = (has_long, pos, entry_px, buy_qty, pnl_current)
+
+                # リアルタイム現在価格
+                cur_px = ws_mgr.get_latest_price(sym)
+                if not cur_px or cur_px <= 0:
+                    cur_bid, cur_ask = get_bingx_orderbook(sym, api.bingx.base_url)
+                    cur_px = cur_bid if cur_bid else entry_px
+
+                # ローソク足取得（キャッシュ優先）
+                df_sym = cached_5m_dfs.get(sym)
+                if df_sym is None or df_sym.empty:
+                    df_raw_init = await fetch_bingx_candles(sym, "5m", limit=3200, mode=mode)
+                    if not df_raw_init.empty:
+                        cached_5m_dfs[sym] = df_raw_init
+                        df_sym = df_raw_init
+
+                if df_sym is None or df_sym.empty or len(df_sym) < 20:
+                    continue
+
                 sym_params = symbol_params_map.get(sym, best_params)
                 cand_interval = int(sym_params.get("interval", 5) or 5)
-
-                # 時間足リサンプリング (5分を超える時間足で個別設定されている場合)
-                if cand_interval > 5:
-                    df = resample_candles(df, cand_interval)
-                    if not df.empty:
-                        last_ts = pd.to_datetime(df['timestamp'].iloc[-1], utc=True)
-                        candle_close_time = last_ts + timedelta(minutes=cand_interval)
-                        if candle_close_time > datetime.now(timezone.utc):
-                            df = df.iloc[:-1].reset_index(drop=True)
-
-                if df.empty or len(df) < 20:
-                    discord.print_log(f"[{sym}] データ不足 (rows={len(df)}). スキップ。", level="debug")
-                    continue
-
+                inv_label_p = f"{cand_interval}m" if cand_interval < 60 else f"{cand_interval // 60}h"
                 cand_strat = str(sym_params.get("strategy", "rsima")).lower()
-                cand_p = sym_params.get("params", {})
-                opt_mp = int(sym_params.get("mp", 200))
-                opt_bins = int(sym_params.get("num_bins", 50))
-                opt_va = float(sym_params.get("value_area_pct", 0.70))
-                opt_ma_type = str(sym_params.get("ma_type", "EMA"))
-                opt_ma_cond = str(sym_params.get("ma_condition", "close_above"))
-                opt_ep = float(sym_params.get("l_ep", cand_p.get("lEp", 40.0)))
-                opt_cp = float(sym_params.get("l_cp", cand_p.get("lCp", 60.0)))
-                opt_sl = float(sym_params.get("sl_pct", 0.090))
 
-                df = logic.make_logic(
-                    df,
-                    market_profile_period=opt_mp,
-                    er_threshold=sym_params.get("er", 40.0),
+                # 採用足リサンプリング
+                df_eval = resample_candles(df_sym, cand_interval) if cand_interval > 5 else df_sym.copy()
+                df_eval = logic.make_logic(
+                    df_eval,
+                    market_profile_period=int(sym_params.get("mp", 200)),
                     strategy_type=cand_strat,
-                    env_len=cand_p.get("length", 15),
-                    env_lower_pct=cand_p.get("lower_pct", 2.0),
-                    env_upper_pct=cand_p.get("upper_pct", 2.0),
-                    env_malen=cand_p.get("malen", 100),
-                    rsi_len=cand_p.get("rsi_len", 9),
-                    lma_len=cand_p.get("lma_len", 7),
-                    lEp=opt_ep,
-                    lCp=opt_cp,
-                    num_bins=opt_bins,
-                    value_area_pct=opt_va,
+                    num_bins=int(sym_params.get("num_bins", 50)),
+                    value_area_pct=float(sym_params.get("value_area_pct", 0.70)),
+                    lEp=float(sym_params.get("l_ep", 40.0)),
+                    lCp=float(sym_params.get("l_cp", 60.0)),
                 )
 
-                current_price = float(df["close"].iloc[-1])
-                vah = float(df["VAH"].iloc[-1]) if ("VAH" in df.columns and not pd.isna(df["VAH"].iloc[-1])) else current_price * 1.02
-                val = float(df["VAL"].iloc[-1]) if ("VAL" in df.columns and not pd.isna(df["VAL"].iloc[-1])) else current_price * 0.98
-                poc = float(df["POC"].iloc[-1]) if ("POC" in df.columns and not pd.isna(df["POC"].iloc[-1])) else current_price
-                vol_surge = float(df["vol_surge_ratio"].iloc[-1]) if "vol_surge_ratio" in df.columns else 1.0
-
-                position = await api.get_positions()
-                balance = cycle_balance
-                buy_qty_cur = float(position.get("buy", 0.0))
-                has_long = buy_qty_cur > 0
-                entry_px_cur = float(position.get("buy_pos", 0.0)) or current_price
-
-                spec = api.bingx.instrument_spec or {}
-                lot_size = compute_lot_size(current_price, TARGET_POSITION_VALUE_USDT, spec)
-                actual_lots_count = int(round(buy_qty_cur / max(lot_size, 1e-6))) if (has_long and lot_size > 0) else (1 if has_long else 0)
+                vah = float(df_eval["VAH"].iloc[-1]) if "VAH" in df_eval.columns else cur_px * 1.02
+                val = float(df_eval["VAL"].iloc[-1]) if "VAL" in df_eval.columns else cur_px * 0.98
+                poc = float(df_eval["POC"].iloc[-1]) if "POC" in df_eval.columns else cur_px
 
                 scale_state_cur = scale_in_states.get(sym, {})
                 cur_nanpin_cnt = int(scale_state_cur.get("nanpin_count", 0))
-                t_count = max(cur_nanpin_cnt + 1, actual_lots_count) if has_long else 0
-                last_px_cur = float(scale_state_cur.get("last_entry_price", entry_px_cur)) if has_long else 0.0
+                t_count = max(cur_nanpin_cnt + 1, trade_counts.get(sym, 1))
+                last_px_cur = float(scale_state_cur.get("last_entry_price", entry_px))
 
-                regime_info = get_regime_gate_info(sym)
-                overall_regime = regime_info.get("overall_regime", "NEUTRAL")
-                is_emergency_be = (overall_regime != "BUY")
                 in_cooldown, rem_h = is_in_sl_cooldown(sym)
 
-                # 【PROJECT_RULES 第3項準拠】2大基本戦略 (VAL_POC vs RSIMA) シグナル評価
+                # 戦略シグナル評価
                 if cand_strat in ("val_poc", "vp_val_gc"):
                     sig_eval = check_val_poc_signals(
-                        df_5m=df,
-                        current_pos_qty=buy_qty_cur,
+                        df_5m=df_eval,
+                        current_pos_qty=buy_qty,
                         current_trades_count=t_count,
-                        avg_entry_price=entry_px_cur if has_long else 0.0,
+                        avg_entry_price=entry_px,
                         last_entry_price=last_px_cur,
-                        current_price=current_price,
-                        vp_period=opt_mp,
-                        num_bins=opt_bins,
-                        value_area_pct=opt_va,
-                        ma_type=opt_ma_type,
-                        ma_condition=opt_ma_cond,
+                        current_price=cur_px,
+                        vp_period=int(sym_params.get("mp", 200)),
+                        num_bins=int(sym_params.get("num_bins", 50)),
+                        value_area_pct=float(sym_params.get("value_area_pct", 0.70)),
+                        ma_type=str(sym_params.get("ma_type", "EMA")),
+                        ma_condition=str(sym_params.get("ma_condition", "close_above")),
                         max_trades=MAX_TRADES_COUNT,
                         target_ratio=0.60,
-                        min_va_width=0.015,
-                        nanpin_drop_pct=0.030,
-                        sl_pct=opt_sl,
+                        sl_pct=float(sym_params.get("sl_pct", 0.090)),
                         is_cooldown_active=in_cooldown,
                         is_emergency_breakeven=is_emergency_be,
                     )
                 else:
                     sig_eval = check_rsima3_signals(
-                        df_5m=df,
-                        current_pos_qty=buy_qty_cur,
+                        df_5m=df_eval,
+                        current_pos_qty=buy_qty,
                         current_trades_count=t_count,
-                        avg_entry_price=entry_px_cur if has_long else 0.0,
-                        current_price=current_price,
+                        avg_entry_price=entry_px,
+                        current_price=cur_px,
                         rsi_len=9,
                         ema_len=7,
-                        l_ep=opt_ep,
-                        l_cp=opt_cp,
-                        sl_pct=opt_sl,
+                        l_ep=float(sym_params.get("l_ep", 40.0)),
+                        l_cp=float(sym_params.get("l_cp", 60.0)),
+                        sl_pct=float(sym_params.get("sl_pct", 0.090)),
                         max_trades=MAX_TRADES_COUNT,
                         last_entry_price=last_px_cur,
                         val_price=val,
@@ -2152,461 +2297,309 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                         is_emergency_breakeven=is_emergency_be,
                     )
 
-                sig_action = sig_eval.get("action", "NONE")
-                sig_reason = sig_eval.get("reason", "")
-                long_signal = (sig_action == "INITIAL_ENTRY")
-
-                pos_str = f"LONG({t_count}枠)" if has_long else "FLAT"
-                sig_str = sig_action if sig_action not in ("NONE", "HOLD") else "---"
-                pnl_current = float(position.get("profit", 0.0)) if has_long else 0.0
-                pnl_str = f" | 含み損益: {pnl_current:+.2f} USDT" if has_long else ""
-
+                pos_action = sig_eval.get("action", "HOLD")
+                exit_reason = sig_eval.get("reason", "HOLD")
                 whale_info = get_whale_sentiment_info(sym)
                 whale_sig = whale_info.get("signal", "NEUTRAL")
 
-                strat_name = f"{cand_strat.upper()}({cand_interval}m)"
-                discord.print_log(
-                    f"[{sym}] Price: ${current_price:,.4f} | Pos: {pos_str}{pnl_str} | Signal: {sig_str} ({strat_name}) | "
-                    f"FR: {funding_val:+.6f} | VolSurge: {vol_surge:.1f}x | OIΔ: {oi_delta_pct:+.1f}% | "
-                    f"VAH: ${vah:,.4f} | VAL: ${val:,.4f} | POC: ${poc:,.4f} | 口座残高: ${balance:.2f}",
-                    level="debug"
-                )
-
-                whale_tag_short = "🟢買い" if whale_sig == "LONG_ONLY" else ("🔴売り" if whale_sig == "SHORT_ONLY" else "⚪中立")
-                if has_long:
-                    sign_p = "+" if pnl_current >= 0 else "-"
-                    pos_tag_short = f"保有({sign_p}${abs(pnl_current):.2f}/{t_count}本)"
-                else:
-                    pos_tag_short = "ノーポジ"
-                hourly_summary_rows.append({
-                    "sym": sym,
-                    "price": current_price,
-                    "pos": pos_tag_short,
-                    "sig": sig_str,
-                    "whale": whale_tag_short,
-                })
-
-                if has_long:
-                    active_positions[sym] = (has_long, df, position, current_price, pnl_current, sig_eval, t_count)
-                else:
-                    # ポジション未保有（FLAT）の場合
-                    if sym not in selected_set:
-                        discord.print_log(f"[{sym}] 旧選定銘柄ですがポジションがFLATのため、監視リストから解放します。", level="debug")
-                        freed_symbols.append(sym)
-                        continue
-
-                    is_regime_allowed = (regime_info.get("regime_gate") == "ALLOW")
-                    is_whale_allowed = whale_sig in ("LONG_ONLY", "NEUTRAL")
-                    is_long_allowed = is_regime_allowed and is_whale_allowed
-
-                    if in_cooldown:
-                        discord.print_log(f"[{sym}] [COOLDOWN] 過去24h以内に損切りが発生したため冷却中 (残り {rem_h:.1f}h)。エントリー見送り。", level="debug")
-                        continue
-
-                    if long_signal:
-                        if is_long_allowed:
-                            valid_entry_candidates.append({
-                                "symbol": sym,
-                                "side": "LONG",
-                                "df": df,
-                                "position": position,
-                                "balance": balance,
-                                "lot_size": lot_size,
-                                "current_price": current_price,
-                                "whale_sig": whale_sig,
-                                "sig_reason": sig_reason,
-                                "interval": cand_interval,
-                            })
-                        else:
-                            filter_reasons = []
-                            if not is_regime_allowed:
-                                filter_reasons.append(f"レジーム門番停止 ({regime_info.get('regime_reason')})")
-                            if not is_whale_allowed:
-                                filter_reasons.append(f"クジラ売り優勢 ({whale_sig})")
-                            discord.print_log(f"[{sym}] [FILTER] ロングシグナル検出も、{' ＆ '.join(filter_reasons)}のためエントリー見送り。", level="debug")
+                closed = False
+                if pos_action == "STOP_LOSS":
+                    discord.print_log(f"🛑 [{sym}] [{cand_strat.upper()} STOP LOSS] {exit_reason} ➔ 成行損切り", level="warning")
+                    await flatten_current_position_bingx(sym, "USDT", mode, exit_reason, force_market=True)
+                    record_sl_cooldown(sym)
+                    closed = True
+                elif pos_action == "CLOSE_ALL":
+                    discord.print_log(f"🎯 [{sym}] [{cand_strat.upper()} CLOSE ALL] {exit_reason} ➔ 一括成行決済")
+                    await flatten_current_position_bingx(sym, "USDT", mode, exit_reason, force_market=True)
+                    closed = True
+                elif pos_action == "ADD_ENTRY":
+                    if is_emergency_be:
+                        pass
+                    elif t_count >= MAX_TRADES_COUNT:
+                        pass
+                    elif time.time() - last_nanpin_time.get(sym, 0) < 60.0:
+                        pass
                     else:
-                        reg_tag = f"門番:{regime_info.get('regime_gate')}({overall_regime})"
-                        discord.print_log(f"[{sym}] [--] シグナルなし。エントリー見送り ({reg_tag}, クジラ:{whale_sig})。", level="debug")
+                        spec_pos = api.bingx.instrument_spec or {}
+                        base_lot_add = compute_lot_size(cur_px, BINGX_TARGET_POSITION_VALUE_USDT, spec_pos)
+                        nanpin_lot = base_lot_add * float(sig_eval.get("lot_multiplier", 1.0))
+                        if nanpin_lot > 0:
+                            max_notional_limit = BINGX_TARGET_POSITION_VALUE_USDT * 3.15
+                            cur_notional = buy_qty * cur_px
+                            add_notional = nanpin_lot * cur_px
+                            if (cur_notional + add_notional) <= max_notional_limit:
+                                df_add = df_eval.copy()
+                                df_add["long"] = True
+                                entered_add = await api.long_entry(df_add, pos, cycle_balance, nanpin_lot, max_lot, is_nanpin=True, stage_num=t_count+1)
+                                if entered_add:
+                                    last_nanpin_time[sym] = time.time()
+                                    trade_counts[sym] = t_count + 1
+                                    scale_state = scale_in_states.get(sym, {})
+                                    scale_state.update({
+                                        "nanpin_count": t_count,
+                                        "last_entry_price": cur_px,
+                                        "avg_price": entry_px,
+                                    })
+                                    scale_in_states[sym] = scale_state
+                                    save_scale_in_states(scale_in_states)
+                                    record_real_trade(sym, "LONG", "ADD_ENTRY", cur_px, nanpin_lot, 0.0, f"実運用ナンピン ({t_count}/{MAX_TRADES_COUNT - 1})")
+                                    discord.print_log(f"🚀🚀🚀 【ナンピン買い増し約定】 {sym} @ ${cur_px:.4f} (保有枠: {t_count+1}/{MAX_TRADES_COUNT})")
 
-                await asyncio.sleep(0.1)
+                if closed:
+                    trailing_tp_states.pop(sym, None)
+                    save_trailing_tp_states(trailing_tp_states)
+                    scale_in_states.pop(sym, None)
+                    save_scale_in_states(scale_in_states)
+                    trade_counts[sym] = 0
+                    last_trade_time[sym] = time.time()
+                    last_nanpin_time.pop(sym, None)
+                    del active_positions[sym]
+                    tracked_active_positions.discard(sym)
 
-            # スマホ1画面完結サマリーのDiscord送信 (16行程度・スクロール不要)
-            # トレード稼働時は【1時間ごと（毎時00分）】のみDiscord送信し、平時の5分確定足はコンソール/ログ(debug)にとどめる
-            current_hour_slot = (now_jst.date(), now_jst.hour)
-            is_hourly_report_due = (
-                (now_jst.minute < 5 and current_hour_slot != last_summary_hour_slot)
-                or cycle_count == 1
-            )
+                    asyncio.create_task(_async_post_exit_reporting(
+                        sym=sym, side="LONG", close_qty=buy_qty, reported_exit_px=cur_px,
+                        entry_px=entry_px, pnl=pnl_current, exit_reason=exit_reason,
+                        df_chart=df_eval, whale_sig=whale_sig, cycle_balance=cycle_balance,
+                        interval_label=inv_label_p
+                    ))
+            except Exception as pos_err:
+                discord.print_log(f"⚠️ [{sym}] ポジション監視例外: {pos_err}", level="warning")
 
-            if hourly_summary_rows:
-                tbl_header = f"{_pad_display('銘柄', 6)} {_pad_display('現在価格', 8, 'right')} {_pad_display('ポジション', 16)} {_pad_display('クジラ', 6)}"
-                tbl_divider = "────────────────────────────────────────"
-                acct_mode_str = "Live Account" if BINGX_IS_LIVE else "VST Demo Mode"
-                summary_lines = [
-                    f"⏰ **【BingX 毎時ステータスサマリー ({now_jst.strftime('%H:00')} JST)】**",
-                    f"💰 残高: ${cycle_balance:,.2f} ({acct_mode_str}) | 監視体制: 5分足 WebSocketリアルタイム稼働中",
-                    "```text",
-                    tbl_header,
-                    tbl_divider,
-                ]
-                for r in hourly_summary_rows:
-                    px = r["price"]
-                    px_str = f"${px:,.4f}" if px < 10 else (f"${px:,.2f}" if px < 1000 else f"${px:,.1f}")
-                    clean_sym = r["sym"].replace("-USDT", "").replace("USDT", "")
-                    pos_str = r["pos"]
-                    if pos_str in ("FLAT", "--", "None", ""):
-                        pos_str = "ノーポジ"
-                    summary_lines.append(
-                        f"{_pad_display(clean_sym, 6)} {_pad_display(px_str, 8, 'right')} {_pad_display(pos_str, 16)} {_pad_display(r['whale'], 6)}"
-                    )
-                summary_lines.append(tbl_divider)
-                next_hour_jst = (now_jst.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)).strftime('%H:00')
-                summary_lines.append(f"次回定期更新: {next_hour_jst} JST (1時間ごとに定期配信中)")
-                summary_lines.append("```")
-                summary_formatted = "\n".join(summary_lines)
+        # -------------------------------------------------------------
+        # [フェーズ B3] リアルタイム (30秒ごと): 新規エントリー判定 & pending指値スマート追随
+        # -------------------------------------------------------------
+        if not is_regime_safe:
+            if cycle_count % 20 == 0:
+                discord.print_log(f"⚠️ [地合い警戒ブロック] 相場危険検知 (SELL) のため新規ロングを一時停止中", level="info")
+            if pending_entry_orders:
+                for p_sym in list(pending_entry_orders.keys()):
+                    p_api = symbol_apis.get(p_sym)
+                    if p_api:
+                        try:
+                            await p_api.active_order_cancel()
+                            discord.print_log(f"🛡️ [地合い警戒退避] 相場危険検知のため {p_sym} の未約定指値を安全にキャンセルしました。")
+                        except Exception:
+                            pass
+                pending_entry_orders.clear()
+        else:
+            total_active_count = len(active_positions) + len(pending_entry_orders)
+            is_candle_closed = (now_jst.minute % 5 == 0 and now_jst.minute != last_candle_sync_minute)
+            if is_candle_closed:
+                last_candle_sync_minute = now_jst.minute
 
-                if is_hourly_report_due:
-                    discord.print_log(summary_formatted, force_send=True)
-                    last_summary_hour_slot = current_hour_slot
-                else:
-                    discord.print_log(summary_formatted, level="debug")
+            for sym in selected_symbols:
+                if sym in active_positions:
+                    continue
 
-            # FLATになった旧選定銘柄のメモリ解放
-            for fsym in freed_symbols:
-                if fsym in symbol_apis:
-                    del symbol_apis[fsym]
-                if fsym in symbol_params_map:
-                    del symbol_params_map[fsym]
-
-            # 2. 既存ポジションの決済・ナンピン判定 (PROJECT_RULES 準拠: check_val_poc_signals / check_rsima3_signals 連動)
-            from real_trade_tracker import record_real_trade, plot_real_trading_performance, plot_exit_chart
-
-            for sym, (has_long, df, position, current_price, pnl_current, sig_pos, t_count) in list(active_positions.items()):
-                api = symbol_apis[sym]
-                entry_px = float(position.get("buy_pos", 0)) or current_price
-                buy_qty_pos = float(position.get("buy", 0.0))
-                sym_params = symbol_params_map.get(sym, best_params)
-                whale_sig = get_whale_sentiment_info(sym).get("signal", "NEUTRAL")
-                cand_strat = str(sym_params.get("strategy", "rsima")).lower()
-                opt_inv_p = int(sym_params.get("interval", 5) or 5)
-                inv_label_p = f"{opt_inv_p}m" if opt_inv_p < 60 else f"{opt_inv_p // 60}h"
-
-                if has_long:
-                    regime_info = get_regime_gate_info(sym)
-                    overall_regime = regime_info.get("overall_regime", "NEUTRAL")
-                    is_emergency_be = (overall_regime != "BUY")
-
-                    pos_action = sig_pos.get("action", "HOLD")
-                    exit_reason = sig_pos.get("reason", "HOLD")
-                    closed = False
-
-                    # A. 損切り判定 (STOP_LOSS: 最終建値から VA60% 割れ [3枠目以降] または設定SL到達)
-                    if pos_action == "STOP_LOSS":
-                        discord.print_log(
-                            f"🛑 [{sym}] [{cand_strat.upper()} STOP LOSS] {exit_reason}\n"
-                            f"   └ 現在値: ${current_price:,.4f} (平均建値: ${entry_px:,.4f}) ➔ 成行損切り決済 (24hクールダウン開始)",
-                            level="warning"
-                        )
-                        from bingx5_46_2api import flatten_current_position_bingx
-                        await flatten_current_position_bingx(sym, "USDT", mode, exit_reason, force_market=True)
-                        record_sl_cooldown(sym)
-                        closed = True
-
-                    # B. 利確 / 緊急建値撤退判定 (CLOSE_ALL: VAL-VAH 60% TP / RSIMA過熱TP / 非BUY +0.20% 建値撤退)
-                    elif pos_action == "CLOSE_ALL":
-                        discord.print_log(
-                            f"🎯 [{sym}] [{cand_strat.upper()} CLOSE ALL] {exit_reason}\n"
-                            f"   └ 現在値: ${current_price:,.4f} (平均建値: ${entry_px:,.4f}) ➔ 一括成行決済"
-                        )
-                        from bingx5_46_2api import flatten_current_position_bingx
-                        await flatten_current_position_bingx(sym, "USDT", mode, exit_reason, force_market=True)
-                        closed = True
-
-                    # C. 段階的ナンピン判定 (ADD_ENTRY: 4重セーフティリミッター厳格適用)
-                    elif pos_action == "ADD_ENTRY":
-                        # [Guard 1] 地合い悪化時の緊急対応: 全体相場が BUY 以外ならナンピン即時凍結
-                        if is_emergency_be:
-                            discord.print_log(
-                                f"🛡️ [{sym}] [地合い悪化ナンピン凍結] 全体相場非BUY ({overall_regime}) のため追加ナンピンを凍結中。",
-                                level="debug"
-                            )
-                        # [Guard 2] ナンピン上限の物理ロック (最大3枠厳守)
-                        elif t_count >= MAX_TRADES_COUNT:
-                            discord.print_log(
-                                f"🚫 [{sym}] [枠数上限ブロック] すでに最大枠数 ({t_count}/{MAX_TRADES_COUNT}枠) に到達しているため追加ナンピンを拒否しました。",
-                                level="warning"
-                            )
-                        else:
-                            spec_pos = api.bingx.instrument_spec or {}
-                            base_lot_add = compute_lot_size(current_price, BINGX_TARGET_POSITION_VALUE_USDT, spec_pos)
-                            nanpin_lot = base_lot_add * float(sig_pos.get("lot_multiplier", 1.0))
-                            if nanpin_lot > 0:
-                                # [Guard 3] 1銘柄あたりの最大許容ポジション金額 (ドル換算) による二重チェック
-                                max_notional_limit = BINGX_TARGET_POSITION_VALUE_USDT * 3.15
-                                current_notional = buy_qty_pos * current_price
-                                additional_notional = nanpin_lot * current_price
-                                if (current_notional + additional_notional) > max_notional_limit:
-                                    discord.print_log(
-                                        f"🚫 [{sym}] [金額上限ブロック] 追加後想定元本 (${current_notional + additional_notional:.2f}) が"
-                                        f"上限 (${max_notional_limit:.2f}) を超過するためナンピンをブロックしました。",
-                                        level="warning"
-                                    )
-                                else:
-                                    # [Guard 4] 証拠金維持率・有効レバレッジ監査 (3.0倍上限)
-                                    total_portfolio_notional = 0.0
-                                    for a_sym, (a_long, _, a_pos, a_px, _, _, _) in active_positions.items():
-                                        if a_long:
-                                            total_portfolio_notional += float(a_pos.get("buy", 0.0)) * a_px
-                                    after_portfolio_notional = total_portfolio_notional + additional_notional
-                                    account_equity = cycle_balance if cycle_balance > 0 else 1000.0
-                                    effective_leverage = after_portfolio_notional / account_equity
-                                    MAX_SAFE_EFFECTIVE_LEVERAGE = 3.0
-
-                                    if effective_leverage > MAX_SAFE_EFFECTIVE_LEVERAGE:
-                                        discord.print_log(
-                                            f"⚠️ [{sym}] [マージンセーフティブロック] 追加後有効レバレッジ ({effective_leverage:.2f}倍) が"
-                                            f"安全上限 ({MAX_SAFE_EFFECTIVE_LEVERAGE:.1f}倍) を超えるためナンピンをスキップしました。",
-                                            level="warning"
-                                        )
-                                    else:
-                                        discord.print_log(
-                                            f"⚡ [{sym}] [{cand_strat.upper()} ナンピン追加発注>>] {exit_reason} "
-                                            f"(均等1xロット: {nanpin_lot}, 枠: {t_count + 1}/{MAX_TRADES_COUNT})"
-                                        )
-                                        df_add = df.copy()
-                                        df_add["long"] = True
-                                        entered_add = await api.long_entry(
-                                            df_add, position, cycle_balance, nanpin_lot, max_lot,
-                                            max_stage=MAX_TRADES_COUNT, is_scale_in=True, stage_num=t_count + 1
-                                        )
-                                        if entered_add:
-                                            vah_now = float(df["VAH"].iloc[-1]) if "VAH" in df.columns else current_price * 1.02
-                                            val_now = float(df["VAL"].iloc[-1]) if "VAL" in df.columns else current_price * 0.98
-                                            poc_now = float(df["POC"].iloc[-1]) if "POC" in df.columns else current_price
-                                            tp_now = val_now + (vah_now - val_now) * 0.60 if (vah_now > val_now and val_now > 0) else poc_now
-                                            scale_state = scale_in_states.get(sym, {})
-                                            scale_state.update({
-                                                "nanpin_count": t_count,
-                                                "last_entry_price": current_price,
-                                                "avg_price": entry_px,
-                                                "poc_level": poc_now,
-                                                "val_level": val_now,
-                                                "vah_level": vah_now,
-                                                "target_tp": tp_now,
-                                                "strategy": cand_strat,
-                                            })
-                                            scale_in_states[sym] = scale_state
-                                            save_scale_in_states(scale_in_states)
-                                            record_real_trade(sym, "LONG", "ADD_ENTRY", current_price, nanpin_lot, 0.0, f"実運用ナンピン ({t_count}/{MAX_TRADES_COUNT - 1})")
-                                            discord.print_log(
-                                                f"🚀🚀🚀 **【ナンピン買い増し約定 [{inv_label_p}足]】** 🚀🚀🚀\n"
-                                                f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                                                f"📌 **銘柄 / 方向**: `{sym}` (LONG 🟢 / {cand_strat.upper()})\n"
-                                                f"💰 **約定価格**: `${current_price:.6f}`\n"
-                                                f"📦 **追加数量**: `{nanpin_lot:,.2f} {sym}` (1x均等ロット)\n"
-                                                f"🔢 **保有枠数**: `合計 {t_count + 1}/{MAX_TRADES_COUNT} 枠`\n"
-                                                f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-                                            )
-
-                    if closed:
-                        trailing_tp_states.pop(sym, None)
-                        save_trailing_tp_states(trailing_tp_states)
-                        scale_in_states.pop(sym, None)
-                        save_scale_in_states(scale_in_states)
-                        record_real_trade(sym, "LONG", "CLOSE", current_price, buy_qty_pos, pnl_current, f"実運用決済 ({exit_reason})")
-                        discord.print_log(f"[{sym}] [CLOSE] 🟢 ロングポジション決済完了 [{inv_label_p}足] (PnL: {pnl_current:+.2f} USDT, 理由: {exit_reason})")
-                        
-                        # 1. 決済トレードチャート画像の生成 & 送信 (個別最適化採用足種で描画)
-                        exit_chart_file = await asyncio.to_thread(
-                            plot_exit_chart,
-                            symbol=sym, df=df, exit_price=current_price, entry_price=entry_px,
-                            pnl=pnl_current, exit_reason=exit_reason, side="LONG", whale_signal=whale_sig,
-                            interval_label=inv_label_p
-                        )
-                        if exit_chart_file and exit_chart_file.exists():
-                            discord.send_file(exit_chart_file, f"📊 【決済チャート】{sym} LONG 決済完了 [{inv_label_p}足] (PnL: {pnl_current:+.2f} USDT)")
-
-                        # 2. スライディング10日間 累積 PnL パフォーマンスチャート (Clean版 & Detail版 2枚) の生成 & 送信
-                        clean_file, detail_file = await asyncio.to_thread(plot_real_trading_performance, 10, cycle_balance)
-                        if clean_file and clean_file.exists():
-                            discord.send_file(clean_file, f"📈 【実運用実績】累積損益パフォーマンス (直近10日 - Clean版 / 今回決済: {pnl_current:+.2f} USDT)")
-                        if detail_file and detail_file.exists():
-                            discord.send_file(detail_file, f"🔍 【実運用実績】累積損益パフォーマンス (直近10日 - Detail版 / 今回決済: {pnl_current:+.2f} USDT)")
-                        del active_positions[sym]
-
-                        # 旧選定銘柄の決済完了時は監視リストから解放
-                        if sym not in selected_set:
-                            discord.print_log(f"[{sym}] [Graceful Exit Completed] 旧選定銘柄のポジション決済が完了したため、監視リストから解放します。", level="debug")
-                            if sym in symbol_apis:
-                                del symbol_apis[sym]
-                            if sym in symbol_params_map:
-                                del symbol_params_map[sym]
-                    else:
-                        pnl_icon = "🟢" if pnl_current >= 0 else "🔴"
-                        discord.print_log(f"──────────────────────────────────────────────────────────", level="debug")
-                        discord.print_log(f"💰 【{sym} 現在の含み損益】: {pnl_current:+.2f} USDT {pnl_icon} ({t_count}/{MAX_TRADES_COUNT}枠 保有中)", level="debug")
-                        discord.print_log(f"──────────────────────────────────────────────────────────", level="debug")
-
-            # 3. 新規エントリー実行 (最大同時保有ポジション数制限: MAX_ACTIVE_POSITIONS)
-            current_pos_count = len(active_positions)
-            if current_pos_count >= MAX_ACTIVE_POSITIONS:
-                held_syms = ", ".join(active_positions.keys())
-                discord.print_log(f"[ENTRY BLOCK] 現在最大ポジション枠({current_pos_count}/{MAX_ACTIVE_POSITIONS})保有中のため新規エントリーは見送ります。(保有中: {held_syms})", level="debug")
-            elif valid_entry_candidates:
-                candidates_to_enter = [c for c in valid_entry_candidates if c["symbol"] not in active_positions]
-
-                if not candidates_to_enter:
-                    discord.print_log(f"[ENTRY BLOCK] シグナル検出銘柄はすでに保有中のためエントリーをスキップします。", level="debug")
-                else:
-                    sym_rank_map = {sym: i for i, sym in enumerate(selected_symbols)}
-                    candidates_to_enter.sort(key=lambda x: sym_rank_map.get(x["symbol"], 999))
-
-                    available_slots = MAX_ACTIVE_POSITIONS - current_pos_count
-                    all_cand_syms = ", ".join([c["symbol"] for c in candidates_to_enter])
-                    discord.print_log(
-                        f"[CANDIDATES] エントリーシグナル検出: {all_cand_syms} (空き枠: {available_slots}/{MAX_ACTIVE_POSITIONS})",
-                        level="debug"
-                    )
-
-                    for cand_idx, best_cand in enumerate(candidates_to_enter):
-                        if len(active_positions) >= MAX_ACTIVE_POSITIONS:
-                            discord.print_log(
-                                f"[ENTRY LIMIT] 最大ポジション枠({MAX_ACTIVE_POSITIONS})に達したため、残りの候補エントリーを終了します。",
-                                level="debug"
-                            )
-                            break
-
-                        best_sym = best_cand["symbol"]
-                        api = symbol_apis[best_sym]
-                        df = best_cand["df"]
-                        position = best_cand["position"]
-                        balance = best_cand["balance"]
-                        lot_size = best_cand["lot_size"]
-                        current_price = best_cand["current_price"]
-                        whale_sig = best_cand["whale_sig"]
-                        sig_reason_e = best_cand.get("sig_reason", "INITIAL_ENTRY")
-                        opt_inv_e = int(best_cand.get("interval", 5) or 5)
-                        inv_label_e = f"{opt_inv_e}m" if opt_inv_e < 60 else f"{opt_inv_e // 60}h"
-
-                        discord.print_log(f"[{best_sym}] [ENTRY>>] ロングエントリー試行 ({cand_idx+1}/{len(candidates_to_enter)}) [{inv_label_e}足] ({sig_reason_e} / クジラ: {whale_sig})", level="debug")
-                        df_entry = df.copy()
-                        df_entry["long"] = True
-                        entered = await api.long_entry(df_entry, position, balance, lot_size, max_lot)
-                        if entered:
-                            active_positions[best_sym] = (True, df, position, current_price, 0.0, {}, 1)
-                            # 1. 実運用トレード履歴の記録
-                            record_real_trade(best_sym, "LONG", "ENTRY", current_price, lot_size, 0.0, f"新規エントリー約定 [{inv_label_e}足]")
-                            
-                            # 2. 指標値・クジラ情報の取得
-                            last_row = df.iloc[-1] if not df.empty else None
-                            vah_val = float(last_row.get("VAH", 0.0)) if last_row is not None and "VAH" in last_row else 0.0
-                            val_val = float(last_row.get("VAL", 0.0)) if last_row is not None and "VAL" in last_row else 0.0
-                            poc_val = float(last_row.get("POC", 0.0)) if last_row is not None and "POC" in last_row else 0.0
-
-                            # scale_in_states & active_positions_meta.json の初期化
-                            best_sym_params = symbol_params_map.get(best_sym, best_params)
-                            cur_strat = str(best_sym_params.get("strategy", "val_poc" if FORCE_STRATEGY == "val_poc" else "rsima")).lower()
-                            target_tp_val = val_val + (vah_val - val_val) * 0.60 if (vah_val > val_val and val_val > 0) else poc_val
-                            scale_in_states[best_sym] = {
-                                "nanpin_count": 0,
-                                "last_entry_price": current_price,
-                                "avg_price": current_price,
-                                "poc_level": poc_val,
-                                "val_level": val_val,
-                                "vah_level": vah_val,
-                                "target_tp": target_tp_val,
-                                "strategy": cur_strat,
-                                "interval": opt_inv_e,
-                            }
-                            save_scale_in_states(scale_in_states)
-
-                            entry_notional = current_price * lot_size
-                            strat_desc = f"{cur_strat.upper()} ({inv_label_e}足 / MP={best_sym_params.get('mp', '-')})"
-                            whale_info = get_whale_sentiment_info(best_sym)
-                            whale_flow_val = float(whale_info.get("net_flow", 0.0)) if whale_info else 0.0
-                            
-                            # 3. Discord バッファをフラッシュ
-                            discord.flush_all()
-                            
-                            # 4. エントリーチャート画像の生成 & Discord送信 (個別最適化採用足種で描画)
-                            from real_trade_tracker import plot_entry_chart
-                            entry_chart_file = await asyncio.to_thread(
-                                plot_entry_chart,
-                                symbol=best_sym,
-                                df=df,
-                                entry_price=current_price,
-                                vah=vah_val,
-                                val=val_val,
-                                poc=poc_val,
-                                strategy_name=strat_desc,
-                                whale_signal=whale_sig,
-                                whale_flow=whale_flow_val,
-                                interval_label=inv_label_e,
-                            )
-                            
-                            entry_msg = (
-                                f"🚀🚀🚀 **【新規ロングエントリー約定 [{inv_label_e}足]】** 🚀🚀🚀\n"
-                                f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                                f"📌 **銘柄 / 方向**: `{best_sym}` (LONG 🟢 / 採用足種: `{inv_label_e}足`)\n"
-                                f"⚡ **検知トリガー**: `{sig_reason_e}`\n"
-                                f"💰 **約定価格**: `${current_price:.6f}`\n"
-                                f"📦 **発注数量**: `{lot_size:,.2f} {best_sym}` (約 `${entry_notional:,.2f} USDT`)\n"
-                                f"⚙️ **適用戦略**: `{strat_desc}`\n"
-                                f"🎯 **利確目標**: `VAL-VAH 60%水準 (${target_tp_val:.6f}) / RSI過熱利確`\n"
-                                f"📉 **ナンピン設計**: `VA 60%間隔・均等1倍ロット (最大2回追加 / 合計最大3枠)`\n"
-                                f"🐋 **クジラ判定**: `{whale_sig}` (流入: `${whale_flow_val:+,.0f}`)\n"
-                                f"📐 **Volume Profile 指標**:\n"
-                                f"  - **VAH (上値抵抗)**: `${vah_val:.6f}`\n"
-                                f"  - **POC (中心値)**  : `${poc_val:.6f}`\n"
-                                f"  - **VAL (下値支持)**: `${val_val:.6f}`\n"
-                                f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-                            )
-                            
-                            if entry_chart_file and Path(entry_chart_file).exists():
-                                discord.send_file(entry_chart_file, description=entry_msg)
-                            else:
-                                discord.print_log(entry_msg)
-                        else:
-                            discord.print_log(f"[{best_sym}] [FALLTHROUGH] 約定しなかったため見送ります。次の候補銘柄へ移行します。", level="debug")
-
-            # --- ハートビート記録 (Data/bot_heartbeat.json) ---
-            try:
-                hb_file = Path(__file__).resolve().parent / "Data" / "bot_heartbeat.json"
-                hb_file.parent.mkdir(parents=True, exist_ok=True)
-                hb_data = {
-                    "timestamp": time.time(),
-                    "datetime_jst": now_jst.strftime("%Y-%m-%d %H:%M:%S"),
-                    "cycle_count": cycle_count,
-                    "monitored_symbols": list(symbol_apis.keys()),
-                    "active_positions_count": len(active_positions),
-                    "active_symbols": list(active_positions.keys()),
-                }
-                with open(hb_file, "w", encoding="utf-8") as f:
-                    json.dump(hb_data, f, indent=2, ensure_ascii=False)
-            except Exception:
-                pass
-
-
-
-            # PnL 損益グラフ更新 (初回のみ)
-            if cycle_count == 1:
                 try:
-                    from bingx5_46_2api import apis
-                    pnl_calc = PnLCalculator(apis_config=apis, mode=mode)
-                    df_pnl = await pnl_calc.get_bingx_trade_history(apis)
-                    if isinstance(df_pnl, list) and df_pnl:
-                        pnl_calc.calculate_bingx_pnl_from_df(pd.DataFrame(df_pnl))
-                except Exception as pnl_err:
-                    discord.print_log(f"[PnL Warning]: {pnl_err}")
+                    # 確定足タイミングまたは未キャッシュ時はストアから取得
+                    if is_candle_closed or sym not in cached_5m_dfs or cached_5m_dfs[sym].empty:
+                        df_raw = await fetch_bingx_candles(sym, "5m", limit=3200, mode=mode)
+                        if not df_raw.empty:
+                            cached_5m_dfs[sym] = df_raw
 
-        except Exception as exc:
-            discord.print_log(f"[Cycle #{cycle_count}] Exception (Auto Recovery - Retrying in 60s): {exc}")
-            import traceback
-            traceback.print_exc()
-            await asyncio.sleep(60)
-            continue
+                    df_5m = cached_5m_dfs.get(sym)
+                    if df_5m is None or df_5m.empty or len(df_5m) < 20:
+                        continue
 
-        await asyncio.sleep(1)
+                    cur_px = ws_mgr.get_latest_price(sym)
+                    if not cur_px or cur_px <= 0:
+                        cur_bid, cur_ask = get_bingx_orderbook(sym, api_bingx(symbol=sym, mode=mode).bingx.base_url)
+                        cur_px = cur_bid if cur_bid else float(df_5m["close"].iloc[-1])
+
+                    in_cooldown, rem_h = is_in_sl_cooldown(sym)
+                    if in_cooldown:
+                        continue
+
+                    # クールダウンチェック (直近20分以内の取引除外)
+                    if time.time() - last_trade_time.get(sym, 0) < 1200:
+                        continue
+
+                    sym_params_e = symbol_params_map.get(sym, best_params)
+                    cand_interval_e = int(sym_params_e.get("interval", 5) or 5)
+                    cand_strat_e = str(sym_params_e.get("strategy", "rsima")).lower()
+
+                    df_entry_eval = resample_candles(df_5m, cand_interval_e) if cand_interval_e > 5 else df_5m.copy()
+                    df_entry_eval = logic.make_logic(
+                        df_entry_eval,
+                        market_profile_period=int(sym_params_e.get("mp", 200)),
+                        strategy_type=cand_strat_e,
+                        num_bins=int(sym_params_e.get("num_bins", 50)),
+                        value_area_pct=float(sym_params_e.get("value_area_pct", 0.70)),
+                        lEp=float(sym_params_e.get("l_ep", 40.0)),
+                        lCp=float(sym_params_e.get("l_cp", 60.0)),
+                    )
+
+                    vah_e = float(df_entry_eval["VAH"].iloc[-1]) if "VAH" in df_entry_eval.columns else cur_px * 1.02
+                    val_e = float(df_entry_eval["VAL"].iloc[-1]) if "VAL" in df_entry_eval.columns else cur_px * 0.98
+                    poc_e = float(df_entry_eval["POC"].iloc[-1]) if "POC" in df_entry_eval.columns else cur_px
+
+                    if cand_strat_e in ("val_poc", "vp_val_gc"):
+                        sig_entry = check_val_poc_signals(
+                            df_5m=df_entry_eval,
+                            current_pos_qty=0.0,
+                            current_trades_count=0,
+                            avg_entry_price=0.0,
+                            last_entry_price=0.0,
+                            current_price=cur_px,
+                            vp_period=int(sym_params_e.get("mp", 200)),
+                            num_bins=int(sym_params_e.get("num_bins", 50)),
+                            value_area_pct=float(sym_params_e.get("value_area_pct", 0.70)),
+                            ma_type=str(sym_params_e.get("ma_type", "EMA")),
+                            ma_condition=str(sym_params_e.get("ma_condition", "close_above")),
+                            max_trades=MAX_TRADES_COUNT,
+                            target_ratio=0.60,
+                            sl_pct=float(sym_params_e.get("sl_pct", 0.090)),
+                            is_cooldown_active=in_cooldown
+                        )
+                    else:
+                        sig_entry = check_rsima3_signals(
+                            df_5m=df_entry_eval,
+                            current_pos_qty=0.0,
+                            current_trades_count=0,
+                            avg_entry_price=0.0,
+                            current_price=cur_px,
+                            rsi_len=9,
+                            ema_len=7,
+                            l_ep=float(sym_params_e.get("l_ep", 40.0)),
+                            l_cp=float(sym_params_e.get("l_cp", 60.0)),
+                            sl_pct=float(sym_params_e.get("sl_pct", 0.090)),
+                            max_trades=MAX_TRADES_COUNT,
+                            last_entry_price=0.0,
+                            val_price=val_e,
+                            vah_price=vah_e
+                        )
+
+                    entry_action = sig_entry.get("action", "NONE")
+                    entry_reason = sig_entry.get("reason", "INITIAL_ENTRY")
+                    whale_info = get_whale_sentiment_info(sym)
+                    whale_sig = whale_info.get("signal", "NEUTRAL")
+
+                    # ケース 1: すでに指値待機中
+                    if sym in pending_entry_orders:
+                        if is_candle_closed:
+                            if entry_action == "INITIAL_ENTRY" and whale_sig != "SHORT_ONLY":
+                                api = symbol_apis.get(sym)
+                                if api:
+                                    spec = api.bingx.instrument_spec or {}
+                                    lot_size = compute_lot_size(cur_px, BINGX_TARGET_POSITION_VALUE_USDT, spec)
+                                    df_re = df_entry_eval.copy()
+                                    df_re["long"] = True
+                                    entered_re = await api.long_entry(df_re, {}, cycle_balance, lot_size, max_lot)
+                                    if entered_re:
+                                        new_pos = await api.get_positions()
+                                        if float(new_pos.get("buy", 0.0)) > 0:
+                                            pending_entry_orders.pop(sym, None)
+                                            trade_counts[sym] = 1
+                                            last_trade_time[sym] = time.time()
+                                            tracked_active_positions.add(sym)
+                                        else:
+                                            pending_entry_orders[sym]["price"] = cur_px
+                                            discord.print_log(f"📌 [{sym}] 新しい指値に更新完了 (Best Bid 待機継続: 約 ${cur_px:.4f})")
+                            else:
+                                api = symbol_apis.get(sym)
+                                if api:
+                                    try:
+                                        await api.active_order_cancel()
+                                    except Exception:
+                                        pass
+                                pending_entry_orders.pop(sym, None)
+                                discord.print_log(f"🛡️ [{sym}] 5分足LONGサインが終了したため、未約定指値を安全にキャンセルしました (下落ナイフ防止)。")
+                        continue
+
+                    # ケース 2: 新規指値発注
+                    if total_active_count >= MAX_ACTIVE_POSITIONS:
+                        continue
+                    if entry_action != "INITIAL_ENTRY":
+                        continue
+                    if whale_sig == "SHORT_ONLY":
+                        continue
+
+                    api = symbol_apis.get(sym)
+                    if not api:
+                        api = api_bingx(symbol=sym, mode=mode)
+                        spec = fetch_instrument_spec_bingx(sym, mode)
+                        if spec:
+                            api.update_instrument_spec(spec)
+                        symbol_apis[sym] = api
+
+                    spec = api.bingx.instrument_spec or {}
+                    lot_size = compute_lot_size(cur_px, BINGX_TARGET_POSITION_VALUE_USDT, spec)
+                    if lot_size <= 0:
+                        continue
+
+                    pos = await api.get_positions()
+                    if float(pos.get("buy", 0.0)) > 0:
+                        continue
+
+                    api.entry_val = val_e
+                    api.entry_vah = vah_e
+
+                    discord.print_log(f"⚡ [{sym}] [{cand_strat_e.upper()} 初期エントリー>>] {entry_reason} (クジラ: {whale_sig})")
+                    df_entry_send = df_entry_eval.copy()
+                    df_entry_send["long"] = True
+                    entered = await api.long_entry(df_entry_send, pos, cycle_balance, lot_size, max_lot)
+
+                    if entered:
+                        new_pos = await api.get_positions()
+                        if float(new_pos.get("buy", 0.0)) > 0:
+                            # 即時約定
+                            last_trade_time[sym] = time.time()
+                            trade_counts[sym] = 1
+                            last_nanpin_time[sym] = time.time()
+                            tracked_active_positions.add(sym)
+                            total_active_count += 1
+                            inv_label_e = f"{cand_interval_e}m" if cand_interval_e < 60 else f"{cand_interval_e // 60}h"
+                            whale_flow_val = float(whale_info.get("net_flow", 0.0)) if whale_info else 0.0
+                            strat_desc = f"{cand_strat_e.upper()} ({inv_label_e}足 / MP={sym_params_e.get('mp', '-')})"
+                            asyncio.create_task(_async_post_entry_reporting(
+                                sym=sym, entry_px=cur_px, lot_size=lot_size, entry_full_reason=entry_reason,
+                                df_chart=df_entry_eval, vah_val=vah_e, val_val=val_e, poc_val=poc_e,
+                                strat_desc=strat_desc, whale_sig=whale_sig, whale_flow_val=whale_flow_val,
+                                interval_label=inv_label_e
+                            ))
+                        else:
+                            # 指値待機 (pending)
+                            pending_entry_orders[sym] = {
+                                "placed_at": time.time(),
+                                "price": cur_px,
+                                "lot": lot_size,
+                                "reason": entry_reason,
+                                "interval": cand_interval_e,
+                            }
+                            total_active_count += 1
+                            discord.print_log(f"📌 [{sym}] Best Bid 指値を配置し待機中 (数量={lot_size}, 価格=~${cur_px:.4f})")
+                except Exception as ent_err:
+                    discord.print_log(f"⚠️ [{sym}] 新規エントリー判定例外: {ent_err}", level="warning")
+
+        # --- ハートビート記録 (Data/bot_heartbeat.json) ---
+        try:
+            hb_file = Path(__file__).resolve().parent / "Data" / "bot_heartbeat.json"
+            hb_file.parent.mkdir(parents=True, exist_ok=True)
+            hb_data = {
+                "timestamp": time.time(),
+                "datetime_jst": now_jst.strftime("%Y-%m-%d %H:%M:%S"),
+                "cycle_count": cycle_count,
+                "monitored_symbols": list(symbol_apis.keys()),
+                "active_positions_count": len(active_positions),
+                "active_symbols": list(active_positions.keys()),
+                "pending_entry_count": len(pending_entry_orders),
+                "pending_symbols": list(pending_entry_orders.keys()),
+            }
+            with open(hb_file, "w", encoding="utf-8") as f:
+                json.dump(hb_data, f, indent=2, ensure_ascii=False)
+        except Exception:
+            pass
+
+        # --loop フラグがない場合は1サイクルのみ実行
+        if "--loop" not in sys.argv:
+            print("\n==================================================")
+            print("  [Success] 1サイクルの選定・最適化・トレード判定が完走しました。")
+            print("==================================================")
+            break
+
+        # 省エネ30秒待機 (CPU使用率5%以下を維持)
+        await asyncio.sleep(30)
 
 
 if __name__ == "__main__":

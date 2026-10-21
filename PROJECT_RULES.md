@@ -113,7 +113,7 @@ flowchart TD
 ### 🎯 対象銘柄 ＆ 投票重み配分（USDT先物 アルト固定20銘柄 ＋ BTC-USDT 計22票）
 USDCよりも圧倒的に出来高・流動性が厚い **USDT無期限先物ペア** を対象とし、銘柄構成は `hype5_45` と完全統一する：
 * **固定選定アルトリスト (`FIXED_SYMBOLS` 20銘柄 / 各1票 = 計20票)**:
-  `HYPE-USDT`, `SOL-USDT`, `DOGE-USDT`, `XRP-USDT`, `SUI-USDT`, `AVAX-USDT`, `LINK-USDT`, `ADA-USDT`, `NEAR-USDT`, `APT-USDT`, `OP-USDT`, `ARB-USDT`, `TIA-USDT`, `RENDER-USDT`, `WIF-USDT`, `FET-USDT`, `TAO-USDT`, `AAVE-USDT`, `ENA-USDT`, `ZEC-USDT`
+  `HYPE-USDT`, `SOL-USDT`, `DOGE-USDT`, `XRP-USDT`, `SUI-USDT`, `AVAX-USDT`, `LINK-USDT`, `APT-USDT`, `NEAR-USDT`, `ARB-USDT`, `UNI-USDT`, `OP-USDT`, `TIA-USDT`, `RENDER-USDT`, `INJ-USDT`, `FET-USDT`, `TAO-USDT`, `AAVE-USDT`, `ENA-USDT`, `ZEC-USDT`
 * **BTC 先行指標 (`BTC-USDT` 1銘柄 / 2票分 = 計2票)**:
   `BTC-USDT` は市場全体の牽引役として 2 票分の投票権を持つ（※`BTC-USDT` 自身はアルト発注対象外）。
 * **総投票数: 22 票**（「半分以上」の判定基準: **11 票以上**）

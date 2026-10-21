@@ -27,8 +27,8 @@ if hasattr(sys.stderr, "reconfigure"):
 # 固定選定銘柄 (主要アルトコイン20銘柄 / PROJECT_RULES.md 準拠)
 FIXED_SYMBOLS = [
     "HYPE-USDT", "SOL-USDT", "DOGE-USDT", "XRP-USDT", "SUI-USDT",
-    "AVAX-USDT", "LINK-USDT", "ADA-USDT", "NEAR-USDT", "APT-USDT",
-    "OP-USDT", "ARB-USDT", "TIA-USDT", "RENDER-USDT", "WIF-USDT",
+    "AVAX-USDT", "LINK-USDT", "APT-USDT", "NEAR-USDT", "ARB-USDT",
+    "UNI-USDT", "OP-USDT", "TIA-USDT", "RENDER-USDT", "INJ-USDT",
     "FET-USDT", "TAO-USDT", "AAVE-USDT", "ENA-USDT", "ZEC-USDT"
 ]
 

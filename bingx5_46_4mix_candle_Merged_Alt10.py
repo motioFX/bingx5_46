@@ -78,8 +78,8 @@ def is_forex_symbol(s: str) -> bool:
 # 固定選定銘柄 (主要アルトコイン20銘柄 + BTC-USDT 計22票制 / PROJECT_RULES.md 準拠)
 FIXED_TARGET_SYMBOLS: List[str] = [
     "HYPE-USDT", "SOL-USDT", "DOGE-USDT", "XRP-USDT", "SUI-USDT",
-    "AVAX-USDT", "LINK-USDT", "ADA-USDT", "NEAR-USDT", "APT-USDT",
-    "OP-USDT", "ARB-USDT", "TIA-USDT", "RENDER-USDT", "WIF-USDT",
+    "AVAX-USDT", "LINK-USDT", "APT-USDT", "NEAR-USDT", "ARB-USDT",
+    "UNI-USDT", "OP-USDT", "TIA-USDT", "RENDER-USDT", "INJ-USDT",
     "FET-USDT", "TAO-USDT", "AAVE-USDT", "ENA-USDT", "ZEC-USDT"
 ]
 REGIME_SYMBOLS: List[str] = ["BTC-USDT"]
