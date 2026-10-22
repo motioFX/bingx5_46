@@ -972,6 +972,55 @@ async def fetch_all_position_symbols_bingx(coin: str = 'USDT', mode: str = 'demo
         discord.print_log(f"BingX fetch_all_position_symbols error: {exc}")
     return []
 
+async def fetch_all_positions_dict_bingx(mode: str = 'demo') -> Optional[Dict[str, dict]]:
+    """BingX API から全保有ポジションを一括取得し、{symbol: position_dict} を返す。
+    通信エラーやタイムアウト時は None を返し、誤判定によるポジション消失扱いを防止する。"""
+    cred_key = 'bingx_demo' if mode in ("paper", "demo", "testnet") else 'bingx'
+    creds = apis_bingx.get(cred_key) or apis_bingx.get('bingx') or {}
+    api_key = creds.get("api_key", "")
+    secret_key = creds.get("secret_key", "")
+    if not api_key or api_key.startswith("YOUR_") or is_air:
+        return {}
+    base_url = RestAPI_url.get(cred_key, 'https://open-api-vst.bingx.com' if mode in ('paper', 'demo', 'testnet') else 'https://open-api.bingx.com')
+    try:
+        res = await _async_bingx_request("GET", base_url, "/openApi/swap/v2/user/positions", api_key, secret_key, timeout=10)
+        if res.get("code") == 0:
+            positions_data = res.get("data", [])
+            pos_map: Dict[str, dict] = {}
+            for p in positions_data:
+                sym = normalize_symbol(p.get("symbol", ""))
+                amt = float(p.get("positionAmt", 0.0))
+                entry_px = float(p.get("avgPrice") or p.get("entryPrice") or p.get("avgEntryPrice") or 0.0)
+                unrealized_pnl = float(p.get("unrealizedProfit", 0.0))
+                side = str(p.get("positionSide", "")).upper()
+                
+                pos_entry = {
+                    'buy': 0.0,
+                    'sell': 0.0,
+                    'buy_pos': 0.0,
+                    'sell_pos': 0.0,
+                    'profit': unrealized_pnl,
+                    'raw_pnl': unrealized_pnl,
+                    'pos_count': 1.0 if abs(amt) > 0 else 0.0,
+                    'buy_count': 1 if (side == "LONG" or (side == "BOTH" and amt > 0)) and abs(amt) > 0 else 0,
+                    'sell_count': 1 if (side == "SHORT" or (side == "BOTH" and amt < 0)) and abs(amt) > 0 else 0,
+                    'margin_mode': 'crossed',
+                }
+                if side == "LONG" or (side == "BOTH" and amt > 0):
+                    if abs(amt) > 0:
+                        pos_entry['buy'] = abs(amt)
+                        pos_entry['buy_pos'] = entry_px
+                elif side == "SHORT" or (side == "BOTH" and amt < 0):
+                    if abs(amt) > 0:
+                        pos_entry['sell'] = abs(amt)
+                        pos_entry['sell_pos'] = entry_px
+                pos_map[sym] = pos_entry
+            return pos_map
+    except Exception as exc:
+        discord.print_log(f"BingX fetch_all_positions_dict error: {exc}", level="warning")
+    return None
+
+
 async def flatten_all_positions_bingx(
     coin: str = 'USDT',
     mode: str = 'demo',
@@ -994,3 +1043,5 @@ flatten_current_position = flatten_current_position_bingx
 flatten_all_positions = flatten_all_positions_bingx
 fetch_all_position_symbols = fetch_all_position_symbols_bingx
 
+
+fetch_all_positions_dict = fetch_all_positions_dict_bingx

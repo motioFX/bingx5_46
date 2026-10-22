@@ -1954,6 +1954,7 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
     cached_5m_dfs: Dict[str, pd.DataFrame] = {}
     previous_hourly_oi: Dict[str, float] = {}
     last_hourly_slot = None
+    cached_positions_map: Dict[str, dict] = {}
 
     # ========== フェーズB: MTFリアルタイム監視ループ (30秒サイクル省エネ運用) ==========
     while True:
@@ -2084,7 +2085,7 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                 h_balance = await first_api.get_account() if first_api else 1000.0
 
                 for h_sym, h_api in symbol_apis.items():
-                    h_pos = await h_api.get_positions()
+                    h_pos = cached_positions_map.get(h_sym, {})
                     h_qty = float(h_pos.get("buy", 0.0))
                     h_has_long = h_qty > 0
                     h_pnl = float(h_pos.get("profit", 0.0))
@@ -2096,6 +2097,8 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                     if h_has_long:
                         h_sign = "+" if h_pnl >= 0 else "-"
                         h_t_cnt = trade_counts.get(h_sym, 1)
+                        if h_t_cnt <= 0:
+                            h_t_cnt = 1
                         h_pos_tag = f"保有({h_sign}${abs(h_pnl):.2f}/{h_t_cnt}本)"
                     elif h_sym in pending_entry_orders:
                         p_px = pending_entry_orders[h_sym].get("price", 0.0)
@@ -2145,15 +2148,22 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
         is_regime_safe = (regime_info.get("regime_gate") == "ALLOW")
 
         # -------------------------------------------------------------
-        # [フェーズ B2] リアルタイム (30秒ごと): ポジション監視 & 決済判定
+        # [フェーズ B2] リアルタイム (30秒ごと): 全ポジション一括取得 & 監視 & 決済判定
         # -------------------------------------------------------------
+        from bingx5_46_2api import fetch_all_positions_dict_bingx
+        fresh_positions_map = await fetch_all_positions_dict_bingx(mode=mode)
+        if fresh_positions_map is not None:
+            cached_positions_map = fresh_positions_map
+
         active_positions = {}
         first_api = next(iter(symbol_apis.values())) if symbol_apis else None
         cycle_balance = await first_api.get_account() if first_api else 1000.0
 
         for sym, api in list(symbol_apis.items()):
             try:
-                pos = await api.get_positions()
+                pos = cached_positions_map.get(sym, {
+                    'buy': 0.0, 'sell': 0.0, 'buy_pos': 0.0, 'sell_pos': 0.0, 'profit': 0.0, 'pos_count': 0.0
+                })
                 buy_qty = float(pos.get("buy", 0.0))
                 has_long = buy_qty > 0
                 entry_px = float(pos.get("buy_pos", 0.0))
@@ -2161,11 +2171,12 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
 
                 if not has_long:
                     if sym in tracked_active_positions:
-                        tracked_active_positions.discard(sym)
-                        trade_counts[sym] = 0
-                        last_nanpin_time.pop(sym, None)
-                        last_trade_time[sym] = time.time()
-                        discord.print_log(f"⚠️ [{sym}] 取引所側でのポジション解消（外部決済または清算）を検知しました。", level="warning")
+                        if fresh_positions_map is not None:
+                            tracked_active_positions.discard(sym)
+                            trade_counts[sym] = 0
+                            last_nanpin_time.pop(sym, None)
+                            last_trade_time[sym] = time.time()
+                            discord.print_log(f"⚠️ [{sym}] 取引所側でのポジション解消（外部決済または清算）を検知しました。", level="warning")
                     if sym in pending_entry_orders:
                         try:
                             orders = await api.get_open_orders()
@@ -2252,9 +2263,14 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                 val = float(df_eval["VAL"].iloc[-1]) if "VAL" in df_eval.columns else cur_px * 0.98
                 poc = float(df_eval["POC"].iloc[-1]) if "POC" in df_eval.columns else cur_px
 
+                # 保有枠数の厳密算出 (0本バグ防止 & 実ロット連動)
+                spec_pos = api.bingx.instrument_spec or {}
+                base_lot = compute_lot_size(cur_px, BINGX_TARGET_POSITION_VALUE_USDT, spec_pos)
+                actual_lots = max(1, int(round(buy_qty / max(base_lot, 1e-6)))) if base_lot > 0 else 1
                 scale_state_cur = scale_in_states.get(sym, {})
                 cur_nanpin_cnt = int(scale_state_cur.get("nanpin_count", 0))
-                t_count = max(cur_nanpin_cnt + 1, trade_counts.get(sym, 1))
+                t_count = max(trade_counts.get(sym, 1), actual_lots, cur_nanpin_cnt + 1, 1)
+                trade_counts[sym] = t_count
                 last_px_cur = float(scale_state_cur.get("last_entry_price", entry_px))
 
                 in_cooldown, rem_h = is_in_sl_cooldown(sym)
