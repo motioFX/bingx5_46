@@ -1080,7 +1080,8 @@ async def validate_profitable_candidates(trade_side: str, mode: str, base_symbol
                     "ma_condition": best_params_dict.get("ma_condition", "close_above"),
                     "l_ep": best_params_dict.get("l_ep", 40.0),
                     "l_cp": best_params_dict.get("l_cp", 60.0),
-                    "sl_pct": best_params_dict.get("sl_pct", 0.090),
+                    "sl_pct": best_params_dict.get("sl_pct", 0.025),
+                    "dynamic_mae_stop": float(best_params_dict.get("dynamic_mae_stop", -0.025)),
                     "pnl": cand_pnl,
                     "trade_count": trade_cnt,
                     "win_rate": win_rt,
@@ -1095,10 +1096,11 @@ async def validate_profitable_candidates(trade_side: str, mode: str, base_symbol
 
                 # プラス収支かつ最低取引回数(10回以上)クリアで合格
                 if cand_pnl > 0 and trade_cnt >= 10:
+                    dyn_sl_disp = cand_params.get("dynamic_mae_stop", -0.025)
                     if cand_strat == "val_poc":
-                        detail_str = f"MP={cand_mp}, Bins={cand_params['num_bins']}, VA={int(cand_params['value_area_pct']*100)}%, {cand_params['ma_type']}_{cand_params['ma_condition']}"
+                        detail_str = f"MP={cand_mp}, Bins={cand_params['num_bins']}, VA={int(cand_params['value_area_pct']*100)}%, {cand_params['ma_type']}_{cand_params['ma_condition']}, 動的SL={dyn_sl_disp:.2%}"
                     else:
-                        detail_str = f"EP={int(cand_params['l_ep'])}, CP={int(cand_params['l_cp'])}, SL={cand_params['sl_pct']*100:.1f}%"
+                        detail_str = f"EP={int(cand_params['l_ep'])}, CP={int(cand_params['l_cp'])}, 動的SL={dyn_sl_disp:.2%}"
                     s_pnl = cand_params.get('single_pnl', cand_pnl)
                     s_cnt = cand_params.get('single_trades', trade_cnt)
                     s_win = cand_params.get('single_win_rate', win_rt)
@@ -2229,6 +2231,14 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                     last_trade_time[sym] = time.time()
                     last_nanpin_time[sym] = time.time()
                     tracked_active_positions.add(sym)
+                    scale_state_new = {
+                        "nanpin_count": 0,
+                        "last_entry_price": entry_px,
+                        "avg_price": entry_px,
+                        "initial_entry_time": time.time(),
+                    }
+                    scale_in_states[sym] = scale_state_new
+                    save_scale_in_states(scale_in_states)
                     entry_reason_val = p_order.get("reason", "指値約定")
                     opt_inv_p = p_order.get("interval", 5)
                     inv_label_p = f"{opt_inv_p}m" if opt_inv_p < 60 else f"{opt_inv_p // 60}h"
@@ -2309,6 +2319,17 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                 trade_counts[sym] = t_count
                 last_px_cur = float(scale_state_cur.get("last_entry_price", entry_px))
 
+                # エントリー経過時間 (分) および 5分足換算バー数 (4時間タイムアウト判定用)
+                entry_ts = float(scale_state_cur.get("initial_entry_time", 0.0))
+                if entry_ts <= 0:
+                    entry_ts = time.time()
+                    scale_state_cur["initial_entry_time"] = entry_ts
+                    scale_in_states[sym] = scale_state_cur
+                    save_scale_in_states(scale_in_states)
+                elapsed_min = (time.time() - entry_ts) / 60.0
+                bars_held_cur = int(elapsed_min // 5)
+                dyn_sl_pct = float(sym_params.get("dynamic_mae_stop", -0.025))
+
                 in_cooldown, rem_h = is_in_sl_cooldown(sym)
 
                 # 戦略シグナル評価
@@ -2327,9 +2348,11 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                         ma_condition=str(sym_params.get("ma_condition", "close_above")),
                         max_trades=MAX_TRADES_COUNT,
                         target_ratio=0.60,
-                        sl_pct=float(sym_params.get("sl_pct", 0.090)),
+                        sl_pct=abs(dyn_sl_pct),
                         is_cooldown_active=in_cooldown,
                         is_emergency_breakeven=is_emergency_be,
+                        dynamic_sl_pct=dyn_sl_pct,
+                        bars_held=bars_held_cur,
                     )
                 else:
                     sig_eval = check_rsima3_signals(
@@ -2342,12 +2365,14 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                         ema_len=7,
                         l_ep=float(sym_params.get("l_ep", 40.0)),
                         l_cp=float(sym_params.get("l_cp", 60.0)),
-                        sl_pct=float(sym_params.get("sl_pct", 0.090)),
+                        sl_pct=abs(dyn_sl_pct),
                         max_trades=MAX_TRADES_COUNT,
                         last_entry_price=last_px_cur,
                         val_price=val,
                         vah_price=vah,
                         is_emergency_breakeven=is_emergency_be,
+                        dynamic_sl_pct=dyn_sl_pct,
+                        bars_held=bars_held_cur,
                     )
 
                 pos_action = sig_eval.get("action", "HOLD")
@@ -2357,9 +2382,13 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
 
                 closed = False
                 if pos_action == "STOP_LOSS":
-                    discord.print_log(f"🛑 [{sym}] [{cand_strat.upper()} STOP LOSS] {exit_reason} ➔ 成行損切り", level="warning")
+                    discord.print_log(f"🛑 [{sym}] [{cand_strat.upper()} DYNAMIC MAE STOP LOSS] {exit_reason} ➔ 成行損切り", level="warning")
                     await flatten_current_position_bingx(sym, "USDT", mode, exit_reason, force_market=True)
                     record_sl_cooldown(sym)
+                    closed = True
+                elif pos_action == "TIMEOUT_EXIT":
+                    discord.print_log(f"⏰ [{sym}] [{cand_strat.upper()} 4H TIMEOUT EXIT] {exit_reason} ➔ 4時間タイムアウト成行微損撤退", level="warning")
+                    await flatten_current_position_bingx(sym, "USDT", mode, exit_reason, force_market=True)
                     closed = True
                 elif pos_action == "CLOSE_ALL":
                     discord.print_log(f"🎯 [{sym}] [{cand_strat.upper()} CLOSE ALL] {exit_reason} ➔ 一括成行決済")
@@ -2601,6 +2630,14 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                             trade_counts[sym] = 1
                             last_nanpin_time[sym] = time.time()
                             tracked_active_positions.add(sym)
+                            scale_state_new = {
+                                "nanpin_count": 0,
+                                "last_entry_price": cur_px,
+                                "avg_price": cur_px,
+                                "initial_entry_time": time.time(),
+                            }
+                            scale_in_states[sym] = scale_state_new
+                            save_scale_in_states(scale_in_states)
                             total_active_count += 1
                             inv_label_e = f"{cand_interval_e}m" if cand_interval_e < 60 else f"{cand_interval_e // 60}h"
                             whale_flow_val = float(whale_info.get("net_flow", 0.0)) if whale_info else 0.0

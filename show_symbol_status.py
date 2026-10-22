@@ -171,12 +171,13 @@ def build_symbols_status_summary(
                 bins_val = opt_info.get("num_bins", 50)
                 va_pct = int(float(opt_info.get("value_area_pct", 0.70)) * 100)
                 ma_cond = f"{opt_info.get('ma_type', 'EMA')}_{opt_info.get('ma_condition', 'close_above')}"
-                detail_reason = f"戦略={strat} ({interval_val}m / MP={mp_val}, Bins={bins_val}, VA={va_pct}%, {ma_cond})"
+                dyn_sl = float(opt_info.get("dynamic_mae_stop", opt_info.get("sl_pct", 0.025)))
+                detail_reason = f"戦略={strat} ({interval_val}m / MP={mp_val}, Bins={bins_val}, VA={va_pct}%, {ma_cond}, 動的SL={dyn_sl:.2%})"
             else:
                 l_ep = int(float(opt_info.get("l_ep", 40)))
                 l_cp = int(float(opt_info.get("l_cp", 60)))
-                sl_p = float(opt_info.get("sl_pct", 0.090)) * 100
-                detail_reason = f"戦略={strat or 'RSIMA'} ({interval_val}m / R9, M7, EP={l_ep}, CP={l_cp}, SL={sl_p:.1f}%)"
+                dyn_sl = float(opt_info.get("dynamic_mae_stop", opt_info.get("sl_pct", 0.025)))
+                detail_reason = f"戦略={strat or 'RSIMA'} ({interval_val}m / R9, M7, EP={l_ep}, CP={l_cp}, 動的SL={dyn_sl:.2%})"
             if is_peak_dropped:
                 detail_reason += " [※3期間比較:前半高値警戒]"
         elif whale_sig == "SHORT_ONLY":

@@ -1623,14 +1623,14 @@ def simulate_val_poc_fast(
     initial_equity: float = 100.0,
     max_trades: int = 3,
     nanpin_drop_pct: float = 0.030,
-    sl_pct: float = 0.090,
+    sl_pct: float = 0.025,
     target_ratio: float = 0.60,
     cooldown_bars: int = 96,
     fee_rate: float = 0.0006,
     maker_fee: float = 0.0002,
     record_chart: bool = False
 ) -> Dict[str, Any]:
-    """VAL_POC 高速バックテストシミュレータ (VA 60%連動ナンピン・最終建値-60%損切り・最大3枠対応)"""
+    """VAL_POC 高速バックテストシミュレータ (動的ストップ・4時間タイムアウト・最大3枠対応)"""
     n = len(closes)
     trade_size = initial_equity / max_trades
     pos_qty = 0.0
@@ -1638,6 +1638,7 @@ def simulate_val_poc_fast(
     avg_price = 0.0
     pos_count = 0
     last_entry = 0.0
+    entry_bar_idx = -1
     cooldown_until = -1
     pending_limit = -1.0
     cum_pnl = 0.0
@@ -1672,6 +1673,8 @@ def simulate_val_poc_fast(
                 avg_price = pos_cost / pos_qty
                 last_entry = px
                 pos_count += 1
+                if pos_count == 1:
+                    entry_bar_idx = i
                 if record_chart and exec_buy is not None:
                     exec_buy[i] = px
             pending_limit = -1.0
@@ -1682,9 +1685,14 @@ def simulate_val_poc_fast(
             va_spacing = va_diff * target_ratio if va_diff > 0 else (last_entry * nanpin_drop_pct)
             drop_dist = max(last_entry * 0.010, va_spacing) if last_entry > 0 else 0.0
 
-            # 損切り: 最終建値(最大枠到達後)から (VAH - VAL) * 0.60 割れ (確定足終値判定)
-            sl_price = last_entry - drop_dist
-            if pos_count >= max_trades and sl_price > 0 and c <= sl_price:
+            # 損切り: 動的ストップ (sl_pct) または 4時間タイムアウト (48本経過で含み損)
+            is_sl = False
+            if sl_pct > 0 and c <= avg_price * (1.0 - sl_pct):
+                is_sl = True
+            elif entry_bar_idx > 0 and (i - entry_bar_idx) >= 48 and c < avg_price:
+                is_sl = True
+
+            if is_sl:
                 sell_val = pos_qty * c
                 fee = sell_val * fee_rate
                 pnl = sell_val - pos_cost - fee
@@ -1697,6 +1705,7 @@ def simulate_val_poc_fast(
                 avg_price = 0.0
                 pos_count = 0
                 last_entry = 0.0
+                entry_bar_idx = -1
                 cooldown_until = i + cooldown_bars
             else:
                 # 利確 (VAL-VAH 60%水準 到達かつ建値プラス域)
@@ -1716,6 +1725,7 @@ def simulate_val_poc_fast(
                         avg_price = 0.0
                         pos_count = 0
                         last_entry = 0.0
+                        entry_bar_idx = -1
 
         # 2. エントリー / ナンピン判定
         if pending_limit < 0:
@@ -1785,9 +1795,9 @@ def optimize_rsima3_fast(
     min_trades: int = 10,
     val_arr: Optional[np.ndarray] = None,
     vah_arr: Optional[np.ndarray] = None,
-    default_sl_pct: float = 0.05
+    default_sl_pct: float = 0.025
 ) -> Dict[str, Any]:
-    """RSIMA 9通り (EP 30,35,40 × CP 60,65,70, ナンピン/SL: (VAH-VAL)*0.60) 超高速最適化 (MIN_TRADES=10)"""
+    """RSIMA 9通り (EP 30,35,40 × CP 60,65,70, 動的ストップ・4時間タイムアウト) 超高速最適化 (MIN_TRADES=10)"""
     n = len(closes)
     trade_size = initial_equity / max_trades
     maker_fee = 0.0002
@@ -1824,6 +1834,7 @@ def optimize_rsima3_fast(
             avg_px = 0.0
             last_entry_px = 0.0
             pos_cnt = 0
+            entry_bar_idx = -1
             cum_pnl = 0.0
             trades_cnt = 0
             wins_cnt = 0
@@ -1858,18 +1869,17 @@ def optimize_rsima3_fast(
                         last_entry_px = px
                         avg_px = pos_cost / pos_qty
                         pos_cnt += 1
+                        if pos_cnt == 1:
+                            entry_bar_idx = i
                     pending_px = -1.0
 
                 if pos_qty > 0:
-                    # 損切り判定: 最大枠(3枠)到達後に (VAH - VAL) * 0.60 割れ (確定足終値判定)
+                    # 損切り判定: 動的ストップ率 default_sl_pct 割れ (枠数不問発動) または 4時間タイムアウト
                     is_sl = False
-                    if pos_cnt >= max_trades:
-                        if use_va and not np.isnan(val_arr[i]) and not np.isnan(vah_arr[i]) and vah_arr[i] > val_arr[i]:
-                            va_width = vah_arr[i] - val_arr[i]
-                            sl_price = last_entry_px - va_width * 0.60
-                            is_sl = (c < sl_price)
-                        else:
-                            is_sl = (c < avg_px * (1.0 - default_sl_pct))
+                    if default_sl_pct > 0 and c <= avg_px * (1.0 - default_sl_pct):
+                        is_sl = True
+                    elif entry_bar_idx > 0 and (i - entry_bar_idx) >= 48 and c < avg_px:
+                        is_sl = True
 
                     if is_sl:
                         sell_val = pos_qty * c
@@ -1884,6 +1894,7 @@ def optimize_rsima3_fast(
                         avg_px = 0.0
                         last_entry_px = 0.0
                         pos_cnt = 0
+                        entry_bar_idx = -1
                         cooldown_until = i + 288
                         cur_eq = initial_equity + cum_pnl
                         if cur_eq > peak_eq:
@@ -1905,6 +1916,7 @@ def optimize_rsima3_fast(
                         avg_px = 0.0
                         last_entry_px = 0.0
                         pos_cnt = 0
+                        entry_bar_idx = -1
                         cur_eq = initial_equity + cum_pnl
                         if cur_eq > peak_eq:
                             peak_eq = cur_eq
@@ -2033,6 +2045,109 @@ def build_rsima3_chart_df(
     out_df['exec_sell_price'] = exec_sell
     out_df['pnl'] = pnl_curve
     return out_df
+
+
+def calculate_dynamic_mae_stop(
+    df_5m: pd.DataFrame,
+    strategy: str = "val_poc",
+    params: Optional[Dict[str, Any]] = None,
+    default_stop: float = -0.025,
+    min_stop: float = -0.015,  # 上限クランプ (-1.5%: 浅すぎてノイズで切られるのを防ぐ)
+    max_stop: float = -0.032,  # 下限クランプ (-3.2%: 深すぎて大損失になるのを防ぐ)
+) -> float:
+    """
+    直近30日の5分足データから、勝ちトレードの最大逆行幅 (MAE: Maximum Adverse Excursion) 95%ile を動的に算出
+    - 勝ちトレードの95%が耐え切って利確に至った最大の深さを特定
+    - 安全バンド [min_stop, max_stop] にクランプ (基準値: -2.50%)
+    """
+    if df_5m is None or len(df_5m) < 200:
+        return default_stop
+
+    try:
+        c = df_5m["close"].astype(float).values
+        h = df_5m["high"].astype(float).values if "high" in df_5m.columns else c
+        l = df_5m["low"].astype(float).values if "low" in df_5m.columns else c
+        n = len(df_5m)
+
+        strat_type = str(strategy).lower()
+        if "rsi" in strat_type:
+            rsi_s, ma_s = calc_rsi_ema(df_5m["close"].astype(float), 9, 7)
+            rsi_v = rsi_s.values
+            ma_v = ma_s.values
+            l_ep = float(params.get("l_ep", 40.0)) if params else 40.0
+            l_cp = float(params.get("l_cp", 60.0)) if params else 60.0
+        else:
+            mp_period = int(params.get("mp", 150)) if params else 150
+            ema200 = calc_ema(df_5m["close"].astype(float), 200).values
+            ma_filter = (c >= ema200)
+            mp_res = make_market_profile_dual_va(df_5m, period=mp_period, num_bins=50, step=4, use_decay=True)
+            vals = mp_res["val_70"]
+            vahs = mp_res["vah_70"]
+            pocs = mp_res["poc"]
+
+        pos_qty = 0.0
+        pos_cost = 0.0
+        avg_price = 0.0
+        trade_min_l = float("inf")
+        winning_mae = []
+
+        for i in range(1, n):
+            cur_c = c[i]
+            cur_h = h[i]
+            cur_l = l[i]
+
+            if pos_qty == 0.0:
+                if "rsi" in strat_type:
+                    if (cur_c > 0 and rsi_v[i] > ma_v[i] and rsi_v[i-1] <= ma_v[i-1] and ma_v[i] < l_ep):
+                        pos_qty = 100.0 / cur_c
+                        pos_cost = 100.0
+                        avg_price = cur_c
+                        trade_min_l = cur_l
+                else:
+                    if (ma_filter[i] and not np.isnan(vals[i]) and c[i-1] <= vals[i-1] and cur_c > vals[i]):
+                        pos_qty = 100.0 / cur_c
+                        pos_cost = 100.0
+                        avg_price = cur_c
+                        trade_min_l = cur_l
+                continue
+
+            trade_min_l = min(trade_min_l, cur_l)
+
+            # TP / SL check
+            is_tp = False
+            if "rsi" in strat_type:
+                if rsi_v[i] > l_cp and cur_c > avg_price * 1.004:
+                    is_tp = True
+            else:
+                val = vals[i]
+                vah = vahs[i]
+                va_diff = (vah - val) if (not np.isnan(val) and not np.isnan(vah) and vah > val) else 0.0
+                tp_target = val + va_diff * 0.60 if va_diff > 0 else pocs[i]
+                if (cur_h >= tp_target or cur_c >= tp_target) and cur_c > avg_price * 1.0007:
+                    is_tp = True
+
+            # 損切りチェック (5%の広めストップで過去トレードの最悪値を計測)
+            is_sl = (cur_c <= avg_price * 0.95)
+
+            if is_tp:
+                pnl = pos_qty * cur_c - pos_cost
+                if pnl > 0 and avg_price > 0:
+                    mae = (trade_min_l - avg_price) / avg_price
+                    winning_mae.append(mae)
+                pos_qty = 0.0
+                pos_cost = 0.0
+            elif is_sl:
+                pos_qty = 0.0
+                pos_cost = 0.0
+
+        if len(winning_mae) >= 5:
+            mae_95 = float(np.percentile(winning_mae, 5))  # 下位5% (95%のトレードが耐えた逆行幅)
+            # 安全バンドクランプ: 例 [-0.032, -0.015]
+            clamped = max(min(mae_95, min_stop), max_stop)
+            return round(clamped, 4)
+        return default_stop
+    except Exception:
+        return default_stop
 
 
 def run_interval_comparison(df_5m: pd.DataFrame, lot: float = 1.0, data_equity: float = 100.0, side_mode: str = "long", symbol: str = "", force_strategy: Optional[str] = None, prefer_breakout: bool = False):
@@ -2398,6 +2513,19 @@ def run_interval_comparison(df_5m: pd.DataFrame, lot: float = 1.0, data_equity: 
         s_c = best_params['single_trades']
         s_w = best_params['single_win_rate']
         discord.print_log(f"🏆 [{symbol}] 採用戦略: 【VAL_POC ({best_interval}m)】を動的採用！ (純利益: {pnl_vp:+.2f} USDC [ナンピン{cnt_vp}回/{win_vp:.1f}%] vs シングル: {s_p:+.2f} USDC [{s_c}回/{s_w:.1f}%])")
+
+    # 直近30日の勝ちトレード MAE 95%ile に基づく動的ストップ率を算出 (安全バンド: -1.5% 〜 -3.2%)
+    dyn_stop = calculate_dynamic_mae_stop(
+        df_5m=df_5m,
+        strategy=best_strategy,
+        params=best_params,
+        default_stop=-0.025,
+        min_stop=-0.015,
+        max_stop=-0.032
+    )
+    best_params['dynamic_mae_stop'] = dyn_stop
+    best_params['sl_pct'] = abs(dyn_stop)
+    discord.print_log(f"🛡️ [{symbol}] 動的MAEストップ算出: {dyn_stop:.2%} (安全バンド: -1.50%〜-3.20%)")
 
     results["_best_params_"] = best_params
     return results, best_strategy, best_interval, best_mp, best_margin
@@ -3132,7 +3260,9 @@ def check_rsima3_signals(
     last_entry_price: Optional[float] = None,
     val_price: Optional[float] = None,
     vah_price: Optional[float] = None,
-    is_emergency_breakeven: bool = False
+    is_emergency_breakeven: bool = False,
+    dynamic_sl_pct: float = -0.025,
+    bars_held: int = 0,
 ) -> Dict[str, Any]:
     """TradingView『RSIMA3_MaxGambleMoon』の完全移植判定 (新仕様最適化完全連動)
     
@@ -3212,14 +3342,22 @@ def check_rsima3_signals(
         "is_emergency_breakeven": is_emergency_breakeven,
     }
 
-    # === [0] 損切り判定 (最終建値から (VAH - VAL) * 0.60 割れ / 最大枠到達後) ===
-    # PROJECT_RULES: 最終建値から (VAH - VAL) * 0.60 割れ (確定足終値判定) で全決済し、24時間クールダウン発動
-    if lpo and current_trades_count >= max_trades and last_ep > 0:
-        sl_price = last_ep - va_dip_req if va_dip_req > 0 else (avg_entry_price * (1.0 - sl_pct))
-        if current_price < sl_price or prev_close < sl_price:
-            loss_pct = (current_price - avg_entry_price) / avg_entry_price if avg_entry_price > 0 else 0.0
-            reason = f"RSIMA3_STOP_LOSS: 価格(${current_price:.4f}) < 最終建値-VA60%SL(${sl_price:.4f}, 損失{loss_pct:.2%})"
+    # === [0] 動的 MAE ストップロス判定 (直近30d MAE 95%ile 割れ: 枠数不問常時発動) ===
+    # PROJECT_RULES: 1枠目でもナンピン後でも常時発動、ナンピン凍結中の無防備な塩漬け(デッドロック)を完全根絶
+    if lpo and avg_entry_price > 0:
+        eff_sl_pct = abs(dynamic_sl_pct) if dynamic_sl_pct != 0 else 0.025
+        sl_price = avg_entry_price * (1.0 - eff_sl_pct)
+        if current_price <= sl_price or prev_close <= sl_price:
+            loss_pct = (current_price - avg_entry_price) / avg_entry_price
+            reason = f"RSIMA3_DYNAMIC_MAE_SL: 価格(${current_price:.4f}) <= 動的SL(${sl_price:.4f}, SL率-{eff_sl_pct:.2%}, 損失{loss_pct:.2%})"
             return {"action": "STOP_LOSS", "reason": reason, "lot_multiplier": 1.0, "metrics": metrics}
+
+    # === [0-1] 4時間タイムアウト微損撤退判定 (48本経過で含み損なら成行撤退) ===
+    # PROJECT_RULES: 4時間(48本=240分)経過で含み損ならトレンド喪失とみなし微損撤退 (塩漬け完全根絶)
+    if lpo and bars_held >= 48 and avg_entry_price > 0 and current_price < avg_entry_price:
+        loss_pct = (current_price - avg_entry_price) / avg_entry_price
+        reason = f"RSIMA3_TIMEOUT_EXIT: 保有4時間経過({bars_held}本=240分) & 含み損({loss_pct:.2%}) ➔ タイムアウト成行微損撤退"
+        return {"action": "TIMEOUT_EXIT", "reason": reason, "lot_multiplier": 1.0, "metrics": metrics}
 
     # === [1-0] 地合い悪化時の緊急建値撤退判定 (全体地合い非BUY時: 平均建値 +0.20% で早期撤退) ===
     if lpo and is_emergency_breakeven and avg_entry_price > 0:
@@ -3292,6 +3430,8 @@ def check_val_poc_signals(
     sl_pct: float = 0.090,
     is_cooldown_active: bool = False,
     is_emergency_breakeven: bool = False,
+    dynamic_sl_pct: float = -0.025,
+    bars_held: int = 0,
 ) -> Dict[str, Any]:
     """VAL_POC ＋ 200期間MA (EMA/SMA) トレンドフィルター戦略 リアルタイム判定 (新仕様最適化完全連動)
     1. エントリー: VALゴールデンクロス (クロスオーバー) ＆ 200期間MA条件 ＆ バリュー幅>=1.5% ＆ クールダウン解除済
@@ -3387,11 +3527,22 @@ def check_val_poc_signals(
         "is_emergency_breakeven": is_emergency_breakeven,
     }
 
-    # === [1] 損切り判定 (最終建値から (VAH - VAL) * 0.60 割れ / 確定足終値判定: 最大枠到達後) ===
-    if lpo and current_trades_count >= max_trades and ref_last_px > 0 and sl_price > 0 and curr_c <= sl_price:
-        loss_pct = (curr_c - avg_entry_price) / avg_entry_price if avg_entry_price > 0 else 0.0
-        reason = f"VAL_POC_STOP_LOSS: 終値(${curr_c:.4f}) <= 最終建値-VA60%SL(${sl_price:.4f}, 損失{loss_pct:.2%})"
-        return {"action": "STOP_LOSS", "reason": reason, "lot_multiplier": 1.0, "metrics": metrics}
+    # === [1] 動的 MAE ストップロス判定 (直近30d MAE 95%ile 割れ: 枠数不問常時発動) ===
+    # PROJECT_RULES: 1枠目でもナンピン後でも常時発動、ナンピン凍結中の無防備な塩漬け(デッドロック)を完全根絶
+    if lpo and avg_entry_price > 0:
+        eff_sl_pct = abs(dynamic_sl_pct) if dynamic_sl_pct != 0 else 0.025
+        sl_price_dyn = avg_entry_price * (1.0 - eff_sl_pct)
+        if (current_price <= sl_price_dyn) or (curr_c <= sl_price_dyn):
+            loss_pct = (curr_c - avg_entry_price) / avg_entry_price
+            reason = f"VAL_POC_DYNAMIC_MAE_SL: 終値(${curr_c:.4f}) <= 動的SL(${sl_price_dyn:.4f}, SL率-{eff_sl_pct:.2%}, 損失{loss_pct:.2%})"
+            return {"action": "STOP_LOSS", "reason": reason, "lot_multiplier": 1.0, "metrics": metrics}
+
+    # === [1-1] 4時間タイムアウト微損撤退判定 (48本経過で含み損なら成行撤退) ===
+    # PROJECT_RULES: 4時間(48本=240分)経過で含み損ならトレンド喪失とみなし微損撤退 (塩漬け完全根絶)
+    if lpo and bars_held >= 48 and avg_entry_price > 0 and current_price < avg_entry_price:
+        loss_pct = (current_price - avg_entry_price) / avg_entry_price
+        reason = f"VAL_POC_TIMEOUT_EXIT: 保有4時間経過({bars_held}本=240分) & 含み損({loss_pct:.2%}) ➔ タイムアウト成行微損撤退"
+        return {"action": "TIMEOUT_EXIT", "reason": reason, "lot_multiplier": 1.0, "metrics": metrics}
 
     # === [1-0] 地合い悪化時の緊急建値撤退判定 (全体地合い非BUY時: 平均建値 +0.20% で早期撤退) ===
     if lpo and is_emergency_breakeven and avg_entry_price > 0:
@@ -3439,7 +3590,7 @@ def simulate_rsima3_strategy(
     l_cp: float = 60.0,
     max_trades: int = 5,
     initial_equity: float = 100.0,
-    sl_pct: float = 0.090,
+    sl_pct: float = 0.025,
     fee_rate: float = 0.0006,
 ) -> dict:
     """
@@ -3612,7 +3763,7 @@ def simulate_val_poc_strategy(
     max_nanpin: int = 4,
     nanpin_drop_pct: Optional[float] = 0.030,
     initial_equity: float = 100.0,
-    sl_pct: float = 0.090,
+    sl_pct: float = 0.025,
     fee_rate: float = 0.0006,
     target_ratio: float = 0.60,
 ) -> dict:
