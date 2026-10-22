@@ -1955,6 +1955,7 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
     previous_hourly_oi: Dict[str, float] = {}
     last_hourly_slot = None
     cached_positions_map: Dict[str, dict] = {}
+    missing_position_counts: Dict[str, int] = {}
 
     # ========== フェーズB: MTFリアルタイム監視ループ (30秒サイクル省エネ運用) ==========
     while True:
@@ -2152,7 +2153,12 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
         # -------------------------------------------------------------
         from bingx5_46_2api import fetch_all_positions_dict_bingx
         fresh_positions_map = await fetch_all_positions_dict_bingx(mode=mode)
-        if fresh_positions_map is not None:
+
+        # 【多重防御 1: 全銘柄一斉消失サーキットブレーカー】
+        # 直前に2銘柄以上保有していたのに突然全件空リストが返ってきた場合、取引所APIの一時グリッチと判定し前回キャッシュを保護
+        if cached_positions_map and len(cached_positions_map) >= 2 and fresh_positions_map is not None and len(fresh_positions_map) == 0:
+            discord.print_log("🛡️ [Circuit Breaker] 取引所APIが一時的に全件空リストを返却したため、グリッチと判定し前回ポジションを保護維持します。", level="debug")
+        elif fresh_positions_map is not None:
             cached_positions_map = fresh_positions_map
 
         active_positions = {}
@@ -2171,12 +2177,20 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
 
                 if not has_long:
                     if sym in tracked_active_positions:
-                        if fresh_positions_map is not None:
+                        # 【多重防御 2: 連続2回確認デバウンス】
+                        # 1回だけの数量ゼロはAPIの一時不整合の可能性があるため、連続2回(約60秒)確認されるまで誤判定しない
+                        miss_cnt = missing_position_counts.get(sym, 0) + 1
+                        missing_position_counts[sym] = miss_cnt
+                        if miss_cnt >= 2:
                             tracked_active_positions.discard(sym)
                             trade_counts[sym] = 0
                             last_nanpin_time.pop(sym, None)
                             last_trade_time[sym] = time.time()
+                            missing_position_counts.pop(sym, None)
                             discord.print_log(f"⚠️ [{sym}] 取引所側でのポジション解消（外部決済または清算）を検知しました。", level="warning")
+                    else:
+                        missing_position_counts.pop(sym, None)
+
                     if sym in pending_entry_orders:
                         try:
                             orders = await api.get_open_orders()
@@ -2185,6 +2199,9 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                         except Exception:
                             pass
                     continue
+                else:
+                    # 保有が正常確認されたら消失カウントを即座にリセット
+                    missing_position_counts.pop(sym, None)
 
                 # 保有中: 出しっぱなし指値の約定検知！
                 if sym in pending_entry_orders:
