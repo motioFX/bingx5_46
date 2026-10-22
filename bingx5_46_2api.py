@@ -354,6 +354,7 @@ class api_bingx_helper:
                 'buy_count': 0,
                 'sell_count': 0,
                 'margin_mode': 'crossed',
+                'updateTime': None,
             }
 
         def finalize_position(pos: dict) -> dict:
@@ -398,12 +399,14 @@ class api_bingx_helper:
                                 position['buy_pos'] = entry_px
                                 position['profit'] = unrealized_pnl
                                 position['raw_pnl'] = unrealized_pnl
+                                position['updateTime'] = p.get("updateTime")
                         elif side == "SHORT" or (side == "BOTH" and amt < 0):
                             if abs(amt) > 0:
                                 position['sell'] = abs(amt)
                                 position['sell_pos'] = entry_px
                                 position['profit'] = unrealized_pnl
                                 position['raw_pnl'] = unrealized_pnl
+                                position['updateTime'] = p.get("updateTime")
         except Exception as e:
             discord.print_log(f"BingX get_positions error: {e}")
 

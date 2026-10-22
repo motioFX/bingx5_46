@@ -2056,7 +2056,9 @@ def calculate_dynamic_mae_stop(
     max_stop: float = -0.032,  # 下限クランプ (-3.2%: 深すぎて大損失になるのを防ぐ)
 ) -> float:
     """
-    直近30日の5分足データから、勝ちトレードの最大逆行幅 (MAE: Maximum Adverse Excursion) 95%ile を動的に算出
+    直近30日のデータから、勝ちトレードの最大逆行幅 (MAE: Maximum Adverse Excursion) 95%ile を動的に算出
+    - 採用足種 (interval: 5m, 15m, 30m, 60m) へのリサンプリング
+    - 4時間 (240分) タイムアウト微損撤退を完全連動 (長時間捕まった異常トレードを勝ちトレード群から排除)
     - 勝ちトレードの95%が耐え切って利確に至った最大の深さを特定
     - 安全バンド [min_stop, max_stop] にクランプ (基準値: -2.50%)
     """
@@ -2064,23 +2066,32 @@ def calculate_dynamic_mae_stop(
         return default_stop
 
     try:
-        c = df_5m["close"].astype(float).values
-        h = df_5m["high"].astype(float).values if "high" in df_5m.columns else c
-        l = df_5m["low"].astype(float).values if "low" in df_5m.columns else c
-        n = len(df_5m)
+        interval = int(params.get("interval", 5)) if params else 5
+        df_use = resample_candles(df_5m, interval) if interval > 5 else df_5m.copy()
+        if df_use is None or len(df_use) < 30:
+            df_use = df_5m.copy()
+            interval = 5
+
+        c = df_use["close"].astype(float).values
+        h = df_use["high"].astype(float).values if "high" in df_use.columns else c
+        l = df_use["low"].astype(float).values if "low" in df_use.columns else c
+        n = len(df_use)
+
+        timeout_bars = max(1, 240 // interval)  # 4時間 = 240分に相当するバー本数
 
         strat_type = str(strategy).lower()
         if "rsi" in strat_type:
-            rsi_s, ma_s = calc_rsi_ema(df_5m["close"].astype(float), 9, 7)
+            rsi_s, ma_s = calc_rsi_ema(df_use["close"].astype(float), 9, 7)
             rsi_v = rsi_s.values
             ma_v = ma_s.values
             l_ep = float(params.get("l_ep", 40.0)) if params else 40.0
             l_cp = float(params.get("l_cp", 60.0)) if params else 60.0
         else:
             mp_period = int(params.get("mp", 150)) if params else 150
-            ema200 = calc_ema(df_5m["close"].astype(float), 200).values
+            ema200 = calc_ema(df_use["close"].astype(float), 200).values
             ma_filter = (c >= ema200)
-            mp_res = make_market_profile_dual_va(df_5m, period=mp_period, num_bins=50, step=4, use_decay=True)
+            step_calc = max(1, 4 // max(1, interval // 5))
+            mp_res = make_market_profile_dual_va(df_use, period=mp_period, num_bins=50, step=step_calc, use_decay=True)
             vals = mp_res["val_70"]
             vahs = mp_res["vah_70"]
             pocs = mp_res["poc"]
@@ -2088,6 +2099,7 @@ def calculate_dynamic_mae_stop(
         pos_qty = 0.0
         pos_cost = 0.0
         avg_price = 0.0
+        entry_idx = -1
         trade_min_l = float("inf")
         winning_mae = []
 
@@ -2103,17 +2115,34 @@ def calculate_dynamic_mae_stop(
                         pos_cost = 100.0
                         avg_price = cur_c
                         trade_min_l = cur_l
+                        entry_idx = i
                 else:
                     if (ma_filter[i] and not np.isnan(vals[i]) and c[i-1] <= vals[i-1] and cur_c > vals[i]):
                         pos_qty = 100.0 / cur_c
                         pos_cost = 100.0
                         avg_price = cur_c
                         trade_min_l = cur_l
+                        entry_idx = i
                 continue
 
             trade_min_l = min(trade_min_l, cur_l)
+            bars_held = i - entry_idx
 
-            # TP / SL check
+            # 1. 4時間タイムアウト微損撤退 (塩漬けトレードを勝ちトレード群から排除)
+            if bars_held >= timeout_bars and cur_c < avg_price:
+                pos_qty = 0.0
+                pos_cost = 0.0
+                entry_idx = -1
+                continue
+
+            # 2. 損切りチェック (-3.5%カット)
+            if cur_c <= avg_price * 0.965:
+                pos_qty = 0.0
+                pos_cost = 0.0
+                entry_idx = -1
+                continue
+
+            # 3. TP check
             is_tp = False
             if "rsi" in strat_type:
                 if rsi_v[i] > l_cp and cur_c > avg_price * 1.004:
@@ -2126,9 +2155,6 @@ def calculate_dynamic_mae_stop(
                 if (cur_h >= tp_target or cur_c >= tp_target) and cur_c > avg_price * 1.0007:
                     is_tp = True
 
-            # 損切りチェック (5%の広めストップで過去トレードの最悪値を計測)
-            is_sl = (cur_c <= avg_price * 0.95)
-
             if is_tp:
                 pnl = pos_qty * cur_c - pos_cost
                 if pnl > 0 and avg_price > 0:
@@ -2136,9 +2162,7 @@ def calculate_dynamic_mae_stop(
                     winning_mae.append(mae)
                 pos_qty = 0.0
                 pos_cost = 0.0
-            elif is_sl:
-                pos_qty = 0.0
-                pos_cost = 0.0
+                entry_idx = -1
 
         if len(winning_mae) >= 5:
             mae_95 = float(np.percentile(winning_mae, 5))  # 下位5% (95%のトレードが耐えた逆行幅)
@@ -3533,8 +3557,9 @@ def check_val_poc_signals(
         eff_sl_pct = abs(dynamic_sl_pct) if dynamic_sl_pct != 0 else 0.025
         sl_price_dyn = avg_entry_price * (1.0 - eff_sl_pct)
         if (current_price <= sl_price_dyn) or (curr_c <= sl_price_dyn):
-            loss_pct = (curr_c - avg_entry_price) / avg_entry_price
-            reason = f"VAL_POC_DYNAMIC_MAE_SL: 終値(${curr_c:.4f}) <= 動的SL(${sl_price_dyn:.4f}, SL率-{eff_sl_pct:.2%}, 損失{loss_pct:.2%})"
+            trigger_px = current_price if current_price <= sl_price_dyn else curr_c
+            loss_pct = (trigger_px - avg_entry_price) / avg_entry_price
+            reason = f"VAL_POC_DYNAMIC_MAE_SL: 価格(${trigger_px:.4f}) <= 動的SL(${sl_price_dyn:.4f}, SL率-{eff_sl_pct:.2%}, 損失{loss_pct:.2%})"
             return {"action": "STOP_LOSS", "reason": reason, "lot_multiplier": 1.0, "metrics": metrics}
 
     # === [1-1] 4時間タイムアウト微損撤退判定 (48本経過で含み損なら成行撤退) ===

@@ -2322,11 +2322,15 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                 # エントリー経過時間 (分) および 5分足換算バー数 (4時間タイムアウト判定用)
                 entry_ts = float(scale_state_cur.get("initial_entry_time", 0.0))
                 if entry_ts <= 0:
-                    entry_ts = time.time()
+                    api_update_ms = float(pos.get("updateTime", 0) or 0) if isinstance(pos, dict) else 0.0
+                    if api_update_ms > 0:
+                        entry_ts = api_update_ms / 1000.0
+                    else:
+                        entry_ts = time.time()
                     scale_state_cur["initial_entry_time"] = entry_ts
                     scale_in_states[sym] = scale_state_cur
                     save_scale_in_states(scale_in_states)
-                elapsed_min = (time.time() - entry_ts) / 60.0
+                elapsed_min = max(0.0, (time.time() - entry_ts) / 60.0)
                 bars_held_cur = int(elapsed_min // 5)
                 dyn_sl_pct = float(sym_params.get("dynamic_mae_stop", -0.025))
 
