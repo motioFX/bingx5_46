@@ -475,6 +475,164 @@ def send_periodic_pnl_report_discord(days: int = 10, current_balance: Optional[f
         print(f"[Real Trade Tracker] チャート送信エラー: {chart_err}")
 
 
+def print_real_trading_table(days: int = 10, current_balance: Optional[float] = None) -> str:
+    """
+    コンソールログ（bot_output.log）に視認性の高いアスキーテーブル形式で実運用損益表を出力する
+    """
+    summary = get_recent_performance_summary(days=days)
+    if summary.get("status") != "ok":
+        msg = f"[実運用損益表] {summary.get('message', 'データなし')}"
+        print(msg)
+        return msg
+
+    pnl_sign = "+" if summary["total_pnl"] >= 0 else ""
+    pf_str = f"{summary['profit_factor']:.2f}" if summary["profit_factor"] < 900 else "INF (無敗)"
+    bal_str = f"🏦 口座証拠金  : ${current_balance:,.2f} USDT" if (current_balance is not None and current_balance > 0) else ""
+
+    lines = [
+        "================================================================================",
+        f"📊 【BingX 実運用トレード損益表 ({summary['period_label']} / API直接同期SSoT)】",
+        "================================================================================",
+    ]
+    if bal_str:
+        lines.append(f"  {bal_str}")
+    lines.extend([
+        f"  ⏱ 集計期間    : {summary['start_jst']} 〜 {summary['end_jst']} JST",
+        f"  🎯 総決済回数  : {summary['total_trades']} 回 ({summary['wins']}勝 {summary['losses']}敗 / 勝率 {summary['win_rate']:.1f}%)",
+        f"  💰 確定純損益  : {pnl_sign}${summary['total_pnl']:.2f} USDT (総利益: +${summary['gross_profit']:.2f} / 総損失: -${summary['gross_loss']:.2f})",
+        f"  📈 損益因子(PF): {pf_str}",
+        f"  ⚖ 平均損益    : 平均利益 +${summary['avg_win']:.2f} / 平均損失 -${summary['avg_loss']:.2f}",
+        "--------------------------------------------------------------------------------",
+        "  [銘柄別 実績内訳]"
+    ])
+
+    for item in summary["by_symbol"][:15]:
+        s_sign = "+" if item["pnl"] >= 0 else ""
+        lines.append(f"    ・{item['symbol']:<7}: {s_sign}${item['pnl']:>6.2f} ({item['wins']}勝 {item['losses']}敗 / 計 {item['trades']}回)")
+
+    if len(summary["by_symbol"]) > 15:
+        lines.append(f"    ... 他 {len(summary['by_symbol']) - 15} 銘柄")
+
+    lines.append("================================================================================")
+    table_text = "\n".join(lines)
+    print(table_text)
+    return table_text
+
+
+async def sync_real_trades_from_bingx_api(mode: str = 'demo') -> int:
+    """
+    BingX 先物 API (/openApi/swap/v2/user/income?incomeType=REALIZED_PNL) から
+    取引所で確定した実現損益（REALIZED_PNL）履歴を直接取得し、
+    手動決済・外部決済・ボット決済の全レコードを real_trades_history.json と自動同期する。
+    戻り値: 新規追加または更新された件数
+    """
+    try:
+        from bingx5_46_2api import RestAPI_url, apis_bingx, _async_bingx_request, is_air
+        cred_key = 'bingx_demo' if mode in ('paper', 'demo', 'testnet') else 'bingx'
+        creds = apis_bingx.get(cred_key) or apis_bingx.get('bingx') or {}
+        api_key = creds.get("api_key", "")
+        secret_key = creds.get("secret_key", "")
+        if not api_key or api_key.startswith("YOUR_") or is_air:
+            print("[PnL Sync] APIキー未設定またはAIRモードのためスキップします。")
+            return 0
+        base_url = RestAPI_url.get(cred_key, 'https://open-api-vst.bingx.com' if mode in ('paper', 'demo', 'testnet') else 'https://open-api.bingx.com')
+
+        res = await _async_bingx_request(
+            "GET", base_url, "/openApi/swap/v2/user/income",
+            api_key, secret_key,
+            params={"incomeType": "REALIZED_PNL", "limit": 100},
+            timeout=10
+        )
+        if not res or res.get("code") != 0:
+            print(f"[PnL Sync] 取引所からの実現損益取得に失敗しました: {res}")
+            return 0
+
+        data = res.get("data", [])
+        if not data:
+            return 0
+
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        trades = load_real_trades()
+
+        existing_tran_ids = {t.get("tranId") for t in trades if t.get("tranId")}
+
+        close_records = []
+        for idx, t in enumerate(trades):
+            if t.get("action") == "CLOSE":
+                ts = t.get("timestamp")
+                try:
+                    sec = pd.to_datetime(ts, utc=True).timestamp()
+                except Exception:
+                    sec = 0.0
+                close_records.append((idx, t.get("symbol"), sec, float(t.get("pnl", 0.0))))
+
+        new_count = 0
+        updated_count = 0
+
+        for item in reversed(data):
+            sym = item.get("symbol")
+            inc = float(item.get("income", 0.0))
+            t_ms = item.get("time", 0)
+            tran_id = item.get("tranId")
+            trade_id = item.get("tradeId")
+            info = item.get("info", "Close Long")
+
+            t_sec = t_ms / 1000.0
+            dt_iso = datetime.fromtimestamp(t_sec, timezone.utc).isoformat()
+
+            if tran_id and tran_id in existing_tran_ids:
+                continue
+
+            matched_idx = None
+            for idx, c_sym, c_sec, c_pnl in close_records:
+                if c_sym == sym and abs(c_sec - t_sec) <= 180 and abs(c_pnl - inc) <= 0.05:
+                    matched_idx = idx
+                    break
+
+            if matched_idx is not None:
+                trades[matched_idx]["tranId"] = tran_id
+                trades[matched_idx]["tradeId"] = trade_id
+                trades[matched_idx]["pnl"] = inc
+                if tran_id:
+                    existing_tran_ids.add(tran_id)
+                updated_count += 1
+            else:
+                new_entry = {
+                    "timestamp": dt_iso,
+                    "symbol": sym,
+                    "side": "LONG",
+                    "action": "CLOSE",
+                    "price": 0.0,
+                    "qty": 0.0,
+                    "pnl": inc,
+                    "tranId": tran_id,
+                    "tradeId": trade_id,
+                    "note": f"取引所API直接取得決済 ({info}: 手動損切り/外部決済自動同期)"
+                }
+                trades.append(new_entry)
+                if tran_id:
+                    existing_tran_ids.add(tran_id)
+                new_count += 1
+                close_records.append((len(trades) - 1, sym, t_sec, inc))
+
+        if new_count > 0 or updated_count > 0:
+            with open(TRADES_FILE, "w", encoding="utf-8") as f:
+                json.dump(trades, f, indent=2, ensure_ascii=False)
+            sync_trades_to_csv()
+            try:
+                plot_real_trading_performance(days=10)
+            except Exception as pe:
+                print(f"[PnL Sync] チャート更新エラー: {pe}")
+            print(f"[PnL Sync] 取引所API直接同期完了: 新規追加={new_count}件, 更新={updated_count}件 (総履歴: {len(trades)}件)")
+            return new_count + updated_count
+        else:
+            print(f"[PnL Sync] 取引所API同期: 全{len(data)}件の実現損益レコードは既に完全同期済みです。")
+            return 0
+    except Exception as e:
+        print(f"[PnL Sync] 取引所API同期例外エラー: {e}")
+        return 0
+
+
 # =====================================================================
 # 月次パフォーマンスレポート機能（月初 毎月1日 自動配信）
 # =====================================================================

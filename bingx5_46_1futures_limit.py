@@ -1729,13 +1729,21 @@ async def send_periodic_performance_report(symbol_apis: Dict[str, Any], mode: st
     """実運用トレード実績（直近10日間 Clean版/Detail版 2枚の累積PnLチャート画像 ＆ 現在の証拠金残高）をDiscordへ送信 (PROJECT_RULES 準拠)"""
     try:
         from real_trade_tracker import (
+            sync_real_trades_from_bingx_api,
+            print_real_trading_table,
             send_periodic_pnl_report_discord,
             check_and_send_monthly_report_on_first_day,
             get_real_trading_summary,
         )
         from bingx5_46_2api import api_bingx
 
-        # 1. 口座残高（証拠金）の取得
+        # 1. 取引所 API から最新の確定実現損益データを直接同期（手動損切り・外部決済も完全網羅）
+        try:
+            await sync_real_trades_from_bingx_api(mode=mode)
+        except Exception as sync_pnl_err:
+            discord.print_log(f"[Performance Report] 取引所API実現損益同期警告: {sync_pnl_err}")
+
+        # 2. 口座残高（証拠金）の取得
         current_balance = 0.0
         if symbol_apis:
             first_api = next(iter(symbol_apis.values()))
@@ -1750,7 +1758,10 @@ async def send_periodic_performance_report(symbol_apis: Dict[str, Any], mode: st
             except Exception:
                 current_balance = 1000.0
 
-        # 2. スライディング10日間 Clean版・Detail版2枚出力 ＆ 月次レポート判定
+        # 3. コンソールログへ実運用損益表を出力
+        print_real_trading_table(days=10, current_balance=current_balance)
+
+        # 4. スライディング10日間 Clean版・Detail版2枚出力 ＆ 月次レポート判定
         summary = get_real_trading_summary(days=10, current_balance=current_balance)
         await asyncio.to_thread(send_periodic_pnl_report_discord, 10, current_balance)
         await asyncio.to_thread(check_and_send_monthly_report_on_first_day)
@@ -1893,6 +1904,14 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
         discord.print_log(start_msg)
     else:
         print("[Banner Skipped by --no-banner]")
+
+    # ========== 【トレード前準備 ステップ1.5】: 実運用損益の取引所 API 直接同期 & 実運用損益表出力 ==========
+    try:
+        from real_trade_tracker import sync_real_trades_from_bingx_api, print_real_trading_table
+        await sync_real_trades_from_bingx_api(mode=mode)
+        print_real_trading_table(days=10)
+    except Exception as init_pnl_err:
+        print(f"[Startup PnL Sync] 起動時実運用損益同期警告: {init_pnl_err}")
 
     # ========== 【トレード前準備 ステップ2】: 5分足 SSoT 永続ストア同期 (巨大ZIP/全市場DLは完全廃止) ==========
     from candle_5m_store import sync_all_target_symbols_5m
