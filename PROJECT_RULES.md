@@ -432,3 +432,23 @@ BINGX_IS_AIR = ("--air" in sys.argv or "--mock" in sys.argv)
 ### 🌐 クロスプラットフォーム動作保証 ＆ フェイルセーフ例外隔離
 * Windows（`cmd.exe` / PowerShell）および Linux（Ubuntu VPS）の双方でエンコードエラーやパス差異なく動作するよう、`encoding="utf-8"` と `pathlib.Path` の使用を徹底する。
 * 外部 API 通信（HTTP 502/503、タイムアウト、レート制限等）やバックグラウンド処理は、フェイルセーフな例外ブロック（`except (Exception, BaseException):`）で隔離し、メインループが絶対に異常終了しない構造を維持する。
+
+### 📡 WebSocket リアルタイム通信堅牢化 ＆ 未回収タスク例外（`Task exception was never retrieved`）完全根絶規約
+* **送信前クローズ状態チェック**:
+  - WebSocket へのメッセージ送信（`ws.send_str()`、`ws.send_json()` 等）を実行する際は、事前に必ずソケットのクローズ状態（`getattr(ws, "closed", False)`）を確認し、クローズ中または切断済みのトランスポートへの無駄な書き込み（`ClientConnectionResetError: Cannot write to closing transport`）を防止する。
+* **通信例外の完全隔離 (`_safe_send_str`)**:
+  - すべての送信処理は専用の安全送信メソッドを経由し、`try ... except (asyncio.CancelledError, Exception):` で完全防御する。切断例外やキャンセル例外が呼び出し元に波及してプロセスやループを不安定にすることを厳禁とする。
+* **非同期タスク強参照保持 ＆ 自動解放パターン（未回収例外の完全根絶）**:
+  - `asyncio.create_task` で非同期タスク（Ping/Pong 応答、動的銘柄購読等）を生成する際は、**投げっぱなし（参照破棄）を厳禁** とする。
+  - インスタンスレベルのタスクセット（`self._bg_tasks: Set[asyncio.Task] = set()`）にタスクを登録し、`task.add_done_callback(self._bg_tasks.discard)` により完了時に自動解放する Python 公式推奨パターンを必須とする。
+  - これにより、ガベージコレクション（GC）による実行中タスクの強制破棄や、標準エラーへの未回収例外（`Task exception was never retrieved`）の出力を永久に根絶する。
+  - モジュール停止（`stop()`）時は、残存する全タスクを明示的にキャンセルし、`asyncio.gather(*self._bg_tasks, return_exceptions=True)` で安全に回収・クリーンアップする。
+* **pybotters / 外部通信ライブラリの最新安定版維持**:
+  - WebSocket クライアントライブラリ（pybotters、aiohttp 等）は常に最新の安定版（例: pybotters v1.11.2 以上）を維持し、古い開発版や既知のバグを含むバージョンの使用を禁止する。
+
+### ⚡ CPUバウンド計算（個別最適化・バックテスト）時の GIL 協調解放規約
+* **バックテスト実行中のメインイベントループ保護**:
+  - 8時間ごとの銘柄スクリーニングおよび個別パラメータ最適化（72通り検証）等の CPU バウンドな Pure Python / Pandas 計算処理を実行する際は、各足種ループやパラメータ探索ループの合間に小刻みなスリープ（`time.sleep(0.005)` 〜 `time.sleep(0.01)`）を必ず挿入する。
+* **OSレベルでのコンテキストスイッチ強制**:
+  - `asyncio.to_thread` 内で動作していても、計算ループが GIL（グローバルインタプリタロック）を長時間占有すると、メインスレッドの `asyncio` イベントループが遅延し、取引所からの Ping 受信や Pong 応答がタイムアウトして切断される原因となる。
+  - 小刻みな `time.sleep` を挟むことで、OSレベルで確実に GIL を解放し、メインスレッドの WebSocket Keep-Alive、リアルタイム価格更新、注文管理ループが途切れることなく滑らかに常駐稼働し続けることを保証する。

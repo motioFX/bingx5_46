@@ -139,3 +139,9 @@
   - 外部 API 通信やバックグラウンド処理はフェイルセーフな例外ブロック（`except (Exception, BaseException):`）で隔離し、メインループが絶対に異常終了しない構造を維持する。
 * **Python アンバッファ起動**:
   - VPS 上でリアルタイムログ出力を保証するため、必ず **`python3 -u`** で実行する。
+* **WebSocket 通信堅牢化 ＆ 未回収タスク例外（`Task exception was never retrieved`）完全根絶**:
+  - `ws.send_str()` / `ws.send_json()` の直前に `getattr(ws, "closed", False)` をチェックし、送信処理は `try...except` で完全隔離（`_safe_send_str`）。
+  - `asyncio.create_task` で起動するタスク（Pong応答、購読等）は、必ずインスタンスセット（`self._bg_tasks`）に強参照を保持し、`add_done_callback(self._bg_tasks.discard)` で管理。GCによる未完了回収や未回収例外の発生を永久に根絶する。
+  - pybotters 等の通信ライブラリは常に最新安定版（v1.11.2以上）を使用する。
+* **CPUバウンド計算（個別最適化・バックテスト）時の GIL 協調解放**:
+  - 重いバックテスト計算ループ（`run_interval_comparison` 等）の合間に `time.sleep(0.005)` を挿入し、OSレベルで確実に GIL を解放。メインスレッドの WebSocket Keep-Alive（Ping/Pong）や価格更新ループが遅延・切断されるのを物理的に防止する。
