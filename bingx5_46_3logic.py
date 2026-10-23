@@ -2249,6 +2249,7 @@ def run_interval_comparison(df_5m: pd.DataFrame, lot: float = 1.0, data_equity: 
         calc_step = 8 if inv == 5 else (3 if inv == 15 else (2 if inv == 30 else 1))
 
         for mp in mp_periods:
+            time.sleep(0.005)  # 協調的コンテキストスイッチ: GILを解放してメインイベントループ(WebSocket KeepAlive)を保護
             if len(df_inv) < mp + 100:
                 continue
             _touch_bot_heartbeat()
@@ -2316,6 +2317,7 @@ def run_interval_comparison(df_5m: pd.DataFrame, lot: float = 1.0, data_equity: 
                 fallback_vp_cfg = cand_cfg
 
         print(f"   [{symbol}] VAL_POC {inv}m足 ({len(df_inv)}本) 検証完了 (累計 {vp_eval_count} パターン評価済)", flush=True)
+        time.sleep(0.01)
 
     if best_vp_cfg is None:
         best_vp_cfg = fallback_vp_cfg
@@ -2332,6 +2334,7 @@ def run_interval_comparison(df_5m: pd.DataFrame, lot: float = 1.0, data_equity: 
     }
 
     for r_inv in intervals:
+        time.sleep(0.01)  # 協調的コンテキストスイッチ: GILを解放してメインイベントループ(WebSocket KeepAlive)を保護
         _touch_bot_heartbeat()
         df_r_inv = inv_dfs.get(r_inv)
         if df_r_inv is None:

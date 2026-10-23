@@ -37,6 +37,7 @@ class BingXWSManager:
         self._running: bool = False
         self._task: Optional[asyncio.Task] = None
         self._ws_conn: Optional[Any] = None
+        self._bg_tasks: Set[asyncio.Task] = set()
 
     def get_latest_price(self, symbol: str) -> Optional[float]:
         """指定銘柄の最新WebSocket価格を取得"""
@@ -45,6 +46,18 @@ class BingXWSManager:
     def get_latest_kline(self, symbol: str) -> Optional[dict]:
         """指定銘柄の最新5分足ローソク足データを取得"""
         return self.latest_klines.get(symbol)
+
+    async def _safe_send_str(self, ws: Any, text: str) -> bool:
+        """安全に WebSocket 文字列を送信（切断・クローズ例外を完全隔離）"""
+        if ws is None:
+            return False
+        try:
+            if getattr(ws, "closed", False):
+                return False
+            await ws.send_str(text)
+            return True
+        except (asyncio.CancelledError, Exception):
+            return False
 
     async def start(self) -> None:
         """WebSocket接続を開始"""
@@ -64,6 +77,18 @@ class BingXWSManager:
                 await self._task
             except asyncio.CancelledError:
                 pass
+
+        # 残存バックグラウンドタスクの安全なキャンセルと回収
+        for t in list(self._bg_tasks):
+            if not t.done():
+                t.cancel()
+        if self._bg_tasks:
+            try:
+                await asyncio.gather(*list(self._bg_tasks), return_exceptions=True)
+            except Exception:
+                pass
+        self._bg_tasks.clear()
+
         if self._client:
             await self._client.close()
             self._client = None
@@ -86,10 +111,7 @@ class BingXWSManager:
             "reqType": "sub",
             "dataType": data_type
         }
-        try:
-            await ws.send_str(json.dumps(req))
-        except Exception:
-            pass
+        await self._safe_send_str(ws, json.dumps(req))
 
     async def _run_loop(self) -> None:
         """pybotters Client を用いた常駐接続ループ"""
@@ -103,8 +125,11 @@ class BingXWSManager:
                         try:
                             text = gzip.decompress(msg).decode('utf-8')
                             if text.lower() == 'ping':
-                                # Ping に対して Pong を即座に応答（接続維持）
-                                asyncio.create_task(ws.send_str("Pong"))
+                                # Ping に対して Pong を安全に応答（接続維持 ＆ 例外未捕捉防止）
+                                if ws is not None and not getattr(ws, "closed", False):
+                                    t = asyncio.create_task(self._safe_send_str(ws, "Pong"))
+                                    self._bg_tasks.add(t)
+                                    t.add_done_callback(self._bg_tasks.discard)
                                 return
                             
                             data = json.loads(text)
@@ -165,9 +190,17 @@ class BingXWSManager:
                         heartbeat=15.0
                     )
 
-                    # 接続維持ループ
+                    # 接続維持ループ (ws_app の生存を監視)
                     while self._running:
-                        await asyncio.sleep(1.0)
+                        if hasattr(self._ws_app, "wait"):
+                            try:
+                                await asyncio.wait_for(self._ws_app.wait(), timeout=1.0)
+                                # wait() が完了した場合は接続が切断・終了したため再接続へ
+                                break
+                            except asyncio.TimeoutError:
+                                pass
+                        else:
+                            await asyncio.sleep(1.0)
 
             except asyncio.CancelledError:
                 break
