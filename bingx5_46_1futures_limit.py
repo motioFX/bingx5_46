@@ -1916,11 +1916,11 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
     except Exception as init_pnl_err:
         print(f"[Startup PnL Sync] 起動時実運用損益同期警告: {init_pnl_err}")
 
-    # ========== 【トレード前準備 ステップ2】: 5分足 SSoT 永続ストア同期 (巨大ZIP/全市場DLは完全廃止) ==========
+    # ========== 【トレード前準備 ステップ2】: 5分足 SSoT 永続ストア同期 (直近65日分/2ヶ月分蓄積) ==========
     from candle_5m_store import sync_all_target_symbols_5m
-    discord.print_log("\n📦 【トレード前準備: ステップ2】 固定選定20銘柄 + BTC-USDT の 5分足 SSoT 同期を実行します...")
+    discord.print_log("\n📦 【トレード前準備: ステップ2】 固定選定20銘柄 + BTC-USDT の 5分足 SSoT 同期を実行します (過去65日分)...")
     try:
-        sync_all_target_symbols_5m(lookback_days=35)
+        sync_all_target_symbols_5m(lookback_days=65)
         discord.print_log("✅ 5分足 SSoT ストアの同期が正常に完了しました。")
     except Exception as sync_err:
         discord.print_log(f"⚠️ 5分足 SSoT 同期で警告が発生しました (後続処理を継続): {sync_err}")

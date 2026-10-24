@@ -109,7 +109,8 @@
 
 * **単一データ源泉 (SSoT: Single Source of Truth)**:
   - 巨大ZIPや全市場600銘柄ダウンロードは完全廃止。
-  - 固定選定20銘柄 ＋ `BTC-USDT`（計21銘柄）の **5分足（5m）永続ローカル時系列ストア（`Data/candles_5m/candles_5m_{SYMBOL}.csv`）** を単一のデータ源泉とし、差分追記（Append）で軽量管理。
+  - 固定選定20銘柄 ＋ `BTC-USDT`（計21銘柄）の **5分足（5m）永続ローカル時系列ストア（`Data/candles_5m/candles_5m_{SYMBOL}.csv`）** を単一のデータ源泉とし、差分追記（Append）で **直近65日分（約18,720本＝2ヶ月強）** をローリング蓄積。
+  - 過去分不足時は GCP 等のクラウド環境で遮断のない **OKX REST API（`/api/v5/market/history-candles`）** から自動補完。
   - 検証・運用に必要な `15m`, `30m`, `1h`, `1d` は、すべて5分足ストアから `resample_from_5m` で動的に生成。
 * **建玉 (OI) ＆ ファンディングレート (FR) 自前蓄積**:
   - 毎時00分に BingX 全対象銘柄の建玉・FRスナップショットを `Data/oi_store/` へ自動蓄積。

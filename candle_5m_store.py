@@ -4,9 +4,10 @@ candle_5m_store.py
 BingX USDT無期限先物版 (PROJECT_RULES.md 準拠)
 
 - 5分足を最小データ粒度とし、Data/candles_5m/candles_5m_{SYMBOL}.csv に永続保存
-- 初回起動時: BingX REST API (/openApi/swap/v2/quote/klines) から過去35日分 (最大10,080本) を取得保存 (不足時は外部CEXで補完)
+- 初回起動時: BingX REST API (/openApi/swap/v2/quote/klines) から過去分を取得保存 (不足時は OKX REST API で補完)
 - 定期実行時 (8時間ごと/毎時): 最終タイムスタンプ以降の差分のみを取得して高速 Append
-- 稼働継続に伴い、ローカルには 30日 (8,640本) 〜 35日 (10,080本) の高密度データが自然蓄積
+- 稼働継続に伴い、ローカルには 60日〜65日分 (最大18,720本＝約2ヶ月強) の高密度データが自然蓄積
+- GCP・Oracle・AWS 等のクラウド環境で遮断のない OKX REST API (/api/v5/market/history-candles) による外部フォールバック
 - 任意の足種 (15m, 30m, 1h, 1d) への数学的完全整合ダウンサンプリング (resample_from_5m) を提供
 """
 
@@ -149,6 +150,85 @@ def fetch_bingx_5m_candles(symbol: str, start_ms: int, end_ms: int, max_bars: in
     return pd.DataFrame(columns=cols)
 
 
+def fetch_okx_5m_candles(symbol: str, start_ms: int, end_ms: int, max_bars: int = 12000, timeout: int = 8) -> pd.DataFrame:
+    """
+    OKX REST API (/api/v5/market/history-candles) から 5分足データをページネーション取得
+    - GCP / Oracle VPS / AWS いずれのクラウド環境でも遮断なく 65日以上前まで安定取得可能
+    - instId: {TICKER}-USDT-SWAP (例: SOL-USDT-SWAP, BTC-USDT-SWAP, HYPE-USDT-SWAP)
+    """
+    raw_sym = get_clean_symbol(symbol)
+    inst_id = f"{raw_sym}-USDT-SWAP"
+    cols = ["timestamp", "open", "high", "low", "close", "volume", "quote_volume"]
+    rows = []
+    cur_after = str(end_ms + 300_000) if end_ms > 0 else ""
+    consecutive_empty = 0
+
+    while len(rows) < max_bars and consecutive_empty < 3:
+        params = {
+            "instId": inst_id,
+            "bar": "5m",
+            "limit": "100",
+        }
+        if cur_after:
+            params["after"] = cur_after
+
+        try:
+            resp = requests.get(OKX_CANDLES_URL, params=params, timeout=timeout)
+            if resp.status_code == 429:
+                time.sleep(1.0)
+                continue
+            if resp.status_code != 200:
+                consecutive_empty += 1
+                time.sleep(0.4)
+                continue
+
+            data_json = resp.json()
+            if data_json.get("code") != "0":
+                consecutive_empty += 1
+                time.sleep(0.4)
+                continue
+
+            items = data_json.get("data", [])
+            if not items:
+                consecutive_empty += 1
+                break
+
+            consecutive_empty = 0
+            batch = []
+            for item in items:
+                t = int(item[0])
+                if t < start_ms:
+                    continue
+                o = float(item[1])
+                h = float(item[2])
+                l = float(item[3])
+                c = float(item[4])
+                v = float(item[5])
+                qv = float(item[7]) if len(item) > 7 else (v * c)
+                batch.append([t, o, h, l, c, v, qv])
+
+            if not batch:
+                break
+
+            rows = batch + rows
+            oldest_ts = int(items[-1][0])
+            if oldest_ts <= start_ms or len(items) < 10:
+                break
+            cur_after = str(oldest_ts)
+            time.sleep(0.03)  # OKX レート制限保護
+        except Exception:
+            consecutive_empty += 1
+            time.sleep(0.5)
+
+    if rows:
+        df = pd.DataFrame(rows, columns=cols)
+        df["timestamp"] = pd.to_datetime(df["timestamp"].astype(float), unit="ms", utc=True)
+        df = df.drop_duplicates(subset=["timestamp"]).sort_values("timestamp").reset_index(drop=True)
+        return df
+
+    return pd.DataFrame(columns=cols)
+
+
 def fetch_bybit_5m_candles(symbol: str, start_ms: int, end_ms: int, max_bars: int = 5000) -> pd.DataFrame:
     """Bybit V5 Kline API よりフォールバック取得"""
     raw_sym = get_clean_symbol(symbol)
@@ -221,12 +301,12 @@ def load_5m_candles(symbol: str) -> pd.DataFrame:
     return pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume", "quote_volume"])
 
 
-def sync_symbol_5m_candles(symbol: str, target_days: int = 35) -> pd.DataFrame:
+def sync_symbol_5m_candles(symbol: str, target_days: int = 65) -> pd.DataFrame:
     """
     指定銘柄の 5分足データを同期・差分追加 (Append) する
     - 既存ファイルがある場合: 最終足の時刻以降のみ API から取得して差分マージ
-    - 過去分不足時 (30日分未満): BingX/Bybit から過去補完
-    - 最大保持件数: target_days * 288本 (デフォルト 35日分 = 約10,080本) をローリング保持
+    - 過去分不足時 (65日分未満): BingX / OKX (クラウド完全互換) から過去補完
+    - 最大保持件数: target_days * 288本 (デフォルト 65日分 = 約18,720本＝2ヶ月強) をローリング保持
     """
     csv_path = get_5m_csv_path(symbol)
     now_ms = int(time.time() * 1000)
@@ -246,15 +326,26 @@ def sync_symbol_5m_candles(symbol: str, target_days: int = 35) -> pd.DataFrame:
                 existing_df = pd.concat([existing_df, new_df], ignore_index=True)
                 existing_df = existing_df.drop_duplicates(subset=["timestamp"]).sort_values("timestamp").reset_index(drop=True)
 
-        # 過去分が不足している場合 (30日分 = 8,640本未満)、さらに過去方向を取得
+        # 過去分が不足している場合 (60日分 = 17,280本未満)、さらに過去方向を取得
         required_bars = int(target_days * 288 * 0.90)
         if len(existing_df) < required_bars:
             target_start_ms = now_ms - (target_days * 24 * 3600 * 1000)
             oldest_ms = int(existing_df["timestamp"].iloc[0].timestamp() * 1000)
             if oldest_ms > target_start_ms + 3600_000:
+                # 1. BingX で遡れるだけ遡る
                 past_df = fetch_bingx_5m_candles(symbol, start_ms=target_start_ms, end_ms=oldest_ms - 1)
+                # 2. BingX で不足した分 (45日前〜65日前) は OKX (GCP/全クラウド互換) で完全補完
+                if past_df.empty or len(past_df) < 50:
+                    past_df = fetch_okx_5m_candles(symbol, start_ms=target_start_ms, end_ms=oldest_ms - 1)
+                elif int(past_df["timestamp"].iloc[0].timestamp() * 1000) > target_start_ms + 3600_000:
+                    bingx_oldest_ms = int(past_df["timestamp"].iloc[0].timestamp() * 1000)
+                    okx_past_df = fetch_okx_5m_candles(symbol, start_ms=target_start_ms, end_ms=bingx_oldest_ms - 1)
+                    if not okx_past_df.empty:
+                        past_df = pd.concat([okx_past_df, past_df], ignore_index=True).drop_duplicates(subset=["timestamp"]).sort_values("timestamp").reset_index(drop=True)
+                # 3. 最終予備 (Bybit)
                 if past_df.empty or len(past_df) < 50:
                     past_df = fetch_bybit_5m_candles(symbol, start_ms=target_start_ms, end_ms=oldest_ms - 1)
+
                 if not past_df.empty:
                     existing_df = pd.concat([past_df, existing_df], ignore_index=True)
                     existing_df = existing_df.drop_duplicates(subset=["timestamp"]).sort_values("timestamp").reset_index(drop=True)
@@ -268,10 +359,14 @@ def sync_symbol_5m_candles(symbol: str, target_days: int = 35) -> pd.DataFrame:
         start_ms = now_ms - (target_days * 24 * 3600 * 1000)
         df_init = fetch_bingx_5m_candles(symbol, start_ms=start_ms, end_ms=now_ms)
         if df_init.empty or len(df_init) < int(target_days * 288 * 0.5):
-            # Bybit等で補完
-            df_bybit = fetch_bybit_5m_candles(symbol, start_ms=start_ms, end_ms=now_ms)
-            if not df_bybit.empty:
-                df_init = pd.concat([df_bybit, df_init], ignore_index=True).drop_duplicates(subset=["timestamp"]).sort_values("timestamp").reset_index(drop=True)
+            # OKX で補完
+            df_okx = fetch_okx_5m_candles(symbol, start_ms=start_ms, end_ms=now_ms)
+            if not df_okx.empty:
+                df_init = pd.concat([df_okx, df_init], ignore_index=True).drop_duplicates(subset=["timestamp"]).sort_values("timestamp").reset_index(drop=True)
+            if df_init.empty or len(df_init) < int(target_days * 288 * 0.5):
+                df_bybit = fetch_bybit_5m_candles(symbol, start_ms=start_ms, end_ms=now_ms)
+                if not df_bybit.empty:
+                    df_init = pd.concat([df_bybit, df_init], ignore_index=True).drop_duplicates(subset=["timestamp"]).sort_values("timestamp").reset_index(drop=True)
 
         if not df_init.empty:
             if len(df_init) > max_history_bars:
@@ -282,7 +377,7 @@ def sync_symbol_5m_candles(symbol: str, target_days: int = 35) -> pd.DataFrame:
         return pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume", "quote_volume"])
 
 
-def sync_all_target_symbols_5m(symbols: Optional[List[str]] = None, target_days: int = 35, lookback_days: Optional[int] = None) -> Dict[str, pd.DataFrame]:
+def sync_all_target_symbols_5m(symbols: Optional[List[str]] = None, target_days: int = 65, lookback_days: Optional[int] = None) -> Dict[str, pd.DataFrame]:
     """全監視対象銘柄の 5分足データを一括同期・差分最新化"""
     effective_days = lookback_days if lookback_days is not None else target_days
     target_symbols = symbols or DEFAULT_TARGET_SYMBOLS

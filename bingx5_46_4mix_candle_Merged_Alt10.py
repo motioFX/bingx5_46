@@ -288,7 +288,7 @@ async def main() -> None:
 
     # 1. 5分足 SSoT ストアの一括同期
     log(f"[SSoT Sync] 全 {len(ALL_SYMBOLS)} 銘柄の 5分足時系列ストアを同期中...")
-    sync_all_target_symbols_5m(ALL_SYMBOLS, target_days=35)
+    sync_all_target_symbols_5m(ALL_SYMBOLS, target_days=65)
 
     # 2. 5分足ストアから 1H足 および 日足(1D) を動的生成して Data/ に保存
     all_dfs = []
