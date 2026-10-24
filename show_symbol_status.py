@@ -377,7 +377,7 @@ def format_status_table_discord(summary_data: Dict[str, Any]) -> str:
             wr_str = f"勝率{s['win_rate']:.0f}%/{s['trade_count']}回" if s.get("trade_count") else ""
             lines.append(f"• **{sym_clean}**: `{strat}({inv_s})` | {pnl_str} ({wr_str})")
 
-    overall_reg = macro.get("overall_regime", "NEUTRAL")
+    overall_reg = gate_info.get("overall_regime", "NEUTRAL")
     is_sell = (overall_reg == "SELL")
 
     if peak_list:

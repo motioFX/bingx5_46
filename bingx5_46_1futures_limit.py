@@ -2145,7 +2145,7 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                         from real_trade_tracker import check_and_send_monthly_report_on_first_day
                         from monthly_key_levels import get_or_update_monthly_key_levels
                         await asyncio.to_thread(check_and_send_monthly_report_on_first_day)
-                        await asyncio.to_thread(get_or_update_monthly_key_levels)
+                        await asyncio.to_thread(get_or_update_monthly_key_levels, list(symbol_apis.keys()), MIX_SCRIPT_PATH.parent / "Data")
                     except Exception as m_err:
                         discord.print_log(f"[Monthly Check Warning] 月次処理警告: {m_err}", level="debug")
 
