@@ -450,6 +450,8 @@ class send_discord:
             or any(kw in text for kw in [
                 "AUTO TRADING SYSTEM START",
                 "BingX RSIMA3 Scalping System",
+                "BingX Auto Trading System",
+                "PERIODIC SCREENING",
                 "【AIR/実トレード損益レポート",
                 "【実運用実績】",
                 "[ENTRY]",

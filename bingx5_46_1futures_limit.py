@@ -1908,28 +1908,33 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
 
     hours_str = ", ".join([f"{h:02d}:00" for h in sorted(ANALYSIS_HOURS)])
     start_msg = (
-        "```\n"
+        "```text\n"
         " ____  _               __  __\n"
         "| __ )(_)_ __   __ _  \\ \\/ /\n"
         "|  _ \\| | '_ \\ / _` |  \\  / \n"
         "| |_) | | | | | (_| |  /  \\ \n"
         "|____/|_|_| |_|\\__, | /_/\\_\\\n"
         "               |___/        \n"
-        "----------------------------\n"
+        "============================\n"
         "  AUTO TRADING SYSTEM START \n"
-        "----------------------------\n"
+        "============================\n"
         "```\n"
-        f"[BingX Auto Trading System (LONG ONLY)]\n"
-        f"==================================================\n"
+        "🚀 **【BingX Auto Trading System 起動 (3態勢地合い連動)】**\n"
+        "```text\n"
+        "==================================================\n"
         f"  取引口座設定 : {account_mode_str}\n"
         f"  発注モード   : {air_mode_str}\n"
-        f"  戦略方向     : LONG ONLY (上昇特化)\n"
-        f"  ローソク足   : 5分足 (5m) & pybotters WebSocket リアルタイム配信\n"
-        f"  銘柄選定時刻 : 毎日 {hours_str} JST (8時間ごと)\n"
-        f"=================================================="
+        f"  戦略態勢     : 3態勢地合い連動 (BULL:買い / NEUTRAL:待機 / BEAR:売り)\n"
+        f"  監視足種     : 5分足 (5m) & pybotters WebSocket リアルタイム配信\n"
+        f"  銘柄選定周期 : 毎日 {hours_str} JST (8時間ごと)\n"
+        f"  ポジション枠 : 最大 {MAX_ACTIVE_POSITIONS} 銘柄同時保有\n"
+        f"  買い (BULL)  : 最大3枠ナンピン (1.0x等倍) / 動的MAE損切り\n"
+        f"  売り (BEAR)  : 単発1本固定 (ナンピンなし) / 動的MAE損切り\n"
+        "==================================================\n"
+        "```"
     )
     if "--no-banner" not in sys.argv:
-        discord.print_log(start_msg)
+        discord.print_log(start_msg, force_send=True)
     else:
         print("[Banner Skipped by --no-banner]")
 
@@ -2021,26 +2026,28 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
         )
         if is_periodic_reset_time:
             periodic_banner = (
-                "```\n"
+                "```text\n"
                 " ____  _               __  __\n"
                 "| __ )(_)_ __   __ _  \\ \\/ /\n"
                 "|  _ \\| | '_ \\ / _` |  \\  / \n"
                 "| |_) | | | | | (_| |  /  \\ \n"
                 "|____/|_|_| |_|\\__, | /_/\\_\\\n"
                 "               |___/        \n"
-                "----------------------------\n"
-                " PERIODIC SCREENING & OPTIMIZE \n"
-                "----------------------------\n"
+                "================================\n"
+                " PERIODIC SCREENING & OPTIMIZE  \n"
+                "================================\n"
                 "```\n"
-                f"[BingX Periodic Screening (LONG ONLY)]\n"
-                f"==================================================\n"
+                "🔄 **【BingX 定期銘柄スクリーニング＆パラメータ最適化】**\n"
+                "```text\n"
+                "==================================================\n"
                 f"  実行時刻     : {now_jst.strftime('%Y-%m-%d %H:%M')} JST\n"
                 f"  取引口座設定 : {account_mode_str}\n"
-                f"  戦略方向     : LONG ONLY (上昇特化)\n"
+                f"  戦略態勢     : 3態勢地合い連動 (BULL:買い / NEUTRAL:待機 / BEAR:売り)\n"
                 f"  ローソク足   : 5分足 (5m) & pybotters WebSocket リアルタイム配信\n"
-                f"=================================================="
+                "==================================================\n"
+                "```"
             )
-            discord.print_log(periodic_banner)
+            discord.print_log(periodic_banner, force_send=True)
             discord.print_log(f"[Phase C] 定期銘柄選定時刻 ({now_jst.hour:02d}:00 JST) 到達。スクリーニング＆最適化を実行します。")
 
             # 1. 定期フルスクリーニング＆最適化（チャート送信付き）
