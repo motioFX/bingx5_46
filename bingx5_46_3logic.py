@@ -5376,6 +5376,98 @@ def check_normalized_timing_by_regime(df: pd.DataFrame, regime: str = "BUY") -> 
     return False, []
 
 
+def check_bottom_reversal_recovery(df: pd.DataFrame) -> Tuple[bool, List[str]]:
+    """
+    【PROJECT_RULES 第2項準拠】3期間ノーマライズ前半安値反発検出規約 (買い相場用: セリクラ底打ち反転・V字回復銘柄)
+    対象期間: 5d (120h) / 10d (240h) / 30d (720h)
+    判定条件: 最安値(Min)が「前半50%以内」に位置し、現在値がレンジ半値ライン
+             (Min + (Max - Min) * 0.5) 以上まで力強く買い戻されているか検証。
+    採用基準: 前半に大底を打ち、後半にかけてレンジ半値以上へ急反発している銘柄は、
+             「セリクラ底打ち反転・上昇トレンド転換（V字回復）」とみなして買い候補銘柄に追加採用する。
+    """
+    windows = [
+        ("5d", 5 * 24),    # 120h
+        ("10d", 10 * 24),  # 240h
+        ("30d", 30 * 24),  # 720h
+    ]
+    reasons = []
+    is_recovery = False
+
+    for w_name, w_hours in windows:
+        if len(df) < 24:
+            continue
+        sub = df.tail(w_hours).reset_index(drop=True)
+        if len(sub) < 24:
+            continue
+
+        c_series = sub["close"].astype(float)
+        base_c = c_series.iloc[0]
+        if base_c <= 0:
+            continue
+        norm_c = c_series / base_c
+        final_norm = float(norm_c.iloc[-1])
+        c_min = float(norm_c.min())
+        c_max = float(norm_c.max())
+        half_level = c_min + (c_max - c_min) * 0.5
+
+        trough_idx = int(norm_c.argmin())
+        trough_ratio = trough_idx / len(norm_c)
+
+        if trough_ratio < 0.50 and final_norm >= half_level:
+            is_recovery = True
+            reasons.append(
+                f"{w_name}底打ち反転(trough={trough_ratio:.2f}, min={c_min:.2f}x, curr={final_norm:.2f}x >= half={half_level:.2f}x)"
+            )
+
+    return is_recovery, reasons
+
+
+def check_peak_breakdown_trend(df: pd.DataFrame) -> Tuple[bool, List[str]]:
+    """
+    【PROJECT_RULES 第2項準拠】3期間ノーマライズ前半高値急落検出規約 (売り相場用: 天井崩壊トレンド銘柄)
+    対象期間: 5d (120h) / 10d (240h) / 30d (720h)
+    判定条件: 最高値(Max)が「前半50%以内」に位置し、現在値がレンジ半値ライン
+             (Min + (Max - Min) * 0.5) 以下に沈み込んでいるか検証。
+    採用基準: 前半に天井をつけ、後半にかけてレンジ半値以下へ崩落している銘柄は、
+             「天井崩壊トレンド・下落モメンタム発生」とみなして売り候補銘柄に追加採用する。
+    """
+    windows = [
+        ("5d", 5 * 24),    # 120h
+        ("10d", 10 * 24),  # 240h
+        ("30d", 30 * 24),  # 720h
+    ]
+    reasons = []
+    is_breakdown = False
+
+    for w_name, w_hours in windows:
+        if len(df) < 24:
+            continue
+        sub = df.tail(w_hours).reset_index(drop=True)
+        if len(sub) < 24:
+            continue
+
+        c_series = sub["close"].astype(float)
+        base_c = c_series.iloc[0]
+        if base_c <= 0:
+            continue
+        norm_c = c_series / base_c
+        final_norm = float(norm_c.iloc[-1])
+        c_min = float(norm_c.min())
+        c_max = float(norm_c.max())
+        half_level = c_min + (c_max - c_min) * 0.5
+
+        peak_idx = int(norm_c.argmax())
+        peak_ratio = peak_idx / len(norm_c)
+
+        if peak_ratio < 0.50 and final_norm <= half_level:
+            is_breakdown = True
+            reasons.append(
+                f"{w_name}天井崩壊下落(peak={peak_ratio:.2f}, max={c_max:.2f}x, curr={final_norm:.2f}x <= half={half_level:.2f}x)"
+            )
+
+    return is_breakdown, reasons
+
+
 def evaluate_market_regime_3window(
     symbol_1h_dfs: Dict[str, pd.DataFrame]
 ) -> Dict[str, Any]:
