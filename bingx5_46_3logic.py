@@ -5313,6 +5313,69 @@ def check_normalized_peak_timing(df: pd.DataFrame) -> Tuple[bool, List[str]]:
     return is_bad, reasons
 
 
+def check_normalized_trough_timing(df: pd.DataFrame) -> Tuple[bool, List[str]]:
+    """
+    【PROJECT_RULES 第2項準拠】3期間ノーマライズ前半安値検出規約 (ショート用: 底打ち反発・踏み上げ除外フィルター)
+    対象期間: 5d (120h) / 10d (240h) / 30d (720h) 全期間統一基準
+    判定条件: 最安値(Min)が「前半50%以内」に位置している場合、
+             現在値が期間レンジの半値ライン (Min + (Max - Min) * 0.5) を上回っているか検証。
+    除外基準: 前半ボトム かつ 現在値がレンジ半値以上（戻し率50%以上）に反発・上昇している銘柄は、
+             「底打ち反転（踏み上げショートスクイズリスク大）」とみなしてショート候補から除外。
+             ※前半高値をつけて下落基調の銘柄や、安値圏で低迷している下落トレンド銘柄はショート適格としてセーフ。
+    """
+    windows = [
+        ("5d", 5 * 24),    # 120h
+        ("10d", 10 * 24),  # 240h
+        ("30d", 30 * 24),  # 720h
+    ]
+    reasons = []
+    is_bad = False
+
+    for w_name, w_hours in windows:
+        if len(df) < 24:
+            continue
+        sub = df.tail(w_hours).reset_index(drop=True)
+        if len(sub) < 24:
+            continue
+
+        c_series = sub["close"].astype(float)
+        base_c = c_series.iloc[0]
+        if base_c <= 0:
+            continue
+        norm_c = c_series / base_c
+        final_norm = float(norm_c.iloc[-1])
+        c_min = float(norm_c.min())
+        c_max = float(norm_c.max())
+        half_level = c_min + (c_max - c_min) * 0.5
+
+        trough_idx = int(norm_c.argmin())
+        trough_ratio = trough_idx / len(norm_c)
+
+        if trough_ratio < 0.50:
+            if final_norm > half_level:
+                is_bad = True
+                reasons.append(
+                    f"{w_name}前半ボトム半値超え(trough={trough_ratio:.2f}, min={c_min:.2f}x, curr={final_norm:.2f}x > half={half_level:.2f}x)"
+                )
+
+    return is_bad, reasons
+
+
+def check_normalized_timing_by_regime(df: pd.DataFrame, regime: str = "BUY") -> Tuple[bool, List[str]]:
+    """
+    地合い（regime: BUY / SELL / NEUTRAL）に応じたノーマライズ前半高安監査の統合インターフェース
+    - BUY時: 前半ピーク半値割れ除外（ピークアウト警戒）
+    - SELL時: 前半ボトム半値超え除外（底打ち反発警戒）
+    - NEUTRAL時: 新規停止のため除外判定なし（False, []）
+    """
+    reg_upper = str(regime).upper()
+    if reg_upper == "BUY":
+        return check_normalized_peak_timing(df)
+    elif reg_upper == "SELL":
+        return check_normalized_trough_timing(df)
+    return False, []
+
+
 def evaluate_market_regime_3window(
     symbol_1h_dfs: Dict[str, pd.DataFrame]
 ) -> Dict[str, Any]:

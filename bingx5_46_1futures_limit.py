@@ -552,18 +552,18 @@ def get_regime_gate_info(symbol: str) -> Dict[str, Any]:
         excluded = data.get("excluded_symbols", [])
         is_peak_dropped = (clean_sym in excluded or ticker in excluded)
 
-        if is_sell:
-            effective_gate = "STOP"
-            effective_reason = "OVERALL_REGIME_BEAR"
-            effective_action = "STOP_BEAR_REGIME"
-        elif is_peak_dropped:
-            effective_gate = "STOP"
-            effective_reason = "PEAK_OUT_DROPPED"
-            effective_action = "STOP_PEAK_DROP"
+        if overall_reg == "SELL":
+            effective_gate = "ALLOW" if not is_peak_dropped else "STOP"
+            effective_reason = "REGIME_SELL_SHORT" if not is_peak_dropped else "TROUGH_REBOUND_DROPPED"
+            effective_action = "SHORT" if not is_peak_dropped else "STOP_REBOUND"
+        elif overall_reg == "BUY":
+            effective_gate = "ALLOW" if not is_peak_dropped else "STOP"
+            effective_reason = "REGIME_BUY_LONG" if not is_peak_dropped else "PEAK_OUT_DROPPED"
+            effective_action = "LONG" if not is_peak_dropped else "STOP_PEAK_DROP"
         else:
-            effective_gate = "ALLOW"
-            effective_reason = f"REGIME_{overall_reg}"
-            effective_action = "NORMAL" if is_buy else "CAUTION"
+            effective_gate = "STOP"
+            effective_reason = "REGIME_NEUTRAL_HOLD"
+            effective_action = "STOP_NEUTRAL"
 
         return {
             "regime_gate": effective_gate,
@@ -999,6 +999,18 @@ async def validate_profitable_candidates(trade_side: str, mode: str, base_symbol
             s for s in recommended_symbols
             if get_clean_symbol(s) != "BTC" and get_clean_symbol(s) not in excluded_clean
         ]
+        if not all_candidates:
+            period_res = market_state_info.get("period_results", {})
+            any_buy_passed = set()
+            for w_info in period_res.values():
+                for s in w_info.get("buy_passed", []):
+                    cl_s = get_clean_symbol(s)
+                    if cl_s != "BTC" and cl_s not in excluded_clean:
+                        any_buy_passed.add(cl_s)
+            all_candidates = [s for s in FIXED_SYMBOLS if get_clean_symbol(s) in any_buy_passed]
+        if not all_candidates:
+            all_candidates = [s for s in FIXED_SYMBOLS if get_clean_symbol(s) not in excluded_clean]
+
         discord.print_log(
             f"【全体地合い判定: BUY 🟢】3期間買い推奨銘柄（計 {len(all_candidates)} 銘柄: {', '.join(all_candidates) if all_candidates else 'なし'}）"
             f"のロング個別最適化（144通り: 単発厳選 ➔ 3枠ナンピン検証）を開始します..."
@@ -1019,6 +1031,9 @@ async def validate_profitable_candidates(trade_side: str, mode: str, base_symbol
                     if cl_s != "BTC" and cl_s not in excluded_clean:
                         any_sell_passed.add(cl_s)
             all_candidates = [s for s in FIXED_SYMBOLS if get_clean_symbol(s) in any_sell_passed]
+        if not all_candidates:
+            # 売り票合致も0件の場合、固定20銘柄から売り除外(底打ち反発)を除いた銘柄をバックテスト対象とする
+            all_candidates = [s for s in FIXED_SYMBOLS if get_clean_symbol(s) not in excluded_clean]
 
         discord.print_log(
             f"【全体地合い判定: SELL 🔴】3期間売り推奨銘柄（計 {len(all_candidates)} 銘柄: {', '.join(all_candidates) if all_candidates else 'なし'}）"
