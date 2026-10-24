@@ -2350,8 +2350,9 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
 
                 in_cooldown, rem_h = is_in_sl_cooldown(sym)
 
-                # 戦略シグナル評価
-                if cand_strat in ("val_poc", "vp_val_gc"):
+                # 戦略シグナル評価 (4大戦略体系: VAL_POC / VAL_POC_EMA / RSIMA / RSIMA_EMA)
+                if cand_strat.startswith("val_poc"):
+                    use_ema_v = ("ema" in cand_strat)
                     sig_eval = check_val_poc_signals(
                         df_5m=df_eval,
                         current_pos_qty=buy_qty,
@@ -2362,8 +2363,8 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                         vp_period=int(sym_params.get("mp", 200)),
                         num_bins=int(sym_params.get("num_bins", 50)),
                         value_area_pct=float(sym_params.get("value_area_pct", 0.70)),
-                        ma_type=str(sym_params.get("ma_type", "EMA")),
-                        ma_condition=str(sym_params.get("ma_condition", "close_above")),
+                        ma_type=str(sym_params.get("ma_type", "EMA" if use_ema_v else "NONE")),
+                        ma_condition=str(sym_params.get("ma_condition", "close_above" if use_ema_v else "none")),
                         max_trades=MAX_TRADES_COUNT,
                         target_ratio=0.60,
                         sl_pct=abs(dyn_sl_pct),
@@ -2371,8 +2372,10 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                         is_emergency_breakeven=is_emergency_be,
                         dynamic_sl_pct=dyn_sl_pct,
                         bars_held=bars_held_cur,
+                        use_ema_filter=use_ema_v,
                     )
                 else:
+                    use_ema_r = ("ema" in cand_strat)
                     sig_eval = check_rsima3_signals(
                         df_5m=df_eval,
                         current_pos_qty=buy_qty,
@@ -2391,6 +2394,7 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                         is_emergency_breakeven=is_emergency_be,
                         dynamic_sl_pct=dyn_sl_pct,
                         bars_held=bars_held_cur,
+                        use_ema_filter=use_ema_r,
                     )
 
                 pos_action = sig_eval.get("action", "HOLD")
@@ -2534,7 +2538,8 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                     val_e = float(df_entry_eval["VAL"].iloc[-1]) if "VAL" in df_entry_eval.columns else cur_px * 0.98
                     poc_e = float(df_entry_eval["POC"].iloc[-1]) if "POC" in df_entry_eval.columns else cur_px
 
-                    if cand_strat_e in ("val_poc", "vp_val_gc"):
+                    if cand_strat_e.startswith("val_poc"):
+                        use_ema_v = ("ema" in cand_strat_e)
                         sig_entry = check_val_poc_signals(
                             df_5m=df_entry_eval,
                             current_pos_qty=0.0,
@@ -2545,14 +2550,16 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                             vp_period=int(sym_params_e.get("mp", 200)),
                             num_bins=int(sym_params_e.get("num_bins", 50)),
                             value_area_pct=float(sym_params_e.get("value_area_pct", 0.70)),
-                            ma_type=str(sym_params_e.get("ma_type", "EMA")),
-                            ma_condition=str(sym_params_e.get("ma_condition", "close_above")),
+                            ma_type=str(sym_params_e.get("ma_type", "EMA" if use_ema_v else "NONE")),
+                            ma_condition=str(sym_params_e.get("ma_condition", "close_above" if use_ema_v else "none")),
                             max_trades=MAX_TRADES_COUNT,
                             target_ratio=0.60,
                             sl_pct=float(sym_params_e.get("sl_pct", 0.090)),
-                            is_cooldown_active=in_cooldown
+                            is_cooldown_active=in_cooldown,
+                            use_ema_filter=use_ema_v,
                         )
                     else:
+                        use_ema_r = ("ema" in cand_strat_e)
                         sig_entry = check_rsima3_signals(
                             df_5m=df_entry_eval,
                             current_pos_qty=0.0,
@@ -2567,7 +2574,8 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                             max_trades=MAX_TRADES_COUNT,
                             last_entry_price=0.0,
                             val_price=val_e,
-                            vah_price=vah_e
+                            vah_price=vah_e,
+                            use_ema_filter=use_ema_r,
                         )
 
                     entry_action = sig_entry.get("action", "NONE")

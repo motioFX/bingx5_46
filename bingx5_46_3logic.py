@@ -1619,7 +1619,7 @@ def simulate_val_poc_fast(
     vals: np.ndarray,
     vahs: np.ndarray,
     pocs: np.ndarray,
-    ma_filter: np.ndarray,
+    ma_filter: Optional[np.ndarray] = None,
     initial_equity: float = 100.0,
     max_trades: int = 3,
     nanpin_drop_pct: float = 0.030,
@@ -1733,7 +1733,7 @@ def simulate_val_poc_fast(
                 if not np.isnan(val) and not np.isnan(vals[i-1]):
                     val_gc = (closes[i-1] <= vals[i-1]) and (c > val)
                     va_width = (vah - val) / val if val > 0 else 0.0
-                    if val_gc and (va_width >= 0.015) and ma_filter[i]:
+                    if val_gc and (va_width >= 0.015) and (ma_filter is None or ma_filter[i]):
                         pending_limit = c * 0.9998
             elif 1 <= pos_count < max_trades:
                 va_diff = (vah - val) if (not np.isnan(val) and not np.isnan(vah) and vah > val) else 0.0
@@ -1795,7 +1795,8 @@ def optimize_rsima3_fast(
     min_trades: int = 10,
     val_arr: Optional[np.ndarray] = None,
     vah_arr: Optional[np.ndarray] = None,
-    default_sl_pct: float = 0.025
+    default_sl_pct: float = 0.025,
+    ma_filter: Optional[np.ndarray] = None
 ) -> Dict[str, Any]:
     """RSIMA 9通り (EP 30,35,40 × CP 60,65,70, 動的ストップ・4時間タイムアウト) 超高速最適化 (MIN_TRADES=10)"""
     n = len(closes)
@@ -1825,6 +1826,8 @@ def optimize_rsima3_fast(
         ep_sig = gc_arr.copy()
         if n > 2:
             ep_sig[1:] = gc_arr[1:] & ((rsi_ma[1:] < ep) | (rsi_ma[:-1] < ep))
+        if ma_filter is not None and len(ma_filter) == n:
+            ep_sig = ep_sig & ma_filter
         ep_indices = np.flatnonzero(ep_sig[2:]) + 2
         n_ep = len(ep_indices)
 
@@ -1969,7 +1972,8 @@ def build_rsima3_chart_df(
     cp: float,
     sl: float,
     initial_equity: float = 100.0,
-    max_trades: int = 5
+    max_trades: int = 5,
+    ma_filter: Optional[np.ndarray] = None
 ) -> pd.DataFrame:
     """RSIMA3 最良パラメータでの売買マーカー・累積損益曲線付きDataFrameを生成"""
     out_df = df_5m.copy().reset_index(drop=True)
@@ -2033,7 +2037,7 @@ def build_rsima3_chart_df(
         if pending_px < 0:
             gc = (rsi[i] > rsi_ma[i]) and (rsi[i-1] <= rsi_ma[i-1])
             if pos_cnt == 0 and i >= cooldown_until:
-                if gc and (rsi_ma[i] < ep or rsi_ma[i-1] < ep):
+                if gc and (rsi_ma[i] < ep or rsi_ma[i-1] < ep) and (ma_filter is None or ma_filter[i]):
                     pending_px = c * 0.9998
             elif 1 <= pos_cnt < max_trades:
                 if gc and (rsi_ma[i] < ep or rsi_ma[i-1] < ep) and c < avg_px * 0.994:
@@ -2206,27 +2210,37 @@ def run_interval_comparison(df_5m: pd.DataFrame, lot: float = 1.0, data_equity: 
     if len(df_5m) > 8640:
         df_5m = df_5m.tail(8640).reset_index(drop=True)
 
-    discord.print_log(f"\n====== 🌿 [{symbol}] 基本戦略二本立て 低負荷ジェントル最適化 (5m足 {len(df_5m)}本 [30日分] / 最低取引{MIN_TRADES}回以上) ======")
+    discord.print_log(f"\n====== 🌿 [{symbol}] 4大基本戦略体系 (EMA200分離モデル / 計144通り) 低負荷ジェントル最適化 (5m足 {len(df_5m)}本 [30日分] / 最低取引{MIN_TRADES}回以上) ======")
 
     # ==============================================================================
-    # 1. VAL_POC 最適化 (4足種 × MP 9種 × Bins=50固定 × VA=70%固定 × EMA200_close_above固定 ＝ 36通り)
+    # 1. VAL_POC ＆ VAL_POC_EMA 最適化 (4足種 × MP 9種 × 2条件 ＝ 72通り)
     # ==============================================================================
     intervals = [5, 15, 30, 60] if not is_1h else [60]
     mp_periods = [100, 150, 200, 250, 300, 350, 400, 450, 500] if not is_1h else [24, 48, 72, 96]
     bins_fixed = 50
     va_pct_fixed = 0.70
     va_name_fixed = '70%'
-    ma_type_fixed = 'EMA'
-    cond_name_fixed = 'close_above'
 
-    best_vp_pnl = -float('inf')
-    best_vp_cfg: Optional[Dict[str, Any]] = None
-    fallback_vp_pnl = -float('inf')
-    fallback_vp_cfg: Dict[str, Any] = {
-        'interval': 5, 'mp_period': 200, 'num_bins': bins_fixed, 'va': va_name_fixed, 'value_area_pct': va_pct_fixed,
-        'ma_type': ma_type_fixed, 'condition': cond_name_fixed,
+    # VAL_POC (EMAなし)
+    best_vp_none_pnl = -float('inf')
+    best_vp_none_cfg: Optional[Dict[str, Any]] = None
+    fallback_vp_none_pnl = -float('inf')
+    fallback_vp_none_cfg: Dict[str, Any] = {
+        'strategy': 'val_poc', 'interval': 5, 'mp_period': 200, 'num_bins': bins_fixed, 'va': va_name_fixed,
+        'value_area_pct': va_pct_fixed, 'ma_type': 'NONE', 'condition': 'none',
         'pnl': 0.0, 'trade_count': 0, 'win_rate': 0.0, 'DD_max': 0.0
     }
+
+    # VAL_POC_EMA (EMAあり)
+    best_vp_ema_pnl = -float('inf')
+    best_vp_ema_cfg: Optional[Dict[str, Any]] = None
+    fallback_vp_ema_pnl = -float('inf')
+    fallback_vp_ema_cfg: Dict[str, Any] = {
+        'strategy': 'val_poc_ema', 'interval': 5, 'mp_period': 200, 'num_bins': bins_fixed, 'va': va_name_fixed,
+        'value_area_pct': va_pct_fixed, 'ma_type': 'EMA', 'condition': 'close_above',
+        'pnl': 0.0, 'trade_count': 0, 'win_rate': 0.0, 'DD_max': 0.0
+    }
+
     vp_eval_count = 0
     inv_dfs: Dict[int, pd.DataFrame] = {}
 
@@ -2241,9 +2255,9 @@ def run_interval_comparison(df_5m: pd.DataFrame, lot: float = 1.0, data_equity: 
         h_inv = df_inv['high'].astype(float).values if 'high' in df_inv.columns else c_inv
         l_inv = df_inv['low'].astype(float).values if 'low' in df_inv.columns else c_inv
 
-        # トレンドフィルター: EMA(200) close_above に完全固定
         ema200 = calc_ema(df_inv['close'].astype(float), 200).values
-        ma_filter = (c_inv >= ema200)
+        ma_filter_ema = (c_inv >= ema200)
+        ma_filter_none = None
 
         cd_bars = max(10, 288 // (inv // 5)) if not is_1h else 24
         calc_step = 8 if inv == 5 else (3 if inv == 15 else (2 if inv == 30 else 1))
@@ -2259,78 +2273,113 @@ def run_interval_comparison(df_5m: pd.DataFrame, lot: float = 1.0, data_equity: 
             val_arr = mp_res['val_70']
             vah_arr = mp_res['vah_70']
 
-            # 【第1段階】シングルポジション (1枠固定: max_trades=1) でシミュレーション
-            sim_single = simulate_val_poc_fast(
-                c_inv, h_inv, l_inv, val_arr, vah_arr, pocs, ma_filter,
+            # --- [A] VAL_POC (EMAなし) シミュレーション ---
+            sim_single_none = simulate_val_poc_fast(
+                c_inv, h_inv, l_inv, val_arr, vah_arr, pocs, ma_filter_none,
                 initial_equity=fixed_initial_equity, max_trades=1, cooldown_bars=cd_bars
             )
             vp_eval_count += 1
-
-            # 【第2段階】シングルポジションで健全 (取引>=MIN_TRADES かつ PnL>0) ならナンピン(3枠)シミュレーションを実行
-            if sim_single['trade_count'] >= MIN_TRADES and sim_single['final_pnl'] > 0:
-                sim_nanpin = simulate_val_poc_fast(
-                    c_inv, h_inv, l_inv, val_arr, vah_arr, pocs, ma_filter,
+            if sim_single_none['trade_count'] >= MIN_TRADES and sim_single_none['final_pnl'] > 0:
+                sim_none = simulate_val_poc_fast(
+                    c_inv, h_inv, l_inv, val_arr, vah_arr, pocs, ma_filter_none,
                     initial_equity=fixed_initial_equity, max_trades=3, cooldown_bars=cd_bars
                 )
-                sim = sim_nanpin
             else:
-                sim = sim_single
+                sim_none = sim_single_none
+            sim_none['single_pnl'] = sim_single_none['final_pnl']
+            sim_none['single_trades'] = sim_single_none['trade_count']
+            sim_none['single_win_rate'] = sim_single_none['win_rate']
 
-            sim['single_pnl'] = sim_single['final_pnl']
-            sim['single_trades'] = sim_single['trade_count']
-            sim['single_win_rate'] = sim_single['win_rate']
-
-            label = f"VAL_POC_{inv}m_MP{mp}_B{bins_fixed}_VA{va_name_fixed}_{ma_type_fixed}_{cond_name_fixed}"
-            results[label] = {
-                'strategy_type': 'val_poc',
-                'df': pd.DataFrame(),
-                'final_pnl': fixed_initial_equity + sim['final_pnl'],
-                'interval': inv,
-                'mp_period': mp,
-                'num_bins': bins_fixed,
-                'value_area_pct': va_pct_fixed,
-                'ma_type': ma_type_fixed,
-                'ma_condition': cond_name_fixed,
-                'atr_multi': 0.0,
-                'sl_center_margin': 9.0,
-                'DD_max': sim['DD_max'],
-                'win_rate': sim['win_rate'],
-                'trade_count': sim['trade_count'],
-                'single_pnl': sim['single_pnl'],
-                'single_trades': sim['single_trades'],
-                'single_win_rate': sim['single_win_rate']
+            lbl_none = f"VAL_POC_{inv}m_MP{mp}_B{bins_fixed}_VA{va_name_fixed}_NoEMA"
+            results[lbl_none] = {
+                'strategy_type': 'val_poc', 'df': pd.DataFrame(), 'final_pnl': fixed_initial_equity + sim_none['final_pnl'],
+                'interval': inv, 'mp_period': mp, 'num_bins': bins_fixed, 'value_area_pct': va_pct_fixed,
+                'ma_type': 'NONE', 'ma_condition': 'none', 'atr_multi': 0.0, 'sl_center_margin': 9.0,
+                'DD_max': sim_none['DD_max'], 'win_rate': sim_none['win_rate'], 'trade_count': sim_none['trade_count'],
+                'single_pnl': sim_none['single_pnl'], 'single_trades': sim_none['single_trades'], 'single_win_rate': sim_none['single_win_rate']
             }
-
-            cand_cfg = {
-                'interval': inv, 'mp_period': mp, 'num_bins': bins_fixed, 'va': va_name_fixed,
-                'value_area_pct': va_pct_fixed, 'ma_type': ma_type_fixed, 'condition': cond_name_fixed,
-                'pnl': sim['final_pnl'], 'trade_count': sim['trade_count'],
-                'win_rate': sim['win_rate'], 'DD_max': sim['DD_max'],
-                'single_pnl': sim['single_pnl'], 'single_trades': sim['single_trades'],
-                'single_win_rate': sim['single_win_rate']
+            cand_none = {
+                'strategy': 'val_poc', 'interval': inv, 'mp_period': mp, 'num_bins': bins_fixed, 'va': va_name_fixed,
+                'value_area_pct': va_pct_fixed, 'ma_type': 'NONE', 'condition': 'none',
+                'pnl': sim_none['final_pnl'], 'trade_count': sim_none['trade_count'],
+                'win_rate': sim_none['win_rate'], 'DD_max': sim_none['DD_max'],
+                'single_pnl': sim_none['single_pnl'], 'single_trades': sim_none['single_trades'], 'single_win_rate': sim_none['single_win_rate']
             }
-            if sim['trade_count'] >= MIN_TRADES and sim['final_pnl'] > best_vp_pnl:
-                best_vp_pnl = sim['final_pnl']
-                best_vp_cfg = cand_cfg
-            elif sim['trade_count'] >= 5 and sim['final_pnl'] > fallback_vp_pnl:
-                fallback_vp_pnl = sim['final_pnl']
-                fallback_vp_cfg = cand_cfg
+            if sim_none['trade_count'] >= MIN_TRADES and sim_none['final_pnl'] > best_vp_none_pnl:
+                best_vp_none_pnl = sim_none['final_pnl']
+                best_vp_none_cfg = cand_none
+            elif sim_none['trade_count'] >= 5 and sim_none['final_pnl'] > fallback_vp_none_pnl:
+                fallback_vp_none_pnl = sim_none['final_pnl']
+                fallback_vp_none_cfg = cand_none
 
-        print(f"   [{symbol}] VAL_POC {inv}m足 ({len(df_inv)}本) 検証完了 (累計 {vp_eval_count} パターン評価済)", flush=True)
+            # --- [B] VAL_POC_EMA (EMAあり) シミュレーション ---
+            sim_single_ema = simulate_val_poc_fast(
+                c_inv, h_inv, l_inv, val_arr, vah_arr, pocs, ma_filter_ema,
+                initial_equity=fixed_initial_equity, max_trades=1, cooldown_bars=cd_bars
+            )
+            vp_eval_count += 1
+            if sim_single_ema['trade_count'] >= MIN_TRADES and sim_single_ema['final_pnl'] > 0:
+                sim_ema = simulate_val_poc_fast(
+                    c_inv, h_inv, l_inv, val_arr, vah_arr, pocs, ma_filter_ema,
+                    initial_equity=fixed_initial_equity, max_trades=3, cooldown_bars=cd_bars
+                )
+            else:
+                sim_ema = sim_single_ema
+            sim_ema['single_pnl'] = sim_single_ema['final_pnl']
+            sim_ema['single_trades'] = sim_single_ema['trade_count']
+            sim_ema['single_win_rate'] = sim_single_ema['win_rate']
+
+            lbl_ema = f"VAL_POC_EMA_{inv}m_MP{mp}_B{bins_fixed}_VA{va_name_fixed}_EMA200"
+            results[lbl_ema] = {
+                'strategy_type': 'val_poc_ema', 'df': pd.DataFrame(), 'final_pnl': fixed_initial_equity + sim_ema['final_pnl'],
+                'interval': inv, 'mp_period': mp, 'num_bins': bins_fixed, 'value_area_pct': va_pct_fixed,
+                'ma_type': 'EMA', 'ma_condition': 'close_above', 'atr_multi': 0.0, 'sl_center_margin': 9.0,
+                'DD_max': sim_ema['DD_max'], 'win_rate': sim_ema['win_rate'], 'trade_count': sim_ema['trade_count'],
+                'single_pnl': sim_ema['single_pnl'], 'single_trades': sim_ema['single_trades'], 'single_win_rate': sim_ema['single_win_rate']
+            }
+            cand_ema = {
+                'strategy': 'val_poc_ema', 'interval': inv, 'mp_period': mp, 'num_bins': bins_fixed, 'va': va_name_fixed,
+                'value_area_pct': va_pct_fixed, 'ma_type': 'EMA', 'condition': 'close_above',
+                'pnl': sim_ema['final_pnl'], 'trade_count': sim_ema['trade_count'],
+                'win_rate': sim_ema['win_rate'], 'DD_max': sim_ema['DD_max'],
+                'single_pnl': sim_ema['single_pnl'], 'single_trades': sim_ema['single_trades'], 'single_win_rate': sim_ema['single_win_rate']
+            }
+            if sim_ema['trade_count'] >= MIN_TRADES and sim_ema['final_pnl'] > best_vp_ema_pnl:
+                best_vp_ema_pnl = sim_ema['final_pnl']
+                best_vp_ema_cfg = cand_ema
+            elif sim_ema['trade_count'] >= 5 and sim_ema['final_pnl'] > fallback_vp_ema_pnl:
+                fallback_vp_ema_pnl = sim_ema['final_pnl']
+                fallback_vp_ema_cfg = cand_ema
+
+        print(f"   [{symbol}] VAL_POC系 (EMAなし/あり計2種) {inv}m足 ({len(df_inv)}本) 検証完了 (累計 {vp_eval_count} パターン評価済)", flush=True)
         time.sleep(0.01)
 
-    if best_vp_cfg is None:
-        best_vp_cfg = fallback_vp_cfg
+    if best_vp_none_cfg is None:
+        best_vp_none_cfg = fallback_vp_none_cfg
+    if best_vp_ema_cfg is None:
+        best_vp_ema_cfg = fallback_vp_ema_cfg
 
     # ==============================================================================
-    # 2. RSIMA 最適化 (4足種 × EP 3種 × CP 3種 ＝ 36 通り: (VAH-VAL)*0.60 ナンピン/SL)
+    # 2. RSIMA ＆ RSIMA_EMA 最適化 (4足種 × 9 パラメータ × 2条件 ＝ 72通り)
     # ==============================================================================
-    best_rsi_pnl = -float('inf')
-    best_rsi_cfg: Optional[Dict[str, Any]] = None
-    fallback_rsi_pnl = -float('inf')
-    fallback_rsi_cfg: Dict[str, Any] = {
-        'interval': 5, 'l_ep': 40.0, 'l_cp': 60.0, 'sl_pct': 0.05,
-        'final_pnl': 0.0, 'trade_count': 0, 'win_rate': 0.0, 'DD_max': 0.0, 'chart_df': pd.DataFrame()
+    # RSIMA (EMAなし)
+    best_rsi_none_pnl = -float('inf')
+    best_rsi_none_cfg: Optional[Dict[str, Any]] = None
+    fallback_rsi_none_pnl = -float('inf')
+    fallback_rsi_none_cfg: Dict[str, Any] = {
+        'strategy': 'rsima', 'interval': 5, 'l_ep': 40.0, 'l_cp': 60.0, 'sl_pct': 0.05,
+        'final_pnl': 0.0, 'trade_count': 0, 'win_rate': 0.0, 'DD_max': 0.0, 'chart_df': pd.DataFrame(),
+        'use_ema': False
+    }
+
+    # RSIMA_EMA (EMAあり)
+    best_rsi_ema_pnl = -float('inf')
+    best_rsi_ema_cfg: Optional[Dict[str, Any]] = None
+    fallback_rsi_ema_pnl = -float('inf')
+    fallback_rsi_ema_cfg: Dict[str, Any] = {
+        'strategy': 'rsima_ema', 'interval': 5, 'l_ep': 40.0, 'l_cp': 60.0, 'sl_pct': 0.05,
+        'final_pnl': 0.0, 'trade_count': 0, 'win_rate': 0.0, 'DD_max': 0.0, 'chart_df': pd.DataFrame(),
+        'use_ema': True
     }
 
     for r_inv in intervals:
@@ -2347,6 +2396,10 @@ def run_interval_comparison(df_5m: pd.DataFrame, lot: float = 1.0, data_equity: 
         h_r = df_r_inv['high'].astype(float).values if 'high' in df_r_inv.columns else c_r
         l_r = df_r_inv['low'].astype(float).values if 'low' in df_r_inv.columns else c_r
 
+        ema200_r = calc_ema(df_r_inv['close'].astype(float), 200).values
+        ma_filter_r_ema = (c_r >= ema200_r)
+        ma_filter_r_none = None
+
         # 直近 VAL/VAH の取得（step間引きで高速取得）
         val_arr_r, vah_arr_r = None, None
         try:
@@ -2357,129 +2410,183 @@ def run_interval_comparison(df_5m: pd.DataFrame, lot: float = 1.0, data_equity: 
         except Exception:
             pass
 
-        # 【第1段階】シングルポジション (1枠固定: max_trades=1) で最適探索
-        res_r_single = optimize_rsima3_fast(
+        # --- [A] RSIMA (EMAなし) ---
+        res_r_none_single = optimize_rsima3_fast(
             c_r, h_r, l_r, r_rsi.values, r_rsi_ma.values,
             initial_equity=fixed_initial_equity, max_trades=1, min_trades=MIN_TRADES,
-            val_arr=val_arr_r, vah_arr=vah_arr_r
+            val_arr=val_arr_r, vah_arr=vah_arr_r, ma_filter=ma_filter_r_none
         )
-
-        # 【第2段階】シングルポジションで健全 (取引>=MIN_TRADES かつ PnL>0) ならナンピン(3枠)シミュレーションを実行
-        if res_r_single['trade_count'] >= MIN_TRADES and res_r_single['final_pnl'] > 0:
-            res_r_nanpin = optimize_rsima3_fast(
+        if res_r_none_single['trade_count'] >= MIN_TRADES and res_r_none_single['final_pnl'] > 0:
+            res_r_none = optimize_rsima3_fast(
                 c_r, h_r, l_r, r_rsi.values, r_rsi_ma.values,
                 initial_equity=fixed_initial_equity, max_trades=3, min_trades=MIN_TRADES,
-                val_arr=val_arr_r, vah_arr=vah_arr_r
+                val_arr=val_arr_r, vah_arr=vah_arr_r, ma_filter=ma_filter_r_none
             )
-            res_r = res_r_nanpin
         else:
-            res_r = res_r_single
+            res_r_none = res_r_none_single
+        res_r_none['single_pnl'] = res_r_none_single['final_pnl']
+        res_r_none['single_trades'] = res_r_none_single['trade_count']
+        res_r_none['single_win_rate'] = res_r_none_single['win_rate']
 
-        res_r['single_pnl'] = res_r_single['final_pnl']
-        res_r['single_trades'] = res_r_single['trade_count']
-        res_r['single_win_rate'] = res_r_single['win_rate']
-
-        rsima_key = f"RSIMA_{r_inv}m_EP{int(res_r['l_ep'])}_CP{int(res_r['l_cp'])}"
-        results[rsima_key] = {
-            'strategy_type': 'rsima',
-            'df': pd.DataFrame(),
-            'final_pnl': fixed_initial_equity + res_r['final_pnl'],
-            'interval': r_inv,
-            'mp_period': 100,
-            'num_bins': 50,
-            'value_area_pct': 0.70,
-            'ma_type': 'NONE',
-            'ma_condition': 'NONE',
-            'atr_multi': 0.0,
-            'sl_center_margin': 0.0,
-            'l_ep': res_r['l_ep'],
-            'l_cp': res_r['l_cp'],
-            'sl_pct': res_r['sl_pct'],
-            'DD_max': res_r['DD_max'],
-            'win_rate': res_r['win_rate'],
-            'trade_count': res_r['trade_count'],
-            'single_pnl': res_r['single_pnl'],
-            'single_trades': res_r['single_trades'],
-            'single_win_rate': res_r['single_win_rate']
+        rsima_none_key = f"RSIMA_{r_inv}m_EP{int(res_r_none['l_ep'])}_CP{int(res_r_none['l_cp'])}_NoEMA"
+        results[rsima_none_key] = {
+            'strategy_type': 'rsima', 'df': pd.DataFrame(), 'final_pnl': fixed_initial_equity + res_r_none['final_pnl'],
+            'interval': r_inv, 'mp_period': 100, 'num_bins': 50, 'value_area_pct': 0.70,
+            'ma_type': 'NONE', 'ma_condition': 'NONE', 'atr_multi': 0.0, 'sl_center_margin': 0.0,
+            'l_ep': res_r_none['l_ep'], 'l_cp': res_r_none['l_cp'], 'sl_pct': res_r_none['sl_pct'],
+            'DD_max': res_r_none['DD_max'], 'win_rate': res_r_none['win_rate'], 'trade_count': res_r_none['trade_count'],
+            'single_pnl': res_r_none['single_pnl'], 'single_trades': res_r_none['single_trades'], 'single_win_rate': res_r_none['single_win_rate']
         }
+        r_none_cand = {**res_r_none, 'strategy': 'rsima', 'interval': r_inv, 'df_inv': df_r_inv, 'rsi_s': r_rsi, 'rsi_ma_s': r_rsi_ma, 'use_ema': False, 'ma_filter': None}
+        if res_r_none['trade_count'] >= MIN_TRADES and res_r_none['final_pnl'] > best_rsi_none_pnl:
+            best_rsi_none_pnl = res_r_none['final_pnl']
+            best_rsi_none_cfg = r_none_cand
+        elif res_r_none['trade_count'] >= 5 and res_r_none['final_pnl'] > fallback_rsi_none_pnl:
+            fallback_rsi_none_pnl = res_r_none['final_pnl']
+            fallback_rsi_none_cfg = r_none_cand
 
-        r_cand = {**res_r, 'interval': r_inv, 'df_inv': df_r_inv, 'rsi_s': r_rsi, 'rsi_ma_s': r_rsi_ma}
-        if res_r['trade_count'] >= MIN_TRADES and res_r['final_pnl'] > best_rsi_pnl:
-            best_rsi_pnl = res_r['final_pnl']
-            best_rsi_cfg = r_cand
-        elif res_r['trade_count'] >= 5 and res_r['final_pnl'] > fallback_rsi_pnl:
-            fallback_rsi_pnl = res_r['final_pnl']
-            fallback_rsi_cfg = r_cand
-
-    if best_rsi_cfg is None:
-        best_rsi_cfg = fallback_rsi_cfg
-
-    # ==============================================================================
-    # 3. 基本戦略二本立て 直接比較 & 動的採用決定 (最低取引回数フィルター考慮)
-    # ==============================================================================
-    pnl_vp = float(best_vp_cfg['pnl'])
-    cnt_vp = int(best_vp_cfg['trade_count'])
-    win_vp = float(best_vp_cfg['win_rate'])
-
-    pnl_rsi = float(best_rsi_cfg['final_pnl'])
-    cnt_rsi = int(best_rsi_cfg['trade_count'])
-    win_rsi = float(best_rsi_cfg['win_rate'])
-
-    discord.print_log(f"\n📊 【基本戦略二本立て 最適化結果直接比較】 ({symbol})")
-    discord.print_log(
-        f"🔹 [VAL_POC ({best_vp_cfg['interval']}m/MP{best_vp_cfg['mp_period']}/B{best_vp_cfg['num_bins']}/VA{best_vp_cfg['va']}/{best_vp_cfg['ma_type']}_{best_vp_cfg['condition']})]: "
-        f"純利益 = {pnl_vp:+.2f} USDC (取引: {cnt_vp}回, 勝率: {win_vp:.1f}%)"
-    )
-    discord.print_log(
-        f"🔸 [RSIMA ({best_rsi_cfg['interval']}m/EP{int(best_rsi_cfg['l_ep'])}/CP{int(best_rsi_cfg['l_cp'])})]: "
-        f"純利益 = {pnl_rsi:+.2f} USDC (取引: {cnt_rsi}回, 勝率: {win_rsi:.1f}%)"
-    )
-
-    vp_valid = cnt_vp >= MIN_TRADES
-    rsi_valid = cnt_rsi >= MIN_TRADES
-    if rsi_valid and not vp_valid:
-        use_rsima = True
-    elif vp_valid and not rsi_valid:
-        use_rsima = False
-    else:
-        use_rsima = (pnl_rsi > pnl_vp)
-
-    if use_rsima:
-        best_strategy = "rsima"
-        best_interval = int(best_rsi_cfg['interval'])
-        best_mp = 100
-        best_margin = best_rsi_cfg.get('sl_pct', 0.05) * 100.0
-        df_chart_base = best_rsi_cfg.get('df_inv', df_5m)
-        chart_df = build_rsima3_chart_df(
-            df_chart_base, best_rsi_cfg['rsi_s'].values, best_rsi_cfg['rsi_ma_s'].values,
-            best_rsi_cfg['l_ep'], best_rsi_cfg['l_cp'], best_rsi_cfg.get('sl_pct', 0.05),
-            initial_equity=fixed_initial_equity
+        # --- [B] RSIMA_EMA (EMAあり) ---
+        res_r_ema_single = optimize_rsima3_fast(
+            c_r, h_r, l_r, r_rsi.values, r_rsi_ma.values,
+            initial_equity=fixed_initial_equity, max_trades=1, min_trades=MIN_TRADES,
+            val_arr=val_arr_r, vah_arr=vah_arr_r, ma_filter=ma_filter_r_ema
         )
+        if res_r_ema_single['trade_count'] >= MIN_TRADES and res_r_ema_single['final_pnl'] > 0:
+            res_r_ema = optimize_rsima3_fast(
+                c_r, h_r, l_r, r_rsi.values, r_rsi_ma.values,
+                initial_equity=fixed_initial_equity, max_trades=3, min_trades=MIN_TRADES,
+                val_arr=val_arr_r, vah_arr=vah_arr_r, ma_filter=ma_filter_r_ema
+            )
+        else:
+            res_r_ema = res_r_ema_single
+        res_r_ema['single_pnl'] = res_r_ema_single['final_pnl']
+        res_r_ema['single_trades'] = res_r_ema_single['trade_count']
+        res_r_ema['single_win_rate'] = res_r_ema_single['win_rate']
+
+        rsima_ema_key = f"RSIMA_EMA_{r_inv}m_EP{int(res_r_ema['l_ep'])}_CP{int(res_r_ema['l_cp'])}_EMA200"
+        results[rsima_ema_key] = {
+            'strategy_type': 'rsima_ema', 'df': pd.DataFrame(), 'final_pnl': fixed_initial_equity + res_r_ema['final_pnl'],
+            'interval': r_inv, 'mp_period': 100, 'num_bins': 50, 'value_area_pct': 0.70,
+            'ma_type': 'EMA', 'ma_condition': 'close_above', 'atr_multi': 0.0, 'sl_center_margin': 0.0,
+            'l_ep': res_r_ema['l_ep'], 'l_cp': res_r_ema['l_cp'], 'sl_pct': res_r_ema['sl_pct'],
+            'DD_max': res_r_ema['DD_max'], 'win_rate': res_r_ema['win_rate'], 'trade_count': res_r_ema['trade_count'],
+            'single_pnl': res_r_ema['single_pnl'], 'single_trades': res_r_ema['single_trades'], 'single_win_rate': res_r_ema['single_win_rate']
+        }
+        r_ema_cand = {**res_r_ema, 'strategy': 'rsima_ema', 'interval': r_inv, 'df_inv': df_r_inv, 'rsi_s': r_rsi, 'rsi_ma_s': r_rsi_ma, 'use_ema': True, 'ma_filter': ma_filter_r_ema}
+        if res_r_ema['trade_count'] >= MIN_TRADES and res_r_ema['final_pnl'] > best_rsi_ema_pnl:
+            best_rsi_ema_pnl = res_r_ema['final_pnl']
+            best_rsi_ema_cfg = r_ema_cand
+        elif res_r_ema['trade_count'] >= 5 and res_r_ema['final_pnl'] > fallback_rsi_ema_pnl:
+            fallback_rsi_ema_pnl = res_r_ema['final_pnl']
+            fallback_rsi_ema_cfg = r_ema_cand
+
+    if best_rsi_none_cfg is None:
+        best_rsi_none_cfg = fallback_rsi_none_cfg
+    if best_rsi_ema_cfg is None:
+        best_rsi_ema_cfg = fallback_rsi_ema_cfg
+
+    # ==============================================================================
+    # 3. 4大基本戦略体系 直接比較 & 動的採用決定 (最低取引回数フィルター考慮)
+    # ==============================================================================
+    candidates = [
+        best_vp_none_cfg,
+        best_vp_ema_cfg,
+        best_rsi_none_cfg,
+        best_rsi_ema_cfg
+    ]
+
+    pnl_vpn = float(best_vp_none_cfg['pnl'])
+    cnt_vpn = int(best_vp_none_cfg['trade_count'])
+    win_vpn = float(best_vp_none_cfg['win_rate'])
+
+    pnl_vpe = float(best_vp_ema_cfg['pnl'])
+    cnt_vpe = int(best_vp_ema_cfg['trade_count'])
+    win_vpe = float(best_vp_ema_cfg['win_rate'])
+
+    pnl_rsn = float(best_rsi_none_cfg['final_pnl'])
+    cnt_rsn = int(best_rsi_none_cfg['trade_count'])
+    win_rsn = float(best_rsi_none_cfg['win_rate'])
+
+    pnl_rse = float(best_rsi_ema_cfg['final_pnl'])
+    cnt_rse = int(best_rsi_ema_cfg['trade_count'])
+    win_rse = float(best_rsi_ema_cfg['win_rate'])
+
+    discord.print_log(f"\n📊 【4大基本戦略 最適化結果直接比較】 ({symbol})")
+    discord.print_log(
+        f"🔹 [VAL_POC ({best_vp_none_cfg['interval']}m/MP{best_vp_none_cfg['mp_period']}/EMAなし)]: "
+        f"純利益 = {pnl_vpn:+.2f} USDC (取引: {cnt_vpn}回, 勝率: {win_vpn:.1f}%)"
+    )
+    discord.print_log(
+        f"🔹 [VAL_POC_EMA ({best_vp_ema_cfg['interval']}m/MP{best_vp_ema_cfg['mp_period']}/EMAあり)]: "
+        f"純利益 = {pnl_vpe:+.2f} USDC (取引: {cnt_vpe}回, 勝率: {win_vpe:.1f}%)"
+    )
+    discord.print_log(
+        f"🔸 [RSIMA ({best_rsi_none_cfg['interval']}m/EP{int(best_rsi_none_cfg['l_ep'])}/CP{int(best_rsi_none_cfg['l_cp'])}/EMAなし)]: "
+        f"純利益 = {pnl_rsn:+.2f} USDC (取引: {cnt_rsn}回, 勝率: {win_rsn:.1f}%)"
+    )
+    discord.print_log(
+        f"🔸 [RSIMA_EMA ({best_rsi_ema_cfg['interval']}m/EP{int(best_rsi_ema_cfg['l_ep'])}/CP{int(best_rsi_ema_cfg['l_cp'])}/EMAあり)]: "
+        f"純利益 = {pnl_rse:+.2f} USDC (取引: {cnt_rse}回, 勝率: {win_rse:.1f}%)"
+    )
+
+    # 有効性監査: 取引回数 >= MIN_TRADES の合格戦略から最も PnL が高いものを選択
+    valid_cands = []
+    for c in candidates:
+        c_pnl = float(c.get('final_pnl', c.get('pnl', -float('inf'))))
+        c_cnt = int(c.get('trade_count', 0))
+        if c_cnt >= MIN_TRADES:
+            valid_cands.append((c_pnl, c))
+
+    if valid_cands:
+        valid_cands.sort(key=lambda x: x[0], reverse=True)
+        winner = valid_cands[0][1]
+    else:
+        # 全て不合格の場合は全候補から最高PnLを選択
+        candidates.sort(key=lambda c: float(c.get('final_pnl', c.get('pnl', -float('inf')))), reverse=True)
+        winner = candidates[0]
+
+    chosen_strat = winner.get('strategy', 'val_poc')
+    best_interval = int(winner['interval'])
+
+    if chosen_strat in ('rsima', 'rsima_ema'):
+        best_strategy = chosen_strat
+        best_mp = 100
+        best_margin = winner.get('sl_pct', 0.05) * 100.0
+        df_chart_base = winner.get('df_inv', df_5m)
+        chart_df = build_rsima3_chart_df(
+            df_chart_base, winner['rsi_s'].values, winner['rsi_ma_s'].values,
+            winner['l_ep'], winner['l_cp'], winner.get('sl_pct', 0.05),
+            initial_equity=fixed_initial_equity, ma_filter=winner.get('ma_filter')
+        )
+        pnl_final = float(winner['final_pnl'])
+        cnt_final = int(winner['trade_count'])
+        win_final = float(winner['win_rate'])
         best_params = {
-            'strategy': 'rsima',
+            'strategy': best_strategy,
+            'use_ema_filter': winner.get('use_ema', False),
             'interval': best_interval,
             'mp': 100,
-            'l_ep': best_rsi_cfg['l_ep'],
-            'l_cp': best_rsi_cfg['l_cp'],
-            'sl_pct': best_rsi_cfg.get('sl_pct', 0.05),
+            'l_ep': winner['l_ep'],
+            'l_cp': winner['l_cp'],
+            'sl_pct': winner.get('sl_pct', 0.05),
             'margin': best_margin,
-            'pnl': pnl_rsi,
-            'trade_count': cnt_rsi,
-            'win_rate': win_rsi,
-            'DD_max': best_rsi_cfg['DD_max'],
-            'single_pnl': best_rsi_cfg.get('single_pnl', pnl_rsi),
-            'single_trades': best_rsi_cfg.get('single_trades', cnt_rsi),
-            'single_win_rate': best_rsi_cfg.get('single_win_rate', win_rsi),
+            'pnl': pnl_final,
+            'trade_count': cnt_final,
+            'win_rate': win_final,
+            'DD_max': winner['DD_max'],
+            'single_pnl': winner.get('single_pnl', pnl_final),
+            'single_trades': winner.get('single_trades', cnt_final),
+            'single_win_rate': winner.get('single_win_rate', win_final),
             'chart_df': chart_df
         }
         s_p = best_params['single_pnl']
         s_c = best_params['single_trades']
         s_w = best_params['single_win_rate']
-        discord.print_log(f"🏆 [{symbol}] 採用戦略: 【RSIMA ({best_interval}m)】を動的採用！ (純利益: {pnl_rsi:+.2f} USDC [ナンピン{cnt_rsi}回/{win_rsi:.1f}%] vs シングル: {s_p:+.2f} USDC [{s_c}回/{s_w:.1f}%])")
+        ema_tag = "(EMAあり)" if winner.get('use_ema') else "(EMAなし)"
+        discord.print_log(f"🏆 [{symbol}] 採用戦略: 【{best_strategy.upper()} ({best_interval}m/{ema_tag})】を動的採用！ (純利益: {pnl_final:+.2f} USDC [ナンピン{cnt_final}回/{win_final:.1f}%] vs シングル: {s_p:+.2f} USDC [{s_c}回/{s_w:.1f}%])")
     else:
-        best_strategy = "val_poc"
-        best_interval = int(best_vp_cfg['interval'])
-        best_mp = int(best_vp_cfg['mp_period'])
+        best_strategy = chosen_strat
+        best_mp = int(winner['mp_period'])
         best_margin = 9.0
 
         # 最良VAL_POC設定でのチャート用DataFrameを生成
@@ -2491,21 +2598,18 @@ def run_interval_comparison(df_5m: pd.DataFrame, lot: float = 1.0, data_equity: 
         h_b = df_chart['high'].astype(float).values if 'high' in df_chart.columns else c_b
         l_b = df_chart['low'].astype(float).values if 'low' in df_chart.columns else c_b
         step_b = 6 if best_interval == 5 else (2 if best_interval == 15 else 1)
-        mp_b = make_market_profile_dual_va(df_chart, period=best_mp, num_bins=int(best_vp_cfg['num_bins']), step=step_b, use_decay=True)
-        val_b = mp_b['val_70'] if best_vp_cfg['va'] == '70%' else mp_b['val_80']
-        vah_b = mp_b['vah_70'] if best_vp_cfg['va'] == '70%' else mp_b['vah_80']
+        mp_b = make_market_profile_dual_va(df_chart, period=best_mp, num_bins=int(winner['num_bins']), step=step_b, use_decay=True)
+        val_b = mp_b['val_70'] if winner['va'] == '70%' else mp_b['val_80']
+        vah_b = mp_b['vah_70'] if winner['va'] == '70%' else mp_b['vah_80']
         poc_b = mp_b['poc']
-        if best_vp_cfg['ma_type'] == 'SMA':
-            ma_b = df_chart['close'].astype(float).rolling(200, min_periods=1).mean().values
-        else:
+
+        use_ema_val = (best_strategy == 'val_poc_ema')
+        if use_ema_val:
             ma_b = calc_ema(df_chart['close'].astype(float), 200).values
-        ma_r_b = np.concatenate([[True], ma_b[1:] > ma_b[:-1]])
-        if best_vp_cfg['condition'] == 'ma_rising':
-            mf_b = ma_r_b
-        elif best_vp_cfg['condition'] == 'both':
-            mf_b = (c_b >= ma_b) & ma_r_b
-        else:
             mf_b = (c_b >= ma_b)
+        else:
+            mf_b = None
+
         cd_b = max(10, 288 // (best_interval // 5)) if not is_1h else 24
         sim_b = simulate_val_poc_fast(
             c_b, h_b, l_b, val_b, vah_b, poc_b, mf_b,
@@ -2518,28 +2622,33 @@ def run_interval_comparison(df_5m: pd.DataFrame, lot: float = 1.0, data_equity: 
         df_chart['exec_sell_price'] = sim_b['exec_sell_price']
         df_chart['pnl'] = sim_b['pnl_curve']
 
+        pnl_final = float(winner['pnl'])
+        cnt_final = int(winner['trade_count'])
+        win_final = float(winner['win_rate'])
         best_params = {
-            'strategy': 'val_poc',
+            'strategy': best_strategy,
+            'use_ema_filter': use_ema_val,
             'interval': best_interval,
             'mp': best_mp,
-            'num_bins': best_vp_cfg['num_bins'],
-            'value_area_pct': best_vp_cfg['value_area_pct'],
-            'ma_type': best_vp_cfg['ma_type'],
-            'ma_condition': best_vp_cfg['condition'],
+            'num_bins': winner['num_bins'],
+            'value_area_pct': winner['value_area_pct'],
+            'ma_type': 'EMA' if use_ema_val else 'NONE',
+            'ma_condition': 'close_above' if use_ema_val else 'none',
             'margin': 9.0,
-            'pnl': pnl_vp,
-            'trade_count': cnt_vp,
-            'win_rate': win_vp,
-            'DD_max': best_vp_cfg['DD_max'],
-            'single_pnl': best_vp_cfg.get('single_pnl', pnl_vp),
-            'single_trades': best_vp_cfg.get('single_trades', cnt_vp),
-            'single_win_rate': best_vp_cfg.get('single_win_rate', win_vp),
+            'pnl': pnl_final,
+            'trade_count': cnt_final,
+            'win_rate': win_final,
+            'DD_max': winner['DD_max'],
+            'single_pnl': winner.get('single_pnl', pnl_final),
+            'single_trades': winner.get('single_trades', cnt_final),
+            'single_win_rate': winner.get('single_win_rate', win_final),
             'chart_df': df_chart
         }
         s_p = best_params['single_pnl']
         s_c = best_params['single_trades']
         s_w = best_params['single_win_rate']
-        discord.print_log(f"🏆 [{symbol}] 採用戦略: 【VAL_POC ({best_interval}m)】を動的採用！ (純利益: {pnl_vp:+.2f} USDC [ナンピン{cnt_vp}回/{win_vp:.1f}%] vs シングル: {s_p:+.2f} USDC [{s_c}回/{s_w:.1f}%])")
+        ema_tag = "(EMAあり)" if use_ema_val else "(EMAなし)"
+        discord.print_log(f"🏆 [{symbol}] 採用戦略: 【{best_strategy.upper()} ({best_interval}m/{ema_tag})】を動的採用！ (純利益: {pnl_final:+.2f} USDC [ナンピン{cnt_final}回/{win_final:.1f}%] vs シングル: {s_p:+.2f} USDC [{s_c}回/{s_w:.1f}%])")
 
     # 直近30日の勝ちトレード MAE 95%ile に基づく動的ストップ率を算出 (安全バンド: -1.5% 〜 -3.2%)
     dyn_stop = calculate_dynamic_mae_stop(
@@ -3290,6 +3399,7 @@ def check_rsima3_signals(
     is_emergency_breakeven: bool = False,
     dynamic_sl_pct: float = -0.025,
     bars_held: int = 0,
+    use_ema_filter: bool = False,
 ) -> Dict[str, Any]:
     """TradingView『RSIMA3_MaxGambleMoon』の完全移植判定 (新仕様最適化完全連動)
     
@@ -3401,10 +3511,18 @@ def check_rsima3_signals(
         reason = f"RSIMA3_NORMAL_TP: RSI({curr_rsi:.1f} > {l_cp:.0f}) & PnL(+{pnl_pct:.2%} >= +{tp_add_pct:.2%})"
         return {"action": "CLOSE_ALL", "reason": reason, "lot_multiplier": 1.0, "metrics": metrics}
 
+    # EMA 200 トレンドフィルター判定 (use_ema_filter=True 時のみ必須)
+    curr_c = float(c.iloc[-1])
+    ema200 = calc_ema(c, 200)
+    curr_ema200 = float(ema200.iloc[-1]) if len(ema200) > 0 else curr_c
+    trend_ok = (curr_c >= curr_ema200) if use_ema_filter else True
+
     # === [2] 新規エントリー判定 (if LE and LC and poz) ===
-    if poz and LE and LC:
+    if poz and LE and LC and trend_ok:
         lot_m = 1.0  # 全部1倍 (ユーザー指示: ロット倍率撤廃)
-        reason = f"RSIMA3_INITIAL_ENTRY: GC(RSI={curr_rsi:.1f} > MA={curr_ma:.1f} < {l_ep:.0f})"
+        ema_str = f" & EMA200(${curr_ema200:.4f})条件OK" if use_ema_filter else ""
+        strat_tag = "RSIMA_EMA" if use_ema_filter else "RSIMA"
+        reason = f"{strat_tag}_INITIAL_ENTRY: GC(RSI={curr_rsi:.1f} > MA={curr_ma:.1f} < {l_ep:.0f}){ema_str}"
         return {"action": "INITIAL_ENTRY", "reason": reason, "lot_multiplier": float(lot_m), "metrics": metrics}
 
     # === [3] ナンピン追加エントリー判定 (if LE and LC and lpo and longadd) ===
@@ -3459,6 +3577,7 @@ def check_val_poc_signals(
     is_emergency_breakeven: bool = False,
     dynamic_sl_pct: float = -0.025,
     bars_held: int = 0,
+    use_ema_filter: bool = True,
 ) -> Dict[str, Any]:
     """VAL_POC ＋ 200期間MA (EMA/SMA) トレンドフィルター戦略 リアルタイム判定 (新仕様最適化完全連動)
     1. エントリー: VALゴールデンクロス (クロスオーバー) ＆ 200期間MA条件 ＆ バリュー幅>=1.5% ＆ クールダウン解除済
@@ -3507,9 +3626,11 @@ def check_val_poc_signals(
     va_width_pct = ((curr_vah - curr_val) / curr_val) if curr_val > 0 else 0.0
     val_gc = (prev_c <= prev_val) and (curr_c > curr_val)
 
-    # トレンド条件判定: close_above / ma_rising / both
+    # トレンド条件判定: use_ema_filter が False の場合はフィルターなし (Pure VAL_POC)
     cond = str(ma_condition).lower()
-    if cond == "ma_rising":
+    if not use_ema_filter or cond == "none" or str(ma_type).upper() == "NONE":
+        trend_ok = True
+    elif cond == "ma_rising":
         trend_ok = (curr_ma200 > prev_ma200)
     elif cond == "both":
         trend_ok = (curr_c >= curr_ma200) and (curr_ma200 > prev_ma200)
@@ -3592,7 +3713,9 @@ def check_val_poc_signals(
     # === [3] 新規エントリー判定 (VALゴールデンクロス ＆ MA200 ＆ バリュー幅>=1.5% ＆ クールダウン解除) ===
     if poz and not is_cooldown_active:
         if val_gc and (va_width_pct >= min_va_width) and trend_ok:
-            reason = f"VAL_POC_INITIAL_ENTRY: VALブレイク(${curr_c:.4f} > ${curr_val:.4f}) & {ma_type}200(${curr_ma200:.4f})条件OK & 幅({va_width_pct:.1%}>=1.5%)"
+            strat_tag = "VAL_POC_EMA" if (use_ema_filter and str(ma_condition).lower() != "none" and str(ma_type).upper() != "NONE") else "VAL_POC"
+            ema_str = f" & {ma_type}200(${curr_ma200:.4f})条件OK" if "EMA" in strat_tag else ""
+            reason = f"{strat_tag}_INITIAL_ENTRY: VALブレイク(${curr_c:.4f} > ${curr_val:.4f}){ema_str} & 幅({va_width_pct:.1%}>=1.5%)"
             return {"action": "INITIAL_ENTRY", "reason": reason, "lot_multiplier": 1.0, "metrics": metrics}
 
     # === [4] ナンピン判定 (最終建値から (VAH - VAL) * 0.60 下落、最大2回追加 = 計3枠) ===
