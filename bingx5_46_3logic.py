@@ -1624,7 +1624,7 @@ def simulate_val_poc_fast(
     max_trades: int = 3,
     nanpin_drop_pct: float = 0.030,
     sl_pct: float = 0.025,
-    target_ratio: float = 0.60,
+    target_ratio: float = 0.50,
     cooldown_bars: int = 96,
     fee_rate: float = 0.0006,
     maker_fee: float = 0.0002,
@@ -1924,10 +1924,10 @@ def optimize_rsima3_fast(
                         if cur_eq > peak_eq:
                             peak_eq = cur_eq
                     else:
-                        # ナンピン判定: 直近約定価格から (VAH - VAL) * 0.60 下落 (最大3枠)
+                        # ナンピン判定: 直近約定価格から (VAH - VAL) * 0.50 下落 (最大3枠)
                         if pending_px < 0 and 1 <= pos_cnt < max_trades:
                             if use_va and not np.isnan(val_arr[i]) and not np.isnan(vah_arr[i]) and vah_arr[i] > val_arr[i]:
-                                dip_req = (vah_arr[i] - val_arr[i]) * 0.60
+                                dip_req = (vah_arr[i] - val_arr[i]) * 0.50
                                 is_dip = (c <= last_entry_px - dip_req)
                             else:
                                 is_dip = (c < avg_px * 0.994)
@@ -2155,7 +2155,7 @@ def calculate_dynamic_mae_stop(
                 val = vals[i]
                 vah = vahs[i]
                 va_diff = (vah - val) if (not np.isnan(val) and not np.isnan(vah) and vah > val) else 0.0
-                tp_target = val + va_diff * 0.60 if va_diff > 0 else pocs[i]
+                tp_target = val + va_diff * 0.50 if va_diff > 0 else pocs[i]
                 if (cur_h >= tp_target or cur_c >= tp_target) and cur_c > avg_price * 1.0007:
                     is_tp = True
 
@@ -3437,10 +3437,10 @@ def check_rsima3_signals(
     lpo = (current_pos_qty > 0)
     poz = (current_pos_qty <= 0)
 
-    # ナンピン幅判定 (ユーザー新指示: 直近の約定価格から (VAH - VAL) * 0.60 以上下落)
+    # ナンピン幅判定 (ユーザー新指示: 直近の約定価格から (VAH - VAL) * 0.50 以上下落)
     last_ep = last_entry_price if (last_entry_price is not None and last_entry_price > 0) else avg_entry_price
     if val_price is not None and vah_price is not None and vah_price > val_price and last_ep > 0:
-        va_dip_req = (vah_price - val_price) * 0.60
+        va_dip_req = (vah_price - val_price) * 0.50
         longadd = (prev_close <= last_ep - va_dip_req) or (current_price <= last_ep - va_dip_req)
         # 利確用の add_pct (+0.4%〜+1.0%) とナンピン幅を分離
         tp_add_pct = get_tv_add_pct(max(current_trades_count, 1))
@@ -3569,7 +3569,7 @@ def check_val_poc_signals(
     ma_type: str = "EMA",
     ma_condition: str = "close_above",
     max_trades: int = 3,
-    target_ratio: float = 0.60,
+    target_ratio: float = 0.50,
     min_va_width: float = 0.015,
     nanpin_drop_pct: float = 0.030,
     sl_pct: float = 0.090,
@@ -3581,9 +3581,9 @@ def check_val_poc_signals(
 ) -> Dict[str, Any]:
     """VAL_POC ＋ 200期間MA (EMA/SMA) トレンドフィルター戦略 リアルタイム判定 (新仕様最適化完全連動)
     1. エントリー: VALゴールデンクロス (クロスオーバー) ＆ 200期間MA条件 ＆ バリュー幅>=1.5% ＆ クールダウン解除済
-    2. 利確: VAL-VAH中間値50%〜最適化60%水準 (VAL + (VAH-VAL)*target_ratio, デフォルト60%) 到達かつ建値プラス域
-    3. ナンピン: 最後の建値から (VAH-VAL)*0.60 下落 (最大2回追加、初期1本＋ナンピン2回＝計3枠)
-    4. 損切り: 最終建値から (VAH-VAL)*0.60 割れ (5分足終値確定判定) ＋ 24時間クールダウン
+    2. 利確: VAL-VAH中間値50%水準 (VAL + (VAH-VAL)*target_ratio, デフォルト50%) 到達かつ建値プラス域
+    3. ナンピン: 最後の建値から (VAH-VAL)*0.50 下落 (最大2回追加、初期1本＋ナンピン2回＝計3枠)
+    4. 損切り: 最終建値から (VAH-VAL)*0.50 割れ (5分足終値確定判定) ＋ 24時間クールダウン
     5. 緊急建値撤退: 全体地合い非BUY時、平均建値+0.20%到達で即座に早期撤退 (ナンピンは即時凍結)
     """
     if df_5m is None or df_5m.empty or len(df_5m) < 20:
@@ -3637,7 +3637,7 @@ def check_val_poc_signals(
     else:  # "close_above" (デフォルト)
         trend_ok = (curr_c >= curr_ma200) if not np.isnan(curr_ma200) else True
 
-    # 利確目標価格: VAL + (VAH - VAL) * 0.60
+    # 利確目標価格: VAL + (VAH - VAL) * 0.50
     va_diff = (curr_vah - curr_val) if (curr_vah > curr_val and curr_val > 0) else 0.0
     va_spacing = va_diff * target_ratio if va_diff > 0 else 0.0
     target_tp = curr_val + va_spacing if va_spacing > 0 else curr_poc
@@ -3645,7 +3645,7 @@ def check_val_poc_signals(
     ref_last_px = last_entry_price if last_entry_price > 0 else avg_entry_price
     # 安全下限ガード (最低 1.0%)
     drop_dist = max(ref_last_px * 0.010, va_spacing) if (ref_last_px > 0 and va_spacing > 0) else (ref_last_px * nanpin_drop_pct)
-    # 最終建値から (VAH - VAL) * 0.60 割れ
+    # 最終建値から (VAH - VAL) * 0.50 割れ
     sl_price = ref_last_px - drop_dist if ref_last_px > 0 else 0.0
     nanpin_target = ref_last_px - drop_dist if ref_last_px > 0 else 0.0
 
@@ -3701,13 +3701,13 @@ def check_val_poc_signals(
             reason = f"VAL_POC_EMERGENCY_BREAKEVEN_TP: 地合い悪化(非BUY)に伴う緊急建値撤退 (目標: ${breakeven_target:.4f}, PnL: {pnl_pct:+.2%})"
             return {"action": "CLOSE_ALL", "reason": reason, "lot_multiplier": 1.0, "metrics": metrics}
 
-    # === [2] 利確判定 (VAL-VAH 60%水準 到達かつ建値プラス域) ===
+    # === [2] 利確判定 (VAL-VAH 50%水準 到達かつ建値プラス域) ===
     if lpo and target_tp > 0:
         is_tp_hit = (curr_h >= target_tp) or (curr_c >= target_tp) or (current_price >= target_tp)
         is_profit = (current_price > avg_entry_price * 1.0006)
         if is_tp_hit and is_profit:
             pnl_pct = (current_price - avg_entry_price) / avg_entry_price if avg_entry_price > 0 else 0.0
-            reason = f"VAL_POC_60_TP: 目標(${target_tp:.4f})到達 & 建値プラス(PnL={pnl_pct:+.2%})"
+            reason = f"VAL_POC_50_TP: 目標(${target_tp:.4f})到達 & 建値プラス(PnL={pnl_pct:+.2%})"
             return {"action": "CLOSE_ALL", "reason": reason, "lot_multiplier": 1.0, "metrics": metrics}
 
     # === [3] 新規エントリー判定 (VALゴールデンクロス ＆ MA200 ＆ バリュー幅>=1.5% ＆ クールダウン解除) ===
@@ -3718,13 +3718,13 @@ def check_val_poc_signals(
             reason = f"{strat_tag}_INITIAL_ENTRY: VALブレイク(${curr_c:.4f} > ${curr_val:.4f}){ema_str} & 幅({va_width_pct:.1%}>=1.5%)"
             return {"action": "INITIAL_ENTRY", "reason": reason, "lot_multiplier": 1.0, "metrics": metrics}
 
-    # === [4] ナンピン判定 (最終建値から (VAH - VAL) * 0.60 下落、最大2回追加 = 計3枠) ===
+    # === [4] ナンピン判定 (最終建値から (VAH - VAL) * 0.50 下落、最大2回追加 = 計3枠) ===
     # 地合い悪化時 (is_emergency_breakeven=True) は追加ナンピンを即時凍結 (ADD禁止)
     if lpo and not is_emergency_breakeven and (1 <= current_trades_count < max_trades) and ref_last_px > 0 and nanpin_target > 0:
         if (curr_c <= nanpin_target) or (curr_l <= nanpin_target) or (current_price <= nanpin_target):
             drop_pct = (current_price - ref_last_px) / ref_last_px
             va_pct_drop = (drop_dist / ref_last_px) * 100.0
-            reason = f"VAL_POC_ADD_ENTRY (Trade #{current_trades_count+1}, 1x): 最終建値(${ref_last_px:.4f})からVA60%下落({drop_pct:.2%} <= -{va_pct_drop:.1f}%)"
+            reason = f"VAL_POC_ADD_ENTRY (Trade #{current_trades_count+1}, 1x): 最終建値(${ref_last_px:.4f})からVA50%下落({drop_pct:.2%} <= -{va_pct_drop:.1f}%)"
             return {"action": "ADD_ENTRY", "reason": reason, "lot_multiplier": 1.0, "metrics": metrics}
 
     if lpo:
@@ -3916,14 +3916,14 @@ def simulate_val_poc_strategy(
     initial_equity: float = 100.0,
     sl_pct: float = 0.025,
     fee_rate: float = 0.0006,
-    target_ratio: float = 0.60,
+    target_ratio: float = 0.50,
 ) -> dict:
     """
-    VAL ゴールデンクロス ＆ EMA200 ＆ バリュー幅>=1.5% ＆ VAL-VAH 中間値50〜60%利確 ＆ -3%ナンピン最大4回 (VAL_POC 最適仕様)
+    VAL ゴールデンクロス ＆ EMA200 ＆ バリュー幅>=1.5% ＆ VAL-VAH 中間値50%利確 ＆ -3%ナンピン最大4回 (VAL_POC 最適仕様)
     - エントリー: VALクロスオーバー (close > VAL かつ prev_close <= prev_VAL)
     - トレンドフィルター: close >= EMA(close, 200)
     - バリュー幅フィルター: (VAH - VAL) / VAL >= 1.5%
-    - 利確: POCが下すぎる問題を解消するため、VAL-VAH中間値50%〜最適化60%水準 (VAL + (VAH - VAL) * target_ratio) 到達かつ建値プラス域
+    - 利確: POCが下すぎる問題を解消するため、VAL-VAH中間値50%水準 (VAL + (VAH - VAL) * target_ratio) 到達かつ建値プラス域
     - ナンピン: 直近建値から -3.0% 下落ごと、最大4回 (初期1 + ナンピン4 = 計5枠)
     - 損切り: 9.0% (5分足確定終値判定) ＋ 24時間 (288本) クールダウン
     """

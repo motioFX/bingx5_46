@@ -1473,7 +1473,7 @@ async def wait_until_next_candle(
                     max_allowed_nanpins = 2
                     vah_lvl = float(scale_state.get("vah_level", 0.0))
                     val_lvl = float(scale_state.get("val_level", 0.0))
-                    va_spacing = (vah_lvl - val_lvl) * 0.60 if (vah_lvl > val_lvl and val_lvl > 0) else 0.0
+                    va_spacing = (vah_lvl - val_lvl) * 0.50 if (vah_lvl > val_lvl and val_lvl > 0) else 0.0
                     drop_dist = max(last_px * 0.010, va_spacing) if va_spacing > 0 else (last_px * calc_add_pct(cur_nanpin + 1, strategy=strat_type))
                     drop_target = last_px - drop_dist
                     req_drop_pct = (drop_dist / last_px) if last_px > 0 else 0.030
@@ -1793,7 +1793,7 @@ async def _async_post_entry_reporting(
         record_real_trade(sym, "LONG", "ENTRY", entry_px, lot_size, 0.0, f"新規エントリー約定 [{interval_label}足]")
 
         entry_notional = entry_px * lot_size
-        target_tp_val = val_val + (vah_val - val_val) * 0.60 if (vah_val > val_val and val_val > 0) else poc_val
+        target_tp_val = val_val + (vah_val - val_val) * 0.50 if (vah_val > val_val and val_val > 0) else poc_val
 
         entry_msg = (
             f"🚀🚀🚀 **【新規ロングエントリー約定 [{interval_label}足]】** 🚀🚀🚀\n"
@@ -2366,7 +2366,7 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                         ma_type=str(sym_params.get("ma_type", "EMA" if use_ema_v else "NONE")),
                         ma_condition=str(sym_params.get("ma_condition", "close_above" if use_ema_v else "none")),
                         max_trades=MAX_TRADES_COUNT,
-                        target_ratio=0.60,
+                        target_ratio=0.50,
                         sl_pct=abs(dyn_sl_pct),
                         is_cooldown_active=in_cooldown,
                         is_emergency_breakeven=is_emergency_be,
@@ -2553,7 +2553,7 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                             ma_type=str(sym_params_e.get("ma_type", "EMA" if use_ema_v else "NONE")),
                             ma_condition=str(sym_params_e.get("ma_condition", "close_above" if use_ema_v else "none")),
                             max_trades=MAX_TRADES_COUNT,
-                            target_ratio=0.60,
+                            target_ratio=0.50,
                             sl_pct=float(sym_params_e.get("sl_pct", 0.090)),
                             is_cooldown_active=in_cooldown,
                             use_ema_filter=use_ema_v,
