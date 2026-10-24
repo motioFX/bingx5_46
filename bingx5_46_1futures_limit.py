@@ -220,6 +220,7 @@ from bingx5_46_2api import (
     fetch_instrument_spec_bingx,
     compute_bingx_lot_size,
     normalize_symbol,
+    get_bingx_orderbook,
 )
 from bingx5_46_3logic import (
     send_discord,
@@ -2111,7 +2112,20 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                     h_qty = float(h_pos.get("buy", 0.0))
                     h_has_long = h_qty > 0
                     h_pnl = float(h_pos.get("profit", 0.0))
-                    h_px = ws_mgr.get_latest_price(h_sym) or float(h_pos.get("buy_pos", 0.0)) or 1.0
+                    h_px = ws_mgr.get_latest_price(h_sym) or float(h_pos.get("buy_pos", 0.0))
+                    if not h_px or h_px <= 0:
+                        df_h = cached_5m_dfs.get(h_sym)
+                        if df_h is not None and not df_h.empty and "close" in df_h.columns:
+                            h_px = float(df_h["close"].iloc[-1])
+                        else:
+                            try:
+                                bid, _ = get_bingx_orderbook(h_sym, h_api.bingx.base_url if h_api else None)
+                                if bid and bid > 0:
+                                    h_px = bid
+                            except Exception:
+                                pass
+                    if not h_px or h_px <= 0:
+                        h_px = 1.0
                     h_whale_info = get_whale_sentiment_info(h_sym)
                     h_whale_sig = h_whale_info.get("signal", "NEUTRAL")
                     h_whale_tag = "🟢買い" if h_whale_sig == "LONG_ONLY" else ("🔴売り" if h_whale_sig == "SHORT_ONLY" else "⚪中立")
