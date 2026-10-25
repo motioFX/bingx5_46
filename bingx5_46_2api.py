@@ -140,9 +140,8 @@ def get_bingx_contracts(base_url: Optional[str] = None, mode: str = 'demo') -> L
     now = time.time()
     if _bingx_contracts_cache and (now - _bingx_contracts_last_fetch < 300):
         return list(_bingx_contracts_cache.values())
-    if base_url is None:
-        cred_key = 'bingx_demo' if mode in ('paper', 'demo', 'testnet') else 'bingx'
-        base_url = RestAPI_url.get(cred_key, 'https://open-api-vst.bingx.com' if mode in ('paper', 'demo', 'testnet') else 'https://open-api.bingx.com')
+    # PROJECT_RULES準拠: 契約仕様は常に本番取引所(open-api.bingx.com)を参照
+    base_url = 'https://open-api.bingx.com'
     try:
         resp = requests.get(f"{base_url}/openApi/swap/v2/quote/contracts", timeout=10)
         if resp.status_code == 200:
@@ -190,11 +189,11 @@ def get_bingx_universe_symbols(mode: str = 'demo') -> Set[str]:
 
 def get_bingx_orderbook(symbol: str, base_url: Optional[str] = None, mode: str = 'demo') -> Tuple[Optional[float], Optional[float]]:
     try:
-        if base_url is None:
-            cred_key = 'bingx_demo' if mode in ('paper', 'demo', 'testnet') else 'bingx'
-            base_url = RestAPI_url.get(cred_key, 'https://open-api-vst.bingx.com' if mode in ('paper', 'demo', 'testnet') else 'https://open-api.bingx.com')
+        # PROJECT_RULES準拠: 相場板情報 (bookTicker) はデモ口座であっても常に本番取引所 (https://open-api.bingx.com) を参照する
+        # （BingX Web UI の取引板および約定判定が本番市場のリアル板に完全同期しているため）
+        quote_url = 'https://open-api.bingx.com'
         clean_sym = normalize_symbol(symbol)
-        resp = requests.get(f"{base_url}/openApi/swap/v2/quote/bookTicker?symbol={clean_sym}", timeout=5)
+        resp = requests.get(f"{quote_url}/openApi/swap/v2/quote/bookTicker?symbol={clean_sym}", timeout=5)
         if resp.status_code == 200:
             data = resp.json()
             if data.get("code") == 0:

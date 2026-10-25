@@ -50,6 +50,8 @@
   - **Short エントリー**: 常に **`best_ask`（売り気配最良値）** に指値（`timeInForce: "GTC"`）を発注する。
   - **押し目・戻り待機と追随**: 確定足成立後、最大約4分間（240秒）指値を維持して待機。気配値不変なら注文キュー優先順位を維持し、乖離時のみ旧指値を安全キャンセル（`active_order_cancel`）して最新気配値に再配置する。
   - **足確定時のクリーンアップ**: サイン終了時は未約定指値を即座にキャンセル。
+  - **相場板情報 (bookTicker) の本番 API 単一参照規約（デモ・本番共通）**:
+    BingX Web UI の板および約定判定はデモでも本番リアル板に完全同期している。デモ専用APIの気配値は本番と乖離しているため、板気配値（`best_bid` / `best_ask`）はデモ運用時であっても**常に本番取引所公開 API（`https://open-api.bingx.com`）から取得**し、画面の板最前列と 100% 同期した Maker 指値を配置する。発注・ポジション照会のみデモ API（`open-api-vst.bingx.com`）へルーティングする。
 * **ロット・価格の厳格な丸め込み (Quantization)**:
   - 取引所 API（`/openApi/swap/v2/quote/contracts`）より `quantityPrecision`、`pricePrecision`、`tradeMinQuantity`（最小発注枚数）を取得し、端数処理による発注拒否エラーを厳格に防止する。
 * **レバレッジ & 資金管理設定**:
