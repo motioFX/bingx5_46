@@ -1168,7 +1168,7 @@ async def validate_profitable_candidates(trade_side: str, mode: str, base_symbol
                 cand_df = raw_dfs[best_sym]
                 cand_df.tail(min(len(cand_df), 720)).reset_index(drop=True).to_csv(bg_csv, index=False)
 
-            strat_tag = "RSIMA3" if best_strat in ["rsima", "rsima3"] else "VAL_POC"
+            strat_tag = str(best_strat).upper()
             chart_label = f"Best1Month_{strat_tag}_{best_inv}m"
             discord.print_log(
                 f"🏆 **【バックテスト 最優秀成績銘柄 (1ヶ月間)】**\n"
@@ -1651,7 +1651,8 @@ async def run_screening_and_optimization(mode: str, send_charts: bool = False, s
 
     # 選定銘柄の個別最適化パラメータをDiscordログ表示
     if selected_symbols:
-        discord.print_log("\n★ 【合格銘柄 個別最適化パラメータ一覧 (VAL_POC / RSIMA 2段階72通り検証)】")
+        side_strat_label = "ショート4大基本戦略 (VAH_POC / RSIMA_SHORT)" if actual_side == "short" else "ロング4大基本戦略 (VAL_POC / RSIMA)"
+        discord.print_log(f"\n★ 【合格銘柄 個別最適化パラメータ一覧 ({side_strat_label} 144通り検証)】")
         for sym in selected_symbols:
             p = symbol_params_map.get(sym, default_best_params)
             pnl_val = p.get('pnl', 0.0)
@@ -1660,21 +1661,29 @@ async def run_screening_and_optimization(mode: str, send_charts: bool = False, s
             dd_val = p.get('max_dd', 0.0)
             strat = p.get('strategy', 'rsima').upper()
             inv_val = int(p.get('interval', 5))
+            is_short_strat = ("SHORT" in strat or "VAH" in strat or actual_side == "short")
+            max_trades_label = "単発1本固定/ナンピンなし" if is_short_strat else f"最大{MAX_TRADES_COUNT}枠/1x均等"
             
-            if strat in ("VAL_POC", "VP_VAL_GC"):
+            if strat.startswith("VAH_POC") or strat in ("VAL_POC", "VP_VAL_GC"):
                 mp_v = p.get('mp', 200)
                 bins_v = p.get('num_bins', 50)
                 va_v = int(float(p.get('value_area_pct', 0.70)) * 100)
-                ma_v = f"{p.get('ma_type', 'EMA')}_{p.get('ma_condition', 'close_above')}"
-                param_str = f"{inv_val}m / MP={mp_v}, Bins={bins_v}, VA={va_v}%, {ma_v} ➔ VA60%間隔ナンピン(最大2回/計3枠) ➔ VA60%利確"
+                ma_v = f"{p.get('ma_type', 'NONE')}_{p.get('ma_condition', 'none')}"
+                if is_short_strat:
+                    param_str = f"{inv_val}m / MP={mp_v}, Bins={bins_v}, VA={va_v}%, {ma_v} ➔ 単発固定 ➔ VA50%利確"
+                else:
+                    param_str = f"{inv_val}m / MP={mp_v}, Bins={bins_v}, VA={va_v}%, {ma_v} ➔ VA60%間隔ナンピン(最大2回/計3枠) ➔ VA60%利確"
             else:
-                ep_v = int(float(p.get('l_ep', 40)))
-                cp_v = int(float(p.get('l_cp', 60)))
-                sl_v = float(p.get('sl_pct', 0.090)) * 100
-                param_str = f"{inv_val}m / RSI=9, EMA=7, EP={ep_v}, CP={cp_v}, SL={sl_v:.1f}% ➔ VA60%間隔ナンピン(最大2回/計3枠)"
+                ep_v = int(float(p.get('s_ep' if is_short_strat else 'l_ep', 60 if is_short_strat else 40)))
+                cp_v = int(float(p.get('s_cp' if is_short_strat else 'l_cp', 40 if is_short_strat else 60)))
+                sl_v = float(p.get('sl_pct', 0.025)) * 100
+                if is_short_strat:
+                    param_str = f"{inv_val}m / RSI=9, EMA=7, EP={ep_v}, CP={cp_v}, 動的SL={sl_v:.1f}% ➔ 単発固定 ➔ RSI冷却利確"
+                else:
+                    param_str = f"{inv_val}m / RSI=9, EMA=7, EP={ep_v}, CP={cp_v}, SL={sl_v:.1f}% ➔ VA60%間隔ナンピン(最大2回/計3枠)"
 
             discord.print_log(
-                f"   📌 [{sym}] 戦略={strat} (最大{MAX_TRADES_COUNT}枠/1x均等) | {param_str} | "
+                f"   📌 [{sym}] 戦略={strat} ({max_trades_label}) | {param_str} | "
                 f"純利益: {pnl_val:+.4f} USDT (取引: {tc_val}回, 勝率: {wr_val:.1f}%, DD: {dd_val:.2f} USDT ({dd_val:.1f}%))"
             )
     else:
