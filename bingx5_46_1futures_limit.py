@@ -1825,27 +1825,41 @@ async def _async_post_entry_reporting(
     strat_desc: str,
     whale_sig: str,
     whale_flow_val: float,
-    interval_label: str = "5m"
+    interval_label: str = "5m",
+    side: str = "LONG"
 ):
     """新規エントリー約定後のトレード記録・チャート生成・Discord画像送信を完全非同期実行する"""
     try:
         from real_trade_tracker import record_real_trade, plot_entry_chart
-        record_real_trade(sym, "LONG", "ENTRY", entry_px, lot_size, 0.0, f"新規エントリー約定 [{interval_label}足]")
+        is_short = (side.upper() == "SHORT")
+        side_clean = "SHORT" if is_short else "LONG"
+        record_real_trade(sym, side_clean, "ENTRY", entry_px, lot_size, 0.0, f"新規{'ショート' if is_short else 'ロング'}エントリー約定 [{interval_label}足]")
 
         entry_notional = entry_px * lot_size
-        target_tp_val = val_val + (vah_val - val_val) * 0.50 if (vah_val > val_val and val_val > 0) else poc_val
+        if is_short:
+            target_tp_val = vah_val - (vah_val - val_val) * 0.50 if (vah_val > val_val and val_val > 0) else poc_val
+            target_tp_desc = f"VAH-VAL 50%水準 (${target_tp_val:.6f}) / RSI冷却利確"
+            nanpin_desc = "単発1本固定 (ナンピン完全なし)"
+            side_badge = "SHORT 🔴"
+            header_title = f"🚀🚀🚀 **【新規ショートエントリー約定 [{interval_label}足]】** 🚀🚀🚀"
+        else:
+            target_tp_val = val_val + (vah_val - val_val) * 0.50 if (vah_val > val_val and val_val > 0) else poc_val
+            target_tp_desc = f"VAL-VAH 50%水準 (${target_tp_val:.6f}) / RSI過熱利確"
+            nanpin_desc = "VA 60%間隔・均等1倍ロット (最大2回追加 / 合計最大3枠)"
+            side_badge = "LONG 🟢"
+            header_title = f"🚀🚀🚀 **【新規ロングエントリー約定 [{interval_label}足]】** 🚀🚀🚀"
 
         entry_msg = (
-            f"🚀🚀🚀 **【新規ロングエントリー約定 [{interval_label}足]】** 🚀🚀🚀\n"
+            f"{header_title}\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"📌 **銘柄 / 方向**: `{sym}` (LONG 🟢 / 採用足種: `{interval_label}足`)\n"
+            f"📌 **銘柄 / 方向**: `{sym}` ({side_badge} / 採用足種: `{interval_label}足`)\n"
             f"⚡ **検知トリガー**: `{entry_full_reason}`\n"
             f"💰 **約定価格**: `${entry_px:.6f}`\n"
             f"📦 **発注数量**: `{lot_size:,.2f} {sym}` (約 `${entry_notional:,.2f} USDT`)\n"
             f"⚙️ **適用戦略**: `{strat_desc}`\n"
-            f"🎯 **利確目標**: `VAL-VAH 60%水準 (${target_tp_val:.6f}) / RSI過熱利確`\n"
-            f"📉 **ナンピン設計**: `VA 60%間隔・均等1倍ロット (最大2回追加 / 合計最大3枠)`\n"
-            f"🛑 **損切り仕様**: `最終建値から VA 60%割れ (確定足終値判定) ＋ 24hクールダウン`\n"
+            f"🎯 **利確目標**: `{target_tp_desc}`\n"
+            f"📉 **ナンピン設計**: `{nanpin_desc}`\n"
+            f"🛑 **損切り仕様**: `動的MAEストップ (直近30d 95%ile) ＋ 24hクールダウン`\n"
             f"🐋 **クジラ判定**: `{whale_sig}` (流入: `${whale_flow_val:+,.0f}`)\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
         )
@@ -1862,6 +1876,7 @@ async def _async_post_entry_reporting(
             whale_signal=whale_sig,
             whale_flow=whale_flow_val,
             interval_label=interval_label,
+            side=side_clean,
         )
         if entry_chart_file and Path(entry_chart_file).exists():
             discord.send_file(entry_chart_file, description=entry_msg)
@@ -2156,18 +2171,23 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
 
                 for h_sym, h_api in symbol_apis.items():
                     h_pos = cached_positions_map.get(h_sym, {})
-                    h_qty = float(h_pos.get("buy", 0.0))
-                    h_has_long = h_qty > 0
+                    h_qty_buy = float(h_pos.get("buy", 0.0))
+                    h_qty_sell = float(h_pos.get("sell", 0.0))
+                    h_has_long = h_qty_buy > 0
+                    h_has_short = h_qty_sell > 0
                     h_pnl = float(h_pos.get("profit", 0.0))
-                    h_px = ws_mgr.get_latest_price(h_sym) or float(h_pos.get("buy_pos", 0.0))
+                    h_entry_px = float(h_pos.get("sell_pos" if h_has_short else "buy_pos", 0.0))
+                    h_px = ws_mgr.get_latest_price(h_sym) or h_entry_px
                     if not h_px or h_px <= 0:
                         df_h = cached_5m_dfs.get(h_sym)
                         if df_h is not None and not df_h.empty and "close" in df_h.columns:
                             h_px = float(df_h["close"].iloc[-1])
                         else:
                             try:
-                                bid, _ = get_bingx_orderbook(h_sym, h_api.bingx.base_url if h_api else None)
-                                if bid and bid > 0:
+                                bid, ask = get_bingx_orderbook(h_sym, h_api.bingx.base_url if h_api else None)
+                                if h_has_short and ask and ask > 0:
+                                    h_px = ask
+                                elif bid and bid > 0:
                                     h_px = bid
                             except Exception:
                                 pass
@@ -2177,12 +2197,15 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                     h_whale_sig = h_whale_info.get("signal", "NEUTRAL")
                     h_whale_tag = "🟢買い" if h_whale_sig == "LONG_ONLY" else ("🔴売り" if h_whale_sig == "SHORT_ONLY" else "⚪中立")
 
-                    if h_has_long:
+                    if h_has_short:
+                        h_sign = "+" if h_pnl >= 0 else "-"
+                        h_pos_tag = f"保有S({h_sign}${abs(h_pnl):.2f}/1枠)"
+                    elif h_has_long:
                         h_sign = "+" if h_pnl >= 0 else "-"
                         h_t_cnt = trade_counts.get(h_sym, 1)
                         if h_t_cnt <= 0:
                             h_t_cnt = 1
-                        h_pos_tag = f"保有({h_sign}${abs(h_pnl):.2f}/{h_t_cnt}本)"
+                        h_pos_tag = f"保有L({h_sign}${abs(h_pnl):.2f}/{h_t_cnt}枠)"
                     elif h_sym in pending_entry_orders:
                         p_px = pending_entry_orders[h_sym].get("price", 0.0)
                         h_pos_tag = f"指値(${p_px:.4f})" if p_px < 10 else f"指値(${p_px:.2f})"
@@ -2332,7 +2355,7 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                         sym=sym, entry_px=entry_px, lot_size=pos_qty, entry_full_reason=entry_reason_val,
                         df_chart=df_report, vah_val=vah_val, val_val=val_val, poc_val=poc_val,
                         strat_desc=strat_desc, whale_sig=whale_sig, whale_flow_val=whale_flow_val,
-                        interval_label=inv_label_p
+                        interval_label=inv_label_p, side=side_label
                     ))
 
                 tracked_active_positions.add(sym)
@@ -2788,7 +2811,7 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                                     sym=sym, entry_px=cur_px, lot_size=lot_size, entry_full_reason=entry_reason,
                                     df_chart=df_entry_eval, vah_val=vah_e, val_val=val_e, poc_val=poc_e,
                                     strat_desc=strat_desc, whale_sig=whale_sig, whale_flow_val=whale_flow_val,
-                                    interval_label=inv_label_e
+                                    interval_label=inv_label_e, side="SHORT"
                                 ))
                             else:
                                 pending_entry_orders[sym] = {
@@ -2938,7 +2961,7 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                                     sym=sym, entry_px=cur_px, lot_size=lot_size, entry_full_reason=entry_reason,
                                     df_chart=df_entry_eval, vah_val=vah_e, val_val=val_e, poc_val=poc_e,
                                     strat_desc=strat_desc, whale_sig=whale_sig, whale_flow_val=whale_flow_val,
-                                    interval_label=inv_label_e
+                                    interval_label=inv_label_e, side="LONG"
                                 ))
                             else:
                                 pending_entry_orders[sym] = {

@@ -597,10 +597,11 @@ async def sync_real_trades_from_bingx_api(mode: str = 'demo') -> int:
                     existing_tran_ids.add(tran_id)
                 updated_count += 1
             else:
+                side_detected = "SHORT" if ("short" in str(info).lower()) else "LONG"
                 new_entry = {
                     "timestamp": dt_iso,
                     "symbol": sym,
-                    "side": "LONG",
+                    "side": side_detected,
                     "action": "CLOSE",
                     "price": 0.0,
                     "qty": 0.0,
@@ -1075,6 +1076,7 @@ def plot_entry_chart(
     whale_flow: float = 0.0,
     lookback_bars: int = 48,
     interval_label: str = "",
+    side: str = "LONG",
 ) -> Optional[Path]:
     """新規エントリー時点のローソク足とVolume Profile(VAH/VAL/POC)履歴バンド、エントリーポイントを描画して保存する"""
     if df is None or df.empty:
@@ -1119,23 +1121,30 @@ def plot_entry_chart(
 
     x_indices = _draw_candles_and_vp(ax, plot_df)
 
+    is_short = (str(side).upper() == "SHORT")
+    marker_color = "#ff5252" if is_short else "#00e676"
+    marker_sym = "v" if is_short else "^"
+    annot_tag = "▼ SHORT ENTRY" if is_short else "▲ LONG ENTRY"
+    box_bg = "#b71c1c" if is_short else "#1b5e20"
+    side_label_str = "SHORT" if is_short else "LONG"
+
     last_idx = len(plot_df) - 1
-    ax.scatter([last_idx], [entry_price], color="#00e676", s=180, marker="^", edgecolors="#ffffff", linewidths=1.5, zorder=6, label=f"Entry Point @ ${entry_price:.4f}")
+    ax.scatter([last_idx], [entry_price], color=marker_color, s=180, marker=marker_sym, edgecolors="#ffffff", linewidths=1.5, zorder=6, label=f"{side_label_str} Entry Point @ ${entry_price:.4f}")
 
     price_str = f"${entry_price:.6f}" if entry_price < 1 else f"${entry_price:.4f}"
     ax.annotate(
-        f" ▲ LONG ENTRY\n {price_str}",
+        f" {annot_tag}\n {price_str}",
         xy=(last_idx, entry_price),
         xytext=(last_idx + 1.2, entry_price),
         arrowprops=dict(
             arrowstyle="->",
-            facecolor="#00e676",
-            edgecolor="#00e676",
+            facecolor=marker_color,
+            edgecolor=marker_color,
             lw=1.5,
             shrinkA=3,
             shrinkB=5
         ),
-        bbox=dict(boxstyle="round,pad=0.5", facecolor="#1b5e20", edgecolor="#00e676", alpha=0.95),
+        bbox=dict(boxstyle="round,pad=0.5", facecolor=box_bg, edgecolor=marker_color, alpha=0.95),
         fontsize=9,
         color="#ffffff",
         weight="bold",
@@ -1151,7 +1160,7 @@ def plot_entry_chart(
     title_price_str = f"{entry_price:.6f} USDT" if entry_price < 1 else f"{entry_price:.4f} USDT"
 
     ax.set_title(
-        f"[NEW ENTRY] {symbol} (LONG){inv_str} - Execution & Volume Profile Bands\nEntry Price: {title_price_str}{strat_str}{whale_str}",
+        f"[NEW ENTRY] {symbol} ({side_label_str}){inv_str} - Execution & Volume Profile Bands\nEntry Price: {title_price_str}{strat_str}{whale_str}",
         fontsize=11,
         color="#ffffff",
         weight="bold",
@@ -1276,7 +1285,9 @@ def plot_exit_chart(
 
     x_indices = _draw_candles_and_vp(ax, plot_df)
 
-    ax.scatter([entry_idx], [entry_price], color="#00e676", s=160, marker="^", edgecolors="#ffffff", linewidths=1.5, zorder=6, label=f"Entry @ ${entry_price:.4f}")
+    entry_marker_color = "#ff5252" if side.upper() == "SHORT" else "#00e676"
+    entry_marker_shape = "v" if side.upper() == "SHORT" else "^"
+    ax.scatter([entry_idx], [entry_price], color=entry_marker_color, s=160, marker=entry_marker_shape, edgecolors="#ffffff", linewidths=1.5, zorder=6, label=f"Entry ({side.upper()}) @ ${entry_price:.4f}")
     exit_marker_color = "#26a69a" if pnl >= 0 else "#ef5350"
     ax.scatter([exit_idx], [exit_price], color=exit_marker_color, s=160, marker="v", edgecolors="#ffffff", linewidths=1.5, zorder=6, label=f"Exit @ ${exit_price:.4f}")
 
