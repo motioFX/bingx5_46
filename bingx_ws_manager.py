@@ -12,6 +12,7 @@ import asyncio
 import gzip
 import json
 import logging
+import time
 from datetime import datetime, timezone, timedelta
 from typing import Dict, Any, List, Optional, Callable, Set
 import pybotters
@@ -29,8 +30,10 @@ class BingXWSManager:
         
         # 状態キャッシュ
         self.latest_prices: Dict[str, float] = {}
+        self.last_price_times: Dict[str, float] = {}  # symbol -> last update monotonic/epoch time
         self.latest_klines: Dict[str, dict] = {}
         self.last_candle_times: Dict[str, int] = {}  # symbol -> last candle T (ms)
+        self._last_any_msg_time: float = time.time()
         
         self._client: Optional[pybotters.Client] = None
         self._ws_app: Optional[Any] = None
@@ -39,9 +42,15 @@ class BingXWSManager:
         self._ws_conn: Optional[Any] = None
         self._bg_tasks: Set[asyncio.Task] = set()
 
-    def get_latest_price(self, symbol: str) -> Optional[float]:
-        """指定銘柄の最新WebSocket価格を取得"""
-        return self.latest_prices.get(symbol)
+    def get_latest_price(self, symbol: str, max_age_sec: float = 90.0) -> Optional[float]:
+        """指定銘柄の最新WebSocket価格を取得（鮮度チェック付き：古い場合はNoneを返してRESTへフォールバック）"""
+        px = self.latest_prices.get(symbol)
+        if px is None or px <= 0:
+            return None
+        last_ts = self.last_price_times.get(symbol, 0.0)
+        if (time.time() - last_ts) > max_age_sec:
+            return None
+        return px
 
     def get_latest_kline(self, symbol: str) -> Optional[dict]:
         """指定銘柄の最新5分足ローソク足データを取得"""
@@ -122,6 +131,7 @@ class BingXWSManager:
 
                     def on_message_bytes(msg: bytes, ws: Any) -> None:
                         self._ws_conn = ws
+                        self._last_any_msg_time = time.time()
                         try:
                             text = gzip.decompress(msg).decode('utf-8')
                             if text.lower() == 'ping':
@@ -138,8 +148,12 @@ class BingXWSManager:
                             if d_type and "@kline_5m" in d_type:
                                 sym = d_type.split("@")[0]
                                 k_data = data.get("data")
+                                k = None
                                 if isinstance(k_data, list) and len(k_data) > 0:
-                                    k = k_data[0]
+                                    k = k_data[-1]
+                                elif isinstance(k_data, dict):
+                                    k = k_data
+                                if k is not None:
                                     close_px = float(k.get("c", 0.0))
                                     open_px = float(k.get("o", 0.0))
                                     high_px = float(k.get("h", 0.0))
@@ -149,6 +163,7 @@ class BingXWSManager:
 
                                     if close_px > 0:
                                         self.latest_prices[sym] = close_px
+                                        self.last_price_times[sym] = time.time()
                                     
                                     kline_obj = {
                                         "symbol": sym,
@@ -180,6 +195,7 @@ class BingXWSManager:
                         {"id": f"sub_{s}_5m", "reqType": "sub", "dataType": f"{s}@kline_5m"}
                         for s in self.symbols
                     ]
+                    self._last_any_msg_time = time.time()
 
                     # 接続開始 (pybotters の自動再接続 backoff 機構を活用)
                     self._ws_app = await client.ws_connect(
@@ -190,8 +206,11 @@ class BingXWSManager:
                         heartbeat=15.0
                     )
 
-                    # 接続維持ループ (ws_app の生存を監視)
+                    # 接続維持ループ (ws_app の生存およびメッセージ無音タイムアウトを監視)
                     while self._running:
+                        if self.symbols and (time.time() - self._last_any_msg_time) > 60.0:
+                            # 60秒以上一切のWebSocketメッセージ(Ping含む)が途絶えた場合は強制再接続
+                            break
                         if hasattr(self._ws_app, "wait"):
                             try:
                                 await asyncio.wait_for(self._ws_app.wait(), timeout=1.0)

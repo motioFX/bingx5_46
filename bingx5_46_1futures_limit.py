@@ -1099,7 +1099,7 @@ async def validate_profitable_candidates(trade_side: str, mode: str, base_symbol
                     "num_bins": best_params_dict.get("num_bins", 50),
                     "value_area_pct": best_params_dict.get("value_area_pct", 0.70),
                     "ma_type": best_params_dict.get("ma_type", "EMA"),
-                    "ma_condition": best_params_dict.get("ma_condition", "close_above" if not is_sell_regime else "close_below"),
+                    "ma_condition": best_params_dict.get("ma_condition", "close_below" if actual_side == "short" else "close_above"),
                     "l_ep": best_params_dict.get("l_ep", 40.0),
                     "l_cp": best_params_dict.get("l_cp", 60.0),
                     "s_ep": best_params_dict.get("s_ep", 60.0),
@@ -2262,12 +2262,17 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                 discord.print_log(f"[Hourly Update Error] 毎時タスクエラー: {hourly_err}", level="warning")
 
         # -------------------------------------------------------------
-        # [フェーズ B0] リアルタイム (30秒ごと): 全体地合い状態の判定
+        # [フェーズ B0] リアルタイム (30秒ごと): 全体地合い状態の判定 ＆ 5分足確定フラグ判定
         # -------------------------------------------------------------
         regime_info = get_regime_gate_info("BTC-USDT")
         overall_regime = regime_info.get("overall_regime", "NEUTRAL")
         is_emergency_be = (overall_regime != "BUY")
         is_regime_safe = (regime_info.get("regime_gate") == "ALLOW")
+
+        cur_5m_bucket = (now_jst.hour * 12) + (now_jst.minute // 5)
+        is_candle_closed = (cur_5m_bucket != last_candle_sync_minute)
+        if is_candle_closed:
+            last_candle_sync_minute = cur_5m_bucket
 
         # -------------------------------------------------------------
         # [フェーズ B2] リアルタイム (30秒ごと): 全ポジション一括取得 & 監視 & 決済判定
@@ -2377,15 +2382,27 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                 tracked_active_positions.add(sym)
                 active_positions[sym] = (has_pos, pos, entry_px, pos_qty, pnl_current)
 
-                # リアルタイム現在価格
+                # リアルタイム現在価格（WebSocket鮮度切れ時はREST気配値へ確実にフォールバック）
                 cur_px = ws_mgr.get_latest_price(sym)
                 if not cur_px or cur_px <= 0:
                     cur_bid, cur_ask = get_bingx_orderbook(sym, api.bingx.base_url)
-                    cur_px = cur_bid if cur_bid else entry_px
+                    if is_short_pos:
+                        cur_px = cur_ask or cur_bid or entry_px
+                    else:
+                        cur_px = cur_bid or cur_ask or entry_px
 
-                # ローソク足取得（キャッシュ優先）
+                # ローソク足取得（5分足確定時・未キャッシュ時・10分以上未更新時は最新5分足ストアから必ず同期更新）
                 df_sym = cached_5m_dfs.get(sym)
-                if df_sym is None or df_sym.empty:
+                need_candle_refresh = is_candle_closed or (df_sym is None) or df_sym.empty
+                if not need_candle_refresh and "timestamp" in df_sym.columns and len(df_sym) > 0:
+                    try:
+                        last_c_ts = pd.to_datetime(df_sym["timestamp"].iloc[-1], utc=True)
+                        if (datetime.now(timezone.utc) - last_c_ts).total_seconds() > 600:
+                            need_candle_refresh = True
+                    except Exception:
+                        need_candle_refresh = True
+
+                if need_candle_refresh:
                     df_raw_init = await fetch_bingx_candles(sym, "5m", limit=3200, mode=mode)
                     if not df_raw_init.empty:
                         cached_5m_dfs[sym] = df_raw_init
@@ -2637,9 +2654,6 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
             # ===== BULL (買い相場: ロング) または BEAR (売り相場: ショート) =====
             is_sell_regime = (overall_regime == "SELL")
             total_active_count = len(active_positions) + len(pending_entry_orders)
-            is_candle_closed = (now_jst.minute % 5 == 0 and now_jst.minute != last_candle_sync_minute)
-            if is_candle_closed:
-                last_candle_sync_minute = now_jst.minute
 
             for sym in selected_symbols:
                 if sym in active_positions:
@@ -2806,14 +2820,15 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                         if entered:
                             new_pos = await api.get_positions()
                             if float(new_pos.get("sell", 0.0)) > 0:
+                                actual_fill_px = float(new_pos.get("sell_pos", 0.0)) or cur_px
                                 last_trade_time[sym] = time.time()
                                 trade_counts[sym] = 1
                                 last_nanpin_time[sym] = time.time()
                                 tracked_active_positions.add(sym)
                                 scale_state_new = {
                                     "nanpin_count": 0,
-                                    "last_entry_price": cur_px,
-                                    "avg_price": cur_px,
+                                    "last_entry_price": actual_fill_px,
+                                    "avg_price": actual_fill_px,
                                     "initial_entry_time": time.time(),
                                     "side": "short"
                                 }
@@ -2824,7 +2839,7 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                                 whale_flow_val = float(whale_info.get("net_flow", 0.0)) if whale_info else 0.0
                                 strat_desc = f"SHORT {cand_strat_e.upper()} ({inv_label_e}足 / MP={sym_params_e.get('mp', '-')})"
                                 asyncio.create_task(_async_post_entry_reporting(
-                                    sym=sym, entry_px=cur_px, lot_size=lot_size, entry_full_reason=entry_reason,
+                                    sym=sym, entry_px=actual_fill_px, lot_size=lot_size, entry_full_reason=entry_reason,
                                     df_chart=df_entry_eval, vah_val=vah_e, val_val=val_e, poc_val=poc_e,
                                     strat_desc=strat_desc, whale_sig=whale_sig, whale_flow_val=whale_flow_val,
                                     interval_label=inv_label_e, side="SHORT"
@@ -2956,14 +2971,15 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                         if entered:
                             new_pos = await api.get_positions()
                             if float(new_pos.get("buy", 0.0)) > 0:
+                                actual_fill_px = float(new_pos.get("buy_pos", 0.0)) or cur_px
                                 last_trade_time[sym] = time.time()
                                 trade_counts[sym] = 1
                                 last_nanpin_time[sym] = time.time()
                                 tracked_active_positions.add(sym)
                                 scale_state_new = {
                                     "nanpin_count": 0,
-                                    "last_entry_price": cur_px,
-                                    "avg_price": cur_px,
+                                    "last_entry_price": actual_fill_px,
+                                    "avg_price": actual_fill_px,
                                     "initial_entry_time": time.time(),
                                     "side": "long"
                                 }
@@ -2974,7 +2990,7 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                                 whale_flow_val = float(whale_info.get("net_flow", 0.0)) if whale_info else 0.0
                                 strat_desc = f"{cand_strat_e.upper()} ({inv_label_e}足 / MP={sym_params_e.get('mp', '-')})"
                                 asyncio.create_task(_async_post_entry_reporting(
-                                    sym=sym, entry_px=cur_px, lot_size=lot_size, entry_full_reason=entry_reason,
+                                    sym=sym, entry_px=actual_fill_px, lot_size=lot_size, entry_full_reason=entry_reason,
                                     df_chart=df_entry_eval, vah_val=vah_e, val_val=val_e, poc_val=poc_e,
                                     strat_desc=strat_desc, whale_sig=whale_sig, whale_flow_val=whale_flow_val,
                                     interval_label=inv_label_e, side="LONG"

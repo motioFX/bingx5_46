@@ -4347,8 +4347,8 @@ def check_rsima3_signals(
     # LRS = rsi > lCp (rsi > 60)
     LRS = (curr_rsi > l_cp)
 
-    # base_long_exit = avg_price ? LRS and shortadd : LRS
-    base_long_exit = LRS and (shortadd or shortadd_realtime)
+    # base_long_exit = LRS and shortadd_realtime (必ずリアルタイム現在価格が利確ライン超えであることを確認)
+    base_long_exit = LRS and shortadd_realtime
 
     metrics = {
         "curr_price": current_price,
@@ -4365,7 +4365,7 @@ def check_rsima3_signals(
         "LC": LC,
         "opentrades": current_trades_count,
         "longadd": longadd,
-        "shortadd": shortadd or shortadd_realtime,
+        "shortadd": shortadd_realtime,
         "LRS": LRS,
         "is_emergency_breakeven": is_emergency_breakeven,
     }
@@ -4375,7 +4375,7 @@ def check_rsima3_signals(
     if lpo and avg_entry_price > 0:
         eff_sl_pct = abs(dynamic_sl_pct) if dynamic_sl_pct != 0 else 0.025
         sl_price = avg_entry_price * (1.0 - eff_sl_pct)
-        if current_price <= sl_price or prev_close <= sl_price:
+        if current_price <= sl_price:
             loss_pct = (current_price - avg_entry_price) / avg_entry_price
             reason = f"RSIMA3_DYNAMIC_MAE_SL: 価格(${current_price:.4f}) <= 動的SL(${sl_price:.4f}, SL率-{eff_sl_pct:.2%}, 損失{loss_pct:.2%})"
             return {"action": "STOP_LOSS", "reason": reason, "lot_multiplier": 1.0, "metrics": metrics}
@@ -4390,7 +4390,7 @@ def check_rsima3_signals(
     # === [1-0] 地合い悪化時の緊急建値撤退判定 (全体地合い非BUY時: 平均建値 +0.20% で早期撤退) ===
     if lpo and is_emergency_breakeven and avg_entry_price > 0:
         breakeven_target = avg_entry_price * 1.0020  # +0.20% (往復手数料+スリップ考慮で確実にプラス)
-        if current_price >= breakeven_target or prev_close >= breakeven_target:
+        if current_price >= breakeven_target:
             pnl_pct = (current_price - avg_entry_price) / avg_entry_price
             reason = f"RSIMA3_EMERGENCY_BREAKEVEN_TP: 地合い悪化(非BUY)に伴う緊急建値撤退 (目標: ${breakeven_target:.4f}, PnL: {pnl_pct:+.2%})"
             return {"action": "CLOSE_ALL", "reason": reason, "lot_multiplier": 1.0, "metrics": metrics}
@@ -4571,8 +4571,8 @@ def check_val_poc_signals(
     if lpo and avg_entry_price > 0:
         eff_sl_pct = abs(dynamic_sl_pct) if dynamic_sl_pct != 0 else 0.025
         sl_price_dyn = avg_entry_price * (1.0 - eff_sl_pct)
-        if (current_price <= sl_price_dyn) or (curr_c <= sl_price_dyn):
-            trigger_px = current_price if current_price <= sl_price_dyn else curr_c
+        if current_price <= sl_price_dyn:
+            trigger_px = current_price
             loss_pct = (trigger_px - avg_entry_price) / avg_entry_price
             reason = f"VAL_POC_DYNAMIC_MAE_SL: 価格(${trigger_px:.4f}) <= 動的SL(${sl_price_dyn:.4f}, SL率-{eff_sl_pct:.2%}, 損失{loss_pct:.2%})"
             return {"action": "STOP_LOSS", "reason": reason, "lot_multiplier": 1.0, "metrics": metrics}
@@ -4587,14 +4587,14 @@ def check_val_poc_signals(
     # === [1-0] 地合い悪化時の緊急建値撤退判定 (全体地合い非BUY時: 平均建値 +0.20% で早期撤退) ===
     if lpo and is_emergency_breakeven and avg_entry_price > 0:
         breakeven_target = avg_entry_price * 1.0020  # +0.20% (往復手数料+スリップ考慮で確実にプラス)
-        if (curr_h >= breakeven_target) or (curr_c >= breakeven_target) or (current_price >= breakeven_target):
+        if current_price >= breakeven_target:
             pnl_pct = (current_price - avg_entry_price) / avg_entry_price
             reason = f"VAL_POC_EMERGENCY_BREAKEVEN_TP: 地合い悪化(非BUY)に伴う緊急建値撤退 (目標: ${breakeven_target:.4f}, PnL: {pnl_pct:+.2%})"
             return {"action": "CLOSE_ALL", "reason": reason, "lot_multiplier": 1.0, "metrics": metrics}
 
     # === [2] 利確判定 (VAL-VAH 50%水準 到達かつ建値プラス域) ===
     if lpo and target_tp > 0:
-        is_tp_hit = (curr_h >= target_tp) or (curr_c >= target_tp) or (current_price >= target_tp)
+        is_tp_hit = (current_price >= target_tp)
         is_profit = (current_price > avg_entry_price * 1.0006)
         if is_tp_hit and is_profit:
             pnl_pct = (current_price - avg_entry_price) / avg_entry_price if avg_entry_price > 0 else 0.0
@@ -4734,8 +4734,8 @@ def check_vah_poc_signals(
     if spo and avg_entry_price > 0:
         eff_sl_pct = abs(dynamic_sl_pct) if dynamic_sl_pct != 0 else 0.025
         sl_price_dyn = avg_entry_price * (1.0 + eff_sl_pct)
-        if (current_price >= sl_price_dyn) or (curr_c >= sl_price_dyn):
-            trigger_px = current_price if current_price >= sl_price_dyn else curr_c
+        if current_price >= sl_price_dyn:
+            trigger_px = current_price
             loss_pct = (avg_entry_price - trigger_px) / avg_entry_price
             reason = f"VAH_POC_DYNAMIC_MAE_SL: 価格(${trigger_px:.4f}) >= 動的SL(${sl_price_dyn:.4f}, SL率+{eff_sl_pct:.2%}, 損失{loss_pct:.2%})"
             return {"action": "STOP_LOSS", "reason": reason, "lot_multiplier": 1.0, "metrics": metrics}
@@ -4749,14 +4749,14 @@ def check_vah_poc_signals(
     # === [1-0] 地合い非BEAR時の緊急建値撤退判定 (平均建値 -0.20% で早期買戻し) ===
     if spo and is_emergency_breakeven and avg_entry_price > 0:
         breakeven_target = avg_entry_price * 0.9980  # -0.20% (ショート利益圏)
-        if (curr_l <= breakeven_target) or (curr_c <= breakeven_target) or (current_price <= breakeven_target):
+        if current_price <= breakeven_target:
             pnl_pct = (avg_entry_price - current_price) / avg_entry_price
             reason = f"VAH_POC_EMERGENCY_BREAKEVEN_TP: 地合い変化(非BEAR)に伴う緊急建値買戻し撤退 (目標: ${breakeven_target:.4f}, PnL: {pnl_pct:+.2%})"
             return {"action": "CLOSE_ALL", "reason": reason, "lot_multiplier": 1.0, "metrics": metrics}
 
     # === [2] ショート利確判定 (VAH-VAL 50%水準 到達かつ建値プラス利益圏) ===
     if spo and target_tp > 0:
-        is_tp_hit = (curr_l <= target_tp) or (curr_c <= target_tp) or (current_price <= target_tp)
+        is_tp_hit = (current_price <= target_tp)
         is_profit = (current_price < avg_entry_price * 0.9994)
         if is_tp_hit and is_profit:
             pnl_pct = (avg_entry_price - current_price) / avg_entry_price if avg_entry_price > 0 else 0.0
@@ -4859,8 +4859,8 @@ def check_rsima3_short_signals(
     if spo and avg_entry_price > 0:
         eff_sl_pct = abs(dynamic_sl_pct) if dynamic_sl_pct != 0 else 0.025
         sl_price_dyn = avg_entry_price * (1.0 + eff_sl_pct)
-        if (current_price >= sl_price_dyn) or (curr_close >= sl_price_dyn):
-            trigger_px = current_price if current_price >= sl_price_dyn else curr_close
+        if current_price >= sl_price_dyn:
+            trigger_px = current_price
             loss_pct = (avg_entry_price - trigger_px) / avg_entry_price
             reason = f"RSIMA_SHORT_DYNAMIC_MAE_SL: 価格(${trigger_px:.4f}) >= 動的SL(${sl_price_dyn:.4f}, SL率+{eff_sl_pct:.2%}, 損失{loss_pct:.2%})"
             return {"action": "STOP_LOSS", "reason": reason, "lot_multiplier": 1.0, "metrics": metrics}
@@ -4874,7 +4874,7 @@ def check_rsima3_short_signals(
     # === [1-0] 地合い非BEAR時の緊急建値撤退判定 ===
     if spo and is_emergency_breakeven and avg_entry_price > 0:
         breakeven_target = avg_entry_price * 0.9980
-        if (curr_close <= breakeven_target) or (current_price <= breakeven_target):
+        if current_price <= breakeven_target:
             pnl_pct = (avg_entry_price - current_price) / avg_entry_price
             reason = f"RSIMA_SHORT_EMERGENCY_BREAKEVEN_TP: 地合い変化(非BEAR)に伴う緊急建値買戻し撤退 (目標: ${breakeven_target:.4f}, PnL: {pnl_pct:+.2%})"
             return {"action": "CLOSE_ALL", "reason": reason, "lot_multiplier": 1.0, "metrics": metrics}
