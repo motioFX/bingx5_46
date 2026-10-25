@@ -1519,7 +1519,7 @@ async def wait_until_next_candle(
                             continue
 
                         discord.print_log(
-                            f"[{sym}] [REALTIME NANPIN] 📉 最後の建値(${last_px:,.4f})からVA60%(-{req_drop_pct*100:.1f}%)下落検出 (${cur_px:,.4f} <= ${drop_target:,.4f})\n"
+                            f"[{sym}] [REALTIME NANPIN] 📉 最後の建値(${last_px:,.4f})からVA50%(-{req_drop_pct*100:.1f}%)下落検出 (${cur_px:,.4f} <= ${drop_target:,.4f})\n"
                             f"   └ ナンピン発動 ({eff_nanpin + 1}/{max_allowed_nanpins} 回目, 1x均等ロット={base_lot_rt})...",
                             level="debug"
                         )
@@ -1858,7 +1858,7 @@ async def _async_post_entry_reporting(
         else:
             target_tp_val = val_val + (vah_val - val_val) * 0.50 if (vah_val > val_val and val_val > 0) else poc_val
             target_tp_desc = f"VAL-VAH 50%水準 (${target_tp_val:.6f}) / RSI過熱利確"
-            nanpin_desc = "VA 60%間隔・均等1倍ロット (最大2回追加 / 合計最大3枠)"
+            nanpin_desc = "VA 50%間隔・均等1倍ロット (最大2回追加 / 合計最大3枠)"
             side_badge = "LONG 🟢"
             header_title = f"🚀🚀🚀 **【新規ロングエントリー約定 [{interval_label}足]】** 🚀🚀🚀"
 

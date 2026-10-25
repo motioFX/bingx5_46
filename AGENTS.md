@@ -92,16 +92,16 @@
 ## 5. 基本戦略体系 ＆ 3態勢地合い連動モデル (Strategy & 3-Regime Defense)
 
 * **買い4大戦略 ＆ 売り4大戦略 (LONG & SHORT)**:
-  - **LONG戦略（BULL時）**:
-    1. **`VAL_POC`**: ボリュームプロファイル反発（Pure VP: EMA200なし） ＋ VAL-VAH 50%水準利確。
-    2. **`VAL_POC_EMA`**: ボリュームプロファイル ＋ EMA(200) トレンドフィルター ＋ VAL-VAH 50%水準利確。
-    3. **`RSIMA`**: RSI（期間9）× RSI-EMA（期間7）ゴールデンクロス ＋ RSI過熱利確。
-    4. **`RSIMA_EMA`**: RSI × RSI-EMA ＋ EMA(200) トレンドフィルター ＋ RSI過熱利確。
-  - **SHORT戦略（BEAR時・単発1本固定/ナンピンなし）**:
-    1. **`VAH_POC`**: ボリュームプロファイル反落（Pure VP: EMA200なし） ＋ VAH-VAL 50%水準利確。
-    2. **`VAH_POC_EMA`**: ボリュームプロファイル ＋ EMA(200) トレンドフィルター（`close <= EMA`） ＋ VAH-VAL 50%水準利確。
-    3. **`RSIMA_SHORT`**: RSI × RSI-EMA デッドクロス ＋ RSI冷却利確。
-    4. **`RSIMA_SHORT_EMA`**: RSI × RSI-EMA ＋ EMA(200) トレンドフィルター ＋ RSI冷却利確。
+  - **LONG戦略（BULL時・最大3枠ナンピン / VA 50%間隔）**:
+    1. **`VAL_POC`**: ボリュームプロファイル反発（Pure VP: EMA200なし） ＋ `VAL + (VAH - VAL) * 0.50` 利確。
+    2. **`VAL_POC_EMA`**: ボリュームプロファイル ＋ EMA(200) トレンドフィルター ＋ `VAL + (VAH - VAL) * 0.50` 利確。
+    3. **`RSIMA`**: RSI（期間9）× RSI-EMA（期間7）ゴールデンクロス ＋ RSI過熱利確 (`RSI > l_cp`)。
+    4. **`RSIMA_EMA`**: RSI × RSI-EMA ＋ EMA(200) トレンドフィルター ＋ RSI過熱利確 (`RSI > l_cp`)。
+  - **SHORT戦略（BEAR時・単発1本固定 / ナンピン完全なし）**:
+    1. **`VAH_POC`**: ボリュームプロファイル反落（Pure VP: EMA200なし） ＋ `VAH - (VAH - VAL) * 0.50` 利確。
+    2. **`VAH_POC_EMA`**: ボリュームプロファイル ＋ EMA(200) トレンドフィルター（`close <= EMA`） ＋ `VAH - (VAH - VAL) * 0.50` 利確。
+    3. **`RSIMA_SHORT`**: RSI × RSI-EMA デッドクロス ＋ RSI冷却利確 (`RSI < s_cp`)。
+    4. **`RSIMA_SHORT_EMA`**: RSI × RSI-EMA ＋ EMA(200) トレンドフィルター ＋ RSI冷却利確 (`RSI < s_cp`)。
 * **個別パラメータ最適化（各144通り）**:
   - 4足種（5m, 15m, 30m, 60m）× 4戦略（各36通り）＝ 計144通りをシミュレーション。
   - **LONG**: 第1段階（単発厳選）➔ 第2段階（ナンピン検証）。
