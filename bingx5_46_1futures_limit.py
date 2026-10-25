@@ -1843,7 +1843,7 @@ async def _async_post_entry_reporting(
 ):
     """新規エントリー約定後のトレード記録・チャート生成・Discord画像送信を完全非同期実行する"""
     try:
-        from real_trade_tracker import record_real_trade, plot_entry_chart
+        from real_trade_tracker import record_real_trade
         is_short = (side.upper() == "SHORT")
         side_clean = "SHORT" if is_short else "LONG"
         record_real_trade(sym, side_clean, "ENTRY", entry_px, lot_size, 0.0, f"新規{'ショート' if is_short else 'ロング'}エントリー約定 [{interval_label}足]")
@@ -1877,24 +1877,8 @@ async def _async_post_entry_reporting(
             f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
         )
 
-        entry_chart_file = await asyncio.to_thread(
-            plot_entry_chart,
-            symbol=sym,
-            df=df_chart,
-            entry_price=entry_px,
-            vah=vah_val,
-            val=val_val,
-            poc=poc_val,
-            strategy_name=strat_desc,
-            whale_signal=whale_sig,
-            whale_flow=whale_flow_val,
-            interval_label=interval_label,
-            side=side_clean,
-        )
-        if entry_chart_file and Path(entry_chart_file).exists():
-            discord.send_file(entry_chart_file, description=entry_msg)
-        else:
-            discord.print_log(entry_msg)
+        # PROJECT_RULES準拠: エントリー時は画像出力を廃止し、詳細テキスト通知のみを即時送信
+        discord.print_log(entry_msg, force_send=True)
     except Exception as e:
         discord.print_log(f"⚠️ [{sym}] エントリーレポート非同期タスクエラー: {e}", level="warning")
 
