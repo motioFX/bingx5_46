@@ -2140,10 +2140,10 @@ def optimize_rsima3_short_fast(
     eps = [60.0, 65.0, 70.0]
     cps = [30.0, 35.0, 40.0]
 
-    # デッドクロス判定を事前ベクトル計算
+    # デッドクロス判定を事前ベクトル計算 (RSI-EMA下向き転換＝戻り天井確認を必須化)
     dc_arr = np.zeros(n, dtype=bool)
     if n > 2:
-        dc_arr[1:] = (rsi[1:] < rsi_ma[1:]) & (rsi[:-1] >= rsi_ma[:-1])
+        dc_arr[1:] = (rsi[1:] < rsi_ma[1:]) & (rsi[:-1] >= rsi_ma[:-1]) & (rsi_ma[1:] <= rsi_ma[:-1])
 
     best_pnl = -float('inf')
     best_res: Optional[Dict[str, Any]] = None
@@ -4818,13 +4818,14 @@ def check_rsima3_short_signals(
     curr_close = float(c.iloc[-1])
     prev_close = float(c.iloc[-2]) if len(c) >= 2 else current_price
 
-    # 1. デッドクロス判定
+    # 1. デッドクロス判定 & RSI-EMA下向き戻り天井確認
     is_crossunder_curr = (curr_rsi < curr_ma) and (prev_rsi >= prev_ma)
     prev2_rsi = float(rsi.iloc[-3]) if len(rsi) >= 3 else prev_rsi
     prev2_ma = float(lrsi_ma.iloc[-3]) if len(lrsi_ma) >= 3 else prev_ma
     is_crossunder_prev = (prev_rsi < prev_ma) and (prev2_rsi >= prev2_ma) and (curr_rsi <= curr_ma)
 
-    SE = is_crossunder_curr or is_crossunder_prev
+    ma_falling = (curr_ma <= prev_ma)  # 上昇途中の押し目を物理遮断し、戻り天井確認
+    SE = (is_crossunder_curr or is_crossunder_prev) and ma_falling
     SC = (curr_ma > s_ep) or (prev_ma > s_ep)
 
     # 2. EMA(200) トレンドフィルター

@@ -1099,9 +1099,11 @@ async def validate_profitable_candidates(trade_side: str, mode: str, base_symbol
                     "num_bins": best_params_dict.get("num_bins", 50),
                     "value_area_pct": best_params_dict.get("value_area_pct", 0.70),
                     "ma_type": best_params_dict.get("ma_type", "EMA"),
-                    "ma_condition": best_params_dict.get("ma_condition", "close_above"),
+                    "ma_condition": best_params_dict.get("ma_condition", "close_above" if not is_sell_regime else "close_below"),
                     "l_ep": best_params_dict.get("l_ep", 40.0),
                     "l_cp": best_params_dict.get("l_cp", 60.0),
+                    "s_ep": best_params_dict.get("s_ep", 60.0),
+                    "s_cp": best_params_dict.get("s_cp", 40.0),
                     "sl_pct": best_params_dict.get("sl_pct", 0.025),
                     "dynamic_mae_stop": float(best_params_dict.get("dynamic_mae_stop", -0.025)),
                     "pnl": cand_pnl,
@@ -1119,8 +1121,10 @@ async def validate_profitable_candidates(trade_side: str, mode: str, base_symbol
                 # プラス収支かつ最低取引回数(10回以上)クリアで合格
                 if cand_pnl > 0 and trade_cnt >= 10:
                     dyn_sl_disp = cand_params.get("dynamic_mae_stop", -0.025)
-                    if cand_strat == "val_poc":
+                    if "val_poc" in cand_strat or "vah_poc" in cand_strat:
                         detail_str = f"MP={cand_mp}, Bins={cand_params['num_bins']}, VA={int(cand_params['value_area_pct']*100)}%, {cand_params['ma_type']}_{cand_params['ma_condition']}, 動的SL={dyn_sl_disp:.2%}"
+                    elif "short" in cand_strat:
+                        detail_str = f"EP={int(cand_params['s_ep'])}, CP={int(cand_params['s_cp'])}, 動的SL={dyn_sl_disp:.2%}"
                     else:
                         detail_str = f"EP={int(cand_params['l_ep'])}, CP={int(cand_params['l_cp'])}, 動的SL={dyn_sl_disp:.2%}"
                     s_pnl = cand_params.get('single_pnl', cand_pnl)
@@ -1911,18 +1915,21 @@ async def _async_post_exit_reporting(
     """決済完了後のトレード記録・チャート生成・Discord画像送信をメインループから隔離して完全非同期実行する"""
     try:
         from real_trade_tracker import record_real_trade, plot_real_trading_performance, plot_exit_chart
-        record_real_trade(sym, side, "CLOSE", reported_exit_px, close_qty, pnl, f"実運用決済 ({exit_reason})")
-        discord.print_log(f"[{sym}] [CLOSE] 🟢 ロングポジション決済完了 [{interval_label}足] (PnL: {pnl:+.2f} USDT, 理由: {exit_reason})")
+        side_upper = str(side).upper()
+        side_icon = "🟢" if side_upper == "LONG" else "🔴"
+        side_label_ja = "ロング" if side_upper == "LONG" else "ショート"
+        record_real_trade(sym, side_upper, "CLOSE", reported_exit_px, close_qty, pnl, f"実運用決済 ({exit_reason})")
+        discord.print_log(f"[{sym}] [CLOSE] {side_icon} {side_label_ja}ポジション決済完了 [{interval_label}足] (PnL: {pnl:+.2f} USDT, 理由: {exit_reason})")
 
         # 1. 決済トレードチャート画像の生成 & 送信
         exit_chart_file = await asyncio.to_thread(
             plot_exit_chart,
             symbol=sym, df=df_chart, exit_price=reported_exit_px, entry_price=entry_px,
-            pnl=pnl, exit_reason=exit_reason, side=side, whale_signal=whale_sig,
+            pnl=pnl, exit_reason=exit_reason, side=side_upper, whale_signal=whale_sig,
             interval_label=interval_label
         )
         if exit_chart_file and Path(exit_chart_file).exists():
-            discord.send_file(exit_chart_file, f"📊 【決済チャート】{sym} LONG 決済完了 [{interval_label}足] (PnL: {pnl:+.2f} USDT)")
+            discord.send_file(exit_chart_file, f"📊 【決済チャート】{sym} {side_upper} 決済完了 [{interval_label}足] (PnL: {pnl:+.2f} USDT)")
 
         # 2. スライディング10日間 累積 PnL パフォーマンスチャート (Clean版 & Detail版 2枚)
         clean_file, detail_file = await asyncio.to_thread(plot_real_trading_performance, 10, cycle_balance)
