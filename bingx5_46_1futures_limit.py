@@ -1655,7 +1655,7 @@ async def run_screening_and_optimization(mode: str, send_charts: bool = False, s
 
     # 選定銘柄の個別最適化パラメータをDiscordログ表示
     if selected_symbols:
-        side_strat_label = "ショート4大基本戦略 (VAH_POC / RSIMA_SHORT)" if actual_side == "short" else "ロング4大基本戦略 (VAL_POC / RSIMA)"
+        side_strat_label = "ショート4大基本戦略 (VAH_POC / RSIMA_SHORT)" if trade_side == "short" else "ロング4大基本戦略 (VAL_POC / RSIMA)"
         discord.print_log(f"\n★ 【合格銘柄 個別最適化パラメータ一覧 ({side_strat_label} 144通り検証)】")
         for sym in selected_symbols:
             p = symbol_params_map.get(sym, default_best_params)
@@ -1665,7 +1665,7 @@ async def run_screening_and_optimization(mode: str, send_charts: bool = False, s
             dd_val = p.get('max_dd', 0.0)
             strat = p.get('strategy', 'rsima').upper()
             inv_val = int(p.get('interval', 5))
-            is_short_strat = ("SHORT" in strat or "VAH" in strat or actual_side == "short")
+            is_short_strat = ("SHORT" in strat or "VAH" in strat or trade_side == "short")
             max_trades_label = "単発1本固定/ナンピンなし" if is_short_strat else f"最大{MAX_TRADES_COUNT}枠/1x均等"
             
             if strat.startswith("VAH_POC") or strat in ("VAL_POC", "VP_VAL_GC"):
@@ -1676,7 +1676,7 @@ async def run_screening_and_optimization(mode: str, send_charts: bool = False, s
                 if is_short_strat:
                     param_str = f"{inv_val}m / MP={mp_v}, Bins={bins_v}, VA={va_v}%, {ma_v} ➔ 単発固定 ➔ VA50%利確"
                 else:
-                    param_str = f"{inv_val}m / MP={mp_v}, Bins={bins_v}, VA={va_v}%, {ma_v} ➔ VA60%間隔ナンピン(最大2回/計3枠) ➔ VA60%利確"
+                    param_str = f"{inv_val}m / MP={mp_v}, Bins={bins_v}, VA={va_v}%, {ma_v} ➔ VA50%間隔ナンピン(最大2回/計3枠) ➔ VA50%利確"
             else:
                 ep_v = int(float(p.get('s_ep' if is_short_strat else 'l_ep', 60 if is_short_strat else 40)))
                 cp_v = int(float(p.get('s_cp' if is_short_strat else 'l_cp', 40 if is_short_strat else 60)))
@@ -1684,7 +1684,7 @@ async def run_screening_and_optimization(mode: str, send_charts: bool = False, s
                 if is_short_strat:
                     param_str = f"{inv_val}m / RSI=9, EMA=7, EP={ep_v}, CP={cp_v}, 動的SL={sl_v:.1f}% ➔ 単発固定 ➔ RSI冷却利確"
                 else:
-                    param_str = f"{inv_val}m / RSI=9, EMA=7, EP={ep_v}, CP={cp_v}, SL={sl_v:.1f}% ➔ VA60%間隔ナンピン(最大2回/計3枠)"
+                    param_str = f"{inv_val}m / RSI=9, EMA=7, EP={ep_v}, CP={cp_v}, SL={sl_v:.1f}% ➔ VA50%間隔ナンピン(最大2回/計3枠)"
 
             discord.print_log(
                 f"   📌 [{sym}] 戦略={strat} ({max_trades_label}) | {param_str} | "
