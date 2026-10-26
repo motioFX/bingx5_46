@@ -24,6 +24,7 @@ import download_historical_candles as bitbank_pipeline
 import download_binance_candles as binance_pipeline
 import download_hyperliquid_candles as hyperliquid_pipeline
 import download_bingx_candles as bingx_pipeline
+import download_crypto21_5m_history as crypto21_pipeline
 
 if hasattr(sys.stdout, "reconfigure"):
     try:
@@ -52,7 +53,7 @@ async def run_all_exchanges_pipeline(
     days_1d: int = 1460,
     days_1h: int = 1460,
     days_15m: int = 180,
-    days_5m: int = 90,
+    days_5m: int = 60,
     days_1m: int = 30,
     intervals: Optional[Sequence[str]] = None,
     exchanges: Optional[Sequence[str]] = None,
@@ -168,8 +169,26 @@ async def run_all_exchanges_pipeline(
         except Exception as e:
             log(f"⚠️ [BingX パイプライン エラー]: {e}")
         gc.collect()
+        await asyncio.sleep(2.0)
     else:
         log("⏭️ [BingX] 対象外のためスキップします。")
+
+    # 5. BingX クリプト主要21銘柄 5分足データセット (2ヶ月分蓄積 ＆ 一括ZIP配信)
+    if "bingx" in target_exchanges or "crypto21" in target_exchanges:
+        log("\n" + "#" * 25 + " BingX Crypto Top 21 (5m) " + "#" * 25)
+        try:
+            await crypto21_pipeline.run_crypto21_5m_pipeline(
+                days=days_5m,
+                retention_days=75,
+                force=force,
+                force_upload=force_upload,
+                skip_upload=skip_upload,
+                incremental_hours=incremental_hours,
+                webhook_name="real1_bitbank"
+            )
+        except Exception as e:
+            log(f"⚠️ [BingX Crypto Top 21 パイプライン エラー]: {e}")
+        gc.collect()
 
     elapsed_min = (time.time() - start_time) / 60.0
     log("\n" + "=" * 80)
@@ -182,11 +201,11 @@ if __name__ == "__main__":
     parser.add_argument("--days-1d", type=int, default=1460, help="日足取得期間（日）")
     parser.add_argument("--days-1h", type=int, default=1460, help="1時間足取得期間（日）")
     parser.add_argument("--days-15m", type=int, default=180, help="15分足取得期間（日）")
-    parser.add_argument("--days-5m", type=int, default=90, help="5分足取得期間（日）")
+    parser.add_argument("--days-5m", type=int, default=60, help="5分足取得期間（日、デフォルト60日＝2ヶ月分）")
     parser.add_argument("--days-1m", type=int, default=30, help="1分足取得期間（日）")
     parser.add_argument("--intervals", nargs="+", default=["1d", "1h", "15m", "5m"], help="実行する足種 (デフォルト: 1d 1h 15m 5m)")
     parser.add_argument("--exchanges", nargs="+", default=["hyperliquid", "bingx"], help="実行する取引所 (デフォルト: hyperliquid bingx)")
-    parser.add_argument("--bingx-categories", nargs="+", default=None, help="BingX対象カテゴリー (crypto, indices_commodities, forex, stocks)")
+    parser.add_argument("--bingx-categories", nargs="+", default=None, help="BingX対象カテゴリー (crypto_top21, crypto, indices_commodities, forex, stocks)")
     parser.add_argument("--force", action="store_true", help="既存キャッシュを無視して全件再取得")
     parser.add_argument("--force-upload", action="store_true", help="ハッシュを無視して強制アップロード")
     parser.add_argument("--skip-upload", action="store_true", help="Discordアップロードをスキップ")

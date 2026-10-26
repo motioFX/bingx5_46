@@ -38,6 +38,8 @@
   - 47 JPY pairs × 120 days -> Part 1 (past 60d) & Part 2 (recent 60d) ZIPs uploaded to Discord.
 - **Binance Japan 27 Symbols Sync (`download_binance_candles.py`)**:
   - 27 JPY spot pairs × 120 days -> Part 1 (past 60d) & Part 2 (recent 60d) ZIPs uploaded to Discord.
+- **BingX Crypto Top 21 Symbols 5m Sync (download_crypto21_5m_history.py)**:
+  - 21 selected crypto USDT pairs × 5m candles -> 2-month (60d) accumulation dataset -> Part 1 (past 30d) & Part 2 (recent 30d) or single consolidated (~5MB) ZIP uploaded to Discord.
 - **Rate Limit & CPU Safety Guard**:
   - サーバー負荷およびVPSのCPUクレジット消費を徹底抑制するため、各銘柄間に `0.3秒`、ページネーション間に `0.05秒` のウェイトを挿入し、逐次（シングルスレッド）かつ低負荷ZIP圧縮で丁寧に取得する。
 

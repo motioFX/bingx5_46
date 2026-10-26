@@ -77,6 +77,10 @@ def log(message: str) -> None:
 
 
 CATEGORY_METADATA = {
+    "crypto_top21": {
+        "label": "🪙 クリプト主要21銘柄",
+        "file_tag": "crypto_top21",
+    },
     "crypto": {
         "label": "🪙 クリプト",
         "file_tag": "crypto",
@@ -95,6 +99,40 @@ CATEGORY_METADATA = {
     },
 }
 
+# ユーザー指定 クリプト主要21銘柄リスト
+CRYPTO_21_SYMBOLS: List[str] = [
+    "HYPE-USDT",
+    "SOL-USDT",
+    "DOGE-USDT",
+    "XRP-USDT",
+    "SUI-USDT",
+    "AVAX-USDT",
+    "LINK-USDT",
+    "APT-USDT",
+    "NEAR-USDT",
+    "ARB-USDT",
+    "UNI-USDT",
+    "OP-USDT",
+    "TIA-USDT",
+    "RENDER-USDT",
+    "INJ-USDT",
+    "FET-USDT",
+    "TAO-USDT",
+    "AAVE-USDT",
+    "ENA-USDT",
+    "ZEC-USDT",
+    "BTC-USDT"
+]
+
+# BingX API仕様に基づく足種別最大遡及可能日数（安全マージン込み）
+BINGX_API_MAX_DAYS: Dict[str, int] = {
+    "1m": 365,
+    "5m": 44,    # 45日以上過去はAPIが空配列を返すため安全に44日にクランプ
+    "15m": 90,
+    "1h": 730,
+    "1d": 1460,
+}
+
 
 def get_symbol_category(symbol: str) -> str:
     """銘柄コードからカテゴリーを判定 (crypto, indices_commodities, forex, stocks)"""
@@ -110,9 +148,10 @@ def get_symbol_category(symbol: str) -> str:
 
 
 def fetch_bingx_symbols_by_category() -> Dict[str, List[str]]:
-    """BingX の全1,200+銘柄を4大カテゴリー別に分類して取得"""
+    """BingX の全1,200+銘柄を各カテゴリー別に分類して取得（クリプト主要21銘柄を含む）"""
     url = f"{BINGX_API_URL}/openApi/swap/v2/quote/contracts"
     categorized: Dict[str, List[str]] = {
+        "crypto_top21": list(CRYPTO_21_SYMBOLS),
         "crypto": [],
         "indices_commodities": [],
         "forex": [],
@@ -135,6 +174,7 @@ def fetch_bingx_symbols_by_category() -> Dict[str, List[str]]:
         log(f"[BingX API Error] 銘柄一覧取得失敗: {e}")
 
     return {
+        "crypto_top21": list(CRYPTO_21_SYMBOLS),
         "crypto": [
             "BTC-USDT", "ETH-USDT", "SOL-USDT", "NEAR-USDT", "ARB-USDT",
             "DOGE-USDT", "BNB-USDT", "XRP-USDT", "SUI-USDT", "AVAX-USDT", "LINK-USDT"
@@ -152,7 +192,7 @@ def fetch_symbol_klines_bingx(
     end_ms: int,
     limit: int = 1000
 ) -> List[Dict[str, Any]]:
-    """BingX の klines を安全に取得（無限ループ防止ガード付き）"""
+    """BingX の klines を安全に取得（無限ループ防止ガード＆過去境界ガード付き）"""
     url = f"{BINGX_API_URL}/openApi/swap/v2/quote/klines"
     all_data = []
     curr_start = start_ms
@@ -166,12 +206,19 @@ def fetch_symbol_klines_bingx(
     }
     int_ms = interval_ms_map.get(interval, 60 * 1000)
 
+    # API境界ガード: 過去過ぎて空配列が返るのを防止
+    max_days = BINGX_API_MAX_DAYS.get(interval, 365)
+    earliest_safe_ms = end_ms - (max_days * 24 * 60 * 60 * 1000)
+    if curr_start < earliest_safe_ms:
+        curr_start = earliest_safe_ms
+
     while curr_start < end_ms:
+        # 注意: BingX API は endTime を指定すると endTime から逆算した直前 limit 件を返してしまうため、
+        # 過去から未来へ正しくページネーションするには startTime のみを指定する
         params = {
             "symbol": symbol,
             "interval": interval,
             "startTime": str(curr_start),
-            "endTime": str(end_ms),
             "limit": str(limit),
         }
         res_items = None
@@ -194,6 +241,10 @@ def fetch_symbol_klines_bingx(
                 time.sleep(1.0 * (attempt + 1))
 
         if not res_items:
+            # もし初回で空配列だった場合、さらに直近側にクランプして1回だけ再試行
+            if not all_data and curr_start < end_ms - (7 * 24 * 60 * 60 * 1000):
+                curr_start = end_ms - (7 * 24 * 60 * 60 * 1000)
+                continue
             break
 
         all_data.extend(res_items)
@@ -214,27 +265,39 @@ def download_symbol_candles_bingx(
     days: int,
     candles_dir: Path,
     force: bool = False,
-    incremental_hours: int = 8
+    incremental_hours: int = 8,
+    retention_days: int = 75
 ) -> pd.DataFrame:
-    """差分キャッシュを考慮して指定銘柄・時間足のデータを取得・保存"""
+    """差分キャッシュを考慮して指定銘柄・時間足のデータを取得・保存（2ヶ月分蓄積保持対応）"""
     safe_sym_name = symbol.replace("-", "_").replace("/", "_")
     csv_path = candles_dir / f"{safe_sym_name}_{interval}.csv"
     now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
     target_start_ms = now_ms - (days * 24 * 60 * 60 * 1000)
 
-    start_ms = target_start_ms
+    max_days = BINGX_API_MAX_DAYS.get(interval, 365)
+    api_safe_start_ms = now_ms - (max_days * 24 * 60 * 60 * 1000)
+    ideal_start_ms = max(target_start_ms, api_safe_start_ms)
+
     old_df = pd.DataFrame()
+    start_ms = ideal_start_ms
 
     if not force and csv_path.exists():
         try:
             old_df = pd.read_csv(csv_path)
-            old_df["timestamp"] = pd.to_datetime(old_df["timestamp"])
+            old_df["timestamp"] = pd.to_datetime(old_df["timestamp"]).dt.tz_localize(None)
             if not old_df.empty:
                 max_ts = old_df["timestamp"].max()
+                min_ts = old_df["timestamp"].min()
                 latest_ms = int(max_ts.replace(tzinfo=timezone.utc).timestamp() * 1000)
-                start_ms = max(target_start_ms, latest_ms + 1)
-                if incremental_hours > 0:
-                    start_ms = max(start_ms, now_ms - (incremental_hours + 1) * 3600 * 1000)
+                earliest_ms = int(min_ts.replace(tzinfo=timezone.utc).timestamp() * 1000)
+
+                # 過去データが不足している場合はAPI提供限界から補完取得、十分ある場合は最新差分のみ追記
+                if earliest_ms > ideal_start_ms + (24 * 3600 * 1000):
+                    start_ms = ideal_start_ms
+                else:
+                    start_ms = latest_ms + 1
+                    if incremental_hours > 0:
+                        start_ms = max(start_ms, now_ms - (incremental_hours + 1) * 3600 * 1000)
         except Exception:
             old_df = pd.DataFrame()
 
@@ -267,6 +330,11 @@ def download_symbol_candles_bingx(
     else:
         merged_df = pd.DataFrame()
 
+    # 蓄積保持期間（retention_days: デフォルト75日＝約2.5ヶ月分）による安全トリミング
+    if not merged_df.empty and retention_days > 0:
+        cutoff_date = pd.to_datetime(now_ms, unit="ms") - pd.Timedelta(days=retention_days)
+        merged_df = merged_df[merged_df["timestamp"] >= cutoff_date].reset_index(drop=True)
+
     if not merged_df.empty:
         merged_df.to_csv(csv_path, index=False, encoding="utf-8")
 
@@ -278,7 +346,7 @@ async def run_pipeline(
     days_1d: int = 1460,    # 4年分
     days_1h: int = 1460,    # 4年分
     days_15m: int = 180,    # 180日分
-    days_5m: int = 90,      # 90日分
+    days_5m: int = 60,      # 2ヶ月分（60日分蓄積）
     days_1m: int = 30,      # 30日分
     intervals: Optional[Sequence[str]] = None,
     categories: Optional[Sequence[str]] = None,
@@ -295,11 +363,11 @@ async def run_pipeline(
     now_jst = datetime.now(JST).strftime("%Y%m%d_%H%M%S")
     target_intervals = list(intervals) if intervals else ["1d", "1h", "15m", "5m"]
 
-    default_cat_order = ["crypto", "indices_commodities", "forex", "stocks"]
+    default_cat_order = ["crypto_top21", "crypto", "indices_commodities", "forex", "stocks"]
     target_categories = [c.lower() for c in categories] if categories else default_cat_order
 
     log("=" * 75)
-    log("🚀 [BingX] 4大カテゴリー別マルチ時間足データ収集＆時間分割配信パイプライン開始")
+    log("🚀 [BingX] カテゴリー別マルチ時間足データ収集＆時間分割配信パイプライン開始")
     log(f"   対象カテゴリー: {target_categories}")
     log(f"   対象足種: {target_intervals} | 実行日時タグ: {now_jst}")
     log("=" * 75)
@@ -357,6 +425,10 @@ async def run_pipeline(
                 cat_csv = data_dir / f"bingx_{cat_tag}_all_symbols_merged.csv"
                 master_df.to_csv(cat_csv, index=False, encoding="utf-8")
                 log(f"📄 [BingX] [{cat_label}] 1H 統合マスターCSVを更新しました: {cat_csv.name} ({len(master_df):,} 行)")
+            elif interval == "5m" and cat == "crypto_top21":
+                top21_csv = data_dir / "bingx_crypto21_5m_merged.csv"
+                master_df.to_csv(top21_csv, index=False, encoding="utf-8")
+                log(f"📄 [BingX] [{cat_label}] 5M 2ヶ月分統合マスターCSVを更新しました: {top21_csv.name} ({len(master_df):,} 行)")
 
             # 3. カテゴリー別 ZIP アーカイブ生成 (直近8時間差分を足し合わせた全期間データを時間分割ZIP)
             exchange_slug = f"bingx_{cat_tag}"
@@ -366,7 +438,7 @@ async def run_pipeline(
                 interval=interval,
                 out_dir=data_dir,
                 timestamp_tag=now_jst,
-                max_part_rows=400_000,
+                max_part_rows=600_000,
                 min_parts=1
             )
 
@@ -395,18 +467,18 @@ async def run_pipeline(
     log("\n🧹 不要な古いZIPファイルの自動クリーンアップを実行中...")
     cleanup_expired_archives(data_dir=data_dir, patterns=("bingx_*.zip",), max_age_hours=24.0)
 
-    log("\n🎉 [BingX] 全4大カテゴリー・マルチ時間足データ収集＆時間分割配信パイプラインがすべて完了しました！")
+    log("\n🎉 [BingX] 全カテゴリー・マルチ時間足データ収集＆時間分割配信パイプラインがすべて完了しました！")
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="BingX 4大カテゴリー別 全銘柄マルチ時間足データ収集パイプライン")
+    parser = argparse.ArgumentParser(description="BingX 各カテゴリー別 全銘柄マルチ時間足データ収集パイプライン")
     parser.add_argument("--days-1d", type=int, default=1460, help="日足取得期間（日）")
     parser.add_argument("--days-1h", type=int, default=1460, help="1時間足取得期間（日）")
     parser.add_argument("--days-15m", type=int, default=180, help="15分足取得期間（日）")
-    parser.add_argument("--days-5m", type=int, default=90, help="5分足取得期間（日）")
+    parser.add_argument("--days-5m", type=int, default=60, help="5分足取得期間（日、デフォルト60日＝2ヶ月分）")
     parser.add_argument("--days-1m", type=int, default=30, help="1分足取得期間（日）")
     parser.add_argument("--intervals", nargs="+", default=["1d", "1h", "15m", "5m"], help="実行する足種 (デフォルト: 1d 1h 15m 5m)")
-    parser.add_argument("--categories", nargs="+", default=["crypto", "indices_commodities", "forex", "stocks"], help="対象カテゴリー (crypto, indices_commodities, forex, stocks)")
+    parser.add_argument("--categories", nargs="+", default=["crypto_top21", "crypto", "indices_commodities", "forex", "stocks"], help="対象カテゴリー (crypto_top21, crypto, indices_commodities, forex, stocks)")
     parser.add_argument("--force", action="store_true", help="既存キャッシュを無視して全件再取得")
     parser.add_argument("--force-upload", action="store_true", help="ハッシュを無視して強制アップロード")
     parser.add_argument("--skip-upload", action="store_true", help="Discordアップロードをスキップ")

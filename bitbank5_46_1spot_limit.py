@@ -1207,7 +1207,7 @@ async def sync_historical_and_charts(
                 days_1d=1460,
                 days_1h=1460,
                 days_15m=180,
-                days_5m=90,
+                days_5m=60,
                 days_1m=30,
                 intervals=target_intervals,
                 exchanges=["hyperliquid", "bingx"],

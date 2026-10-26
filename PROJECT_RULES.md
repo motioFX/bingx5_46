@@ -4,21 +4,30 @@
 
 ### 【規約】全取引所・全時間足データ取得 ＆ 8時間に1回Discord送信（4取引所対応）
 * **対象スクリプト**: 
-  - 統合オーケストレーター: `master_data_collector.py`
-  - Bitbank: `download_historical_candles.py`
-  - Binance Japan: `download_binance_candles.py`
-  - Hyperliquid: `download_hyperliquid_candles.py`
-  - BingX: `download_bingx_candles.py`
+  - 統合オーケストレーター: master_data_collector.py
+  - Bitbank: download_historical_candles.py
+  - Binance Japan: download_binance_candles.py
+  - Hyperliquid: download_hyperliquid_candles.py
+  - BingX: download_bingx_candles.py
+  - クリプト主要21銘柄5分足データセット: download_crypto21_5m_history.py
 * **対象取引所 ＆ 銘柄規模**:
-  1. **Bitbank**: 現物 JPY 全47銘柄（`btc_jpy`, `eth_jpy`, `xrp_jpy`, `sol_jpy`, `render_jpy` ... 全ペア）
-  2. **Binance Japan**: 現物 JPY 全27銘柄（`ADAJPY`, `BTCJPY`, `ETHJPY`, `NEARJPY`, `SOLJPY` ... 全現物JPYペア）
+  1. **Bitbank**: 現物 JPY 全47銘柄（tc_jpy, eth_jpy, xrp_jpy, sol_jpy, 
+ender_jpy ... 全ペア）
+  2. **Binance Japan**: 現物 JPY 全27銘柄（ADAJPY, BTCJPY, ETHJPY, NEARJPY, SOLJPY ... 全現物JPYペア）
   3. **Hyperliquid**: PERP 全230+銘柄（主要全無期限先物ペア）
   4. **BingX**: USDT無期限先物 全1,100+銘柄（FX除外の暗号資産・コモディティ全ペア）
-* **対応時間足 ＆ 取得期間**:
+  5. **BingX クリプト主要21銘柄データセット (crypto_top21)**:
+     - 全銘柄（crypto）とは完全に独立した厳選データセット
+     - 対象銘柄: HYPE-USDT, SOL-USDT, DOGE-USDT, XRP-USDT, SUI-USDT, AVAX-USDT, LINK-USDT, APT-USDT, NEAR-USDT, ARB-USDT, UNI-USDT, OP-USDT, TIA-USDT, RENDER-USDT, INJ-USDT, FET-USDT, TAO-USDT, AAVE-USDT, ENA-USDT, ZEC-USDT, BTC-USDT (計21銘柄)
+* **対応時間足 ＆ 取得・蓄積期間**:
   - **1d (日足)**: 過去4年分 (設立・メインネット以降全期間、差分キャッシュ更新)
   - **1h (1時間足)**: 過去4年分 (Bitbank丸4年 / Binance Japan全期間 / Hyperliquid約3年半 / BingX直近、差分キャッシュ更新)
   - **15m (15分足)**: 直近180日分 (約半年間、差分キャッシュ更新)
-  - **5m (5分足)**: 直近90日分 (約3ヶ月間、差分キャッシュ更新)
+  - **5m (5分足 - クリプト主要21銘柄ヒストリー蓄積)**:
+    - **2ヶ月分（60日分）蓄積運用**: 初回はBingX API上限（約44日分）から取得を開始し、定期実行（毎時/8時間スロット）により最新差分をアペンド蓄積。
+    - **データセット生成**: 21銘柄包含マスターグリッド（欠損NaN補完）を構築し、全期間一括 1本（単一ZIPアーカイブ、約5.2MB / Discord 25MB制限内に安全収容）およびマスターCSV（Data/bingx_crypto21_5m_merged.csv）を出力・Discord配信。
+    - **キャッシュ保持規約**: キャッシュファイル（Data/historical_candles_bingx/{symbol}_5m.csv）は75日（約2.5ヶ月分）を上限として安全にトリミングし、常に直近2ヶ月分（60日分）のヒストリーを欠落なく保持。
+  - **5m (5分足 - 一般全銘柄)**: 直近90日分 (約3ヶ月間、差分キャッシュ更新)
   - **1m (1分足)**: 直近30日分 (約1ヶ月間、差分キャッシュ更新)
 * **【8時間に1回 厳格送信規約】(8H Sync Guard)**:
   - **全収集データ（4取引所ZIPアーカイブ ＆ ノーマライズ比較チャート）のDiscord送信は、厳格に「8時間に1回（定期選定時刻: 01:06, 09:06, 17:06 JST）」のみ実施する**。
