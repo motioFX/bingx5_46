@@ -1626,8 +1626,9 @@ def simulate_val_poc_fast(
     max_trades: int = 3,
     nanpin_drop_pct: float = 0.030,
     sl_pct: float = 0.025,
-    target_ratio: float = 0.50,
+    target_ratio: float = 0.70,
     cooldown_bars: int = 96,
+    timeout_bars: int = 48,
     fee_rate: float = 0.0006,
     maker_fee: float = 0.0002,
     record_chart: bool = False
@@ -1687,11 +1688,11 @@ def simulate_val_poc_fast(
             va_spacing = va_diff * target_ratio if va_diff > 0 else (last_entry * nanpin_drop_pct)
             drop_dist = max(last_entry * 0.010, va_spacing) if last_entry > 0 else 0.0
 
-            # 損切り: 動的ストップ (sl_pct) または 4時間タイムアウト (48本経過で含み損)
+            # 損切り: 動的ストップ (sl_pct) または 4時間タイムアウト (timeout_bars本経過で含み損)
             is_sl = False
             if sl_pct > 0 and c <= avg_price * (1.0 - sl_pct):
                 is_sl = True
-            elif entry_bar_idx > 0 and (i - entry_bar_idx) >= 48 and c < avg_price:
+            elif entry_bar_idx > 0 and (i - entry_bar_idx) >= timeout_bars and c < avg_price:
                 is_sl = True
 
             if is_sl:
@@ -1710,11 +1711,11 @@ def simulate_val_poc_fast(
                 entry_bar_idx = -1
                 cooldown_until = i + cooldown_bars
             else:
-                # 利確 (VAL-VAH 60%水準 到達かつ建値プラス域)
+                # 利確 (VAL-VAH 70%水準 到達かつ建値+0.40%以上利益)
                 target_tp = val + va_spacing if va_spacing > 0 else pocs[i]
                 if (h >= target_tp or c >= target_tp) and target_tp > 0:
                     exit_px = max(c, target_tp) if h >= target_tp else c
-                    if exit_px > avg_price * (1.0 + fee_rate):
+                    if exit_px >= avg_price * 1.0040:
                         sell_val = pos_qty * exit_px
                         fee = sell_val * fee_rate
                         pnl = sell_val - pos_cost - fee
@@ -1788,8 +1789,9 @@ def simulate_vah_poc_fast(
     max_trades: int = 1,
     nanpin_drop_pct: float = 0.030,
     sl_pct: float = 0.025,
-    target_ratio: float = 0.50,
+    target_ratio: float = 0.70,
     cooldown_bars: int = 96,
+    timeout_bars: int = 48,
     fee_rate: float = 0.0006,
     maker_fee: float = 0.0002,
     record_chart: bool = False
@@ -1845,11 +1847,11 @@ def simulate_vah_poc_fast(
             va_diff = (vah - val) if (not np.isnan(val) and not np.isnan(vah) and vah > val) else 0.0
             va_spacing = va_diff * target_ratio if va_diff > 0 else (avg_price * nanpin_drop_pct)
 
-            # 損切り: 動的ストップ (sl_pct 逆行上昇) または 4時間タイムアウト (48本経過で含み損=価格上昇)
+            # 損切り: 動的ストップ (sl_pct 逆行上昇) または 4時間タイムアウト (timeout_bars本経過で含み損=価格上昇)
             is_sl = False
             if sl_pct > 0 and c >= avg_price * (1.0 + sl_pct):
                 is_sl = True
-            elif entry_bar_idx > 0 and (i - entry_bar_idx) >= 48 and c > avg_price:
+            elif entry_bar_idx > 0 and (i - entry_bar_idx) >= timeout_bars and c > avg_price:
                 is_sl = True
 
             if is_sl:
@@ -1868,11 +1870,11 @@ def simulate_vah_poc_fast(
                 entry_bar_idx = -1
                 cooldown_until = i + cooldown_bars
             else:
-                # ショート利確 (VAH - (VAH-VAL)*50%水準 到達かつ建値利益圏)
+                # ショート利確 (VAH - (VAH-VAL)*70%水準 到達かつ建値-0.40%以下利益)
                 target_tp = vah - va_spacing if va_spacing > 0 else pocs[i]
                 if (l <= target_tp or c <= target_tp) and target_tp > 0:
                     exit_px = min(c, target_tp) if l <= target_tp else c
-                    if exit_px < avg_price * (1.0 - fee_rate):
+                    if exit_px <= avg_price * 0.9960:
                         buy_val = pos_qty * exit_px
                         fee = buy_val * fee_rate
                         entry_fee = pos_cost * maker_fee
@@ -1949,7 +1951,9 @@ def optimize_rsima3_fast(
     val_arr: Optional[np.ndarray] = None,
     vah_arr: Optional[np.ndarray] = None,
     default_sl_pct: float = 0.025,
-    ma_filter: Optional[np.ndarray] = None
+    ma_filter: Optional[np.ndarray] = None,
+    timeout_bars: int = 48,
+    cooldown_bars: int = 288
 ) -> Dict[str, Any]:
     """RSIMA 9通り (EP 30,35,40 × CP 60,65,70, 動的ストップ・4時間タイムアウト) 超高速最適化 (MIN_TRADES=10)"""
     n = len(closes)
@@ -2034,7 +2038,7 @@ def optimize_rsima3_fast(
                     is_sl = False
                     if default_sl_pct > 0 and c <= avg_px * (1.0 - default_sl_pct):
                         is_sl = True
-                    elif entry_bar_idx > 0 and (i - entry_bar_idx) >= 48 and c < avg_px:
+                    elif entry_bar_idx > 0 and (i - entry_bar_idx) >= timeout_bars and c < avg_px:
                         is_sl = True
 
                     if is_sl:
@@ -2051,7 +2055,7 @@ def optimize_rsima3_fast(
                         last_entry_px = 0.0
                         pos_cnt = 0
                         entry_bar_idx = -1
-                        cooldown_until = i + 288
+                        cooldown_until = i + cooldown_bars
                         cur_eq = initial_equity + cum_pnl
                         if cur_eq > peak_eq:
                             peak_eq = cur_eq
@@ -2129,7 +2133,9 @@ def optimize_rsima3_short_fast(
     val_arr: Optional[np.ndarray] = None,
     vah_arr: Optional[np.ndarray] = None,
     default_sl_pct: float = 0.025,
-    ma_filter: Optional[np.ndarray] = None
+    ma_filter: Optional[np.ndarray] = None,
+    timeout_bars: int = 48,
+    cooldown_bars: int = 288
 ) -> Dict[str, Any]:
     """RSIMA ショート 9通り (EP 60,65,70 × CP 30,35,40, 単発1本固定・動的ストップ・4時間タイムアウト) 高速最適化"""
     n = len(closes)
@@ -2210,7 +2216,7 @@ def optimize_rsima3_short_fast(
                     is_sl = False
                     if default_sl_pct > 0 and c >= avg_px * (1.0 + default_sl_pct):
                         is_sl = True
-                    elif entry_bar_idx > 0 and (i - entry_bar_idx) >= 48 and c > avg_px:
+                    elif entry_bar_idx > 0 and (i - entry_bar_idx) >= timeout_bars and c > avg_px:
                         is_sl = True
 
                     if is_sl:
@@ -2227,7 +2233,7 @@ def optimize_rsima3_short_fast(
                         avg_px = 0.0
                         pos_cnt = 0
                         entry_bar_idx = -1
-                        cooldown_until = i + 288
+                        cooldown_until = i + cooldown_bars
                         cur_eq = initial_equity + cum_pnl
                         if cur_eq > peak_eq:
                             peak_eq = cur_eq
@@ -2701,7 +2707,7 @@ def _run_interval_comparison_short(df_5m: pd.DataFrame, lot: float = 1.0, data_e
     fallback_vp_none_pnl = -float('inf')
     fallback_vp_none_cfg: Dict[str, Any] = {
         'strategy': 'vah_poc', 'interval': 5, 'mp_period': 200, 'num_bins': bins_fixed, 'va': va_name_fixed,
-        'value_area_pct': va_pct_fixed, 'ma_type': 'NONE', 'condition': 'none',
+        'value_area_pct': va_pct_fixed, 'target_ratio': 0.70, 'ma_type': 'NONE', 'condition': 'none',
         'pnl': 0.0, 'trade_count': 0, 'win_rate': 0.0, 'DD_max': 0.0
     }
 
@@ -2711,7 +2717,7 @@ def _run_interval_comparison_short(df_5m: pd.DataFrame, lot: float = 1.0, data_e
     fallback_vp_ema_pnl = -float('inf')
     fallback_vp_ema_cfg: Dict[str, Any] = {
         'strategy': 'vah_poc_ema', 'interval': 5, 'mp_period': 200, 'num_bins': bins_fixed, 'va': va_name_fixed,
-        'value_area_pct': va_pct_fixed, 'ma_type': 'EMA', 'condition': 'close_below',
+        'value_area_pct': va_pct_fixed, 'target_ratio': 0.70, 'ma_type': 'EMA', 'condition': 'close_below',
         'pnl': 0.0, 'trade_count': 0, 'win_rate': 0.0, 'DD_max': 0.0
     }
 
@@ -2733,8 +2739,11 @@ def _run_interval_comparison_short(df_5m: pd.DataFrame, lot: float = 1.0, data_e
         ma_filter_ema = (c_inv <= ema200)  # ショートは close <= EMA200
         ma_filter_none = None
 
-        cd_bars = max(10, 288 // (inv // 5)) if not is_1h else 24
+        cd_bars = max(10, 1440 // inv) if not is_1h else 24
+        to_bars = max(2, 240 // inv) if not is_1h else 4
         calc_step = 8 if inv == 5 else (3 if inv == 15 else (2 if inv == 30 else 1))
+
+        target_ratios = [0.50, 0.60, 0.70, 0.80]
 
         for mp in mp_periods:
             time.sleep(0.005)
@@ -2746,61 +2755,64 @@ def _run_interval_comparison_short(df_5m: pd.DataFrame, lot: float = 1.0, data_e
             val_arr = mp_res['val_70']
             vah_arr = mp_res['vah_70']
 
-            # --- [A] VAH_POC (EMAなし) ---
-            sim_none = simulate_vah_poc_fast(
-                c_inv, h_inv, l_inv, val_arr, vah_arr, pocs, ma_filter_none,
-                initial_equity=fixed_initial_equity, max_trades=1, cooldown_bars=cd_bars
-            )
-            vp_eval_count += 1
-            lbl_none = f"VAH_POC_{inv}m_MP{mp}_B{bins_fixed}_VA{va_name_fixed}_NoEMA"
-            results[lbl_none] = {
-                'strategy_type': 'vah_poc', 'df': pd.DataFrame(), 'final_pnl': fixed_initial_equity + sim_none['final_pnl'],
-                'interval': inv, 'mp_period': mp, 'num_bins': bins_fixed, 'value_area_pct': va_pct_fixed,
-                'ma_type': 'NONE', 'ma_condition': 'none', 'atr_multi': 0.0, 'sl_center_margin': 9.0,
-                'DD_max': sim_none['DD_max'], 'win_rate': sim_none['win_rate'], 'trade_count': sim_none['trade_count'],
-                'single_pnl': sim_none['final_pnl'], 'single_trades': sim_none['trade_count'], 'single_win_rate': sim_none['win_rate']
-            }
-            cand_none = {
-                'strategy': 'vah_poc', 'interval': inv, 'mp_period': mp, 'num_bins': bins_fixed, 'va': va_name_fixed,
-                'value_area_pct': va_pct_fixed, 'ma_type': 'NONE', 'condition': 'none',
-                'pnl': sim_none['final_pnl'], 'trade_count': sim_none['trade_count'],
-                'win_rate': sim_none['win_rate'], 'DD_max': sim_none['DD_max'],
-                'single_pnl': sim_none['final_pnl'], 'single_trades': sim_none['trade_count'], 'single_win_rate': sim_none['win_rate']
-            }
-            if sim_none['trade_count'] >= MIN_TRADES and sim_none['final_pnl'] > best_vp_none_pnl:
-                best_vp_none_pnl = sim_none['final_pnl']
-                best_vp_none_cfg = cand_none
-            elif sim_none['trade_count'] >= 5 and sim_none['final_pnl'] > fallback_vp_none_pnl:
-                fallback_vp_none_pnl = sim_none['final_pnl']
-                fallback_vp_none_cfg = cand_none
+            for tr in target_ratios:
+                # --- [A] VAH_POC (EMAなし) ---
+                sim_none = simulate_vah_poc_fast(
+                    c_inv, h_inv, l_inv, val_arr, vah_arr, pocs, ma_filter_none,
+                    initial_equity=fixed_initial_equity, max_trades=1, cooldown_bars=cd_bars, timeout_bars=to_bars, target_ratio=tr
+                )
+                vp_eval_count += 1
+                lbl_none = f"VAH_POC_{inv}m_MP{mp}_B{bins_fixed}_VA{va_name_fixed}_TR{int(tr*100)}_NoEMA"
+                results[lbl_none] = {
+                    'strategy_type': 'vah_poc', 'df': pd.DataFrame(), 'final_pnl': fixed_initial_equity + sim_none['final_pnl'],
+                    'interval': inv, 'mp_period': mp, 'num_bins': bins_fixed, 'value_area_pct': va_pct_fixed,
+                    'target_ratio': tr,
+                    'ma_type': 'NONE', 'ma_condition': 'none', 'atr_multi': 0.0, 'sl_center_margin': 9.0,
+                    'DD_max': sim_none['DD_max'], 'win_rate': sim_none['win_rate'], 'trade_count': sim_none['trade_count'],
+                    'single_pnl': sim_none['final_pnl'], 'single_trades': sim_none['trade_count'], 'single_win_rate': sim_none['win_rate']
+                }
+                cand_none = {
+                    'strategy': 'vah_poc', 'interval': inv, 'mp_period': mp, 'num_bins': bins_fixed, 'va': va_name_fixed,
+                    'value_area_pct': va_pct_fixed, 'target_ratio': tr, 'ma_type': 'NONE', 'condition': 'none',
+                    'pnl': sim_none['final_pnl'], 'trade_count': sim_none['trade_count'],
+                    'win_rate': sim_none['win_rate'], 'DD_max': sim_none['DD_max'],
+                    'single_pnl': sim_none['final_pnl'], 'single_trades': sim_none['trade_count'], 'single_win_rate': sim_none['win_rate']
+                }
+                if sim_none['trade_count'] >= MIN_TRADES and sim_none['final_pnl'] > best_vp_none_pnl:
+                    best_vp_none_pnl = sim_none['final_pnl']
+                    best_vp_none_cfg = cand_none
+                elif sim_none['trade_count'] >= 5 and sim_none['final_pnl'] > fallback_vp_none_pnl:
+                    fallback_vp_none_pnl = sim_none['final_pnl']
+                    fallback_vp_none_cfg = cand_none
 
-            # --- [B] VAH_POC_EMA (EMAあり) ---
-            sim_ema = simulate_vah_poc_fast(
-                c_inv, h_inv, l_inv, val_arr, vah_arr, pocs, ma_filter_ema,
-                initial_equity=fixed_initial_equity, max_trades=1, cooldown_bars=cd_bars
-            )
-            vp_eval_count += 1
-            lbl_ema = f"VAH_POC_EMA_{inv}m_MP{mp}_B{bins_fixed}_VA{va_name_fixed}_EMA200"
-            results[lbl_ema] = {
-                'strategy_type': 'vah_poc_ema', 'df': pd.DataFrame(), 'final_pnl': fixed_initial_equity + sim_ema['final_pnl'],
-                'interval': inv, 'mp_period': mp, 'num_bins': bins_fixed, 'value_area_pct': va_pct_fixed,
-                'ma_type': 'EMA', 'ma_condition': 'close_below', 'atr_multi': 0.0, 'sl_center_margin': 9.0,
-                'DD_max': sim_ema['DD_max'], 'win_rate': sim_ema['win_rate'], 'trade_count': sim_ema['trade_count'],
-                'single_pnl': sim_ema['final_pnl'], 'single_trades': sim_ema['trade_count'], 'single_win_rate': sim_ema['win_rate']
-            }
-            cand_ema = {
-                'strategy': 'vah_poc_ema', 'interval': inv, 'mp_period': mp, 'num_bins': bins_fixed, 'va': va_name_fixed,
-                'value_area_pct': va_pct_fixed, 'ma_type': 'EMA', 'condition': 'close_below',
-                'pnl': sim_ema['final_pnl'], 'trade_count': sim_ema['trade_count'],
-                'win_rate': sim_ema['win_rate'], 'DD_max': sim_ema['DD_max'],
-                'single_pnl': sim_ema['final_pnl'], 'single_trades': sim_ema['trade_count'], 'single_win_rate': sim_ema['win_rate']
-            }
-            if sim_ema['trade_count'] >= MIN_TRADES and sim_ema['final_pnl'] > best_vp_ema_pnl:
-                best_vp_ema_pnl = sim_ema['final_pnl']
-                best_vp_ema_cfg = cand_ema
-            elif sim_ema['trade_count'] >= 5 and sim_ema['final_pnl'] > fallback_vp_ema_pnl:
-                fallback_vp_ema_pnl = sim_ema['final_pnl']
-                fallback_vp_ema_cfg = cand_ema
+                # --- [B] VAH_POC_EMA (EMAあり) ---
+                sim_ema = simulate_vah_poc_fast(
+                    c_inv, h_inv, l_inv, val_arr, vah_arr, pocs, ma_filter_ema,
+                    initial_equity=fixed_initial_equity, max_trades=1, cooldown_bars=cd_bars, timeout_bars=to_bars, target_ratio=tr
+                )
+                vp_eval_count += 1
+                lbl_ema = f"VAH_POC_EMA_{inv}m_MP{mp}_B{bins_fixed}_VA{va_name_fixed}_TR{int(tr*100)}_EMA200"
+                results[lbl_ema] = {
+                    'strategy_type': 'vah_poc_ema', 'df': pd.DataFrame(), 'final_pnl': fixed_initial_equity + sim_ema['final_pnl'],
+                    'interval': inv, 'mp_period': mp, 'num_bins': bins_fixed, 'value_area_pct': va_pct_fixed,
+                    'target_ratio': tr,
+                    'ma_type': 'EMA', 'ma_condition': 'close_below', 'atr_multi': 0.0, 'sl_center_margin': 9.0,
+                    'DD_max': sim_ema['DD_max'], 'win_rate': sim_ema['win_rate'], 'trade_count': sim_ema['trade_count'],
+                    'single_pnl': sim_ema['final_pnl'], 'single_trades': sim_ema['trade_count'], 'single_win_rate': sim_ema['win_rate']
+                }
+                cand_ema = {
+                    'strategy': 'vah_poc_ema', 'interval': inv, 'mp_period': mp, 'num_bins': bins_fixed, 'va': va_name_fixed,
+                    'value_area_pct': va_pct_fixed, 'target_ratio': tr, 'ma_type': 'EMA', 'condition': 'close_below',
+                    'pnl': sim_ema['final_pnl'], 'trade_count': sim_ema['trade_count'],
+                    'win_rate': sim_ema['win_rate'], 'DD_max': sim_ema['DD_max'],
+                    'single_pnl': sim_ema['final_pnl'], 'single_trades': sim_ema['trade_count'], 'single_win_rate': sim_ema['win_rate']
+                }
+                if sim_ema['trade_count'] >= MIN_TRADES and sim_ema['final_pnl'] > best_vp_ema_pnl:
+                    best_vp_ema_pnl = sim_ema['final_pnl']
+                    best_vp_ema_cfg = cand_ema
+                elif sim_ema['trade_count'] >= 5 and sim_ema['final_pnl'] > fallback_vp_ema_pnl:
+                    fallback_vp_ema_pnl = sim_ema['final_pnl']
+                    fallback_vp_ema_cfg = cand_ema
 
         print(f"   [{symbol}] VAH_POC系 (ショートEMAなし/あり計2種) {inv}m足 ({len(df_inv)}本) 検証完了 (累計 {vp_eval_count} パターン評価済)", flush=True)
         time.sleep(0.01)
@@ -2857,10 +2869,13 @@ def _run_interval_comparison_short(df_5m: pd.DataFrame, lot: float = 1.0, data_e
             pass
 
         # --- [A] RSIMA_SHORT (EMAなし) ---
+        cd_bars_r = max(10, 1440 // r_inv) if not is_1h else 24
+        to_bars_r = max(2, 240 // r_inv) if not is_1h else 4
         res_r_none = optimize_rsima3_short_fast(
             c_r, h_r, l_r, r_rsi.values, r_rsi_ma.values,
             initial_equity=fixed_initial_equity, max_trades=1, min_trades=MIN_TRADES,
-            val_arr=val_arr_r, vah_arr=vah_arr_r, ma_filter=ma_filter_r_none
+            val_arr=val_arr_r, vah_arr=vah_arr_r, ma_filter=ma_filter_r_none,
+            cooldown_bars=cd_bars_r, timeout_bars=to_bars_r
         )
         rsima_none_key = f"RSIMA_SHORT_{r_inv}m_EP{int(res_r_none['s_ep'])}_CP{int(res_r_none['s_cp'])}_NoEMA"
         results[rsima_none_key] = {
@@ -2883,7 +2898,8 @@ def _run_interval_comparison_short(df_5m: pd.DataFrame, lot: float = 1.0, data_e
         res_r_ema = optimize_rsima3_short_fast(
             c_r, h_r, l_r, r_rsi.values, r_rsi_ma.values,
             initial_equity=fixed_initial_equity, max_trades=1, min_trades=MIN_TRADES,
-            val_arr=val_arr_r, vah_arr=vah_arr_r, ma_filter=ma_filter_r_ema
+            val_arr=val_arr_r, vah_arr=vah_arr_r, ma_filter=ma_filter_r_ema,
+            cooldown_bars=cd_bars_r, timeout_bars=to_bars_r
         )
         rsima_ema_key = f"RSIMA_SHORT_EMA_{r_inv}m_EP{int(res_r_ema['s_ep'])}_CP{int(res_r_ema['s_cp'])}_EMA200"
         results[rsima_ema_key] = {
@@ -2931,9 +2947,11 @@ def _run_interval_comparison_short(df_5m: pd.DataFrame, lot: float = 1.0, data_e
     cnt_rse = int(best_rsi_ema_cfg['trade_count'])
     win_rse = float(best_rsi_ema_cfg['win_rate'])
 
+    tr_vpn = int(best_vp_none_cfg.get('target_ratio', 0.70) * 100)
+    tr_vpe = int(best_vp_ema_cfg.get('target_ratio', 0.70) * 100)
     discord.print_log(f"\n📊 【ショート4大基本戦略 最適化結果直接比較】 ({symbol})")
-    discord.print_log(f"🔹 [VAH_POC ({best_vp_none_cfg['interval']}m/MP{best_vp_none_cfg['mp_period']}/EMAなし)]: 純利益 = {pnl_vpn:+.2f} USDC (取引: {cnt_vpn}回, 勝率: {win_vpn:.1f}%)")
-    discord.print_log(f"🔹 [VAH_POC_EMA ({best_vp_ema_cfg['interval']}m/MP{best_vp_ema_cfg['mp_period']}/EMAあり)]: 純利益 = {pnl_vpe:+.2f} USDC (取引: {cnt_vpe}回, 勝率: {win_vpe:.1f}%)")
+    discord.print_log(f"🔹 [VAH_POC ({best_vp_none_cfg['interval']}m/MP{best_vp_none_cfg['mp_period']}/TR{tr_vpn}%/EMAなし)]: 純利益 = {pnl_vpn:+.2f} USDC (取引: {cnt_vpn}回, 勝率: {win_vpn:.1f}%)")
+    discord.print_log(f"🔹 [VAH_POC_EMA ({best_vp_ema_cfg['interval']}m/MP{best_vp_ema_cfg['mp_period']}/TR{tr_vpe}%/EMAあり)]: 純利益 = {pnl_vpe:+.2f} USDC (取引: {cnt_vpe}回, 勝率: {win_vpe:.1f}%)")
     discord.print_log(f"🔸 [RSIMA_SHORT ({best_rsi_none_cfg['interval']}m/EP{int(best_rsi_none_cfg['s_ep'])}/CP{int(best_rsi_none_cfg['s_cp'])}/EMAなし)]: 純利益 = {pnl_rsn:+.2f} USDC (取引: {cnt_rsn}回, 勝率: {win_rsn:.1f}%)")
     discord.print_log(f"🔸 [RSIMA_SHORT_EMA ({best_rsi_ema_cfg['interval']}m/EP{int(best_rsi_ema_cfg['s_ep'])}/CP{int(best_rsi_ema_cfg['s_cp'])}/EMAあり)]: 純利益 = {pnl_rse:+.2f} USDC (取引: {cnt_rse}回, 勝率: {win_rse:.1f}%)")
 
@@ -3013,10 +3031,12 @@ def _run_interval_comparison_short(df_5m: pd.DataFrame, lot: float = 1.0, data_e
         else:
             mf_b = None
 
-        cd_b = max(10, 288 // (best_interval // 5)) if not is_1h else 24
+        cd_b = max(10, 1440 // best_interval) if not is_1h else 24
+        to_b = max(2, 240 // best_interval) if not is_1h else 4
+        winner_tr = float(winner.get('target_ratio', 0.70))
         sim_b = simulate_vah_poc_fast(
             c_b, h_b, l_b, val_b, vah_b, poc_b, mf_b,
-            initial_equity=fixed_initial_equity, max_trades=1, cooldown_bars=cd_b, record_chart=True
+            initial_equity=fixed_initial_equity, max_trades=1, cooldown_bars=cd_b, timeout_bars=to_b, target_ratio=winner_tr, record_chart=True
         )
         df_chart['POC'] = pd.Series(poc_b).ffill().bfill().values
         df_chart['VAH'] = pd.Series(vah_b).ffill().bfill().values
@@ -3036,6 +3056,7 @@ def _run_interval_comparison_short(df_5m: pd.DataFrame, lot: float = 1.0, data_e
             'mp': best_mp,
             'num_bins': winner['num_bins'],
             'value_area_pct': winner['value_area_pct'],
+            'target_ratio': winner_tr,
             'ma_type': 'EMA' if use_ema_val else 'NONE',
             'ma_condition': 'close_below' if use_ema_val else 'none',
             'margin': 9.0,
@@ -3117,7 +3138,7 @@ def run_interval_comparison(df_5m: pd.DataFrame, lot: float = 1.0, data_equity: 
     fallback_vp_none_pnl = -float('inf')
     fallback_vp_none_cfg: Dict[str, Any] = {
         'strategy': 'val_poc', 'interval': 5, 'mp_period': 200, 'num_bins': bins_fixed, 'va': va_name_fixed,
-        'value_area_pct': va_pct_fixed, 'ma_type': 'NONE', 'condition': 'none',
+        'value_area_pct': va_pct_fixed, 'target_ratio': 0.70, 'ma_type': 'NONE', 'condition': 'none',
         'pnl': 0.0, 'trade_count': 0, 'win_rate': 0.0, 'DD_max': 0.0
     }
 
@@ -3127,7 +3148,7 @@ def run_interval_comparison(df_5m: pd.DataFrame, lot: float = 1.0, data_equity: 
     fallback_vp_ema_pnl = -float('inf')
     fallback_vp_ema_cfg: Dict[str, Any] = {
         'strategy': 'val_poc_ema', 'interval': 5, 'mp_period': 200, 'num_bins': bins_fixed, 'va': va_name_fixed,
-        'value_area_pct': va_pct_fixed, 'ma_type': 'EMA', 'condition': 'close_above',
+        'value_area_pct': va_pct_fixed, 'target_ratio': 0.70, 'ma_type': 'EMA', 'condition': 'close_above',
         'pnl': 0.0, 'trade_count': 0, 'win_rate': 0.0, 'DD_max': 0.0
     }
 
@@ -3149,8 +3170,11 @@ def run_interval_comparison(df_5m: pd.DataFrame, lot: float = 1.0, data_equity: 
         ma_filter_ema = (c_inv >= ema200)
         ma_filter_none = None
 
-        cd_bars = max(10, 288 // (inv // 5)) if not is_1h else 24
+        cd_bars = max(10, 1440 // inv) if not is_1h else 24
+        to_bars = max(2, 240 // inv) if not is_1h else 4
         calc_step = 8 if inv == 5 else (3 if inv == 15 else (2 if inv == 30 else 1))
+
+        target_ratios = [0.50, 0.60, 0.70, 0.80]
 
         for mp in mp_periods:
             time.sleep(0.005)  # 協調的コンテキストスイッチ: GILを解放してメインイベントループ(WebSocket KeepAlive)を保護
@@ -3163,83 +3187,86 @@ def run_interval_comparison(df_5m: pd.DataFrame, lot: float = 1.0, data_equity: 
             val_arr = mp_res['val_70']
             vah_arr = mp_res['vah_70']
 
-            # --- [A] VAL_POC (EMAなし) シミュレーション ---
-            sim_single_none = simulate_val_poc_fast(
-                c_inv, h_inv, l_inv, val_arr, vah_arr, pocs, ma_filter_none,
-                initial_equity=fixed_initial_equity, max_trades=1, cooldown_bars=cd_bars
-            )
-            vp_eval_count += 1
-            if sim_single_none['trade_count'] >= MIN_TRADES and sim_single_none['final_pnl'] > 0:
-                sim_none = simulate_val_poc_fast(
+            for tr in target_ratios:
+                # --- [A] VAL_POC (EMAなし) シミュレーション ---
+                sim_single_none = simulate_val_poc_fast(
                     c_inv, h_inv, l_inv, val_arr, vah_arr, pocs, ma_filter_none,
-                    initial_equity=fixed_initial_equity, max_trades=3, cooldown_bars=cd_bars
+                    initial_equity=fixed_initial_equity, max_trades=1, cooldown_bars=cd_bars, timeout_bars=to_bars, target_ratio=tr
                 )
-            else:
-                sim_none = sim_single_none
-            sim_none['single_pnl'] = sim_single_none['final_pnl']
-            sim_none['single_trades'] = sim_single_none['trade_count']
-            sim_none['single_win_rate'] = sim_single_none['win_rate']
+                vp_eval_count += 1
+                if sim_single_none['trade_count'] >= MIN_TRADES and sim_single_none['final_pnl'] > 0:
+                    sim_none = simulate_val_poc_fast(
+                        c_inv, h_inv, l_inv, val_arr, vah_arr, pocs, ma_filter_none,
+                        initial_equity=fixed_initial_equity, max_trades=3, cooldown_bars=cd_bars, timeout_bars=to_bars, target_ratio=tr
+                    )
+                else:
+                    sim_none = sim_single_none
+                sim_none['single_pnl'] = sim_single_none['final_pnl']
+                sim_none['single_trades'] = sim_single_none['trade_count']
+                sim_none['single_win_rate'] = sim_single_none['win_rate']
 
-            lbl_none = f"VAL_POC_{inv}m_MP{mp}_B{bins_fixed}_VA{va_name_fixed}_NoEMA"
-            results[lbl_none] = {
-                'strategy_type': 'val_poc', 'df': pd.DataFrame(), 'final_pnl': fixed_initial_equity + sim_none['final_pnl'],
-                'interval': inv, 'mp_period': mp, 'num_bins': bins_fixed, 'value_area_pct': va_pct_fixed,
-                'ma_type': 'NONE', 'ma_condition': 'none', 'atr_multi': 0.0, 'sl_center_margin': 9.0,
-                'DD_max': sim_none['DD_max'], 'win_rate': sim_none['win_rate'], 'trade_count': sim_none['trade_count'],
-                'single_pnl': sim_none['single_pnl'], 'single_trades': sim_none['single_trades'], 'single_win_rate': sim_none['single_win_rate']
-            }
-            cand_none = {
-                'strategy': 'val_poc', 'interval': inv, 'mp_period': mp, 'num_bins': bins_fixed, 'va': va_name_fixed,
-                'value_area_pct': va_pct_fixed, 'ma_type': 'NONE', 'condition': 'none',
-                'pnl': sim_none['final_pnl'], 'trade_count': sim_none['trade_count'],
-                'win_rate': sim_none['win_rate'], 'DD_max': sim_none['DD_max'],
-                'single_pnl': sim_none['single_pnl'], 'single_trades': sim_none['single_trades'], 'single_win_rate': sim_none['single_win_rate']
-            }
-            if sim_none['trade_count'] >= MIN_TRADES and sim_none['final_pnl'] > best_vp_none_pnl:
-                best_vp_none_pnl = sim_none['final_pnl']
-                best_vp_none_cfg = cand_none
-            elif sim_none['trade_count'] >= 5 and sim_none['final_pnl'] > fallback_vp_none_pnl:
-                fallback_vp_none_pnl = sim_none['final_pnl']
-                fallback_vp_none_cfg = cand_none
+                lbl_none = f"VAL_POC_{inv}m_MP{mp}_B{bins_fixed}_VA{va_name_fixed}_TR{int(tr*100)}_NoEMA"
+                results[lbl_none] = {
+                    'strategy_type': 'val_poc', 'df': pd.DataFrame(), 'final_pnl': fixed_initial_equity + sim_none['final_pnl'],
+                    'interval': inv, 'mp_period': mp, 'num_bins': bins_fixed, 'value_area_pct': va_pct_fixed,
+                    'target_ratio': tr,
+                    'ma_type': 'NONE', 'ma_condition': 'none', 'atr_multi': 0.0, 'sl_center_margin': 9.0,
+                    'DD_max': sim_none['DD_max'], 'win_rate': sim_none['win_rate'], 'trade_count': sim_none['trade_count'],
+                    'single_pnl': sim_none['single_pnl'], 'single_trades': sim_none['single_trades'], 'single_win_rate': sim_none['single_win_rate']
+                }
+                cand_none = {
+                    'strategy': 'val_poc', 'interval': inv, 'mp_period': mp, 'num_bins': bins_fixed, 'va': va_name_fixed,
+                    'value_area_pct': va_pct_fixed, 'target_ratio': tr, 'ma_type': 'NONE', 'condition': 'none',
+                    'pnl': sim_none['final_pnl'], 'trade_count': sim_none['trade_count'],
+                    'win_rate': sim_none['win_rate'], 'DD_max': sim_none['DD_max'],
+                    'single_pnl': sim_none['single_pnl'], 'single_trades': sim_none['single_trades'], 'single_win_rate': sim_none['single_win_rate']
+                }
+                if sim_none['trade_count'] >= MIN_TRADES and sim_none['final_pnl'] > best_vp_none_pnl:
+                    best_vp_none_pnl = sim_none['final_pnl']
+                    best_vp_none_cfg = cand_none
+                elif sim_none['trade_count'] >= 5 and sim_none['final_pnl'] > fallback_vp_none_pnl:
+                    fallback_vp_none_pnl = sim_none['final_pnl']
+                    fallback_vp_none_cfg = cand_none
 
-            # --- [B] VAL_POC_EMA (EMAあり) シミュレーション ---
-            sim_single_ema = simulate_val_poc_fast(
-                c_inv, h_inv, l_inv, val_arr, vah_arr, pocs, ma_filter_ema,
-                initial_equity=fixed_initial_equity, max_trades=1, cooldown_bars=cd_bars
-            )
-            vp_eval_count += 1
-            if sim_single_ema['trade_count'] >= MIN_TRADES and sim_single_ema['final_pnl'] > 0:
-                sim_ema = simulate_val_poc_fast(
+                # --- [B] VAL_POC_EMA (EMAあり) シミュレーション ---
+                sim_single_ema = simulate_val_poc_fast(
                     c_inv, h_inv, l_inv, val_arr, vah_arr, pocs, ma_filter_ema,
-                    initial_equity=fixed_initial_equity, max_trades=3, cooldown_bars=cd_bars
+                    initial_equity=fixed_initial_equity, max_trades=1, cooldown_bars=cd_bars, timeout_bars=to_bars, target_ratio=tr
                 )
-            else:
-                sim_ema = sim_single_ema
-            sim_ema['single_pnl'] = sim_single_ema['final_pnl']
-            sim_ema['single_trades'] = sim_single_ema['trade_count']
-            sim_ema['single_win_rate'] = sim_single_ema['win_rate']
+                vp_eval_count += 1
+                if sim_single_ema['trade_count'] >= MIN_TRADES and sim_single_ema['final_pnl'] > 0:
+                    sim_ema = simulate_val_poc_fast(
+                        c_inv, h_inv, l_inv, val_arr, vah_arr, pocs, ma_filter_ema,
+                        initial_equity=fixed_initial_equity, max_trades=3, cooldown_bars=cd_bars, timeout_bars=to_bars, target_ratio=tr
+                    )
+                else:
+                    sim_ema = sim_single_ema
+                sim_ema['single_pnl'] = sim_single_ema['final_pnl']
+                sim_ema['single_trades'] = sim_single_ema['trade_count']
+                sim_ema['single_win_rate'] = sim_single_ema['win_rate']
 
-            lbl_ema = f"VAL_POC_EMA_{inv}m_MP{mp}_B{bins_fixed}_VA{va_name_fixed}_EMA200"
-            results[lbl_ema] = {
-                'strategy_type': 'val_poc_ema', 'df': pd.DataFrame(), 'final_pnl': fixed_initial_equity + sim_ema['final_pnl'],
-                'interval': inv, 'mp_period': mp, 'num_bins': bins_fixed, 'value_area_pct': va_pct_fixed,
-                'ma_type': 'EMA', 'ma_condition': 'close_above', 'atr_multi': 0.0, 'sl_center_margin': 9.0,
-                'DD_max': sim_ema['DD_max'], 'win_rate': sim_ema['win_rate'], 'trade_count': sim_ema['trade_count'],
-                'single_pnl': sim_ema['single_pnl'], 'single_trades': sim_ema['single_trades'], 'single_win_rate': sim_ema['single_win_rate']
-            }
-            cand_ema = {
-                'strategy': 'val_poc_ema', 'interval': inv, 'mp_period': mp, 'num_bins': bins_fixed, 'va': va_name_fixed,
-                'value_area_pct': va_pct_fixed, 'ma_type': 'EMA', 'condition': 'close_above',
-                'pnl': sim_ema['final_pnl'], 'trade_count': sim_ema['trade_count'],
-                'win_rate': sim_ema['win_rate'], 'DD_max': sim_ema['DD_max'],
-                'single_pnl': sim_ema['single_pnl'], 'single_trades': sim_ema['single_trades'], 'single_win_rate': sim_ema['single_win_rate']
-            }
-            if sim_ema['trade_count'] >= MIN_TRADES and sim_ema['final_pnl'] > best_vp_ema_pnl:
-                best_vp_ema_pnl = sim_ema['final_pnl']
-                best_vp_ema_cfg = cand_ema
-            elif sim_ema['trade_count'] >= 5 and sim_ema['final_pnl'] > fallback_vp_ema_pnl:
-                fallback_vp_ema_pnl = sim_ema['final_pnl']
-                fallback_vp_ema_cfg = cand_ema
+                lbl_ema = f"VAL_POC_EMA_{inv}m_MP{mp}_B{bins_fixed}_VA{va_name_fixed}_TR{int(tr*100)}_EMA200"
+                results[lbl_ema] = {
+                    'strategy_type': 'val_poc_ema', 'df': pd.DataFrame(), 'final_pnl': fixed_initial_equity + sim_ema['final_pnl'],
+                    'interval': inv, 'mp_period': mp, 'num_bins': bins_fixed, 'value_area_pct': va_pct_fixed,
+                    'target_ratio': tr,
+                    'ma_type': 'EMA', 'ma_condition': 'close_above', 'atr_multi': 0.0, 'sl_center_margin': 9.0,
+                    'DD_max': sim_ema['DD_max'], 'win_rate': sim_ema['win_rate'], 'trade_count': sim_ema['trade_count'],
+                    'single_pnl': sim_ema['single_pnl'], 'single_trades': sim_ema['single_trades'], 'single_win_rate': sim_ema['single_win_rate']
+                }
+                cand_ema = {
+                    'strategy': 'val_poc_ema', 'interval': inv, 'mp_period': mp, 'num_bins': bins_fixed, 'va': va_name_fixed,
+                    'value_area_pct': va_pct_fixed, 'target_ratio': tr, 'ma_type': 'EMA', 'condition': 'close_above',
+                    'pnl': sim_ema['final_pnl'], 'trade_count': sim_ema['trade_count'],
+                    'win_rate': sim_ema['win_rate'], 'DD_max': sim_ema['DD_max'],
+                    'single_pnl': sim_ema['single_pnl'], 'single_trades': sim_ema['single_trades'], 'single_win_rate': sim_ema['single_win_rate']
+                }
+                if sim_ema['trade_count'] >= MIN_TRADES and sim_ema['final_pnl'] > best_vp_ema_pnl:
+                    best_vp_ema_pnl = sim_ema['final_pnl']
+                    best_vp_ema_cfg = cand_ema
+                elif sim_ema['trade_count'] >= 5 and sim_ema['final_pnl'] > fallback_vp_ema_pnl:
+                    fallback_vp_ema_pnl = sim_ema['final_pnl']
+                    fallback_vp_ema_cfg = cand_ema
 
         print(f"   [{symbol}] VAL_POC系 (EMAなし/あり計2種) {inv}m足 ({len(df_inv)}本) 検証完了 (累計 {vp_eval_count} パターン評価済)", flush=True)
         time.sleep(0.01)
@@ -3301,16 +3328,20 @@ def run_interval_comparison(df_5m: pd.DataFrame, lot: float = 1.0, data_equity: 
             pass
 
         # --- [A] RSIMA (EMAなし) ---
+        cd_bars_r = max(10, 1440 // r_inv) if not is_1h else 24
+        to_bars_r = max(2, 240 // r_inv) if not is_1h else 4
         res_r_none_single = optimize_rsima3_fast(
             c_r, h_r, l_r, r_rsi.values, r_rsi_ma.values,
             initial_equity=fixed_initial_equity, max_trades=1, min_trades=MIN_TRADES,
-            val_arr=val_arr_r, vah_arr=vah_arr_r, ma_filter=ma_filter_r_none
+            val_arr=val_arr_r, vah_arr=vah_arr_r, ma_filter=ma_filter_r_none,
+            cooldown_bars=cd_bars_r, timeout_bars=to_bars_r
         )
         if res_r_none_single['trade_count'] >= MIN_TRADES and res_r_none_single['final_pnl'] > 0:
             res_r_none = optimize_rsima3_fast(
                 c_r, h_r, l_r, r_rsi.values, r_rsi_ma.values,
                 initial_equity=fixed_initial_equity, max_trades=3, min_trades=MIN_TRADES,
-                val_arr=val_arr_r, vah_arr=vah_arr_r, ma_filter=ma_filter_r_none
+                val_arr=val_arr_r, vah_arr=vah_arr_r, ma_filter=ma_filter_r_none,
+                cooldown_bars=cd_bars_r, timeout_bars=to_bars_r
             )
         else:
             res_r_none = res_r_none_single
@@ -3339,13 +3370,15 @@ def run_interval_comparison(df_5m: pd.DataFrame, lot: float = 1.0, data_equity: 
         res_r_ema_single = optimize_rsima3_fast(
             c_r, h_r, l_r, r_rsi.values, r_rsi_ma.values,
             initial_equity=fixed_initial_equity, max_trades=1, min_trades=MIN_TRADES,
-            val_arr=val_arr_r, vah_arr=vah_arr_r, ma_filter=ma_filter_r_ema
+            val_arr=val_arr_r, vah_arr=vah_arr_r, ma_filter=ma_filter_r_ema,
+            cooldown_bars=cd_bars_r, timeout_bars=to_bars_r
         )
         if res_r_ema_single['trade_count'] >= MIN_TRADES and res_r_ema_single['final_pnl'] > 0:
             res_r_ema = optimize_rsima3_fast(
                 c_r, h_r, l_r, r_rsi.values, r_rsi_ma.values,
                 initial_equity=fixed_initial_equity, max_trades=3, min_trades=MIN_TRADES,
-                val_arr=val_arr_r, vah_arr=vah_arr_r, ma_filter=ma_filter_r_ema
+                val_arr=val_arr_r, vah_arr=vah_arr_r, ma_filter=ma_filter_r_ema,
+                cooldown_bars=cd_bars_r, timeout_bars=to_bars_r
             )
         else:
             res_r_ema = res_r_ema_single
@@ -3401,13 +3434,15 @@ def run_interval_comparison(df_5m: pd.DataFrame, lot: float = 1.0, data_equity: 
     cnt_rse = int(best_rsi_ema_cfg['trade_count'])
     win_rse = float(best_rsi_ema_cfg['win_rate'])
 
+    tr_vpn = int(best_vp_none_cfg.get('target_ratio', 0.70) * 100)
+    tr_vpe = int(best_vp_ema_cfg.get('target_ratio', 0.70) * 100)
     discord.print_log(f"\n📊 【4大基本戦略 最適化結果直接比較】 ({symbol})")
     discord.print_log(
-        f"🔹 [VAL_POC ({best_vp_none_cfg['interval']}m/MP{best_vp_none_cfg['mp_period']}/EMAなし)]: "
+        f"🔹 [VAL_POC ({best_vp_none_cfg['interval']}m/MP{best_vp_none_cfg['mp_period']}/TR{tr_vpn}%/EMAなし)]: "
         f"純利益 = {pnl_vpn:+.2f} USDC (取引: {cnt_vpn}回, 勝率: {win_vpn:.1f}%)"
     )
     discord.print_log(
-        f"🔹 [VAL_POC_EMA ({best_vp_ema_cfg['interval']}m/MP{best_vp_ema_cfg['mp_period']}/EMAあり)]: "
+        f"🔹 [VAL_POC_EMA ({best_vp_ema_cfg['interval']}m/MP{best_vp_ema_cfg['mp_period']}/TR{tr_vpe}%/EMAあり)]: "
         f"純利益 = {pnl_vpe:+.2f} USDC (取引: {cnt_vpe}回, 勝率: {win_vpe:.1f}%)"
     )
     discord.print_log(
@@ -3500,10 +3535,12 @@ def run_interval_comparison(df_5m: pd.DataFrame, lot: float = 1.0, data_equity: 
         else:
             mf_b = None
 
-        cd_b = max(10, 288 // (best_interval // 5)) if not is_1h else 24
+        cd_b = max(10, 1440 // best_interval) if not is_1h else 24
+        to_b = max(2, 240 // best_interval) if not is_1h else 4
+        winner_tr = float(winner.get('target_ratio', 0.70))
         sim_b = simulate_val_poc_fast(
             c_b, h_b, l_b, val_b, vah_b, poc_b, mf_b,
-            initial_equity=fixed_initial_equity, cooldown_bars=cd_b, record_chart=True
+            initial_equity=fixed_initial_equity, cooldown_bars=cd_b, timeout_bars=to_b, target_ratio=winner_tr, record_chart=True
         )
         df_chart['POC'] = pd.Series(poc_b).ffill().bfill().values
         df_chart['VAH'] = pd.Series(vah_b).ffill().bfill().values
@@ -3522,6 +3559,7 @@ def run_interval_comparison(df_5m: pd.DataFrame, lot: float = 1.0, data_equity: 
             'mp': best_mp,
             'num_bins': winner['num_bins'],
             'value_area_pct': winner['value_area_pct'],
+            'target_ratio': winner_tr,
             'ma_type': 'EMA' if use_ema_val else 'NONE',
             'ma_condition': 'close_above' if use_ema_val else 'none',
             'margin': 9.0,
@@ -4460,7 +4498,7 @@ def check_val_poc_signals(
     ma_type: str = "EMA",
     ma_condition: str = "close_above",
     max_trades: int = 3,
-    target_ratio: float = 0.50,
+    target_ratio: float = 0.70,
     min_va_width: float = 0.015,
     nanpin_drop_pct: float = 0.030,
     sl_pct: float = 0.090,
@@ -4592,13 +4630,13 @@ def check_val_poc_signals(
             reason = f"VAL_POC_EMERGENCY_BREAKEVEN_TP: 地合い悪化(非BUY)に伴う緊急建値撤退 (目標: ${breakeven_target:.4f}, PnL: {pnl_pct:+.2%})"
             return {"action": "CLOSE_ALL", "reason": reason, "lot_multiplier": 1.0, "metrics": metrics}
 
-    # === [2] 利確判定 (VAL-VAH 50%水準 到達かつ建値プラス域) ===
+    # === [2] 利確判定 (VAL-VAH 最適比率水準 到達かつ建値+0.40%以上利益) ===
     if lpo and target_tp > 0:
         is_tp_hit = (current_price >= target_tp)
-        is_profit = (current_price > avg_entry_price * 1.0006)
+        is_profit = (current_price >= avg_entry_price * 1.0040)
         if is_tp_hit and is_profit:
             pnl_pct = (current_price - avg_entry_price) / avg_entry_price if avg_entry_price > 0 else 0.0
-            reason = f"VAL_POC_50_TP: 目標(${target_tp:.4f})到達 & 建値プラス(PnL={pnl_pct:+.2%})"
+            reason = f"VAL_POC_TP (TR={target_ratio:.2f}): 目標(${target_tp:.4f})到達 & 建値利益(PnL={pnl_pct:+.2%})"
             return {"action": "CLOSE_ALL", "reason": reason, "lot_multiplier": 1.0, "metrics": metrics}
 
     # === [3] 新規エントリー判定 (VALゴールデンクロス ＆ MA200 ＆ バリュー幅>=1.5% ＆ クールダウン解除) ===
@@ -4637,7 +4675,7 @@ def check_vah_poc_signals(
     ma_type: str = "EMA",
     ma_condition: str = "close_below",
     max_trades: int = 1,
-    target_ratio: float = 0.50,
+    target_ratio: float = 0.70,
     min_va_width: float = 0.015,
     sl_pct: float = 0.090,
     is_cooldown_active: bool = False,
@@ -4754,13 +4792,13 @@ def check_vah_poc_signals(
             reason = f"VAH_POC_EMERGENCY_BREAKEVEN_TP: 地合い変化(非BEAR)に伴う緊急建値買戻し撤退 (目標: ${breakeven_target:.4f}, PnL: {pnl_pct:+.2%})"
             return {"action": "CLOSE_ALL", "reason": reason, "lot_multiplier": 1.0, "metrics": metrics}
 
-    # === [2] ショート利確判定 (VAH-VAL 50%水準 到達かつ建値プラス利益圏) ===
+    # === [2] ショート利確判定 (VAH-VAL 最適比率水準 到達かつ建値-0.40%以下利益) ===
     if spo and target_tp > 0:
         is_tp_hit = (current_price <= target_tp)
-        is_profit = (current_price < avg_entry_price * 0.9994)
+        is_profit = (current_price <= avg_entry_price * 0.9960)
         if is_tp_hit and is_profit:
             pnl_pct = (avg_entry_price - current_price) / avg_entry_price if avg_entry_price > 0 else 0.0
-            reason = f"VAH_POC_50_TP: 目標(${target_tp:.4f})到達 & 建値利益(PnL={pnl_pct:+.2%})"
+            reason = f"VAH_POC_TP (TR={target_ratio:.2f}): 目標(${target_tp:.4f})到達 & 建値利益(PnL={pnl_pct:+.2%})"
             return {"action": "CLOSE_ALL", "reason": reason, "lot_multiplier": 1.0, "metrics": metrics}
 
     # === [3] 新規ショートエントリー判定 (VAHデッドクロス ＆ MA200 ＆ バリュー幅>=1.5% ＆ クールダウン解除) ===

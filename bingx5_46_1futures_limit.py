@@ -2465,7 +2465,7 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                             ma_type=str(sym_params.get("ma_type", "EMA" if use_ema_v else "NONE")),
                             ma_condition=str(sym_params.get("ma_condition", "close_below" if use_ema_v else "none")),
                             max_trades=1,
-                            target_ratio=0.50,
+                            target_ratio=float(sym_params.get("target_ratio", 0.70)),
                             sl_pct=abs(dyn_sl_pct),
                             is_cooldown_active=in_cooldown,
                             is_emergency_breakeven=pos_emergency_be,
@@ -2512,7 +2512,7 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                             ma_type=str(sym_params.get("ma_type", "EMA" if use_ema_v else "NONE")),
                             ma_condition=str(sym_params.get("ma_condition", "close_above" if use_ema_v else "none")),
                             max_trades=MAX_TRADES_COUNT,
-                            target_ratio=0.50,
+                            target_ratio=float(sym_params.get("target_ratio", 0.70)),
                             sl_pct=abs(dyn_sl_pct),
                             is_cooldown_active=in_cooldown,
                             is_emergency_breakeven=pos_emergency_be,
@@ -2555,8 +2555,9 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                     record_sl_cooldown(sym)
                     closed = True
                 elif pos_action == "TIMEOUT_EXIT":
-                    discord.print_log(f"⏰ [{sym}] [{cand_strat.upper()} 4H TIMEOUT EXIT] {exit_reason} ➔ 4時間タイムアウト成行微損撤退", level="warning")
+                    discord.print_log(f"⏰ [{sym}] [{cand_strat.upper()} 4H TIMEOUT EXIT] {exit_reason} ➔ 4時間タイムアウト成行微損撤退 (24hクールダウン移行)", level="warning")
                     await flatten_current_position_bingx(sym, "USDT", mode, exit_reason, force_market=True)
+                    record_sl_cooldown(sym)
                     closed = True
                 elif pos_action == "CLOSE_ALL":
                     discord.print_log(f"🎯 [{sym}] [{cand_strat.upper()} CLOSE ALL] {exit_reason} ➔ 一括成行決済")
@@ -2708,7 +2709,7 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                                 ma_type=str(sym_params_e.get("ma_type", "EMA" if use_ema_v else "NONE")),
                                 ma_condition=str(sym_params_e.get("ma_condition", "close_below" if use_ema_v else "none")),
                                 max_trades=1,
-                                target_ratio=0.50,
+                                target_ratio=float(sym_params_e.get("target_ratio", 0.70)),
                                 sl_pct=float(sym_params_e.get("sl_pct", 0.090)),
                                 is_cooldown_active=in_cooldown,
                                 use_ema_filter=use_ema_v,
@@ -2859,7 +2860,7 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                                 ma_type=str(sym_params_e.get("ma_type", "EMA" if use_ema_v else "NONE")),
                                 ma_condition=str(sym_params_e.get("ma_condition", "close_above" if use_ema_v else "none")),
                                 max_trades=MAX_TRADES_COUNT,
-                                target_ratio=0.50,
+                                target_ratio=float(sym_params_e.get("target_ratio", 0.70)),
                                 sl_pct=float(sym_params_e.get("sl_pct", 0.090)),
                                 is_cooldown_active=in_cooldown,
                                 use_ema_filter=use_ema_v,
