@@ -350,9 +350,13 @@ def sync_symbol_5m_candles(symbol: str, target_days: int = 65) -> pd.DataFrame:
                     existing_df = pd.concat([past_df, existing_df], ignore_index=True)
                     existing_df = existing_df.drop_duplicates(subset=["timestamp"]).sort_values("timestamp").reset_index(drop=True)
 
-        if len(existing_df) > max_history_bars:
-            existing_df = existing_df.tail(max_history_bars).reset_index(drop=True)
+        # ディスク上の SSoT ストアは常に最低 65 日分 (18,720 本) を保持し、短期差分同期で過去データが切り詰められるのを防止
+        disk_max_bars = max(target_days, 65) * 288
+        if len(existing_df) > disk_max_bars:
+            existing_df = existing_df.tail(disk_max_bars).reset_index(drop=True)
         existing_df.to_csv(csv_path, index=False)
+        if len(existing_df) > max_history_bars:
+            return existing_df.tail(max_history_bars).reset_index(drop=True)
         return existing_df
     else:
         # 初回ブートストラップ: 過去 target_days 日分を取得
@@ -394,7 +398,7 @@ def sync_all_target_symbols_5m(symbols: Optional[List[str]] = None, target_days:
     return results
 
 
-def resample_from_5m(df_5m: pd.DataFrame, interval_minutes: int) -> pd.DataFrame:
+def resample_from_5m(df_5m: pd.DataFrame, interval_minutes: int = 5, rule: Optional[str] = None) -> pd.DataFrame:
     """
     単一源泉の 5分足データから任意の時間足へ数学的完全整合ダウンサンプリング (リサンプリング)
     - 5m: そのまま返却
@@ -404,7 +408,12 @@ def resample_from_5m(df_5m: pd.DataFrame, interval_minutes: int) -> pd.DataFrame
     - 240m (4H): 4時間足 (48本集約)
     - 1440m (1D): 日足 (288本集約)
     """
-    if df_5m is None or df_5m.empty or interval_minutes <= 5:
+    if rule is not None and interval_minutes == 5:
+        r_up = str(rule).upper()
+        rule_min_map = {"15MIN": 15, "30MIN": 30, "1H": 60, "60MIN": 60, "4H": 240, "1D": 1440}
+        interval_minutes = rule_min_map.get(r_up, 15)
+
+    if df_5m is None or df_5m.empty or int(interval_minutes) <= 5:
         return df_5m.copy() if df_5m is not None else pd.DataFrame()
 
     df_copy = df_5m.copy()
@@ -412,7 +421,7 @@ def resample_from_5m(df_5m: pd.DataFrame, interval_minutes: int) -> pd.DataFrame
         df_copy["timestamp"] = pd.to_datetime(df_copy["timestamp"], utc=True)
     df_copy = df_copy.sort_values("timestamp").reset_index(drop=True)
 
-    rule = f"{interval_minutes}min"
+    resample_rule = f"{int(interval_minutes)}min"
     df_indexed = df_copy.set_index("timestamp")
 
     agg_dict = {
@@ -424,8 +433,11 @@ def resample_from_5m(df_5m: pd.DataFrame, interval_minutes: int) -> pd.DataFrame
     }
     if "quote_volume" in df_indexed.columns:
         agg_dict["quote_volume"] = "sum"
+    for col in ("openInterest", "oi_chg_4h", "fundingRate"):
+        if col in df_indexed.columns:
+            agg_dict[col] = "last"
 
-    resampled = df_indexed.resample(rule, closed="left", label="left").agg(agg_dict)
+    resampled = df_indexed.resample(resample_rule, closed="left", label="left").agg(agg_dict)
     resampled = resampled.dropna(subset=["open", "close"]).reset_index()
     return resampled
 

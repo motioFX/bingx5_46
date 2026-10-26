@@ -1098,6 +1098,7 @@ async def validate_profitable_candidates(trade_side: str, mode: str, base_symbol
                     "margin": cand_margin,
                     "num_bins": best_params_dict.get("num_bins", 50),
                     "value_area_pct": best_params_dict.get("value_area_pct", 0.70),
+                    "target_ratio": float(best_params_dict.get("target_ratio", 0.70)),
                     "ma_type": best_params_dict.get("ma_type", "EMA"),
                     "ma_condition": best_params_dict.get("ma_condition", "close_below" if actual_side == "short" else "close_above"),
                     "l_ep": best_params_dict.get("l_ep", 40.0),
@@ -1122,7 +1123,7 @@ async def validate_profitable_candidates(trade_side: str, mode: str, base_symbol
                 if cand_pnl > 0 and trade_cnt >= 10:
                     dyn_sl_disp = cand_params.get("dynamic_mae_stop", -0.025)
                     if "val_poc" in cand_strat or "vah_poc" in cand_strat:
-                        detail_str = f"MP={cand_mp}, Bins={cand_params['num_bins']}, VA={int(cand_params['value_area_pct']*100)}%, {cand_params['ma_type']}_{cand_params['ma_condition']}, 動的SL={dyn_sl_disp:.2%}"
+                        detail_str = f"MP={cand_mp}, Bins={cand_params['num_bins']}, VA={int(cand_params['value_area_pct']*100)}%, TR={int(cand_params['target_ratio']*100)}%, {cand_params['ma_type']}_{cand_params['ma_condition']}, 動的SL={dyn_sl_disp:.2%}"
                     elif "short" in cand_strat:
                         detail_str = f"EP={int(cand_params['s_ep'])}, CP={int(cand_params['s_cp'])}, 動的SL={dyn_sl_disp:.2%}"
                     else:
@@ -2673,6 +2674,11 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                     cand_strat_e = str(sym_params_e.get("strategy", "rsima")).lower()
 
                     df_entry_eval = resample_candles(df_5m, cand_interval_e) if cand_interval_e > 5 else df_5m.copy()
+                    try:
+                        from bingx_oi_collector import enrich_candles_with_oi_fr
+                        df_entry_eval = enrich_candles_with_oi_fr(df_entry_eval, sym, auto_sync=False)
+                    except Exception:
+                        pass
                     df_entry_eval = logic.make_logic(
                         df_entry_eval,
                         market_profile_period=int(sym_params_e.get("mp", 200)),

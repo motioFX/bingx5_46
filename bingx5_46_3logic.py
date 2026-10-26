@@ -1378,12 +1378,108 @@ def resample_candles(df, interval_minutes):
     }
     if 'turnover' in df_copy.columns:
         agg_dict['turnover'] = 'sum'
+    for extra_col in ('openInterest', 'oi_chg_4h', 'fundingRate'):
+        if extra_col in df_copy.columns:
+            agg_dict[extra_col] = 'last'
     
     resampled = df_copy.resample(rule, closed='left', label='left').agg(agg_dict)
     resampled = resampled.dropna(subset=['open', 'close'])
     resampled = resampled.reset_index()
     
     return resampled
+
+
+def build_entry_precision_filter(df_inv: pd.DataFrame, side: str = "short", is_vp: bool = True) -> np.ndarray:
+    """
+    Volume × OI × FR 3要素エントリー精度フィルター配列 (bool ndarray) を生成する。
+    バックテストとリアルタイム判定で 100% 同一基準を適用する。
+    """
+    n = len(df_inv)
+    if n == 0:
+        return np.ones(0, dtype=bool)
+    mask = np.ones(n, dtype=bool)
+    side_lower = str(side).lower()
+
+    # 1. Volume 条件 (直前20本平均出来高に対する倍率)
+    if 'volume' in df_inv.columns:
+        v = pd.to_numeric(df_inv['volume'], errors='coerce').fillna(0.0).values
+        v_ma20 = pd.Series(v).rolling(20, min_periods=5).mean().shift(1).values
+        with np.errstate(divide='ignore', invalid='ignore'):
+            vol_r = np.where((v_ma20 > 0) & (~np.isnan(v_ma20)), v / v_ma20, 1.0)
+        # 全戦略共通: 異常スパイク足 (> 2.5x) を遮断
+        mask &= (vol_r <= 2.5)
+        # VP系 (VAL_POC / VAH_POC): 極端な薄商いダマシ (< 0.6x) も遮断
+        if is_vp:
+            mask &= (vol_r >= 0.6)
+
+    # 2. OI 4時間変化率条件 (oi_chg_4h, %)
+    if 'oi_chg_4h' in df_inv.columns:
+        oi_c = pd.to_numeric(df_inv['oi_chg_4h'], errors='coerce').fillna(0.0).values
+        if side_lower == "short":
+            mask &= (oi_c >= -3.0) & (oi_c <= 3.0)
+        else:
+            mask &= (oi_c >= -3.0) & (oi_c <= 5.0)
+
+    # 3. ファンディングレート条件 (fundingRate: 8h decimal rate, e.g. 0.0001 = +0.01%)
+    if 'fundingRate' in df_inv.columns:
+        fr = pd.to_numeric(df_inv['fundingRate'], errors='coerce').fillna(0.0).values
+        if side_lower == "short":
+            # 強いマイナスFR (< -0.005%) での踏み上げショート遮断
+            mask &= (fr >= -0.00005)
+        else:
+            # 過熱ロングFR (> +0.025%) や強い逆風 (< -0.005%) を遮断
+            mask &= (fr >= -0.00005) & (fr <= 0.00025)
+
+    return mask
+
+
+def evaluate_entry_precision_gate(df_eval: pd.DataFrame, side: str = "short", is_vp: bool = True) -> Tuple[bool, str, Dict[str, float]]:
+    """
+    最新確定足 (iloc[-1]) に対して Volume × OI × FR 3要素エントリー精度フィルターを判定する。
+    """
+    info: Dict[str, float] = {"vol_ratio": 1.0, "oi_chg_4h": 0.0, "funding_rate_pct": 0.0}
+    if df_eval is None or df_eval.empty:
+        return True, "OK", info
+
+    side_lower = str(side).lower()
+
+    # 1. Volume 判定
+    if "volume" in df_eval.columns and len(df_eval) >= 6:
+        v_ser = pd.to_numeric(df_eval["volume"], errors="coerce").fillna(0.0)
+        curr_v = float(v_ser.iloc[-1])
+        prev_v_ma = float(v_ser.iloc[:-1].tail(20).mean())
+        vol_r = (curr_v / prev_v_ma) if prev_v_ma > 0 else 1.0
+        info["vol_ratio"] = round(vol_r, 2)
+        if vol_r > 2.5:
+            return False, f"VOL_SPIKE_BLOCK(Vol={vol_r:.2f}x > 2.5x)", info
+        if is_vp and vol_r < 0.6:
+            return False, f"VOL_THIN_BLOCK(Vol={vol_r:.2f}x < 0.6x)", info
+
+    # 2. OI 4h変化率判定
+    if "oi_chg_4h" in df_eval.columns:
+        val_oi = pd.to_numeric(df_eval["oi_chg_4h"], errors="coerce").iloc[-1]
+        if pd.notna(val_oi):
+            oi_c = float(val_oi)
+            info["oi_chg_4h"] = round(oi_c, 2)
+            if side_lower == "short" and not (-3.0 <= oi_c <= 3.0):
+                return False, f"OI_SURGE_BLOCK(dOI_4h={oi_c:+.2f}% outside [-3%,+3%])", info
+            if side_lower != "short" and not (-3.0 <= oi_c <= 5.0):
+                return False, f"OI_ANOMALY_BLOCK(dOI_4h={oi_c:+.2f}% outside [-3%,+5%])", info
+
+    # 3. Funding Rate 判定
+    if "fundingRate" in df_eval.columns:
+        val_fr = pd.to_numeric(df_eval["fundingRate"], errors="coerce").iloc[-1]
+        if pd.notna(val_fr):
+            fr = float(val_fr)
+            fr_pct = fr * 100.0
+            info["funding_rate_pct"] = round(fr_pct, 4)
+            if side_lower == "short" and fr < -0.00005:
+                return False, f"FR_SQUEEZE_BLOCK(FR={fr_pct:+.4f}% < -0.005%)", info
+            if side_lower != "short" and not (-0.00005 <= fr <= 0.00025):
+                return False, f"FR_CROWD_BLOCK(FR={fr_pct:+.4f}% outside [-0.005%,+0.025%])", info
+
+    tag = f"Vol={info['vol_ratio']:.2f}x, dOI4h={info['oi_chg_4h']:+.2f}%, FR={info['funding_rate_pct']:+.4f}%"
+    return True, tag, info
 
 
 def compute_dynamic_center_margin(df: pd.DataFrame, strategy_type: str = "breakout", side_mode: str = "long") -> float:
@@ -2692,6 +2788,13 @@ def _run_interval_comparison_short(df_5m: pd.DataFrame, lot: float = 1.0, data_e
     if len(df_5m) > 8640:
         df_5m = df_5m.tail(8640).reset_index(drop=True)
 
+    if symbol and not is_1h:
+        try:
+            from bingx_oi_collector import enrich_candles_with_oi_fr
+            df_5m = enrich_candles_with_oi_fr(df_5m, symbol, auto_sync=True)
+        except Exception as _e:
+            print(f"   ⚠️ [{symbol}] OI/FR履歴結合スキップ: {_e}", flush=True)
+
     discord.print_log(f"\n====== 🐻 [{symbol}] ショート4大基本戦略体系 (単発1本固定/EMA200分離モデル / 計144通り) 低負荷ジェントル最適化 (5m足 {len(df_5m)}本 [30日分] / 最低取引{MIN_TRADES}回以上) ======")
 
     # 1. VAH_POC ＆ VAH_POC_EMA 最適化 (4足種 × MP 9種 × 2条件 ＝ 72通り)
@@ -2736,8 +2839,9 @@ def _run_interval_comparison_short(df_5m: pd.DataFrame, lot: float = 1.0, data_e
         l_inv = df_inv['low'].astype(float).values if 'low' in df_inv.columns else c_inv
 
         ema200 = calc_ema(df_inv['close'].astype(float), 200).values
-        ma_filter_ema = (c_inv <= ema200)  # ショートは close <= EMA200
-        ma_filter_none = None
+        prec_vp = build_entry_precision_filter(df_inv, side="short", is_vp=True)
+        ma_filter_ema = (c_inv <= ema200) & prec_vp  # ショートは close <= EMA200 かつ 3要素フィルター
+        ma_filter_none = prec_vp
 
         cd_bars = max(10, 1440 // inv) if not is_1h else 24
         to_bars = max(2, 240 // inv) if not is_1h else 4
@@ -2856,8 +2960,9 @@ def _run_interval_comparison_short(df_5m: pd.DataFrame, lot: float = 1.0, data_e
         l_r = df_r_inv['low'].astype(float).values if 'low' in df_r_inv.columns else c_r
 
         ema200_r = calc_ema(df_r_inv['close'].astype(float), 200).values
-        ma_filter_r_ema = (c_r <= ema200_r)  # ショートは close <= EMA200
-        ma_filter_r_none = None
+        prec_rsi = build_entry_precision_filter(df_r_inv, side="short", is_vp=False)
+        ma_filter_r_ema = (c_r <= ema200_r) & prec_rsi  # ショートは close <= EMA200 かつ 3要素フィルター
+        ma_filter_r_none = prec_rsi
 
         val_arr_r, vah_arr_r = None, None
         try:
@@ -2886,7 +2991,7 @@ def _run_interval_comparison_short(df_5m: pd.DataFrame, lot: float = 1.0, data_e
             'DD_max': res_r_none['DD_max'], 'win_rate': res_r_none['win_rate'], 'trade_count': res_r_none['trade_count'],
             'single_pnl': res_r_none['final_pnl'], 'single_trades': res_r_none['trade_count'], 'single_win_rate': res_r_none['win_rate']
         }
-        r_none_cand = {**res_r_none, 'strategy': 'rsima_short', 'interval': r_inv, 'df_inv': df_r_inv, 'rsi_s': r_rsi, 'rsi_ma_s': r_rsi_ma, 'use_ema': False, 'ma_filter': None}
+        r_none_cand = {**res_r_none, 'strategy': 'rsima_short', 'interval': r_inv, 'df_inv': df_r_inv, 'rsi_s': r_rsi, 'rsi_ma_s': r_rsi_ma, 'use_ema': False, 'ma_filter': ma_filter_r_none}
         if res_r_none['trade_count'] >= MIN_TRADES and res_r_none['final_pnl'] > best_rsi_none_pnl:
             best_rsi_none_pnl = res_r_none['final_pnl']
             best_rsi_none_cfg = r_none_cand
@@ -3025,11 +3130,12 @@ def _run_interval_comparison_short(df_5m: pd.DataFrame, lot: float = 1.0, data_e
         poc_b = mp_b['poc']
 
         use_ema_val = (best_strategy == 'vah_poc_ema')
+        prec_b = build_entry_precision_filter(df_chart, side="short", is_vp=True)
         if use_ema_val:
             ma_b = calc_ema(df_chart['close'].astype(float), 200).values
-            mf_b = (c_b <= ma_b)
+            mf_b = (c_b <= ma_b) & prec_b
         else:
-            mf_b = None
+            mf_b = prec_b
 
         cd_b = max(10, 1440 // best_interval) if not is_1h else 24
         to_b = max(2, 240 // best_interval) if not is_1h else 4
@@ -3121,6 +3227,13 @@ def run_interval_comparison(df_5m: pd.DataFrame, lot: float = 1.0, data_equity: 
     if len(df_5m) > 8640:
         df_5m = df_5m.tail(8640).reset_index(drop=True)
 
+    if symbol and not is_1h:
+        try:
+            from bingx_oi_collector import enrich_candles_with_oi_fr
+            df_5m = enrich_candles_with_oi_fr(df_5m, symbol, auto_sync=True)
+        except Exception as _e:
+            print(f"   ⚠️ [{symbol}] OI/FR履歴結合スキップ: {_e}", flush=True)
+
     discord.print_log(f"\n====== 🌿 [{symbol}] 4大基本戦略体系 (EMA200分離モデル / 計144通り) 低負荷ジェントル最適化 (5m足 {len(df_5m)}本 [30日分] / 最低取引{MIN_TRADES}回以上) ======")
 
     # ==============================================================================
@@ -3167,8 +3280,9 @@ def run_interval_comparison(df_5m: pd.DataFrame, lot: float = 1.0, data_equity: 
         l_inv = df_inv['low'].astype(float).values if 'low' in df_inv.columns else c_inv
 
         ema200 = calc_ema(df_inv['close'].astype(float), 200).values
-        ma_filter_ema = (c_inv >= ema200)
-        ma_filter_none = None
+        prec_vp = build_entry_precision_filter(df_inv, side="long", is_vp=True)
+        ma_filter_ema = (c_inv >= ema200) & prec_vp
+        ma_filter_none = prec_vp
 
         cd_bars = max(10, 1440 // inv) if not is_1h else 24
         to_bars = max(2, 240 // inv) if not is_1h else 4
@@ -3314,8 +3428,9 @@ def run_interval_comparison(df_5m: pd.DataFrame, lot: float = 1.0, data_equity: 
         l_r = df_r_inv['low'].astype(float).values if 'low' in df_r_inv.columns else c_r
 
         ema200_r = calc_ema(df_r_inv['close'].astype(float), 200).values
-        ma_filter_r_ema = (c_r >= ema200_r)
-        ma_filter_r_none = None
+        prec_rsi = build_entry_precision_filter(df_r_inv, side="long", is_vp=False)
+        ma_filter_r_ema = (c_r >= ema200_r) & prec_rsi
+        ma_filter_r_none = prec_rsi
 
         # 直近 VAL/VAH の取得（step間引きで高速取得）
         val_arr_r, vah_arr_r = None, None
@@ -3358,7 +3473,7 @@ def run_interval_comparison(df_5m: pd.DataFrame, lot: float = 1.0, data_equity: 
             'DD_max': res_r_none['DD_max'], 'win_rate': res_r_none['win_rate'], 'trade_count': res_r_none['trade_count'],
             'single_pnl': res_r_none['single_pnl'], 'single_trades': res_r_none['single_trades'], 'single_win_rate': res_r_none['single_win_rate']
         }
-        r_none_cand = {**res_r_none, 'strategy': 'rsima', 'interval': r_inv, 'df_inv': df_r_inv, 'rsi_s': r_rsi, 'rsi_ma_s': r_rsi_ma, 'use_ema': False, 'ma_filter': None}
+        r_none_cand = {**res_r_none, 'strategy': 'rsima', 'interval': r_inv, 'df_inv': df_r_inv, 'rsi_s': r_rsi, 'rsi_ma_s': r_rsi_ma, 'use_ema': False, 'ma_filter': ma_filter_r_none}
         if res_r_none['trade_count'] >= MIN_TRADES and res_r_none['final_pnl'] > best_rsi_none_pnl:
             best_rsi_none_pnl = res_r_none['final_pnl']
             best_rsi_none_cfg = r_none_cand
@@ -3529,11 +3644,12 @@ def run_interval_comparison(df_5m: pd.DataFrame, lot: float = 1.0, data_equity: 
         poc_b = mp_b['poc']
 
         use_ema_val = (best_strategy == 'val_poc_ema')
+        prec_b = build_entry_precision_filter(df_chart, side="long", is_vp=True)
         if use_ema_val:
             ma_b = calc_ema(df_chart['close'].astype(float), 200).values
-            mf_b = (c_b >= ma_b)
+            mf_b = (c_b >= ma_b) & prec_b
         else:
-            mf_b = None
+            mf_b = prec_b
 
         cd_b = max(10, 1440 // best_interval) if not is_1h else 24
         to_b = max(2, 240 // best_interval) if not is_1h else 4
@@ -4446,13 +4562,18 @@ def check_rsima3_signals(
     curr_ema200 = float(ema200.iloc[-1]) if len(ema200) > 0 else curr_c
     trend_ok = (curr_c >= curr_ema200) if use_ema_filter else True
 
-    # === [2] 新規エントリー判定 (if LE and LC and poz) ===
-    if poz and LE and LC and trend_ok:
-        lot_m = 1.0  # 全部1倍 (ユーザー指示: ロット倍率撤廃)
-        ema_str = f" & EMA200(${curr_ema200:.4f})条件OK" if use_ema_filter else ""
-        strat_tag = "RSIMA_EMA" if use_ema_filter else "RSIMA"
-        reason = f"{strat_tag}_INITIAL_ENTRY: GC(RSI={curr_rsi:.1f} > MA={curr_ma:.1f} < {l_ep:.0f}){ema_str}"
-        return {"action": "INITIAL_ENTRY", "reason": reason, "lot_multiplier": float(lot_m), "metrics": metrics}
+    # === [2] 新規エントリー判定 (if LE and LC and poz and 3要素フィルター) ===
+    if poz and not is_cooldown_active and LE and LC and trend_ok:
+        prec_ok, prec_msg, prec_info = evaluate_entry_precision_gate(df_5m, side="long", is_vp=False)
+        metrics.update(prec_info)
+        if prec_ok:
+            lot_m = 1.0  # 全部1倍 (ユーザー指示: ロット倍率撤廃)
+            ema_str = f" & EMA200(${curr_ema200:.4f})条件OK" if use_ema_filter else ""
+            strat_tag = "RSIMA_EMA" if use_ema_filter else "RSIMA"
+            reason = f"{strat_tag}_INITIAL_ENTRY: GC(RSI={curr_rsi:.1f} > MA={curr_ma:.1f} < {l_ep:.0f}){ema_str} [{prec_msg}]"
+            return {"action": "INITIAL_ENTRY", "reason": reason, "lot_multiplier": float(lot_m), "metrics": metrics}
+        else:
+            return {"action": "NONE", "reason": f"RSIMA3_PRECISION_FILTER_WAIT: {prec_msg}", "lot_multiplier": 1.0, "metrics": metrics}
 
     # === [3] ナンピン追加エントリー判定 (if LE and LC and lpo and longadd) ===
     # 地合い悪化時 (is_emergency_breakeven=True) は追加ナンピンを即時凍結 (ADD禁止)
@@ -4639,13 +4760,18 @@ def check_val_poc_signals(
             reason = f"VAL_POC_TP (TR={target_ratio:.2f}): 目標(${target_tp:.4f})到達 & 建値利益(PnL={pnl_pct:+.2%})"
             return {"action": "CLOSE_ALL", "reason": reason, "lot_multiplier": 1.0, "metrics": metrics}
 
-    # === [3] 新規エントリー判定 (VALゴールデンクロス ＆ MA200 ＆ バリュー幅>=1.5% ＆ クールダウン解除) ===
+    # === [3] 新規エントリー判定 (VALゴールデンクロス ＆ MA200 ＆ バリュー幅>=1.5% ＆ 3要素フィルター ＆ クールダウン解除) ===
     if poz and not is_cooldown_active:
         if val_gc and (va_width_pct >= min_va_width) and trend_ok:
-            strat_tag = "VAL_POC_EMA" if (use_ema_filter and str(ma_condition).lower() != "none" and str(ma_type).upper() != "NONE") else "VAL_POC"
-            ema_str = f" & {ma_type}200(${curr_ma200:.4f})条件OK" if "EMA" in strat_tag else ""
-            reason = f"{strat_tag}_INITIAL_ENTRY: VALブレイク(${curr_c:.4f} > ${curr_val:.4f}){ema_str} & 幅({va_width_pct:.1%}>=1.5%)"
-            return {"action": "INITIAL_ENTRY", "reason": reason, "lot_multiplier": 1.0, "metrics": metrics}
+            prec_ok, prec_msg, prec_info = evaluate_entry_precision_gate(df_5m, side="long", is_vp=True)
+            metrics.update(prec_info)
+            if prec_ok:
+                strat_tag = "VAL_POC_EMA" if (use_ema_filter and str(ma_condition).lower() != "none" and str(ma_type).upper() != "NONE") else "VAL_POC"
+                ema_str = f" & {ma_type}200(${curr_ma200:.4f})条件OK" if "EMA" in strat_tag else ""
+                reason = f"{strat_tag}_INITIAL_ENTRY: VALブレイク(${curr_c:.4f} > ${curr_val:.4f}){ema_str} & 幅({va_width_pct:.1%}>=1.5%) [{prec_msg}]"
+                return {"action": "INITIAL_ENTRY", "reason": reason, "lot_multiplier": 1.0, "metrics": metrics}
+            else:
+                return {"action": "NONE", "reason": f"VAL_POC_PRECISION_FILTER_WAIT: {prec_msg}", "lot_multiplier": 1.0, "metrics": metrics}
 
     # === [4] ナンピン判定 (最終建値から (VAH - VAL) * 0.50 下落、最大2回追加 = 計3枠) ===
     # 地合い悪化時 (is_emergency_breakeven=True) は追加ナンピンを即時凍結 (ADD禁止)
@@ -4801,13 +4927,18 @@ def check_vah_poc_signals(
             reason = f"VAH_POC_TP (TR={target_ratio:.2f}): 目標(${target_tp:.4f})到達 & 建値利益(PnL={pnl_pct:+.2%})"
             return {"action": "CLOSE_ALL", "reason": reason, "lot_multiplier": 1.0, "metrics": metrics}
 
-    # === [3] 新規ショートエントリー判定 (VAHデッドクロス ＆ MA200 ＆ バリュー幅>=1.5% ＆ クールダウン解除) ===
+    # === [3] 新規ショートエントリー判定 (VAHデッドクロス ＆ MA200 ＆ バリュー幅>=1.5% ＆ 3要素フィルター ＆ クールダウン解除) ===
     if poz and not is_cooldown_active:
         if vah_dc and (va_width_pct >= min_va_width) and trend_ok:
-            strat_tag = "VAH_POC_EMA" if (use_ema_filter and str(ma_condition).lower() != "none" and str(ma_type).upper() != "NONE") else "VAH_POC"
-            ema_str = f" & {ma_type}200(${curr_ma200:.4f})条件OK" if "EMA" in strat_tag else ""
-            reason = f"{strat_tag}_INITIAL_ENTRY_SHORT: VAH割れ(${curr_c:.4f} < ${curr_vah:.4f}){ema_str} & 幅({va_width_pct:.1%}>=1.5%)"
-            return {"action": "INITIAL_ENTRY_SHORT", "reason": reason, "lot_multiplier": 1.0, "metrics": metrics}
+            prec_ok, prec_msg, prec_info = evaluate_entry_precision_gate(df_5m, side="short", is_vp=True)
+            metrics.update(prec_info)
+            if prec_ok:
+                strat_tag = "VAH_POC_EMA" if (use_ema_filter and str(ma_condition).lower() != "none" and str(ma_type).upper() != "NONE") else "VAH_POC"
+                ema_str = f" & {ma_type}200(${curr_ma200:.4f})条件OK" if "EMA" in strat_tag else ""
+                reason = f"{strat_tag}_INITIAL_ENTRY_SHORT: VAH割れ(${curr_c:.4f} < ${curr_vah:.4f}){ema_str} & 幅({va_width_pct:.1%}>=1.5%) [{prec_msg}]"
+                return {"action": "INITIAL_ENTRY_SHORT", "reason": reason, "lot_multiplier": 1.0, "metrics": metrics}
+            else:
+                return {"action": "NONE", "reason": f"VAH_POC_PRECISION_FILTER_WAIT: {prec_msg}", "lot_multiplier": 1.0, "metrics": metrics}
 
     if spo:
         return {"action": "HOLD", "reason": "VAH_POC_HOLD", "lot_multiplier": 1.0, "metrics": metrics}
@@ -4924,13 +5055,18 @@ def check_rsima3_short_signals(
             reason = f"RSIMA_SHORT_TP: RSI({curr_rsi:.1f}) < s_cp({s_cp:.0f}) & 建値利益(PnL={pnl_pct:+.2%})"
             return {"action": "CLOSE_ALL", "reason": reason, "lot_multiplier": 1.0, "metrics": metrics}
 
-    # === [3] 新規ショートエントリー判定 ===
+    # === [3] 新規ショートエントリー判定 (3要素フィルター統合) ===
     if poz and not is_cooldown_active:
         if SE and SC and trend_ok:
-            strat_name = "RSIMA_SHORT_EMA" if use_ema_filter else "RSIMA_SHORT"
-            ema_str = f" & EMA200(${curr_ema200:.4f})条件OK" if use_ema_filter else ""
-            reason = f"{strat_name}_INITIAL_ENTRY_SHORT: デッドクロス & lrsiMA({curr_ma:.1f}>{s_ep:.0f}){ema_str}"
-            return {"action": "INITIAL_ENTRY_SHORT", "reason": reason, "lot_multiplier": 1.0, "metrics": metrics}
+            prec_ok, prec_msg, prec_info = evaluate_entry_precision_gate(df_5m, side="short", is_vp=False)
+            metrics.update(prec_info)
+            if prec_ok:
+                strat_name = "RSIMA_SHORT_EMA" if use_ema_filter else "RSIMA_SHORT"
+                ema_str = f" & EMA200(${curr_ema200:.4f})条件OK" if use_ema_filter else ""
+                reason = f"{strat_name}_INITIAL_ENTRY_SHORT: デッドクロス & lrsiMA({curr_ma:.1f}>{s_ep:.0f}){ema_str} [{prec_msg}]"
+                return {"action": "INITIAL_ENTRY_SHORT", "reason": reason, "lot_multiplier": 1.0, "metrics": metrics}
+            else:
+                return {"action": "NONE", "reason": f"RSIMA_SHORT_PRECISION_FILTER_WAIT: {prec_msg}", "lot_multiplier": 1.0, "metrics": metrics}
 
     if spo:
         return {"action": "HOLD", "reason": "RSIMA_SHORT_HOLD", "lot_multiplier": 1.0, "metrics": metrics}
