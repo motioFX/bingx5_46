@@ -5824,6 +5824,9 @@ def evaluate_market_regime_3window(
     peak_breakdown_by_window = {}
     btc_peak_breakdown_by_window = {}
     market_peak_bd_by_window = {}
+    bottom_reversal_by_window = {}
+    btc_bottom_rev_by_window = {}
+    market_bottom_rev_by_window = {}
 
     # 銘柄の重複キーを排除（ティッカー単位でユニーク化して計22票を厳格保証）
     unique_symbol_dfs = {}
@@ -5839,6 +5842,8 @@ def evaluate_market_regime_3window(
         sell_passed = set()
         peak_breakdown_passed = set()
         btc_peak_breakdown = False
+        bottom_reversal_passed = set()
+        btc_bottom_reversal = False
         norm_series_list = []
         total_votes = 0
 
@@ -5874,6 +5879,13 @@ def evaluate_market_regime_3window(
                 if ticker == "BTC":
                     btc_peak_breakdown = True
 
+            # 底打ち反転判定 (前半50%以内に最安値があり、現在値がレンジ半値以上へ急反発)
+            is_bottom_rev = (trough_ratio < 0.50 and final_norm >= half_level)
+            if is_bottom_rev:
+                bottom_reversal_passed.add(sym)
+                if ticker == "BTC":
+                    btc_bottom_reversal = True
+
             norm_series_list.append(norm_c)
 
             # 買い候補判定 (プラスかつ前半高値半値維持)
@@ -5888,8 +5900,9 @@ def evaluate_market_regime_3window(
                     sell_votes += votes
                     sell_passed.add(sym)
 
-        # 市場平均ノーマライズ系列の天井崩壊判定
+        # 市場平均ノーマライズ系列の天井崩壊・底打ち反転判定
         market_peak_bd = False
+        market_bottom_rev = False
         if norm_series_list:
             min_l = min(len(s) for s in norm_series_list)
             if min_l >= 24:
@@ -5898,11 +5911,17 @@ def evaluate_market_regime_3window(
                 m_min = float(np.min(m_mean))
                 m_max = float(np.max(m_mean))
                 m_half = m_min + (m_max - m_min) * 0.5
+                m_final = float(m_mean[-1])
+
                 m_peak_idx = int(np.argmax(m_mean))
                 m_peak_ratio = m_peak_idx / len(m_mean)
-                m_final = float(m_mean[-1])
                 if m_peak_ratio < 0.50 and m_final <= m_half:
                     market_peak_bd = True
+
+                m_trough_idx = int(np.argmin(m_mean))
+                m_trough_ratio = m_trough_idx / len(m_mean)
+                if m_trough_ratio < 0.50 and m_final >= m_half:
+                    market_bottom_rev = True
 
         # 判定基準: 半分以上 (11票以上 / 22票)
         state = "NEUTRAL"
@@ -5920,13 +5939,19 @@ def evaluate_market_regime_3window(
             "sell_passed": list(sell_passed),
             "peak_breakdown_passed": list(peak_breakdown_passed),
             "btc_peak_breakdown": btc_peak_breakdown,
-            "market_peak_bd": market_peak_bd
+            "market_peak_bd": market_peak_bd,
+            "bottom_reversal_passed": list(bottom_reversal_passed),
+            "btc_bottom_reversal": btc_bottom_reversal,
+            "market_bottom_rev": market_bottom_rev,
         }
         eligible_buy_by_window[w_name] = buy_passed
         eligible_sell_by_window[w_name] = sell_passed
         peak_breakdown_by_window[w_name] = peak_breakdown_passed
         btc_peak_breakdown_by_window[w_name] = btc_peak_breakdown
         market_peak_bd_by_window[w_name] = market_peak_bd
+        bottom_reversal_by_window[w_name] = bottom_reversal_passed
+        btc_bottom_rev_by_window[w_name] = btc_bottom_reversal
+        market_bottom_rev_by_window[w_name] = market_bottom_rev
 
     # 30d 天井崩壊判定の集約 (BTC天井崩壊、市場平均天井崩壊、またはアルト等天井崩壊8銘柄以上)
     is_30d_peak_breakdown = (
@@ -5935,7 +5960,14 @@ def evaluate_market_regime_3window(
         or len(peak_breakdown_by_window.get("30d", set())) >= 8
     )
 
-    # 総合地合い判定 (3期間すべてが一致しているか、または30d天井崩壊緩和)
+    # 30d 底打ち反転判定の集約 (BTC底打ち反転、市場平均底打ち反転、またはアルト等底打ち反転8銘柄以上)
+    is_30d_bottom_reversal = (
+        btc_bottom_rev_by_window.get("30d", False)
+        or market_bottom_rev_by_window.get("30d", False)
+        or len(bottom_reversal_by_window.get("30d", set())) >= 8
+    )
+
+    # 総合地合い判定 (3期間すべてが一致しているか、または30d天井崩壊/底打ち反転緩和)
     states = [period_results[w]["state"] for w in ["30d", "10d", "5d"]]
     recommended_symbols = []
     regime_reason = ""
@@ -5950,6 +5982,25 @@ def evaluate_market_regime_3window(
         regime_reason = "3期間すべて売り (SELL一致)"
         common_sell = set.intersection(*(eligible_sell_by_window[w] for w in ["30d", "10d", "5d"]))
         recommended_symbols = sorted([s for s in common_sell if s.upper().replace("-USDT", "").replace("USDT", "") != "BTC"])
+    elif states[1] == "BUY" and states[2] == "BUY" and is_30d_bottom_reversal:
+        overall_regime = "BUY"
+        rev_detail = []
+        if btc_bottom_rev_by_window.get("30d", False):
+            rev_detail.append("BTC底打ち反転")
+        if market_bottom_rev_by_window.get("30d", False):
+            rev_detail.append("市場平均底打ち反転")
+        rev_count = len(bottom_reversal_by_window.get("30d", set()))
+        if rev_count > 0:
+            rev_detail.append(f"底打ち反転{rev_count}銘柄")
+        detail_str = "/".join(rev_detail) if rev_detail else "底打ち反転検知"
+        regime_reason = f"30d底打ち反転上昇({detail_str}) ＆ 10d/5d買い一致 (30d={states[0]}から買い判定緩和)"
+
+        common_10_5 = eligible_buy_by_window["10d"].intersection(eligible_buy_by_window["5d"])
+        eligible_30d_long = eligible_buy_by_window["30d"].union(bottom_reversal_by_window.get("30d", set()))
+        common_buy = common_10_5.intersection(eligible_30d_long)
+        if not common_buy:
+            common_buy = common_10_5
+        recommended_symbols = sorted([s for s in common_buy if s.upper().replace("-USDT", "").replace("USDT", "") != "BTC"])
     elif states[1] == "SELL" and states[2] == "SELL" and is_30d_peak_breakdown:
         overall_regime = "SELL"
         bd_detail = []
@@ -5980,6 +6031,7 @@ def evaluate_market_regime_3window(
         "is_sell_regime": (overall_regime == "SELL"),
         "regime_reason": regime_reason,
         "is_30d_peak_breakdown": is_30d_peak_breakdown,
+        "is_30d_bottom_reversal": is_30d_bottom_reversal,
         "period_results": period_results,
         "recommended_symbols": recommended_symbols,
         "timestamp": datetime.now(timezone.utc).isoformat()

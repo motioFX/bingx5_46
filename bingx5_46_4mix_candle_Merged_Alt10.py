@@ -446,6 +446,7 @@ async def main() -> None:
         "overall_regime": overall_reg,
         "regime_reason": regime_eval_res.get("regime_reason", ""),
         "is_30d_peak_breakdown": regime_eval_res.get("is_30d_peak_breakdown", False),
+        "is_30d_bottom_reversal": regime_eval_res.get("is_30d_bottom_reversal", False),
         "is_buy_regime": (overall_reg == "BUY"),
         "is_sell_regime": (overall_reg == "SELL"),
         "period_results": period_res,
