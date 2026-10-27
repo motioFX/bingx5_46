@@ -5821,6 +5821,9 @@ def evaluate_market_regime_3window(
     period_results = {}
     eligible_buy_by_window = {}
     eligible_sell_by_window = {}
+    peak_breakdown_by_window = {}
+    btc_peak_breakdown_by_window = {}
+    market_peak_bd_by_window = {}
 
     # 銘柄の重複キーを排除（ティッカー単位でユニーク化して計22票を厳格保証）
     unique_symbol_dfs = {}
@@ -5834,6 +5837,9 @@ def evaluate_market_regime_3window(
         sell_votes = 0
         buy_passed = set()
         sell_passed = set()
+        peak_breakdown_passed = set()
+        btc_peak_breakdown = False
+        norm_series_list = []
         total_votes = 0
 
         for ticker, (sym, df) in unique_symbol_dfs.items():
@@ -5861,6 +5867,15 @@ def evaluate_market_regime_3window(
             votes = 2 if sym.upper().replace("-USDT", "").replace("USDT", "") == "BTC" else 1
             total_votes += votes
 
+            # 天井崩壊判定 (前半50%以内に最高値があり、現在値がレンジ半値以下へ崩落)
+            is_peak_bd = (peak_ratio < 0.50 and final_norm <= half_level)
+            if is_peak_bd:
+                peak_breakdown_passed.add(sym)
+                if ticker == "BTC":
+                    btc_peak_breakdown = True
+
+            norm_series_list.append(norm_c)
+
             # 買い候補判定 (プラスかつ前半高値半値維持)
             if final_norm >= 1.0:
                 if peak_ratio >= 0.50 or final_norm >= half_level:
@@ -5872,6 +5887,22 @@ def evaluate_market_regime_3window(
                 if trough_ratio >= 0.50 or final_norm <= half_level:
                     sell_votes += votes
                     sell_passed.add(sym)
+
+        # 市場平均ノーマライズ系列の天井崩壊判定
+        market_peak_bd = False
+        if norm_series_list:
+            min_l = min(len(s) for s in norm_series_list)
+            if min_l >= 24:
+                stacked = np.array([s.iloc[-min_l:].values for s in norm_series_list])
+                m_mean = np.mean(stacked, axis=0)
+                m_min = float(np.min(m_mean))
+                m_max = float(np.max(m_mean))
+                m_half = m_min + (m_max - m_min) * 0.5
+                m_peak_idx = int(np.argmax(m_mean))
+                m_peak_ratio = m_peak_idx / len(m_mean)
+                m_final = float(m_mean[-1])
+                if m_peak_ratio < 0.50 and m_final <= m_half:
+                    market_peak_bd = True
 
         # 判定基準: 半分以上 (11票以上 / 22票)
         state = "NEUTRAL"
@@ -5886,31 +5917,69 @@ def evaluate_market_regime_3window(
             "sell_votes": sell_votes,
             "total_votes": total_votes,
             "buy_passed": list(buy_passed),
-            "sell_passed": list(sell_passed)
+            "sell_passed": list(sell_passed),
+            "peak_breakdown_passed": list(peak_breakdown_passed),
+            "btc_peak_breakdown": btc_peak_breakdown,
+            "market_peak_bd": market_peak_bd
         }
         eligible_buy_by_window[w_name] = buy_passed
         eligible_sell_by_window[w_name] = sell_passed
+        peak_breakdown_by_window[w_name] = peak_breakdown_passed
+        btc_peak_breakdown_by_window[w_name] = btc_peak_breakdown
+        market_peak_bd_by_window[w_name] = market_peak_bd
 
-    # 総合地合い判定 (3期間すべてが一致しているか)
+    # 30d 天井崩壊判定の集約 (BTC天井崩壊、市場平均天井崩壊、またはアルト等天井崩壊8銘柄以上)
+    is_30d_peak_breakdown = (
+        btc_peak_breakdown_by_window.get("30d", False)
+        or market_peak_bd_by_window.get("30d", False)
+        or len(peak_breakdown_by_window.get("30d", set())) >= 8
+    )
+
+    # 総合地合い判定 (3期間すべてが一致しているか、または30d天井崩壊緩和)
     states = [period_results[w]["state"] for w in ["30d", "10d", "5d"]]
     recommended_symbols = []
+    regime_reason = ""
 
     if states == ["BUY", "BUY", "BUY"]:
         overall_regime = "BUY"
+        regime_reason = "3期間すべて買い (BUY一致)"
         common_buy = set.intersection(*(eligible_buy_by_window[w] for w in ["30d", "10d", "5d"]))
         recommended_symbols = sorted([s for s in common_buy if s.upper().replace("-USDT", "").replace("USDT", "") != "BTC"])
     elif states == ["SELL", "SELL", "SELL"]:
         overall_regime = "SELL"
+        regime_reason = "3期間すべて売り (SELL一致)"
         common_sell = set.intersection(*(eligible_sell_by_window[w] for w in ["30d", "10d", "5d"]))
+        recommended_symbols = sorted([s for s in common_sell if s.upper().replace("-USDT", "").replace("USDT", "") != "BTC"])
+    elif states[1] == "SELL" and states[2] == "SELL" and is_30d_peak_breakdown:
+        overall_regime = "SELL"
+        bd_detail = []
+        if btc_peak_breakdown_by_window.get("30d", False):
+            bd_detail.append("BTC天井崩壊")
+        if market_peak_bd_by_window.get("30d", False):
+            bd_detail.append("市場平均天井崩壊")
+        bd_count = len(peak_breakdown_by_window.get("30d", set()))
+        if bd_count > 0:
+            bd_detail.append(f"天井崩壊{bd_count}銘柄")
+        detail_str = "/".join(bd_detail) if bd_detail else "天井崩壊検知"
+        regime_reason = f"30d天井崩壊下落({detail_str}) ＆ 10d/5d売り一致 (30d={states[0]}から売り判定緩和)"
+
+        common_10_5 = eligible_sell_by_window["10d"].intersection(eligible_sell_by_window["5d"])
+        eligible_30d_short = eligible_sell_by_window["30d"].union(peak_breakdown_by_window.get("30d", set()))
+        common_sell = common_10_5.intersection(eligible_30d_short)
+        if not common_sell:
+            common_sell = common_10_5
         recommended_symbols = sorted([s for s in common_sell if s.upper().replace("-USDT", "").replace("USDT", "") != "BTC"])
     else:
         overall_regime = "NEUTRAL"
+        regime_reason = f"地合い不一致または中立 (30d={states[0]}, 10d={states[1]}, 5d={states[2]})"
         recommended_symbols = []
 
     return {
         "overall_regime": overall_regime,
         "is_buy_regime": (overall_regime == "BUY"),
         "is_sell_regime": (overall_regime == "SELL"),
+        "regime_reason": regime_reason,
+        "is_30d_peak_breakdown": is_30d_peak_breakdown,
         "period_results": period_results,
         "recommended_symbols": recommended_symbols,
         "timestamp": datetime.now(timezone.utc).isoformat()

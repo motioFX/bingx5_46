@@ -421,7 +421,9 @@ async def main() -> None:
 
         overall_icon = "🟢" if overall_reg == "BUY" else ("🔴" if overall_reg == "SELL" else "⚪")
         overall_label = state_label_map.get(overall_reg, overall_reg)
-        regime_summary_lines.append(f"\n👉 **総合地合い判定**: {overall_icon} **{overall_label}** (3期間合致判定)")
+        reg_reason = regime_eval_res.get("regime_reason", "")
+        reason_suffix = f" ({reg_reason})" if reg_reason else " (3期間合致判定)"
+        regime_summary_lines.append(f"\n👉 **総合地合い判定**: {overall_icon} **{overall_label}**{reason_suffix}")
 
         if overall_reg == "BUY":
             regime_summary_lines.append(f"🎯 **買いトレード推奨銘柄 ({len(recommended_syms)}銘柄)**: `{', '.join(recommended_syms) if recommended_syms else 'なし'}`")
@@ -442,6 +444,8 @@ async def main() -> None:
     state_data = {
         "market_state": final_state,
         "overall_regime": overall_reg,
+        "regime_reason": regime_eval_res.get("regime_reason", ""),
+        "is_30d_peak_breakdown": regime_eval_res.get("is_30d_peak_breakdown", False),
         "is_buy_regime": (overall_reg == "BUY"),
         "is_sell_regime": (overall_reg == "SELL"),
         "period_results": period_res,
