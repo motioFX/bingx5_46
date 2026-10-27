@@ -1114,13 +1114,19 @@ async def validate_profitable_candidates(trade_side: str, mode: str, base_symbol
                     "single_pnl": best_params_dict.get("single_pnl", cand_pnl),
                     "single_trades": best_params_dict.get("single_trades", trade_cnt),
                     "single_win_rate": best_params_dict.get("single_win_rate", win_rt),
+                    "pnl_first_half": float(best_params_dict.get("pnl_first_half", 0.0)),
+                    "pnl_second_half": float(best_params_dict.get("pnl_second_half", 0.0)),
+                    "is_qualified": bool(best_params_dict.get("is_qualified", False)),
                     "chart_df": best_params_dict.get("chart_df"),
                     "params": best_params_dict,
                 }
                 symbol_params_map[cand] = cand_params
 
-                # プラス収支かつ最低取引回数(10回以上)クリアで合格
-                if cand_pnl > 0 and trade_cnt >= 10:
+                # 二重頑健性フィルター (全体10回以上 & 前半純利益>0 & 後半純利益>前半純利益) クリアで合格
+                pnl_1st = float(cand_params.get("pnl_first_half", 0.0))
+                pnl_2nd = float(cand_params.get("pnl_second_half", 0.0))
+                is_qual = bool(cand_params.get("is_qualified", False) and trade_cnt >= 10 and pnl_1st > 0.0 and pnl_2nd > pnl_1st)
+                if is_qual:
                     dyn_sl_disp = cand_params.get("dynamic_mae_stop", -0.025)
                     if "val_poc" in cand_strat or "vah_poc" in cand_strat:
                         detail_str = f"MP={cand_mp}, Bins={cand_params['num_bins']}, VA={int(cand_params['value_area_pct']*100)}%, TR={int(cand_params['target_ratio']*100)}%, {cand_params['ma_type']}_{cand_params['ma_condition']}, 動的SL={dyn_sl_disp:.2%}"
@@ -1133,24 +1139,24 @@ async def validate_profitable_candidates(trade_side: str, mode: str, base_symbol
                     s_win = cand_params.get('single_win_rate', win_rt)
                     discord.print_log(
                         f"   [合格 🟢] {cand}: 戦略={cand_strat.upper()} ({cand_inv}m / {detail_str}) -> "
-                        f"純利益: +${cand_pnl:.2f} USDT (取引: {trade_cnt}回, 勝率: {win_rt:.1f}%, DD: {max_dd:.2f} USDT ({max_dd:.1f}%)) "
+                        f"純利益: +${cand_pnl:.2f} USDT (前半: +${pnl_1st:.2f} / 後半: +${pnl_2nd:.2f}, 取引: {trade_cnt}回, 勝率: {win_rt:.1f}%, DD: {max_dd:.2f} USDT ({max_dd:.1f}%)) "
                         f"[シングル1枠: +${s_pnl:.2f} / {s_cnt}回 / {s_win:.1f}%]"
                     )
                     profitable_cands.append(cand)
                 else:
-                    discord.print_log(f"   [不合格 🔴] {cand}: PnL = ${cand_pnl:+.2f} USDT (取引: {trade_cnt}回 < 最低10回基準またはマイナス)")
+                    discord.print_log(f"   [不合格 🔴] {cand}: PnL = ${cand_pnl:+.2f} USDT [前半: ${pnl_1st:+.2f} / 後半: ${pnl_2nd:+.2f}] (取引: {trade_cnt}回 / 二重頑健性未達: 前半黒字かつ後半加速が必須)")
 
             except Exception as opt_err:
                 discord.print_log(f"   [最適化エラー] {cand}: {opt_err}")
 
         await asyncio.sleep(0.1)
 
-    # 1ヶ月間バックテスト 最優秀成績銘柄 チャート1枚出力 (PROJECT_RULES.md 準拠)
+    # 1ヶ月間バックテスト 最優秀成績銘柄 チャート1枚出力 (PROJECT_RULES.md 準拠: 後半純利益最大を選抜)
     best_sym = None
     if profitable_cands:
-        best_sym = max(profitable_cands, key=lambda s: symbol_params_map[s].get("pnl", 0.0))
+        best_sym = max(profitable_cands, key=lambda s: symbol_params_map[s].get("pnl_second_half", symbol_params_map[s].get("pnl", 0.0)))
     elif symbol_params_map:
-        best_sym = max(symbol_params_map.keys(), key=lambda s: symbol_params_map[s].get("pnl", 0.0))
+        best_sym = max(symbol_params_map.keys(), key=lambda s: symbol_params_map[s].get("pnl_second_half", symbol_params_map[s].get("pnl", 0.0)))
 
     if best_sym and best_sym in symbol_params_map:
         try:
@@ -1175,10 +1181,12 @@ async def validate_profitable_candidates(trade_side: str, mode: str, base_symbol
 
             strat_tag = str(best_strat).upper()
             chart_label = f"Best1Month_{strat_tag}_{best_inv}m"
+            b_p1 = float(best_p.get('pnl_first_half', 0.0))
+            b_p2 = float(best_p.get('pnl_second_half', 0.0))
             discord.print_log(
-                f"🏆 **【バックテスト 最優秀成績銘柄 (1ヶ月間)】**\n"
+                f"🏆 **【バックテスト 最優秀成績銘柄 (1ヶ月間・二重頑健性クリア)】**\n"
                 f"・銘柄: `{best_sym}` (採用足種: `{best_inv}m足` / 戦略: `{strat_tag}`)\n"
-                f"・純利益: `+${best_pnl:.2f} USDT` (取引: {best_cnt}回, 勝率: {best_win:.1f}%, MaxDD: `-${best_dd:.2f} USDT (-{best_dd:.1f}%)`)\n"
+                f"・純利益: `+${best_pnl:.2f} USDT` [前半: +${b_p1:.2f} / 後半: +${b_p2:.2f}] (取引: {best_cnt}回, 勝率: {best_win:.1f}%, MaxDD: `-${best_dd:.2f} USDT (-{best_dd:.1f}%)`)\n"
                 f"・最優秀成績チャート1枚を出力します。"
             )
             discord.plot_backtest(label=chart_label, csv_file=bg_csv, symbol=best_sym)

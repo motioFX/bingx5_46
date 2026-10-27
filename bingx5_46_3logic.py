@@ -1731,6 +1731,7 @@ def simulate_val_poc_fast(
 ) -> Dict[str, Any]:
     """VAL_POC 高速バックテストシミュレータ (動的ストップ・4時間タイムアウト・最大3枠対応)"""
     n = len(closes)
+    half_idx = n // 2
     trade_size = initial_equity / max_trades
     pos_qty = 0.0
     pos_cost = 0.0
@@ -1741,6 +1742,8 @@ def simulate_val_poc_fast(
     cooldown_until = -1
     pending_limit = -1.0
     cum_pnl = 0.0
+    pnl_first_half = 0.0
+    pnl_second_half = 0.0
     trades = []
     peak_eq = initial_equity
     max_dd = 0.0
@@ -1796,6 +1799,10 @@ def simulate_val_poc_fast(
                 fee = sell_val * fee_rate
                 pnl = sell_val - pos_cost - fee
                 cum_pnl += pnl
+                if i < half_idx:
+                    pnl_first_half += pnl
+                else:
+                    pnl_second_half += pnl
                 trades.append(pnl)
                 if record_chart and exec_sell is not None:
                     exec_sell[i] = c
@@ -1816,6 +1823,10 @@ def simulate_val_poc_fast(
                         fee = sell_val * fee_rate
                         pnl = sell_val - pos_cost - fee
                         cum_pnl += pnl
+                        if i < half_idx:
+                            pnl_first_half += pnl
+                        else:
+                            pnl_second_half += pnl
                         trades.append(pnl)
                         if record_chart and exec_sell is not None:
                             exec_sell[i] = exit_px
@@ -1862,6 +1873,8 @@ def simulate_val_poc_fast(
     win_rate = (win_cnt / trade_cnt * 100.0) if trade_cnt > 0 else 0.0
     res_dict: Dict[str, Any] = {
         'final_pnl': float(cum_pnl),
+        'pnl_first_half': float(pnl_first_half),
+        'pnl_second_half': float(pnl_second_half),
         'trade_count': trade_cnt,
         'win_rate': win_rate,
         'DD_max': float(max_dd)
@@ -1894,6 +1907,7 @@ def simulate_vah_poc_fast(
 ) -> Dict[str, Any]:
     """VAH_POC 高速ショートバックテストシミュレータ (単発1本固定・動的ストップ・4時間タイムアウト)"""
     n = len(closes)
+    half_idx = n // 2
     trade_size = initial_equity  # ショートはナンピンなし・単発100%フルサイズ固定
     pos_qty = 0.0
     pos_cost = 0.0
@@ -1903,6 +1917,8 @@ def simulate_vah_poc_fast(
     cooldown_until = -1
     pending_limit = -1.0
     cum_pnl = 0.0
+    pnl_first_half = 0.0
+    pnl_second_half = 0.0
     trades = []
     peak_eq = initial_equity
     max_dd = 0.0
@@ -1956,6 +1972,10 @@ def simulate_vah_poc_fast(
                 entry_fee = pos_cost * maker_fee
                 pnl = pos_cost - buy_val - fee - entry_fee
                 cum_pnl += pnl
+                if i < half_idx:
+                    pnl_first_half += pnl
+                else:
+                    pnl_second_half += pnl
                 trades.append(pnl)
                 if record_chart and exec_buy is not None:
                     exec_buy[i] = c
@@ -1976,6 +1996,10 @@ def simulate_vah_poc_fast(
                         entry_fee = pos_cost * maker_fee
                         pnl = pos_cost - buy_val - fee - entry_fee
                         cum_pnl += pnl
+                        if i < half_idx:
+                            pnl_first_half += pnl
+                        else:
+                            pnl_second_half += pnl
                         trades.append(pnl)
                         if record_chart and exec_buy is not None:
                             exec_buy[i] = exit_px
@@ -2014,6 +2038,8 @@ def simulate_vah_poc_fast(
     win_rate = (win_cnt / trade_cnt * 100.0) if trade_cnt > 0 else 0.0
     res_dict: Dict[str, Any] = {
         'final_pnl': float(cum_pnl),
+        'pnl_first_half': float(pnl_first_half),
+        'pnl_second_half': float(pnl_second_half),
         'trade_count': trade_cnt,
         'win_rate': win_rate,
         'DD_max': float(max_dd)
@@ -2053,6 +2079,7 @@ def optimize_rsima3_fast(
 ) -> Dict[str, Any]:
     """RSIMA 9通り (EP 30,35,40 × CP 60,65,70, 動的ストップ・4時間タイムアウト) 超高速最適化 (MIN_TRADES=10)"""
     n = len(closes)
+    half_idx = n // 2
     trade_size = initial_equity / max_trades
     maker_fee = 0.0002
     taker_fee = 0.0006
@@ -2070,7 +2097,8 @@ def optimize_rsima3_fast(
     fallback_pnl = -float('inf')
     fallback_res: Dict[str, Any] = {
         'l_ep': 40.0, 'l_cp': 60.0, 'sl_pct': default_sl_pct,
-        'final_pnl': 0.0, 'trade_count': 0, 'win_rate': 0.0, 'DD_max': 0.0
+        'final_pnl': 0.0, 'pnl_first_half': 0.0, 'pnl_second_half': 0.0,
+        'trade_count': 0, 'win_rate': 0.0, 'DD_max': 0.0
     }
 
     use_va = (val_arr is not None and vah_arr is not None and len(val_arr) == n)
@@ -2092,6 +2120,8 @@ def optimize_rsima3_fast(
             pos_cnt = 0
             entry_bar_idx = -1
             cum_pnl = 0.0
+            pnl_first_half = 0.0
+            pnl_second_half = 0.0
             trades_cnt = 0
             wins_cnt = 0
             pending_px = -1.0
@@ -2142,6 +2172,10 @@ def optimize_rsima3_fast(
                         fee = sell_val * taker_fee
                         pnl = sell_val - pos_cost - fee
                         cum_pnl += pnl
+                        if i < half_idx:
+                            pnl_first_half += pnl
+                        else:
+                            pnl_second_half += pnl
                         trades_cnt += 1
                         if pnl > 0:
                             wins_cnt += 1
@@ -2164,6 +2198,10 @@ def optimize_rsima3_fast(
                         fee = sell_val * taker_fee
                         pnl = sell_val - pos_cost - fee
                         cum_pnl += pnl
+                        if i < half_idx:
+                            pnl_first_half += pnl
+                        else:
+                            pnl_second_half += pnl
                         trades_cnt += 1
                         if pnl > 0:
                             wins_cnt += 1
@@ -2203,12 +2241,19 @@ def optimize_rsima3_fast(
                 'l_cp': float(cp),
                 'sl_pct': float(default_sl_pct),
                 'final_pnl': float(cum_pnl),
+                'pnl_first_half': float(pnl_first_half),
+                'pnl_second_half': float(pnl_second_half),
                 'trade_count': int(trades_cnt),
                 'win_rate': float(win_rt),
                 'DD_max': float(max_dd)
             }
-            if trades_cnt >= min_trades and cum_pnl > best_pnl:
-                best_pnl = cum_pnl
+            is_qualified = (
+                trades_cnt >= min_trades
+                and pnl_first_half > 0.0
+                and pnl_second_half > pnl_first_half
+            )
+            if is_qualified and pnl_second_half > best_pnl:
+                best_pnl = pnl_second_half
                 best_res = cand_entry
             elif trades_cnt >= 5 and cum_pnl > fallback_pnl:
                 fallback_pnl = cum_pnl
@@ -2235,6 +2280,7 @@ def optimize_rsima3_short_fast(
 ) -> Dict[str, Any]:
     """RSIMA ショート 9通り (EP 60,65,70 × CP 30,35,40, 単発1本固定・動的ストップ・4時間タイムアウト) 高速最適化"""
     n = len(closes)
+    half_idx = n // 2
     trade_size = initial_equity  # ショートはナンピンなし・単発100%フルサイズ固定
     maker_fee = 0.0002
     taker_fee = 0.0006
@@ -2252,7 +2298,8 @@ def optimize_rsima3_short_fast(
     fallback_pnl = -float('inf')
     fallback_res: Dict[str, Any] = {
         's_ep': 60.0, 's_cp': 40.0, 'sl_pct': default_sl_pct,
-        'final_pnl': 0.0, 'trade_count': 0, 'win_rate': 0.0, 'DD_max': 0.0
+        'final_pnl': 0.0, 'pnl_first_half': 0.0, 'pnl_second_half': 0.0,
+        'trade_count': 0, 'win_rate': 0.0, 'DD_max': 0.0
     }
 
     for ep in eps:
@@ -2271,6 +2318,8 @@ def optimize_rsima3_short_fast(
             pos_cnt = 0
             entry_bar_idx = -1
             cum_pnl = 0.0
+            pnl_first_half = 0.0
+            pnl_second_half = 0.0
             trades_cnt = 0
             wins_cnt = 0
             pending_px = -1.0
@@ -2321,6 +2370,10 @@ def optimize_rsima3_short_fast(
                         entry_fee = pos_cost * maker_fee
                         pnl = pos_cost - buy_val - fee - entry_fee
                         cum_pnl += pnl
+                        if i < half_idx:
+                            pnl_first_half += pnl
+                        else:
+                            pnl_second_half += pnl
                         trades_cnt += 1
                         if pnl > 0:
                             wins_cnt += 1
@@ -2343,6 +2396,10 @@ def optimize_rsima3_short_fast(
                         entry_fee = pos_cost * maker_fee
                         pnl = pos_cost - buy_val - fee - entry_fee
                         cum_pnl += pnl
+                        if i < half_idx:
+                            pnl_first_half += pnl
+                        else:
+                            pnl_second_half += pnl
                         trades_cnt += 1
                         if pnl > 0:
                             wins_cnt += 1
@@ -2373,12 +2430,19 @@ def optimize_rsima3_short_fast(
                 's_cp': float(cp),
                 'sl_pct': float(default_sl_pct),
                 'final_pnl': float(cum_pnl),
+                'pnl_first_half': float(pnl_first_half),
+                'pnl_second_half': float(pnl_second_half),
                 'trade_count': int(trades_cnt),
                 'win_rate': float(win_rt),
                 'DD_max': float(max_dd)
             }
-            if trades_cnt >= min_trades and cum_pnl > best_pnl:
-                best_pnl = cum_pnl
+            is_qualified = (
+                trades_cnt >= min_trades
+                and pnl_first_half > 0.0
+                and pnl_second_half > pnl_first_half
+            )
+            if is_qualified and pnl_second_half > best_pnl:
+                best_pnl = pnl_second_half
                 best_res = cand_entry
             elif trades_cnt >= 5 and cum_pnl > fallback_pnl:
                 fallback_pnl = cum_pnl
@@ -2878,12 +2942,18 @@ def _run_interval_comparison_short(df_5m: pd.DataFrame, lot: float = 1.0, data_e
                 cand_none = {
                     'strategy': 'vah_poc', 'interval': inv, 'mp_period': mp, 'num_bins': bins_fixed, 'va': va_name_fixed,
                     'value_area_pct': va_pct_fixed, 'target_ratio': tr, 'ma_type': 'NONE', 'condition': 'none',
-                    'pnl': sim_none['final_pnl'], 'trade_count': sim_none['trade_count'],
+                    'pnl': sim_none['final_pnl'], 'pnl_first_half': sim_none.get('pnl_first_half', 0.0), 'pnl_second_half': sim_none.get('pnl_second_half', 0.0),
+                    'trade_count': sim_none['trade_count'],
                     'win_rate': sim_none['win_rate'], 'DD_max': sim_none['DD_max'],
                     'single_pnl': sim_none['final_pnl'], 'single_trades': sim_none['trade_count'], 'single_win_rate': sim_none['win_rate']
                 }
-                if sim_none['trade_count'] >= MIN_TRADES and sim_none['final_pnl'] > best_vp_none_pnl:
-                    best_vp_none_pnl = sim_none['final_pnl']
+                is_none_qual = (
+                    sim_none['trade_count'] >= MIN_TRADES
+                    and sim_none.get('pnl_first_half', 0.0) > 0.0
+                    and sim_none.get('pnl_second_half', 0.0) > sim_none.get('pnl_first_half', 0.0)
+                )
+                if is_none_qual and sim_none.get('pnl_second_half', 0.0) > best_vp_none_pnl:
+                    best_vp_none_pnl = sim_none.get('pnl_second_half', 0.0)
                     best_vp_none_cfg = cand_none
                 elif sim_none['trade_count'] >= 5 and sim_none['final_pnl'] > fallback_vp_none_pnl:
                     fallback_vp_none_pnl = sim_none['final_pnl']
@@ -2907,12 +2977,18 @@ def _run_interval_comparison_short(df_5m: pd.DataFrame, lot: float = 1.0, data_e
                 cand_ema = {
                     'strategy': 'vah_poc_ema', 'interval': inv, 'mp_period': mp, 'num_bins': bins_fixed, 'va': va_name_fixed,
                     'value_area_pct': va_pct_fixed, 'target_ratio': tr, 'ma_type': 'EMA', 'condition': 'close_below',
-                    'pnl': sim_ema['final_pnl'], 'trade_count': sim_ema['trade_count'],
+                    'pnl': sim_ema['final_pnl'], 'pnl_first_half': sim_ema.get('pnl_first_half', 0.0), 'pnl_second_half': sim_ema.get('pnl_second_half', 0.0),
+                    'trade_count': sim_ema['trade_count'],
                     'win_rate': sim_ema['win_rate'], 'DD_max': sim_ema['DD_max'],
                     'single_pnl': sim_ema['final_pnl'], 'single_trades': sim_ema['trade_count'], 'single_win_rate': sim_ema['win_rate']
                 }
-                if sim_ema['trade_count'] >= MIN_TRADES and sim_ema['final_pnl'] > best_vp_ema_pnl:
-                    best_vp_ema_pnl = sim_ema['final_pnl']
+                is_ema_qual = (
+                    sim_ema['trade_count'] >= MIN_TRADES
+                    and sim_ema.get('pnl_first_half', 0.0) > 0.0
+                    and sim_ema.get('pnl_second_half', 0.0) > sim_ema.get('pnl_first_half', 0.0)
+                )
+                if is_ema_qual and sim_ema.get('pnl_second_half', 0.0) > best_vp_ema_pnl:
+                    best_vp_ema_pnl = sim_ema.get('pnl_second_half', 0.0)
                     best_vp_ema_cfg = cand_ema
                 elif sim_ema['trade_count'] >= 5 and sim_ema['final_pnl'] > fallback_vp_ema_pnl:
                     fallback_vp_ema_pnl = sim_ema['final_pnl']
@@ -2992,8 +3068,13 @@ def _run_interval_comparison_short(df_5m: pd.DataFrame, lot: float = 1.0, data_e
             'single_pnl': res_r_none['final_pnl'], 'single_trades': res_r_none['trade_count'], 'single_win_rate': res_r_none['win_rate']
         }
         r_none_cand = {**res_r_none, 'strategy': 'rsima_short', 'interval': r_inv, 'df_inv': df_r_inv, 'rsi_s': r_rsi, 'rsi_ma_s': r_rsi_ma, 'use_ema': False, 'ma_filter': ma_filter_r_none}
-        if res_r_none['trade_count'] >= MIN_TRADES and res_r_none['final_pnl'] > best_rsi_none_pnl:
-            best_rsi_none_pnl = res_r_none['final_pnl']
+        is_r_none_qual = (
+            res_r_none['trade_count'] >= MIN_TRADES
+            and res_r_none.get('pnl_first_half', 0.0) > 0.0
+            and res_r_none.get('pnl_second_half', 0.0) > res_r_none.get('pnl_first_half', 0.0)
+        )
+        if is_r_none_qual and res_r_none.get('pnl_second_half', 0.0) > best_rsi_none_pnl:
+            best_rsi_none_pnl = res_r_none.get('pnl_second_half', 0.0)
             best_rsi_none_cfg = r_none_cand
         elif res_r_none['trade_count'] >= 5 and res_r_none['final_pnl'] > fallback_rsi_none_pnl:
             fallback_rsi_none_pnl = res_r_none['final_pnl']
@@ -3016,8 +3097,13 @@ def _run_interval_comparison_short(df_5m: pd.DataFrame, lot: float = 1.0, data_e
             'single_pnl': res_r_ema['final_pnl'], 'single_trades': res_r_ema['trade_count'], 'single_win_rate': res_r_ema['win_rate']
         }
         r_ema_cand = {**res_r_ema, 'strategy': 'rsima_short_ema', 'interval': r_inv, 'df_inv': df_r_inv, 'rsi_s': r_rsi, 'rsi_ma_s': r_rsi_ma, 'use_ema': True, 'ma_filter': ma_filter_r_ema}
-        if res_r_ema['trade_count'] >= MIN_TRADES and res_r_ema['final_pnl'] > best_rsi_ema_pnl:
-            best_rsi_ema_pnl = res_r_ema['final_pnl']
+        is_r_ema_qual = (
+            res_r_ema['trade_count'] >= MIN_TRADES
+            and res_r_ema.get('pnl_first_half', 0.0) > 0.0
+            and res_r_ema.get('pnl_second_half', 0.0) > res_r_ema.get('pnl_first_half', 0.0)
+        )
+        if is_r_ema_qual and res_r_ema.get('pnl_second_half', 0.0) > best_rsi_ema_pnl:
+            best_rsi_ema_pnl = res_r_ema.get('pnl_second_half', 0.0)
             best_rsi_ema_cfg = r_ema_cand
         elif res_r_ema['trade_count'] >= 5 and res_r_ema['final_pnl'] > fallback_rsi_ema_pnl:
             fallback_rsi_ema_pnl = res_r_ema['final_pnl']
@@ -3055,24 +3141,27 @@ def _run_interval_comparison_short(df_5m: pd.DataFrame, lot: float = 1.0, data_e
     tr_vpn = int(best_vp_none_cfg.get('target_ratio', 0.70) * 100)
     tr_vpe = int(best_vp_ema_cfg.get('target_ratio', 0.70) * 100)
     discord.print_log(f"\n📊 【ショート4大基本戦略 最適化結果直接比較】 ({symbol})")
-    discord.print_log(f"🔹 [VAH_POC ({best_vp_none_cfg['interval']}m/MP{best_vp_none_cfg['mp_period']}/TR{tr_vpn}%/EMAなし)]: 純利益 = {pnl_vpn:+.2f} USDC (取引: {cnt_vpn}回, 勝率: {win_vpn:.1f}%)")
-    discord.print_log(f"🔹 [VAH_POC_EMA ({best_vp_ema_cfg['interval']}m/MP{best_vp_ema_cfg['mp_period']}/TR{tr_vpe}%/EMAあり)]: 純利益 = {pnl_vpe:+.2f} USDC (取引: {cnt_vpe}回, 勝率: {win_vpe:.1f}%)")
-    discord.print_log(f"🔸 [RSIMA_SHORT ({best_rsi_none_cfg['interval']}m/EP{int(best_rsi_none_cfg['s_ep'])}/CP{int(best_rsi_none_cfg['s_cp'])}/EMAなし)]: 純利益 = {pnl_rsn:+.2f} USDC (取引: {cnt_rsn}回, 勝率: {win_rsn:.1f}%)")
-    discord.print_log(f"🔸 [RSIMA_SHORT_EMA ({best_rsi_ema_cfg['interval']}m/EP{int(best_rsi_ema_cfg['s_ep'])}/CP{int(best_rsi_ema_cfg['s_cp'])}/EMAあり)]: 純利益 = {pnl_rse:+.2f} USDC (取引: {cnt_rse}回, 勝率: {win_rse:.1f}%)")
+    discord.print_log(f"🔹 [VAH_POC ({best_vp_none_cfg['interval']}m/MP{best_vp_none_cfg['mp_period']}/TR{tr_vpn}%/EMAなし)]: 純利益 = {pnl_vpn:+.2f} USDC (前半: {best_vp_none_cfg.get('pnl_first_half', 0.0):+.2f} / 後半: {best_vp_none_cfg.get('pnl_second_half', 0.0):+.2f}, 取引: {cnt_vpn}回, 勝率: {win_vpn:.1f}%)")
+    discord.print_log(f"🔹 [VAH_POC_EMA ({best_vp_ema_cfg['interval']}m/MP{best_vp_ema_cfg['mp_period']}/TR{tr_vpe}%/EMAあり)]: 純利益 = {pnl_vpe:+.2f} USDC (前半: {best_vp_ema_cfg.get('pnl_first_half', 0.0):+.2f} / 後半: {best_vp_ema_cfg.get('pnl_second_half', 0.0):+.2f}, 取引: {cnt_vpe}回, 勝率: {win_vpe:.1f}%)")
+    discord.print_log(f"🔸 [RSIMA_SHORT ({best_rsi_none_cfg['interval']}m/EP{int(best_rsi_none_cfg['s_ep'])}/CP{int(best_rsi_none_cfg['s_cp'])}/EMAなし)]: 純利益 = {pnl_rsn:+.2f} USDC (前半: {best_rsi_none_cfg.get('pnl_first_half', 0.0):+.2f} / 後半: {best_rsi_none_cfg.get('pnl_second_half', 0.0):+.2f}, 取引: {cnt_rsn}回, 勝率: {win_rsn:.1f}%)")
+    discord.print_log(f"🔸 [RSIMA_SHORT_EMA ({best_rsi_ema_cfg['interval']}m/EP{int(best_rsi_ema_cfg['s_ep'])}/CP{int(best_rsi_ema_cfg['s_cp'])}/EMAあり)]: 純利益 = {pnl_rse:+.2f} USDC (前半: {best_rsi_ema_cfg.get('pnl_first_half', 0.0):+.2f} / 後半: {best_rsi_ema_cfg.get('pnl_second_half', 0.0):+.2f}, 取引: {cnt_rse}回, 勝率: {win_rse:.1f}%)")
 
     valid_cands = []
     for c in candidates:
-        c_pnl = float(c.get('final_pnl', c.get('pnl', -float('inf'))))
         c_cnt = int(c.get('trade_count', 0))
-        if c_cnt >= MIN_TRADES:
-            valid_cands.append((c_pnl, c))
+        c_pnl_1st = float(c.get('pnl_first_half', 0.0))
+        c_pnl_2nd = float(c.get('pnl_second_half', 0.0))
+        if c_cnt >= MIN_TRADES and c_pnl_1st > 0.0 and c_pnl_2nd > c_pnl_1st:
+            valid_cands.append((c_pnl_2nd, c))
 
     if valid_cands:
         valid_cands.sort(key=lambda x: x[0], reverse=True)
         winner = valid_cands[0][1]
+        is_winner_qual = True
     else:
         candidates.sort(key=lambda c: float(c.get('final_pnl', c.get('pnl', -float('inf')))), reverse=True)
         winner = candidates[0]
+        is_winner_qual = False
 
     chosen_strat = winner.get('strategy', 'vah_poc')
     best_interval = int(winner['interval'])
@@ -3107,10 +3196,16 @@ def _run_interval_comparison_short(df_5m: pd.DataFrame, lot: float = 1.0, data_e
             'single_pnl': pnl_final,
             'single_trades': cnt_final,
             'single_win_rate': win_final,
+            'pnl_first_half': float(winner.get('pnl_first_half', 0.0)),
+            'pnl_second_half': float(winner.get('pnl_second_half', 0.0)),
+            'is_qualified': is_winner_qual,
             'chart_df': chart_df
         }
         ema_tag = "(EMAあり)" if winner.get('use_ema') else "(EMAなし)"
-        discord.print_log(f"🏆 [{symbol}] 採用ショート戦略: 【{best_strategy.upper()} ({best_interval}m/{ema_tag})】を動的採用！ (純利益: {pnl_final:+.2f} USDC [単発{cnt_final}回/{win_final:.1f}%])")
+        p1st = winner.get('pnl_first_half', 0.0)
+        p2nd = winner.get('pnl_second_half', 0.0)
+        qual_tag = "🟢合格(前半黒字&後半加速)" if is_winner_qual else "🔴二重頑健性未達"
+        discord.print_log(f"🏆 [{symbol}] 採用ショート戦略: 【{best_strategy.upper()} ({best_interval}m/{ema_tag})】を動的採用！ (純利益: {pnl_final:+.2f} USDC [前半: {p1st:+.2f} / 後半: {p2nd:+.2f} / 単発{cnt_final}回/{win_final:.1f}%] - {qual_tag})")
     else:
         best_strategy = chosen_strat
         best_mp = int(winner['mp_period'])
@@ -3173,10 +3268,16 @@ def _run_interval_comparison_short(df_5m: pd.DataFrame, lot: float = 1.0, data_e
             'single_pnl': pnl_final,
             'single_trades': cnt_final,
             'single_win_rate': win_final,
+            'pnl_first_half': float(winner.get('pnl_first_half', 0.0)),
+            'pnl_second_half': float(winner.get('pnl_second_half', 0.0)),
+            'is_qualified': is_winner_qual,
             'chart_df': df_chart
         }
         ema_tag = "(EMAあり)" if use_ema_val else "(EMAなし)"
-        discord.print_log(f"🏆 [{symbol}] 採用ショート戦略: 【{best_strategy.upper()} ({best_interval}m/{ema_tag})】を動的採用！ (純利益: {pnl_final:+.2f} USDC [単発{cnt_final}回/{win_final:.1f}%])")
+        p1st = winner.get('pnl_first_half', 0.0)
+        p2nd = winner.get('pnl_second_half', 0.0)
+        qual_tag = "🟢合格(前半黒字&後半加速)" if is_winner_qual else "🔴二重頑健性未達"
+        discord.print_log(f"🏆 [{symbol}] 採用ショート戦略: 【{best_strategy.upper()} ({best_interval}m/{ema_tag})】を動的採用！ (純利益: {pnl_final:+.2f} USDC [前半: {p1st:+.2f} / 後半: {p2nd:+.2f} / 単発{cnt_final}回/{win_final:.1f}%] - {qual_tag})")
 
     dyn_stop = calculate_dynamic_mae_stop(
         df_5m=df_5m,
@@ -3308,7 +3409,12 @@ def run_interval_comparison(df_5m: pd.DataFrame, lot: float = 1.0, data_equity: 
                     initial_equity=fixed_initial_equity, max_trades=1, cooldown_bars=cd_bars, timeout_bars=to_bars, target_ratio=tr
                 )
                 vp_eval_count += 1
-                if sim_single_none['trade_count'] >= MIN_TRADES and sim_single_none['final_pnl'] > 0:
+                is_single_none_qual = (
+                    sim_single_none['trade_count'] >= MIN_TRADES
+                    and sim_single_none.get('pnl_first_half', 0.0) > 0.0
+                    and sim_single_none.get('pnl_second_half', 0.0) > sim_single_none.get('pnl_first_half', 0.0)
+                )
+                if is_single_none_qual:
                     sim_none = simulate_val_poc_fast(
                         c_inv, h_inv, l_inv, val_arr, vah_arr, pocs, ma_filter_none,
                         initial_equity=fixed_initial_equity, max_trades=3, cooldown_bars=cd_bars, timeout_bars=to_bars, target_ratio=tr
@@ -3331,12 +3437,18 @@ def run_interval_comparison(df_5m: pd.DataFrame, lot: float = 1.0, data_equity: 
                 cand_none = {
                     'strategy': 'val_poc', 'interval': inv, 'mp_period': mp, 'num_bins': bins_fixed, 'va': va_name_fixed,
                     'value_area_pct': va_pct_fixed, 'target_ratio': tr, 'ma_type': 'NONE', 'condition': 'none',
-                    'pnl': sim_none['final_pnl'], 'trade_count': sim_none['trade_count'],
+                    'pnl': sim_none['final_pnl'], 'pnl_first_half': sim_none.get('pnl_first_half', 0.0), 'pnl_second_half': sim_none.get('pnl_second_half', 0.0),
+                    'trade_count': sim_none['trade_count'],
                     'win_rate': sim_none['win_rate'], 'DD_max': sim_none['DD_max'],
                     'single_pnl': sim_none['single_pnl'], 'single_trades': sim_none['single_trades'], 'single_win_rate': sim_none['single_win_rate']
                 }
-                if sim_none['trade_count'] >= MIN_TRADES and sim_none['final_pnl'] > best_vp_none_pnl:
-                    best_vp_none_pnl = sim_none['final_pnl']
+                is_none_qual = (
+                    sim_none['trade_count'] >= MIN_TRADES
+                    and sim_none.get('pnl_first_half', 0.0) > 0.0
+                    and sim_none.get('pnl_second_half', 0.0) > sim_none.get('pnl_first_half', 0.0)
+                )
+                if is_none_qual and sim_none.get('pnl_second_half', 0.0) > best_vp_none_pnl:
+                    best_vp_none_pnl = sim_none.get('pnl_second_half', 0.0)
                     best_vp_none_cfg = cand_none
                 elif sim_none['trade_count'] >= 5 and sim_none['final_pnl'] > fallback_vp_none_pnl:
                     fallback_vp_none_pnl = sim_none['final_pnl']
@@ -3348,7 +3460,12 @@ def run_interval_comparison(df_5m: pd.DataFrame, lot: float = 1.0, data_equity: 
                     initial_equity=fixed_initial_equity, max_trades=1, cooldown_bars=cd_bars, timeout_bars=to_bars, target_ratio=tr
                 )
                 vp_eval_count += 1
-                if sim_single_ema['trade_count'] >= MIN_TRADES and sim_single_ema['final_pnl'] > 0:
+                is_single_ema_qual = (
+                    sim_single_ema['trade_count'] >= MIN_TRADES
+                    and sim_single_ema.get('pnl_first_half', 0.0) > 0.0
+                    and sim_single_ema.get('pnl_second_half', 0.0) > sim_single_ema.get('pnl_first_half', 0.0)
+                )
+                if is_single_ema_qual:
                     sim_ema = simulate_val_poc_fast(
                         c_inv, h_inv, l_inv, val_arr, vah_arr, pocs, ma_filter_ema,
                         initial_equity=fixed_initial_equity, max_trades=3, cooldown_bars=cd_bars, timeout_bars=to_bars, target_ratio=tr
@@ -3371,12 +3488,18 @@ def run_interval_comparison(df_5m: pd.DataFrame, lot: float = 1.0, data_equity: 
                 cand_ema = {
                     'strategy': 'val_poc_ema', 'interval': inv, 'mp_period': mp, 'num_bins': bins_fixed, 'va': va_name_fixed,
                     'value_area_pct': va_pct_fixed, 'target_ratio': tr, 'ma_type': 'EMA', 'condition': 'close_above',
-                    'pnl': sim_ema['final_pnl'], 'trade_count': sim_ema['trade_count'],
+                    'pnl': sim_ema['final_pnl'], 'pnl_first_half': sim_ema.get('pnl_first_half', 0.0), 'pnl_second_half': sim_ema.get('pnl_second_half', 0.0),
+                    'trade_count': sim_ema['trade_count'],
                     'win_rate': sim_ema['win_rate'], 'DD_max': sim_ema['DD_max'],
                     'single_pnl': sim_ema['single_pnl'], 'single_trades': sim_ema['single_trades'], 'single_win_rate': sim_ema['single_win_rate']
                 }
-                if sim_ema['trade_count'] >= MIN_TRADES and sim_ema['final_pnl'] > best_vp_ema_pnl:
-                    best_vp_ema_pnl = sim_ema['final_pnl']
+                is_ema_qual = (
+                    sim_ema['trade_count'] >= MIN_TRADES
+                    and sim_ema.get('pnl_first_half', 0.0) > 0.0
+                    and sim_ema.get('pnl_second_half', 0.0) > sim_ema.get('pnl_first_half', 0.0)
+                )
+                if is_ema_qual and sim_ema.get('pnl_second_half', 0.0) > best_vp_ema_pnl:
+                    best_vp_ema_pnl = sim_ema.get('pnl_second_half', 0.0)
                     best_vp_ema_cfg = cand_ema
                 elif sim_ema['trade_count'] >= 5 and sim_ema['final_pnl'] > fallback_vp_ema_pnl:
                     fallback_vp_ema_pnl = sim_ema['final_pnl']
@@ -3451,7 +3574,12 @@ def run_interval_comparison(df_5m: pd.DataFrame, lot: float = 1.0, data_equity: 
             val_arr=val_arr_r, vah_arr=vah_arr_r, ma_filter=ma_filter_r_none,
             cooldown_bars=cd_bars_r, timeout_bars=to_bars_r
         )
-        if res_r_none_single['trade_count'] >= MIN_TRADES and res_r_none_single['final_pnl'] > 0:
+        is_single_r_none_qual = (
+            res_r_none_single['trade_count'] >= MIN_TRADES
+            and res_r_none_single.get('pnl_first_half', 0.0) > 0.0
+            and res_r_none_single.get('pnl_second_half', 0.0) > res_r_none_single.get('pnl_first_half', 0.0)
+        )
+        if is_single_r_none_qual:
             res_r_none = optimize_rsima3_fast(
                 c_r, h_r, l_r, r_rsi.values, r_rsi_ma.values,
                 initial_equity=fixed_initial_equity, max_trades=3, min_trades=MIN_TRADES,
@@ -3474,8 +3602,13 @@ def run_interval_comparison(df_5m: pd.DataFrame, lot: float = 1.0, data_equity: 
             'single_pnl': res_r_none['single_pnl'], 'single_trades': res_r_none['single_trades'], 'single_win_rate': res_r_none['single_win_rate']
         }
         r_none_cand = {**res_r_none, 'strategy': 'rsima', 'interval': r_inv, 'df_inv': df_r_inv, 'rsi_s': r_rsi, 'rsi_ma_s': r_rsi_ma, 'use_ema': False, 'ma_filter': ma_filter_r_none}
-        if res_r_none['trade_count'] >= MIN_TRADES and res_r_none['final_pnl'] > best_rsi_none_pnl:
-            best_rsi_none_pnl = res_r_none['final_pnl']
+        is_r_none_qual = (
+            res_r_none['trade_count'] >= MIN_TRADES
+            and res_r_none.get('pnl_first_half', 0.0) > 0.0
+            and res_r_none.get('pnl_second_half', 0.0) > res_r_none.get('pnl_first_half', 0.0)
+        )
+        if is_r_none_qual and res_r_none.get('pnl_second_half', 0.0) > best_rsi_none_pnl:
+            best_rsi_none_pnl = res_r_none.get('pnl_second_half', 0.0)
             best_rsi_none_cfg = r_none_cand
         elif res_r_none['trade_count'] >= 5 and res_r_none['final_pnl'] > fallback_rsi_none_pnl:
             fallback_rsi_none_pnl = res_r_none['final_pnl']
@@ -3488,7 +3621,12 @@ def run_interval_comparison(df_5m: pd.DataFrame, lot: float = 1.0, data_equity: 
             val_arr=val_arr_r, vah_arr=vah_arr_r, ma_filter=ma_filter_r_ema,
             cooldown_bars=cd_bars_r, timeout_bars=to_bars_r
         )
-        if res_r_ema_single['trade_count'] >= MIN_TRADES and res_r_ema_single['final_pnl'] > 0:
+        is_single_r_ema_qual = (
+            res_r_ema_single['trade_count'] >= MIN_TRADES
+            and res_r_ema_single.get('pnl_first_half', 0.0) > 0.0
+            and res_r_ema_single.get('pnl_second_half', 0.0) > res_r_ema_single.get('pnl_first_half', 0.0)
+        )
+        if is_single_r_ema_qual:
             res_r_ema = optimize_rsima3_fast(
                 c_r, h_r, l_r, r_rsi.values, r_rsi_ma.values,
                 initial_equity=fixed_initial_equity, max_trades=3, min_trades=MIN_TRADES,
@@ -3511,8 +3649,13 @@ def run_interval_comparison(df_5m: pd.DataFrame, lot: float = 1.0, data_equity: 
             'single_pnl': res_r_ema['single_pnl'], 'single_trades': res_r_ema['single_trades'], 'single_win_rate': res_r_ema['single_win_rate']
         }
         r_ema_cand = {**res_r_ema, 'strategy': 'rsima_ema', 'interval': r_inv, 'df_inv': df_r_inv, 'rsi_s': r_rsi, 'rsi_ma_s': r_rsi_ma, 'use_ema': True, 'ma_filter': ma_filter_r_ema}
-        if res_r_ema['trade_count'] >= MIN_TRADES and res_r_ema['final_pnl'] > best_rsi_ema_pnl:
-            best_rsi_ema_pnl = res_r_ema['final_pnl']
+        is_r_ema_qual = (
+            res_r_ema['trade_count'] >= MIN_TRADES
+            and res_r_ema.get('pnl_first_half', 0.0) > 0.0
+            and res_r_ema.get('pnl_second_half', 0.0) > res_r_ema.get('pnl_first_half', 0.0)
+        )
+        if is_r_ema_qual and res_r_ema.get('pnl_second_half', 0.0) > best_rsi_ema_pnl:
+            best_rsi_ema_pnl = res_r_ema.get('pnl_second_half', 0.0)
             best_rsi_ema_cfg = r_ema_cand
         elif res_r_ema['trade_count'] >= 5 and res_r_ema['final_pnl'] > fallback_rsi_ema_pnl:
             fallback_rsi_ema_pnl = res_r_ema['final_pnl']
@@ -3554,36 +3697,39 @@ def run_interval_comparison(df_5m: pd.DataFrame, lot: float = 1.0, data_equity: 
     discord.print_log(f"\n📊 【4大基本戦略 最適化結果直接比較】 ({symbol})")
     discord.print_log(
         f"🔹 [VAL_POC ({best_vp_none_cfg['interval']}m/MP{best_vp_none_cfg['mp_period']}/TR{tr_vpn}%/EMAなし)]: "
-        f"純利益 = {pnl_vpn:+.2f} USDC (取引: {cnt_vpn}回, 勝率: {win_vpn:.1f}%)"
+        f"純利益 = {pnl_vpn:+.2f} USDC (前半: {best_vp_none_cfg.get('pnl_first_half', 0.0):+.2f} / 後半: {best_vp_none_cfg.get('pnl_second_half', 0.0):+.2f}, 取引: {cnt_vpn}回, 勝率: {win_vpn:.1f}%)"
     )
     discord.print_log(
         f"🔹 [VAL_POC_EMA ({best_vp_ema_cfg['interval']}m/MP{best_vp_ema_cfg['mp_period']}/TR{tr_vpe}%/EMAあり)]: "
-        f"純利益 = {pnl_vpe:+.2f} USDC (取引: {cnt_vpe}回, 勝率: {win_vpe:.1f}%)"
+        f"純利益 = {pnl_vpe:+.2f} USDC (前半: {best_vp_ema_cfg.get('pnl_first_half', 0.0):+.2f} / 後半: {best_vp_ema_cfg.get('pnl_second_half', 0.0):+.2f}, 取引: {cnt_vpe}回, 勝率: {win_vpe:.1f}%)"
     )
     discord.print_log(
         f"🔸 [RSIMA ({best_rsi_none_cfg['interval']}m/EP{int(best_rsi_none_cfg['l_ep'])}/CP{int(best_rsi_none_cfg['l_cp'])}/EMAなし)]: "
-        f"純利益 = {pnl_rsn:+.2f} USDC (取引: {cnt_rsn}回, 勝率: {win_rsn:.1f}%)"
+        f"純利益 = {pnl_rsn:+.2f} USDC (前半: {best_rsi_none_cfg.get('pnl_first_half', 0.0):+.2f} / 後半: {best_rsi_none_cfg.get('pnl_second_half', 0.0):+.2f}, 取引: {cnt_rsn}回, 勝率: {win_rsn:.1f}%)"
     )
     discord.print_log(
         f"🔸 [RSIMA_EMA ({best_rsi_ema_cfg['interval']}m/EP{int(best_rsi_ema_cfg['l_ep'])}/CP{int(best_rsi_ema_cfg['l_cp'])}/EMAあり)]: "
-        f"純利益 = {pnl_rse:+.2f} USDC (取引: {cnt_rse}回, 勝率: {win_rse:.1f}%)"
+        f"純利益 = {pnl_rse:+.2f} USDC (前半: {best_rsi_ema_cfg.get('pnl_first_half', 0.0):+.2f} / 後半: {best_rsi_ema_cfg.get('pnl_second_half', 0.0):+.2f}, 取引: {cnt_rse}回, 勝率: {win_rse:.1f}%)"
     )
 
-    # 有効性監査: 取引回数 >= MIN_TRADES の合格戦略から最も PnL が高いものを選択
+    # 有効性監査: 取引回数 >= MIN_TRADES & 前半純利益>0 & 後半純利益>前半純利益 の合格戦略から後半PnLが最高を選択
     valid_cands = []
     for c in candidates:
-        c_pnl = float(c.get('final_pnl', c.get('pnl', -float('inf'))))
         c_cnt = int(c.get('trade_count', 0))
-        if c_cnt >= MIN_TRADES:
-            valid_cands.append((c_pnl, c))
+        c_pnl_1st = float(c.get('pnl_first_half', 0.0))
+        c_pnl_2nd = float(c.get('pnl_second_half', 0.0))
+        if c_cnt >= MIN_TRADES and c_pnl_1st > 0.0 and c_pnl_2nd > c_pnl_1st:
+            valid_cands.append((c_pnl_2nd, c))
 
     if valid_cands:
         valid_cands.sort(key=lambda x: x[0], reverse=True)
         winner = valid_cands[0][1]
+        is_winner_qual = True
     else:
         # 全て不合格の場合は全候補から最高PnLを選択
         candidates.sort(key=lambda c: float(c.get('final_pnl', c.get('pnl', -float('inf')))), reverse=True)
         winner = candidates[0]
+        is_winner_qual = False
 
     chosen_strat = winner.get('strategy', 'val_poc')
     best_interval = int(winner['interval'])
@@ -3617,13 +3763,19 @@ def run_interval_comparison(df_5m: pd.DataFrame, lot: float = 1.0, data_equity: 
             'single_pnl': winner.get('single_pnl', pnl_final),
             'single_trades': winner.get('single_trades', cnt_final),
             'single_win_rate': winner.get('single_win_rate', win_final),
+            'pnl_first_half': float(winner.get('pnl_first_half', 0.0)),
+            'pnl_second_half': float(winner.get('pnl_second_half', 0.0)),
+            'is_qualified': is_winner_qual,
             'chart_df': chart_df
         }
         s_p = best_params['single_pnl']
         s_c = best_params['single_trades']
         s_w = best_params['single_win_rate']
         ema_tag = "(EMAあり)" if winner.get('use_ema') else "(EMAなし)"
-        discord.print_log(f"🏆 [{symbol}] 採用戦略: 【{best_strategy.upper()} ({best_interval}m/{ema_tag})】を動的採用！ (純利益: {pnl_final:+.2f} USDC [ナンピン{cnt_final}回/{win_final:.1f}%] vs シングル: {s_p:+.2f} USDC [{s_c}回/{s_w:.1f}%])")
+        p1st = winner.get('pnl_first_half', 0.0)
+        p2nd = winner.get('pnl_second_half', 0.0)
+        qual_tag = "🟢合格(前半黒字&後半加速)" if is_winner_qual else "🔴二重頑健性未達"
+        discord.print_log(f"🏆 [{symbol}] 採用戦略: 【{best_strategy.upper()} ({best_interval}m/{ema_tag})】を動的採用！ (純利益: {pnl_final:+.2f} USDC [前半: {p1st:+.2f} / 後半: {p2nd:+.2f} / ナンピン{cnt_final}回/{win_final:.1f}%] vs シングル: {s_p:+.2f} USDC [{s_c}回/{s_w:.1f}%] - {qual_tag})")
     else:
         best_strategy = chosen_strat
         best_mp = int(winner['mp_period'])
@@ -3686,13 +3838,19 @@ def run_interval_comparison(df_5m: pd.DataFrame, lot: float = 1.0, data_equity: 
             'single_pnl': winner.get('single_pnl', pnl_final),
             'single_trades': winner.get('single_trades', cnt_final),
             'single_win_rate': winner.get('single_win_rate', win_final),
+            'pnl_first_half': float(winner.get('pnl_first_half', 0.0)),
+            'pnl_second_half': float(winner.get('pnl_second_half', 0.0)),
+            'is_qualified': is_winner_qual,
             'chart_df': df_chart
         }
         s_p = best_params['single_pnl']
         s_c = best_params['single_trades']
         s_w = best_params['single_win_rate']
         ema_tag = "(EMAあり)" if use_ema_val else "(EMAなし)"
-        discord.print_log(f"🏆 [{symbol}] 採用戦略: 【{best_strategy.upper()} ({best_interval}m/{ema_tag})】を動的採用！ (純利益: {pnl_final:+.2f} USDC [ナンピン{cnt_final}回/{win_final:.1f}%] vs シングル: {s_p:+.2f} USDC [{s_c}回/{s_w:.1f}%])")
+        p1st = winner.get('pnl_first_half', 0.0)
+        p2nd = winner.get('pnl_second_half', 0.0)
+        qual_tag = "🟢合格(前半黒字&後半加速)" if is_winner_qual else "🔴二重頑健性未達"
+        discord.print_log(f"🏆 [{symbol}] 採用戦略: 【{best_strategy.upper()} ({best_interval}m/{ema_tag})】を動的採用！ (純利益: {pnl_final:+.2f} USDC [前半: {p1st:+.2f} / 後半: {p2nd:+.2f} / ナンピン{cnt_final}回/{win_final:.1f}%] vs シングル: {s_p:+.2f} USDC [{s_c}回/{s_w:.1f}%] - {qual_tag})")
 
     # 直近30日の勝ちトレード MAE 95%ile に基づく動的ストップ率を算出 (安全バンド: -1.5% 〜 -3.2%)
     dyn_stop = calculate_dynamic_mae_stop(

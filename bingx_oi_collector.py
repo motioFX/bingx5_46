@@ -8,7 +8,7 @@ BingX USDT無期限先物 建玉（Open Interest）＆ ファンディングレ�
 機能:
 1. BingX Swap V2 API (premiumIndex, ticker, openInterest) から固定20銘柄 + BTC-USDT の最新 OI / FR / MarkPrice を取得。
 2. Data/oi_store/{symbol}_oi.csv に時系列としてアペンド保存（重複排除・UTF-8）。
-3. 蓄積前の過去分（直近35日分）は Bybit V5 USDT先物（1時間OI・8時間FR履歴）を境界比率スケーリングでシームレスに補完し、
+3. 蓄積前の過去分（直近35日分）は全クラウド・日本人環境互換の OKX 公開API（1時間OI・8時間FR履歴）を最優先で境界比率スケーリング結合し、
    ローソク足マージ・分析・バックテスト・実運用に 100% 同一の OI変化率 (oi_chg_4h) と FR (fundingRate) を提供する。
 """
 from __future__ import annotations
@@ -200,11 +200,100 @@ def load_bingx_oi_history(symbol: str, start_ms: int = 0, end_ms: int = 99999999
     return pd.DataFrame()
 
 
-def _fetch_bybit_historical_oi_fr(symbol: str, days: int = 35) -> pd.DataFrame:
+OKX_BASE_URL = "https://www.okx.com"
+OKX_OI_HISTORY_URL = "https://www.okx.com/api/v5/rubik/stat/contracts/open-interest-history"
+OKX_FR_HISTORY_URL = "https://www.okx.com/api/v5/public/funding-rate-history"
+
+
+def _fetch_okx_historical_oi_fr(symbol: str, days: int = 35) -> pd.DataFrame:
     """
-    PROJECT_RULES.md 第6項準拠:
-    BingX 自前蓄積前の過去分（直近35日分）を Bybit V5 USDT先物（1時間OI・8時間FR履歴）から取得
+    PROJECT_RULES.md 第6項準拠 (OKX最優先仕様):
+    BingX 自前蓄積前の過去分（直近35日分）を全クラウド・日本人環境互換の
+    OKX 公開 API (Rubik Open Interest & Funding Rate 履歴) から取得。
     """
+    clean_sym = normalize_sym(symbol)  # e.g. "BTC-USDT"
+    inst_id = f"{clean_sym}-SWAP"       # e.g. "BTC-USDT-SWAP"
+    now_ms = int(time.time() * 1000)
+    start_ms = now_ms - (days * 24 * 3600 * 1000)
+
+    # 1. OKX ヒストリカル OI (1時間足) 取得
+    oi_rows = []
+    cur_end_ms = now_ms
+    headers = {"User-Agent": "Mozilla/5.0"}
+
+    for _ in range(10):  # 最大10ページ (1000時間 = 約41日分)
+        params = {"instId": inst_id, "period": "1H", "end": str(cur_end_ms)}
+        try:
+            resp = requests.get(OKX_OI_HISTORY_URL, params=params, headers=headers, timeout=6)
+            if resp.status_code != 200:
+                break
+            r_json = resp.json()
+            if r_json.get("code") != "0":
+                break
+            lst = r_json.get("data", [])
+            if not lst:
+                break
+
+            min_ts = cur_end_ms
+            for item in lst:
+                if len(item) >= 4:
+                    t = int(item[0])
+                    # item[3] が USD 建て OI 想定元本
+                    oi_usd = float(item[3])
+                    if start_ms <= t <= now_ms:
+                        oi_rows.append((t, oi_usd))
+                    if t < min_ts:
+                        min_ts = t
+
+            if min_ts <= start_ms or min_ts >= cur_end_ms:
+                break
+            cur_end_ms = min_ts - 1000
+            time.sleep(0.04)  # レート制限保護
+        except Exception:
+            break
+
+    # 2. OKX ヒストリカル Funding Rate (8時間足) 取得
+    fr_rows = []
+    cur_after = ""
+    for _ in range(3):  # 最大3ページ (300件 = 2400時間 = 100日分)
+        fr_params: Dict[str, Any] = {"instId": inst_id, "limit": 100}
+        if cur_after:
+            fr_params["after"] = cur_after
+        try:
+            resp_fr = requests.get(OKX_FR_HISTORY_URL, params=fr_params, headers=headers, timeout=6)
+            if resp_fr.status_code == 200:
+                r_fr = resp_fr.json()
+                if r_fr.get("code") == "0":
+                    data = r_fr.get("data", [])
+                    if not data:
+                        break
+                    for x in data:
+                        ft = int(x["fundingTime"])
+                        fr_rows.append((ft, float(x["fundingRate"])))
+                    cur_after = str(data[-1]["fundingTime"])
+                    if int(cur_after) <= start_ms:
+                        break
+            time.sleep(0.04)
+        except Exception:
+            break
+
+    if oi_rows:
+        df_oi = pd.DataFrame(oi_rows, columns=["timestamp", "openInterest"]).drop_duplicates("timestamp").sort_values("timestamp").reset_index(drop=True)
+        if fr_rows:
+            df_fr = pd.DataFrame(fr_rows, columns=["timestamp", "fundingRate"]).drop_duplicates("timestamp").sort_values("timestamp").reset_index(drop=True)
+            df_merged = pd.merge_asof(df_oi, df_fr, on="timestamp", direction="backward")
+            df_merged["fundingRate"] = df_merged["fundingRate"].ffill().bfill().fillna(0.0001)
+        else:
+            df_merged = df_oi
+            df_merged["fundingRate"] = 0.0001
+        return df_merged
+
+    # OKX に上場がない銘柄 (HYPEなど) のみ Bybit フォールバック試行
+    return _fetch_bybit_historical_oi_fr_fallback(symbol, days)
+
+
+def _fetch_bybit_historical_oi_fr_fallback(symbol: str, days: int = 35) -> pd.DataFrame:
+    """OKX未上場銘柄用のフォールバック (Bybit V5)"""
     clean_sym = normalize_sym(symbol)
     b_sym = clean_sym.replace("-USDT", "USDT")
     now_ms = int(time.time() * 1000)
@@ -267,7 +356,7 @@ def sync_oi_fr_history_for_symbol(symbol: str, target_days: int = 35) -> pd.Data
     """
     指定銘柄の OI / FR 時系列を取得・補完し、4時間OI変化率 (oi_chg_4h) を付与して返す。
     - BingX 自前蓄積データ (Data/oi_store/{symbol}_oi.csv) が存在する期間は 100% BingX 純正データを最優先採用。
-    - 過去不足分 (30日未満) は Bybit V5 1時間OI/FR履歴を境界比率スケーリングでシームレスに結合し CSV に永続化。
+    - 過去不足分 (30日未満) は OKX 公開API (Rubik OI・FR履歴) を最優先で境界比率スケーリング結合し CSV に永続化。
     """
     clean_sym = normalize_sym(symbol)
     now_sec = time.time()
@@ -286,7 +375,7 @@ def sync_oi_fr_history_for_symbol(symbol: str, target_days: int = 35) -> pd.Data
             need_backfill = False
 
     if need_backfill:
-        df_ext = _fetch_bybit_historical_oi_fr(clean_sym, days=target_days)
+        df_ext = _fetch_okx_historical_oi_fr(clean_sym, days=target_days)
         if not df_ext.empty:
             if not df_bingx.empty and "openInterest" in df_bingx.columns:
                 # 境界時刻での建玉スケール比率を合わせて段差を完全排除

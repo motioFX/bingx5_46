@@ -225,9 +225,9 @@ def build_symbols_status_summary(
             category = "OPT_REJECTED"
             counts["OPT_REJECTED"] += 1
             if pnl is not None:
-                detail_reason = f"個別最適化不合格 (PnL: ${pnl:+.2f}, 取引: {trade_count}回 < 10回基準またはマイナス, 勝率: {win_rate:.0f}%)"
+                detail_reason = f"個別最適化不合格 (PnL: ${pnl:+.2f}, 取引: {trade_count}回, 二重頑健性未達: 前半黒字かつ後半加速が必要)"
             else:
-                detail_reason = "直近データ不足または第1段階シングル枠(10回以上&黒字)未達"
+                detail_reason = "直近データ不足または二重頑健性基準(10回以上＆前半黒字＆後半加速)未達"
 
         results.append({
             "symbol": sym,
