@@ -1147,16 +1147,25 @@ async def validate_profitable_candidates(trade_side: str, mode: str, base_symbol
 
         await asyncio.sleep(0.1)
 
-    # 1ヶ月間バックテスト 最優秀成績銘柄 チャート1枚出力 (PROJECT_RULES.md 準拠: 直近7日純利益最大を最優先選抜)
+    # 1ヶ月間バックテスト 最優秀成績銘柄 チャート1枚出力 (PROJECT_RULES.md 準拠: Tier 1直近7日黒字銘柄から総合最高スコアを選抜)
     best_sym = None
     target_pool = profitable_cands if profitable_cands else list(symbol_params_map.keys())
     if target_pool:
+        def _calc_overall_best_score(sym):
+            p = symbol_params_map[sym]
+            pnl_tot = float(p.get("pnl", 0.0))
+            pnl_2nd = float(p.get("pnl_second_half", 0.0))
+            pnl_7d = float(p.get("pnl_recent_7d", 0.0))
+            win_rt = float(p.get("win_rate", 0.0))
+            # 30日総合純利益に最大ウェイト(1.0)、後半加速(0.5)、直近7日利益(0.5)、勝率ボーナス(win_rt*0.05)
+            return pnl_tot * 1.0 + pnl_2nd * 0.5 + pnl_7d * 0.5 + (win_rt * 0.05)
+
         # Tier 1: 直近7日黒字かつ取引発生銘柄を最優先選抜
         tier1_cands = [s for s in target_pool if symbol_params_map[s].get("pnl_recent_7d", 0.0) > 0 and symbol_params_map[s].get("trades_recent_7d", 0) >= 1]
         if tier1_cands:
-            best_sym = max(tier1_cands, key=lambda s: (symbol_params_map[s].get("pnl_recent_7d", 0.0), symbol_params_map[s].get("pnl_second_half", 0.0)))
+            best_sym = max(tier1_cands, key=_calc_overall_best_score)
         else:
-            best_sym = max(target_pool, key=lambda s: symbol_params_map[s].get("pnl_second_half", symbol_params_map[s].get("pnl", 0.0)))
+            best_sym = max(target_pool, key=_calc_overall_best_score)
 
     if best_sym and best_sym in symbol_params_map:
         try:

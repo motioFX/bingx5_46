@@ -2521,9 +2521,11 @@ def build_rsima3_short_chart_df(
     s_cp: float,
     sl: float,
     initial_equity: float = 100.0,
-    ma_filter: Optional[np.ndarray] = None
+    ma_filter: Optional[np.ndarray] = None,
+    cooldown_bars: int = 288,
+    timeout_bars: int = 48
 ) -> pd.DataFrame:
-    """RSIMA3 ショート最良パラメータでの売買マーカー・累積損益曲線付きDataFrameを生成"""
+    """RSIMA3 ショート最良パラメータでの売買マーカー・累積損益曲線付きDataFrameを生成 (optimize_rsima3_short_fastと100%完全同期)"""
     out_df = df_5m.copy().reset_index(drop=True)
     n = len(out_df)
     closes = out_df['close'].astype(float).values
@@ -2535,6 +2537,15 @@ def build_rsima3_short_chart_df(
     exec_sell = np.full(n, np.nan)
     exec_buy = np.full(n, np.nan)
     pnl_curve = np.full(n, initial_equity, dtype=float)
+
+    dc_arr = np.zeros(n, dtype=bool)
+    if n > 2:
+        dc_arr[1:] = (rsi[1:] < rsi_ma[1:]) & (rsi[:-1] >= rsi_ma[:-1]) & (rsi_ma[1:] <= rsi_ma[:-1])
+    ep_sig = dc_arr.copy()
+    if n > 2:
+        ep_sig[1:] = dc_arr[1:] & ((rsi_ma[1:] > s_ep) | (rsi_ma[:-1] > s_ep))
+    if ma_filter is not None and len(ma_filter) == n:
+        ep_sig = ep_sig & ma_filter
 
     pos_qty = 0.0
     pos_cost = 0.0
@@ -2565,7 +2576,7 @@ def build_rsima3_short_chart_df(
             is_sl = False
             if sl > 0 and c >= avg_px * (1.0 + sl):
                 is_sl = True
-            elif entry_bar_idx > 0 and (i - entry_bar_idx) >= 48 and c > avg_px:
+            elif entry_bar_idx > 0 and (i - entry_bar_idx) >= timeout_bars and c > avg_px:
                 is_sl = True
 
             if is_sl:
@@ -2580,7 +2591,7 @@ def build_rsima3_short_chart_df(
                 avg_px = 0.0
                 pos_cnt = 0
                 entry_bar_idx = -1
-                cooldown_until = i + 288
+                cooldown_until = i + cooldown_bars
             elif rsi[i] < s_cp and c <= avg_px * 0.996:
                 buy_val = pos_qty * c
                 fee = buy_val * taker_fee
@@ -2593,12 +2604,8 @@ def build_rsima3_short_chart_df(
                 avg_px = 0.0
                 pos_cnt = 0
                 entry_bar_idx = -1
-        elif pending_px < 0 and i >= cooldown_until:
-            dc = (rsi[i] < rsi_ma[i]) and (rsi[i-1] >= rsi_ma[i-1]) and (rsi_ma[i] > s_ep)
-            if ma_filter is not None and len(ma_filter) == n:
-                dc = dc and ma_filter[i]
-            if dc:
-                pending_px = c * 1.0002
+        elif pending_px < 0 and ep_sig[i] and i >= cooldown_until:
+            pending_px = c * 1.0002
 
         pnl_curve[i] = initial_equity + cum_pnl + (pos_cost - pos_qty * c if pos_qty > 0 else 0.0)
 
@@ -2617,9 +2624,11 @@ def build_rsima3_chart_df(
     sl: float,
     initial_equity: float = 100.0,
     max_trades: int = 5,
-    ma_filter: Optional[np.ndarray] = None
+    ma_filter: Optional[np.ndarray] = None,
+    cooldown_bars: int = 288,
+    timeout_bars: int = 48
 ) -> pd.DataFrame:
-    """RSIMA3 最良パラメータでの売買マーカー・累積損益曲線付きDataFrameを生成"""
+    """RSIMA3 最良パラメータでの売買マーカー・累積損益曲線付きDataFrameを生成 (optimize_rsima3_fastと100%完全同期)"""
     out_df = df_5m.copy().reset_index(drop=True)
     n = len(out_df)
     closes = out_df['close'].astype(float).values
@@ -2632,13 +2641,24 @@ def build_rsima3_chart_df(
     exec_sell = np.full(n, np.nan)
     pnl_curve = np.full(n, initial_equity, dtype=float)
 
+    gc_arr = np.zeros(n, dtype=bool)
+    if n > 2:
+        gc_arr[1:] = (rsi[1:] > rsi_ma[1:]) & (rsi[:-1] <= rsi_ma[:-1]) & (rsi_ma[1:] >= rsi_ma[:-1])
+    ep_sig = gc_arr.copy()
+    if n > 2:
+        ep_sig[1:] = gc_arr[1:] & ((rsi_ma[1:] < ep) | (rsi_ma[:-1] < ep))
+    if ma_filter is not None and len(ma_filter) == n:
+        ep_sig = ep_sig & ma_filter
+
     pos_qty = 0.0
     pos_cost = 0.0
     avg_px = 0.0
+    last_entry_px = 0.0
     pos_cnt = 0
     cum_pnl = 0.0
     pending_px = -1.0
     cooldown_until = -1
+    entry_bar_idx = -1
 
     for i in range(2, n):
         c = closes[i]
@@ -2650,13 +2670,22 @@ def build_rsima3_chart_df(
                 qty = trade_size / px
                 pos_cost += trade_size + trade_size * maker_fee
                 pos_qty += qty
+                last_entry_px = px
                 avg_px = pos_cost / pos_qty
                 pos_cnt += 1
+                if pos_cnt == 1:
+                    entry_bar_idx = i
                 exec_buy[i] = px
             pending_px = -1.0
 
         if pos_qty > 0:
-            if sl > 0 and c < avg_px * (1.0 - sl):
+            is_sl = False
+            if sl > 0 and c <= avg_px * (1.0 - sl):
+                is_sl = True
+            elif entry_bar_idx > 0 and (i - entry_bar_idx) >= timeout_bars and c < avg_px:
+                is_sl = True
+
+            if is_sl:
                 sell_val = pos_qty * c
                 fee = sell_val * taker_fee
                 pnl = sell_val - pos_cost - fee
@@ -2666,7 +2695,8 @@ def build_rsima3_chart_df(
                 pos_cost = 0.0
                 avg_px = 0.0
                 pos_cnt = 0
-                cooldown_until = i + 288
+                entry_bar_idx = -1
+                cooldown_until = i + cooldown_bars
             elif rsi[i] > cp and c >= avg_px * 1.006:
                 sell_val = pos_qty * c
                 fee = sell_val * taker_fee
@@ -2677,17 +2707,16 @@ def build_rsima3_chart_df(
                 pos_cost = 0.0
                 avg_px = 0.0
                 pos_cnt = 0
-
-        if pending_px < 0:
-            gc = (rsi[i] > rsi_ma[i]) and (rsi[i-1] <= rsi_ma[i-1])
-            if pos_cnt == 0 and i >= cooldown_until:
-                if gc and (rsi_ma[i] < ep or rsi_ma[i-1] < ep) and (ma_filter is None or ma_filter[i]):
+                entry_bar_idx = -1
+        elif pending_px < 0 and i >= cooldown_until:
+            if pos_cnt == 0:
+                if ep_sig[i]:
                     pending_px = c * 0.9998
             elif 1 <= pos_cnt < max_trades:
-                if gc and (rsi_ma[i] < ep or rsi_ma[i-1] < ep) and c < avg_px * 0.994:
+                if ep_sig[i] and c < last_entry_px * 0.990:
                     pending_px = c * 0.9998
 
-        pnl_curve[i] = initial_equity + cum_pnl
+        pnl_curve[i] = initial_equity + cum_pnl + (pos_qty * c - pos_cost if pos_qty > 0 else 0.0)
 
     out_df['exec_buy_price'] = exec_buy
     out_df['exec_sell_price'] = exec_sell
@@ -3354,10 +3383,13 @@ def _run_interval_comparison_short(df_5m: pd.DataFrame, lot: float = 1.0, data_e
         best_mp = 100
         best_margin = winner.get('sl_pct', 0.05) * 100.0
         df_chart_base = winner.get('df_inv', df_5m)
+        cd_bars_chart = max(10, 1440 // best_interval) if best_interval < 60 else 24
+        to_bars_chart = max(2, 240 // best_interval) if best_interval < 60 else 4
         chart_df = build_rsima3_short_chart_df(
             df_chart_base, winner['rsi_s'].values, winner['rsi_ma_s'].values,
             winner['s_ep'], winner['s_cp'], winner.get('sl_pct', 0.05),
-            initial_equity=fixed_initial_equity, ma_filter=winner.get('ma_filter')
+            initial_equity=fixed_initial_equity, ma_filter=winner.get('ma_filter'),
+            cooldown_bars=cd_bars_chart, timeout_bars=to_bars_chart
         )
         pnl_final = float(winner['final_pnl'])
         cnt_final = int(winner['trade_count'])
@@ -4000,10 +4032,13 @@ def run_interval_comparison(df_5m: pd.DataFrame, lot: float = 1.0, data_equity: 
         best_mp = 100
         best_margin = winner.get('sl_pct', 0.05) * 100.0
         df_chart_base = winner.get('df_inv', df_5m)
+        cd_bars_chart = max(10, 1440 // best_interval) if best_interval < 60 else 24
+        to_bars_chart = max(2, 240 // best_interval) if best_interval < 60 else 4
         chart_df = build_rsima3_chart_df(
             df_chart_base, winner['rsi_s'].values, winner['rsi_ma_s'].values,
             winner['l_ep'], winner['l_cp'], winner.get('sl_pct', 0.05),
-            initial_equity=fixed_initial_equity, ma_filter=winner.get('ma_filter')
+            initial_equity=fixed_initial_equity, max_trades=3, ma_filter=winner.get('ma_filter'),
+            cooldown_bars=cd_bars_chart, timeout_bars=to_bars_chart
         )
         pnl_final = float(winner['final_pnl'])
         cnt_final = int(winner['trade_count'])
