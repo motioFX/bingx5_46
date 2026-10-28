@@ -2640,16 +2640,35 @@ def calculate_dynamic_mae_stop(
     default_stop: float = -0.025,
     min_stop: float = -0.015,  # 上限クランプ (-1.5%: 浅すぎてノイズで切られるのを防ぐ)
     max_stop: float = -0.032,  # 下限クランプ (-3.2%: 深すぎて大損失になるのを防ぐ)
-) -> float:
+    return_details: bool = False,
+) -> Any:
     """
-    直近30日のデータから、勝ちトレードの最大逆行幅 (MAE: Maximum Adverse Excursion) 95%ile を動的に算出
+    直近30日のデータから、勝ちトレードの最大逆行幅 (MAE: Maximum Adverse Excursion) 95%ile および
+    勝ちトレード保有時間分布 (動的タイムアウト) を動的に算出
     - 採用足種 (interval: 5m, 15m, 30m, 60m) へのリサンプリング
-    - 4時間 (240分) タイムアウト微損撤退を完全連動 (長時間捕まった異常トレードを勝ちトレード群から排除)
-    - 勝ちトレードの95%が耐え切って利確に至った最大の深さを特定
-    - 安全バンド [min_stop, max_stop] にクランプ (基準値: -2.50%)
+    - 勝ちトレードの95%が耐え切って利確に至った最大の深さを特定 (動的ストップ)
+    - 勝ちトレードの90%が決着した保有バー数に安全バッファを加算 (動的タイムアウト)
+    - 安全バンド:
+        ストップ: [min_stop, max_stop] にクランプ (基準値: -2.50%)
+        タイムアウト: [最低1時間相当, 最大4時間相当] にクランプ
     """
+    default_interval = int(params.get("interval", 5)) if params else 5
+    default_timeout_bars = max(3, 240 // default_interval)
+    default_profile = {
+        "dynamic_mae_stop": default_stop,
+        "dynamic_timeout_bars": default_timeout_bars,
+        "dynamic_timeout_minutes": default_timeout_bars * default_interval,
+        "avg_hold_bars": float(default_timeout_bars),
+        "avg_hold_minutes": float(default_timeout_bars * default_interval),
+        "p90_hold_bars": default_timeout_bars,
+        "p90_hold_minutes": float(default_timeout_bars * default_interval),
+        "max_hold_bars": default_timeout_bars,
+        "max_hold_minutes": float(default_timeout_bars * default_interval),
+        "winning_trades_count": 0,
+    }
+
     if df_5m is None or len(df_5m) < 200:
-        return default_stop
+        return (default_stop, default_profile) if return_details else default_stop
 
     try:
         interval = int(params.get("interval", 5)) if params else 5
@@ -2695,6 +2714,7 @@ def calculate_dynamic_mae_stop(
         trade_min_l = float("inf")
         trade_max_h = 0.0
         winning_mae = []
+        winning_bars = []
 
         for i in range(1, n):
             cur_c = c[i]
@@ -2773,6 +2793,7 @@ def calculate_dynamic_mae_stop(
                     if pnl > 0 and avg_price > 0:
                         mae = (avg_price - trade_max_h) / avg_price  # 逆行幅 (負の値)
                         winning_mae.append(mae)
+                        winning_bars.append(bars_held)
                     pos_qty = 0.0
                     pos_cost = 0.0
                     entry_idx = -1
@@ -2807,18 +2828,54 @@ def calculate_dynamic_mae_stop(
                     if pnl > 0 and avg_price > 0:
                         mae = (trade_min_l - avg_price) / avg_price
                         winning_mae.append(mae)
+                        winning_bars.append(bars_held)
                     pos_qty = 0.0
                     pos_cost = 0.0
                     entry_idx = -1
 
+        # 動的MAEストップ算出
         if len(winning_mae) >= 5:
             mae_95 = float(np.percentile(winning_mae, 5))  # 下位5% (95%のトレードが耐えた逆行幅)
-            # 安全バンドクランプ: 例 [-0.032, -0.015]
             clamped = max(min(mae_95, min_stop), max_stop)
-            return round(clamped, 4)
-        return default_stop
+            final_stop = round(clamped, 4)
+        else:
+            final_stop = default_stop
+
+        # 動的タイムアウト算出 (安全ガード: 最低1時間相当 〜 最大4時間相当)
+        min_to_bars = max(3, 60 // interval)            # 最低1時間 (5mなら12本)
+        max_to_bars = max(min_to_bars, 240 // interval)  # 最大4時間 (5mなら48本)
+
+        if len(winning_bars) >= 5:
+            p90_bars = int(np.ceil(np.percentile(winning_bars, 90)))
+            avg_bars = float(np.mean(winning_bars))
+            max_bars = int(np.max(winning_bars))
+            # 勝ちトレードの90%が決着する時間に安全バッファ (+20% または 最低+2本)
+            buffered_bars = max(p90_bars + 2, int(np.ceil(p90_bars * 1.2)))
+            dyn_to_bars = min(max_to_bars, max(min_to_bars, buffered_bars))
+        else:
+            dyn_to_bars = max_to_bars
+            p90_bars = max_to_bars
+            avg_bars = float(max_to_bars)
+            max_bars = max_to_bars
+
+        profile = {
+            "dynamic_mae_stop": final_stop,
+            "dynamic_timeout_bars": dyn_to_bars,
+            "dynamic_timeout_minutes": dyn_to_bars * interval,
+            "avg_hold_bars": round(avg_bars, 1),
+            "avg_hold_minutes": round(avg_bars * interval, 1),
+            "p90_hold_bars": p90_bars,
+            "p90_hold_minutes": round(p90_bars * interval, 1),
+            "max_hold_bars": max_bars,
+            "max_hold_minutes": round(max_bars * interval, 1),
+            "winning_trades_count": len(winning_bars),
+        }
+
+        if return_details:
+            return final_stop, profile
+        return final_stop
     except Exception:
-        return default_stop
+        return (default_stop, default_profile) if return_details else default_stop
 
 
 def _run_interval_comparison_short(df_5m: pd.DataFrame, lot: float = 1.0, data_equity: float = 100.0, symbol: str = ""):
@@ -3279,17 +3336,26 @@ def _run_interval_comparison_short(df_5m: pd.DataFrame, lot: float = 1.0, data_e
         qual_tag = "🟢合格(前半黒字&後半加速)" if is_winner_qual else "🔴二重頑健性未達"
         discord.print_log(f"🏆 [{symbol}] 採用ショート戦略: 【{best_strategy.upper()} ({best_interval}m/{ema_tag})】を動的採用！ (純利益: {pnl_final:+.2f} USDC [前半: {p1st:+.2f} / 後半: {p2nd:+.2f} / 単発{cnt_final}回/{win_final:.1f}%] - {qual_tag})")
 
-    dyn_stop = calculate_dynamic_mae_stop(
+    dyn_stop, risk_prof = calculate_dynamic_mae_stop(
         df_5m=df_5m,
         strategy=best_strategy,
         params=best_params,
         default_stop=-0.025,
         min_stop=-0.015,
-        max_stop=-0.032
+        max_stop=-0.032,
+        return_details=True
     )
     best_params['dynamic_mae_stop'] = dyn_stop
     best_params['sl_pct'] = abs(dyn_stop)
-    discord.print_log(f"🛡️ [{symbol}] ショート動的MAEストップ算出: {dyn_stop:.2%} (安全バンド: -1.50%〜-3.20%)")
+    best_params['dynamic_timeout_bars'] = risk_prof['dynamic_timeout_bars']
+    best_params['dynamic_timeout_minutes'] = risk_prof['dynamic_timeout_minutes']
+    best_params['avg_hold_minutes'] = risk_prof['avg_hold_minutes']
+    best_params['p90_hold_minutes'] = risk_prof['p90_hold_minutes']
+    best_params['max_hold_minutes'] = risk_prof['max_hold_minutes']
+    to_min = risk_prof['dynamic_timeout_minutes']
+    to_b = risk_prof['dynamic_timeout_bars']
+    p90_m = risk_prof['p90_hold_minutes']
+    discord.print_log(f"🛡️ [{symbol}] ショート動的リスク算出: 動的SL={dyn_stop:.2%} (バンド: -1.50%〜-3.20%) | 動的タイムアウト={to_min}分 ({to_b}本, 勝ち90%ile={p90_m}分)")
 
     results["_best_params_"] = best_params
     return results, best_strategy, best_interval, best_mp, best_margin
@@ -3853,17 +3919,26 @@ def run_interval_comparison(df_5m: pd.DataFrame, lot: float = 1.0, data_equity: 
         discord.print_log(f"🏆 [{symbol}] 採用戦略: 【{best_strategy.upper()} ({best_interval}m/{ema_tag})】を動的採用！ (純利益: {pnl_final:+.2f} USDC [前半: {p1st:+.2f} / 後半: {p2nd:+.2f} / ナンピン{cnt_final}回/{win_final:.1f}%] vs シングル: {s_p:+.2f} USDC [{s_c}回/{s_w:.1f}%] - {qual_tag})")
 
     # 直近30日の勝ちトレード MAE 95%ile に基づく動的ストップ率を算出 (安全バンド: -1.5% 〜 -3.2%)
-    dyn_stop = calculate_dynamic_mae_stop(
+    dyn_stop, risk_prof = calculate_dynamic_mae_stop(
         df_5m=df_5m,
         strategy=best_strategy,
         params=best_params,
         default_stop=-0.025,
         min_stop=-0.015,
-        max_stop=-0.032
+        max_stop=-0.032,
+        return_details=True
     )
     best_params['dynamic_mae_stop'] = dyn_stop
     best_params['sl_pct'] = abs(dyn_stop)
-    discord.print_log(f"🛡️ [{symbol}] 動的MAEストップ算出: {dyn_stop:.2%} (安全バンド: -1.50%〜-3.20%)")
+    best_params['dynamic_timeout_bars'] = risk_prof['dynamic_timeout_bars']
+    best_params['dynamic_timeout_minutes'] = risk_prof['dynamic_timeout_minutes']
+    best_params['avg_hold_minutes'] = risk_prof['avg_hold_minutes']
+    best_params['p90_hold_minutes'] = risk_prof['p90_hold_minutes']
+    best_params['max_hold_minutes'] = risk_prof['max_hold_minutes']
+    to_min = risk_prof['dynamic_timeout_minutes']
+    to_b = risk_prof['dynamic_timeout_bars']
+    p90_m = risk_prof['p90_hold_minutes']
+    discord.print_log(f"🛡️ [{symbol}] 動的リスク算出: 動的SL={dyn_stop:.2%} (バンド: -1.50%〜-3.20%) | 動的タイムアウト={to_min}分 ({to_b}本, 勝ち90%ile={p90_m}分)")
 
     results["_best_params_"] = best_params
     return results, best_strategy, best_interval, best_mp, best_margin
@@ -4603,6 +4678,7 @@ def check_rsima3_signals(
     dynamic_sl_pct: float = -0.025,
     bars_held: int = 0,
     use_ema_filter: bool = False,
+    timeout_bars: int = 48,
 ) -> Dict[str, Any]:
     """TradingView『RSIMA3_MaxGambleMoon』の完全移植判定 (新仕様最適化完全連動)
     
@@ -4692,11 +4768,11 @@ def check_rsima3_signals(
             reason = f"RSIMA3_DYNAMIC_MAE_SL: 価格(${current_price:.4f}) <= 動的SL(${sl_price:.4f}, SL率-{eff_sl_pct:.2%}, 損失{loss_pct:.2%})"
             return {"action": "STOP_LOSS", "reason": reason, "lot_multiplier": 1.0, "metrics": metrics}
 
-    # === [0-1] 4時間タイムアウト微損撤退判定 (48本経過で含み損なら成行撤退) ===
-    # PROJECT_RULES: 4時間(48本=240分)経過で含み損ならトレンド喪失とみなし微損撤退 (塩漬け完全根絶)
-    if lpo and bars_held >= 48 and avg_entry_price > 0 and current_price < avg_entry_price:
+    # === [0-1] 動的タイムアウト微損撤退判定 (timeout_bars本経過で含み損なら成行撤退) ===
+    # PROJECT_RULES: バックテスト保有時間最適化(timeout_bars本)経過で含み損ならモメンタム喪失とみなし微損撤退
+    if lpo and bars_held >= timeout_bars and avg_entry_price > 0 and current_price < avg_entry_price:
         loss_pct = (current_price - avg_entry_price) / avg_entry_price
-        reason = f"RSIMA3_TIMEOUT_EXIT: 保有4時間経過({bars_held}本=240分) & 含み損({loss_pct:.2%}) ➔ タイムアウト成行微損撤退"
+        reason = f"RSIMA3_TIMEOUT_EXIT: 保有タイムアウト({bars_held}本>={timeout_bars}本) & 含み損({loss_pct:.2%}) ➔ 動的タイムアウト成行微損撤退"
         return {"action": "TIMEOUT_EXIT", "reason": reason, "lot_multiplier": 1.0, "metrics": metrics}
 
     # === [1-0] 地合い悪化時の緊急建値撤退判定 (全体地合い非BUY時: 平均建値 +0.20% で早期撤退) ===
@@ -4786,6 +4862,7 @@ def check_val_poc_signals(
     dynamic_sl_pct: float = -0.025,
     bars_held: int = 0,
     use_ema_filter: bool = True,
+    timeout_bars: int = 48,
 ) -> Dict[str, Any]:
     """VAL_POC ＋ 200期間MA (EMA/SMA) トレンドフィルター戦略 リアルタイム判定 (新仕様最適化完全連動)
     1. エントリー: VALゴールデンクロス (クロスオーバー) ＆ 200期間MA条件 ＆ バリュー幅>=1.5% ＆ クールダウン解除済
@@ -4894,11 +4971,11 @@ def check_val_poc_signals(
             reason = f"VAL_POC_DYNAMIC_MAE_SL: 価格(${trigger_px:.4f}) <= 動的SL(${sl_price_dyn:.4f}, SL率-{eff_sl_pct:.2%}, 損失{loss_pct:.2%})"
             return {"action": "STOP_LOSS", "reason": reason, "lot_multiplier": 1.0, "metrics": metrics}
 
-    # === [1-1] 4時間タイムアウト微損撤退判定 (48本経過で含み損なら成行撤退) ===
-    # PROJECT_RULES: 4時間(48本=240分)経過で含み損ならトレンド喪失とみなし微損撤退 (塩漬け完全根絶)
-    if lpo and bars_held >= 48 and avg_entry_price > 0 and current_price < avg_entry_price:
+    # === [1-1] 動的タイムアウト微損撤退判定 (timeout_bars本経過で含み損なら成行撤退) ===
+    # PROJECT_RULES: バックテスト保有時間最適化(timeout_bars本)経過で含み損ならモメンタム喪失とみなし微損撤退
+    if lpo and bars_held >= timeout_bars and avg_entry_price > 0 and current_price < avg_entry_price:
         loss_pct = (current_price - avg_entry_price) / avg_entry_price
-        reason = f"VAL_POC_TIMEOUT_EXIT: 保有4時間経過({bars_held}本=240分) & 含み損({loss_pct:.2%}) ➔ タイムアウト成行微損撤退"
+        reason = f"VAL_POC_TIMEOUT_EXIT: 保有タイムアウト({bars_held}本>={timeout_bars}本) & 含み損({loss_pct:.2%}) ➔ 動的タイムアウト成行微損撤退"
         return {"action": "TIMEOUT_EXIT", "reason": reason, "lot_multiplier": 1.0, "metrics": metrics}
 
     # === [1-0] 地合い悪化時の緊急建値撤退判定 (全体地合い非BUY時: 平均建値 +0.20% で早期撤退) ===
@@ -4967,6 +5044,7 @@ def check_vah_poc_signals(
     dynamic_sl_pct: float = 0.025,
     bars_held: int = 0,
     use_ema_filter: bool = True,
+    timeout_bars: int = 48,
 ) -> Dict[str, Any]:
     """VAH_POC ＋ 200期間MA (EMA/SMA) ショート戦略 リアルタイム判定 (単発1本固定・ナンピン完全なし)
     1. エントリー: VAHデッドクロス (クロスアンダー) ＆ 200期間MA条件 (close <= EMA200) ＆ バリュー幅>=1.5% ＆ クールダウン解除済
@@ -5062,10 +5140,10 @@ def check_vah_poc_signals(
             reason = f"VAH_POC_DYNAMIC_MAE_SL: 価格(${trigger_px:.4f}) >= 動的SL(${sl_price_dyn:.4f}, SL率+{eff_sl_pct:.2%}, 損失{loss_pct:.2%})"
             return {"action": "STOP_LOSS", "reason": reason, "lot_multiplier": 1.0, "metrics": metrics}
 
-    # === [1-1] 4時間タイムアウト微損撤退判定 (48本経過で含み損なら成行買戻し撤退) ===
-    if spo and bars_held >= 48 and avg_entry_price > 0 and current_price > avg_entry_price:
+    # === [1-1] 動的タイムアウト微損撤退判定 (timeout_bars本経過で含み損なら成行買戻し撤退) ===
+    if spo and bars_held >= timeout_bars and avg_entry_price > 0 and current_price > avg_entry_price:
         loss_pct = (avg_entry_price - current_price) / avg_entry_price
-        reason = f"VAH_POC_TIMEOUT_EXIT: 保有4時間経過({bars_held}本=240分) & ショート含み損({loss_pct:.2%}) ➔ タイムアウト成行買戻し撤退"
+        reason = f"VAH_POC_TIMEOUT_EXIT: 保有タイムアウト({bars_held}本>={timeout_bars}本) & ショート含み損({loss_pct:.2%}) ➔ 動的タイムアウト成行買戻し撤退"
         return {"action": "TIMEOUT_EXIT", "reason": reason, "lot_multiplier": 1.0, "metrics": metrics}
 
     # === [1-0] 地合い非BEAR時の緊急建値撤退判定 (平均建値 -0.20% で早期買戻し) ===
@@ -5124,6 +5202,7 @@ def check_rsima3_short_signals(
     dynamic_sl_pct: float = 0.025,
     bars_held: int = 0,
     use_ema_filter: bool = False,
+    timeout_bars: int = 48,
 ) -> Dict[str, Any]:
     """RSIMA3 ショート判定 (単発1本固定・ナンピン完全なし)
     1. エントリー: RSI×RSI-EMA デッドクロス ＆ RSI-EMA > s_ep ＆ (EMA200フィルター)
@@ -5192,10 +5271,10 @@ def check_rsima3_short_signals(
             reason = f"RSIMA_SHORT_DYNAMIC_MAE_SL: 価格(${trigger_px:.4f}) >= 動的SL(${sl_price_dyn:.4f}, SL率+{eff_sl_pct:.2%}, 損失{loss_pct:.2%})"
             return {"action": "STOP_LOSS", "reason": reason, "lot_multiplier": 1.0, "metrics": metrics}
 
-    # === [1-1] 4時間タイムアウト微損撤退判定 ===
-    if spo and bars_held >= 48 and avg_entry_price > 0 and current_price > avg_entry_price:
+    # === [1-1] 動的タイムアウト微損撤退判定 ===
+    if spo and bars_held >= timeout_bars and avg_entry_price > 0 and current_price > avg_entry_price:
         loss_pct = (avg_entry_price - current_price) / avg_entry_price
-        reason = f"RSIMA_SHORT_TIMEOUT_EXIT: 保有4時間経過({bars_held}本=240分) & ショート含み損({loss_pct:.2%}) ➔ タイムアウト成行買戻し撤退"
+        reason = f"RSIMA_SHORT_TIMEOUT_EXIT: 保有タイムアウト({bars_held}本>={timeout_bars}本) & ショート含み損({loss_pct:.2%}) ➔ 動的タイムアウト成行買戻し撤退"
         return {"action": "TIMEOUT_EXIT", "reason": reason, "lot_multiplier": 1.0, "metrics": metrics}
 
     # === [1-0] 地合い非BEAR時の緊急建値撤退判定 ===

@@ -2449,6 +2449,8 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                 elapsed_min = max(0.0, (time.time() - entry_ts) / 60.0)
                 bars_held_cur = int(elapsed_min // 5)
                 dyn_sl_pct = float(sym_params.get("dynamic_mae_stop", -0.025))
+                cand_interval = int(sym_params.get("interval", 5))
+                dyn_to_bars = int(sym_params.get("dynamic_timeout_bars", max(3, 240 // cand_interval)))
 
                 in_cooldown, rem_h = is_in_sl_cooldown(sym)
 
@@ -2481,6 +2483,7 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                             dynamic_sl_pct=dyn_sl_pct,
                             bars_held=bars_held_cur,
                             use_ema_filter=use_ema_v,
+                            timeout_bars=dyn_to_bars,
                         )
                     else:
                         use_ema_r = ("ema" in cand_strat)
@@ -2503,6 +2506,7 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                             dynamic_sl_pct=dyn_sl_pct,
                             bars_held=bars_held_cur,
                             use_ema_filter=use_ema_r,
+                            timeout_bars=dyn_to_bars,
                         )
                 else:
                     # ===== LONG ポジション監視 =====
@@ -2528,6 +2532,7 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                             dynamic_sl_pct=dyn_sl_pct,
                             bars_held=bars_held_cur,
                             use_ema_filter=use_ema_v,
+                            timeout_bars=dyn_to_bars,
                         )
                     else:
                         use_ema_r = ("ema" in cand_strat)
@@ -2550,6 +2555,7 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                             dynamic_sl_pct=dyn_sl_pct,
                             bars_held=bars_held_cur,
                             use_ema_filter=use_ema_r,
+                            timeout_bars=dyn_to_bars,
                         )
 
                 pos_action = sig_eval.get("action", "HOLD")
@@ -2564,7 +2570,7 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                     record_sl_cooldown(sym)
                     closed = True
                 elif pos_action == "TIMEOUT_EXIT":
-                    discord.print_log(f"⏰ [{sym}] [{cand_strat.upper()} 4H TIMEOUT EXIT] {exit_reason} ➔ 4時間タイムアウト成行微損撤退 (24hクールダウン移行)", level="warning")
+                    discord.print_log(f"⏰ [{sym}] [{cand_strat.upper()} DYNAMIC TIMEOUT EXIT] {exit_reason} ➔ 動的タイムアウト成行撤退 (24hクールダウン移行)", level="warning")
                     await flatten_current_position_bingx(sym, "USDT", mode, exit_reason, force_market=True)
                     record_sl_cooldown(sym)
                     closed = True
