@@ -2280,13 +2280,22 @@ def optimize_rsima3_fast(
                 'win_rate': float(win_rt),
                 'DD_max': float(max_dd)
             }
-            # 三段階頑健性 (Tier 1: 直近7日黒字 & 取引発生を最優先)
-            is_tier1 = (trades_cnt >= min_trades and cum_pnl > 0.0 and pnl_recent_7d > 0.0 and trades_recent_7d >= 1)
-            is_tier2 = (trades_cnt >= min_trades and cum_pnl > 0.0 and pnl_first_half > 0.0 and pnl_second_half > pnl_first_half)
+            # 4大完全必須条件 (Tier 1: 前半黒字 & 後半加速 & 直近7日取引1回以上 & 直近7日黒字)
+            is_tier1 = (
+                trades_cnt >= min_trades
+                and pnl_first_half > 0.0
+                and pnl_second_half > pnl_first_half
+                and pnl_recent_7d > 0.0
+                and trades_recent_7d >= 1
+            )
+            is_tier2 = (
+                trades_cnt >= min_trades
+                and pnl_first_half > 0.0
+                and pnl_second_half > pnl_first_half
+            )
             
-            # スコアリング: Tier 1最優先(1000点ゲタ+直近7d重視), Tier 2(500点ゲタ+後半重視), Tier 3(総合PnL)
             if is_tier1:
-                score = 1000.0 + pnl_recent_7d * 2.0 + pnl_second_half + cum_pnl * 0.1
+                score = 1000.0 + pnl_second_half * 1.0 + pnl_recent_7d * 1.0 + cum_pnl * 0.2 + (win_rt * 0.05)
             elif is_tier2:
                 score = 500.0 + pnl_second_half + cum_pnl * 0.1
             elif trades_cnt >= 5 and cum_pnl > 0.0:
@@ -2489,13 +2498,22 @@ def optimize_rsima3_short_fast(
                 'win_rate': float(win_rt),
                 'DD_max': float(max_dd)
             }
-            # 三段階頑健性 (Tier 1: 直近7日黒字 & 取引発生を最優先)
-            is_tier1 = (trades_cnt >= min_trades and cum_pnl > 0.0 and pnl_recent_7d > 0.0 and trades_recent_7d >= 1)
-            is_tier2 = (trades_cnt >= min_trades and cum_pnl > 0.0 and pnl_first_half > 0.0 and pnl_second_half > pnl_first_half)
+            # 4大完全必須条件 (Tier 1: 前半黒字 & 後半加速 & 直近7日取引1回以上 & 直近7日黒字)
+            is_tier1 = (
+                trades_cnt >= min_trades
+                and pnl_first_half > 0.0
+                and pnl_second_half > pnl_first_half
+                and pnl_recent_7d > 0.0
+                and trades_recent_7d >= 1
+            )
+            is_tier2 = (
+                trades_cnt >= min_trades
+                and pnl_first_half > 0.0
+                and pnl_second_half > pnl_first_half
+            )
             
-            # スコアリング: Tier 1最優先(1000点ゲタ+直近7d重視), Tier 2(500点ゲタ+後半重視), Tier 3(総合PnL)
             if is_tier1:
-                score = 1000.0 + pnl_recent_7d * 2.0 + pnl_second_half + cum_pnl * 0.1
+                score = 1000.0 + pnl_second_half * 1.0 + pnl_recent_7d * 1.0 + cum_pnl * 0.2 + (win_rt * 0.05)
             elif is_tier2:
                 score = 500.0 + pnl_second_half + cum_pnl * 0.1
             elif trades_cnt >= 5 and cum_pnl > 0.0:
@@ -3102,10 +3120,10 @@ def _run_interval_comparison_short(df_5m: pd.DataFrame, lot: float = 1.0, data_e
                 vp_p2nd = sim_none.get('pnl_second_half', 0.0)
                 vp_p7d = sim_none.get('pnl_recent_7d', 0.0)
                 vp_c7d = sim_none.get('trades_recent_7d', 0)
-                is_vp_tier1 = (vp_cnt >= MIN_TRADES and vp_pnl > 0.0 and vp_p7d > 0.0 and vp_c7d >= 1)
-                is_vp_tier2 = (vp_cnt >= MIN_TRADES and vp_pnl > 0.0 and vp_p1st > 0.0 and vp_p2nd > vp_p1st)
+                is_vp_tier1 = (vp_cnt >= MIN_TRADES and vp_p1st > 0.0 and vp_p2nd > vp_p1st and vp_p7d > 0.0 and vp_c7d >= 1)
+                is_vp_tier2 = (vp_cnt >= MIN_TRADES and vp_p1st > 0.0 and vp_p2nd > vp_p1st)
                 if is_vp_tier1:
-                    vp_score = 1000.0 + vp_p7d * 2.0 + vp_p2nd + vp_pnl * 0.1
+                    vp_score = 1000.0 + vp_p2nd * 1.0 + vp_p7d * 1.0 + vp_pnl * 0.2
                 elif is_vp_tier2:
                     vp_score = 500.0 + vp_p2nd + vp_pnl * 0.1
                 elif vp_cnt >= 5 and vp_pnl > 0.0:
@@ -3150,10 +3168,10 @@ def _run_interval_comparison_short(df_5m: pd.DataFrame, lot: float = 1.0, data_e
                 vpe_p2nd = sim_ema.get('pnl_second_half', 0.0)
                 vpe_p7d = sim_ema.get('pnl_recent_7d', 0.0)
                 vpe_c7d = sim_ema.get('trades_recent_7d', 0)
-                is_vpe_tier1 = (vpe_cnt >= MIN_TRADES and vpe_pnl > 0.0 and vpe_p7d > 0.0 and vpe_c7d >= 1)
-                is_vpe_tier2 = (vpe_cnt >= MIN_TRADES and vpe_pnl > 0.0 and vpe_p1st > 0.0 and vpe_p2nd > vpe_p1st)
+                is_vpe_tier1 = (vpe_cnt >= MIN_TRADES and vpe_p1st > 0.0 and vpe_p2nd > vpe_p1st and vpe_p7d > 0.0 and vpe_c7d >= 1)
+                is_vpe_tier2 = (vpe_cnt >= MIN_TRADES and vpe_p1st > 0.0 and vpe_p2nd > vpe_p1st)
                 if is_vpe_tier1:
-                    vpe_score = 1000.0 + vpe_p7d * 2.0 + vpe_p2nd + vpe_pnl * 0.1
+                    vpe_score = 1000.0 + vpe_p2nd * 1.0 + vpe_p7d * 1.0 + vpe_pnl * 0.2
                 elif is_vpe_tier2:
                     vpe_score = 500.0 + vpe_p2nd + vpe_pnl * 0.1
                 elif vpe_cnt >= 5 and vpe_pnl > 0.0:
@@ -3248,10 +3266,10 @@ def _run_interval_comparison_short(df_5m: pd.DataFrame, lot: float = 1.0, data_e
         rn_p2nd = res_r_none.get('pnl_second_half', 0.0)
         rn_p7d = res_r_none.get('pnl_recent_7d', 0.0)
         rn_c7d = res_r_none.get('trades_recent_7d', 0)
-        is_rn_tier1 = (rn_cnt >= MIN_TRADES and rn_pnl > 0.0 and rn_p7d > 0.0 and rn_c7d >= 1)
-        is_rn_tier2 = (rn_cnt >= MIN_TRADES and rn_pnl > 0.0 and rn_p1st > 0.0 and rn_p2nd > rn_p1st)
+        is_rn_tier1 = (rn_cnt >= MIN_TRADES and rn_p1st > 0.0 and rn_p2nd > rn_p1st and rn_p7d > 0.0 and rn_c7d >= 1)
+        is_rn_tier2 = (rn_cnt >= MIN_TRADES and rn_p1st > 0.0 and rn_p2nd > rn_p1st)
         if is_rn_tier1:
-            rn_score = 1000.0 + rn_p7d * 2.0 + rn_p2nd + rn_pnl * 0.1
+            rn_score = 1000.0 + rn_p2nd * 1.0 + rn_p7d * 1.0 + rn_pnl * 0.2
         elif is_rn_tier2:
             rn_score = 500.0 + rn_p2nd + rn_pnl * 0.1
         elif rn_cnt >= 5 and rn_pnl > 0.0:
@@ -3289,10 +3307,10 @@ def _run_interval_comparison_short(df_5m: pd.DataFrame, lot: float = 1.0, data_e
         re_p2nd = res_r_ema.get('pnl_second_half', 0.0)
         re_p7d = res_r_ema.get('pnl_recent_7d', 0.0)
         re_c7d = res_r_ema.get('trades_recent_7d', 0)
-        is_re_tier1 = (re_cnt >= MIN_TRADES and re_pnl > 0.0 and re_p7d > 0.0 and re_c7d >= 1)
-        is_re_tier2 = (re_cnt >= MIN_TRADES and re_pnl > 0.0 and re_p1st > 0.0 and re_p2nd > re_p1st)
+        is_re_tier1 = (re_cnt >= MIN_TRADES and re_p1st > 0.0 and re_p2nd > re_p1st and re_p7d > 0.0 and re_c7d >= 1)
+        is_re_tier2 = (re_cnt >= MIN_TRADES and re_p1st > 0.0 and re_p2nd > re_p1st)
         if is_re_tier1:
-            re_score = 1000.0 + re_p7d * 2.0 + re_p2nd + re_pnl * 0.1
+            re_score = 1000.0 + re_p2nd * 1.0 + re_p7d * 1.0 + re_pnl * 0.2
         elif is_re_tier2:
             re_score = 500.0 + re_p2nd + re_pnl * 0.1
         elif re_cnt >= 5 and re_pnl > 0.0:
@@ -3353,10 +3371,10 @@ def _run_interval_comparison_short(df_5m: pd.DataFrame, lot: float = 1.0, data_e
         c_pnl_2nd = float(c.get('pnl_second_half', 0.0))
         c_pnl_7d = float(c.get('pnl_recent_7d', 0.0))
         c_cnt_7d = int(c.get('trades_recent_7d', 0))
-        if c_cnt >= MIN_TRADES and c_pnl > 0.0 and c_pnl_7d > 0.0 and c_cnt_7d >= 1:
-            # Tier 1: 直近7日黒字 & 取引発生を最優先ソート
-            valid_cands_tier1.append((c_pnl_7d * 2.0 + c_pnl_2nd + c_pnl * 0.1, c))
-        elif c_cnt >= MIN_TRADES and c_pnl > 0.0 and c_pnl_1st > 0.0 and c_pnl_2nd > c_pnl_1st:
+        if c_cnt >= MIN_TRADES and c_pnl_1st > 0.0 and c_pnl_2nd > c_pnl_1st and c_pnl_7d > 0.0 and c_cnt_7d >= 1:
+            # Tier 1: 前半黒字 & 後半加速 & 直近7日黒字 & 取引発生
+            valid_cands_tier1.append((c_pnl_2nd * 1.0 + c_pnl_7d * 1.0 + c_pnl * 0.2, c))
+        elif c_cnt >= MIN_TRADES and c_pnl_1st > 0.0 and c_pnl_2nd > c_pnl_1st:
             valid_cands_tier2.append((c_pnl_2nd, c))
 
     if valid_cands_tier1:
@@ -3681,10 +3699,10 @@ def run_interval_comparison(df_5m: pd.DataFrame, lot: float = 1.0, data_equity: 
                 vp_p2nd = sim_none.get('pnl_second_half', 0.0)
                 vp_p7d = sim_none.get('pnl_recent_7d', 0.0)
                 vp_c7d = sim_none.get('trades_recent_7d', 0)
-                is_vp_tier1 = (vp_cnt >= MIN_TRADES and vp_pnl > 0.0 and vp_p7d > 0.0 and vp_c7d >= 1)
-                is_vp_tier2 = (vp_cnt >= MIN_TRADES and vp_pnl > 0.0 and vp_p1st > 0.0 and vp_p2nd > vp_p1st)
+                is_vp_tier1 = (vp_cnt >= MIN_TRADES and vp_p1st > 0.0 and vp_p2nd > vp_p1st and vp_p7d > 0.0 and vp_c7d >= 1)
+                is_vp_tier2 = (vp_cnt >= MIN_TRADES and vp_p1st > 0.0 and vp_p2nd > vp_p1st)
                 if is_vp_tier1:
-                    vp_score = 1000.0 + vp_p7d * 2.0 + vp_p2nd + vp_pnl * 0.1
+                    vp_score = 1000.0 + vp_p2nd * 1.0 + vp_p7d * 1.0 + vp_pnl * 0.2
                 elif is_vp_tier2:
                     vp_score = 500.0 + vp_p2nd + vp_pnl * 0.1
                 elif vp_cnt >= 5 and vp_pnl > 0.0:
@@ -3745,10 +3763,10 @@ def run_interval_comparison(df_5m: pd.DataFrame, lot: float = 1.0, data_equity: 
                 vpe_p2nd = sim_ema.get('pnl_second_half', 0.0)
                 vpe_p7d = sim_ema.get('pnl_recent_7d', 0.0)
                 vpe_c7d = sim_ema.get('trades_recent_7d', 0)
-                is_vpe_tier1 = (vpe_cnt >= MIN_TRADES and vpe_pnl > 0.0 and vpe_p7d > 0.0 and vpe_c7d >= 1)
-                is_vpe_tier2 = (vpe_cnt >= MIN_TRADES and vpe_pnl > 0.0 and vpe_p1st > 0.0 and vpe_p2nd > vpe_p1st)
+                is_vpe_tier1 = (vpe_cnt >= MIN_TRADES and vpe_p1st > 0.0 and vpe_p2nd > vpe_p1st and vpe_p7d > 0.0 and vpe_c7d >= 1)
+                is_vpe_tier2 = (vpe_cnt >= MIN_TRADES and vpe_p1st > 0.0 and vpe_p2nd > vpe_p1st)
                 if is_vpe_tier1:
-                    vpe_score = 1000.0 + vpe_p7d * 2.0 + vpe_p2nd + vpe_pnl * 0.1
+                    vpe_score = 1000.0 + vpe_p2nd * 1.0 + vpe_p7d * 1.0 + vpe_pnl * 0.2
                 elif is_vpe_tier2:
                     vpe_score = 500.0 + vpe_p2nd + vpe_pnl * 0.1
                 elif vpe_cnt >= 5 and vpe_pnl > 0.0:
@@ -3866,10 +3884,10 @@ def run_interval_comparison(df_5m: pd.DataFrame, lot: float = 1.0, data_equity: 
         rn_p2nd = res_r_none.get('pnl_second_half', 0.0)
         rn_p7d = res_r_none.get('pnl_recent_7d', 0.0)
         rn_c7d = res_r_none.get('trades_recent_7d', 0)
-        is_rn_tier1 = (rn_cnt >= MIN_TRADES and rn_pnl > 0.0 and rn_p7d > 0.0 and rn_c7d >= 1)
-        is_rn_tier2 = (rn_cnt >= MIN_TRADES and rn_pnl > 0.0 and rn_p1st > 0.0 and rn_p2nd > rn_p1st)
+        is_rn_tier1 = (rn_cnt >= MIN_TRADES and rn_p1st > 0.0 and rn_p2nd > rn_p1st and rn_p7d > 0.0 and rn_c7d >= 1)
+        is_rn_tier2 = (rn_cnt >= MIN_TRADES and rn_p1st > 0.0 and rn_p2nd > rn_p1st)
         if is_rn_tier1:
-            rn_score = 1000.0 + rn_p7d * 2.0 + rn_p2nd + rn_pnl * 0.1
+            rn_score = 1000.0 + rn_p2nd * 1.0 + rn_p7d * 1.0 + rn_pnl * 0.2
         elif is_rn_tier2:
             rn_score = 500.0 + rn_p2nd + rn_pnl * 0.1
         elif rn_cnt >= 5 and rn_pnl > 0.0:
@@ -3925,10 +3943,10 @@ def run_interval_comparison(df_5m: pd.DataFrame, lot: float = 1.0, data_equity: 
         re_p2nd = res_r_ema.get('pnl_second_half', 0.0)
         re_p7d = res_r_ema.get('pnl_recent_7d', 0.0)
         re_c7d = res_r_ema.get('trades_recent_7d', 0)
-        is_re_tier1 = (re_cnt >= MIN_TRADES and re_pnl > 0.0 and re_p7d > 0.0 and re_c7d >= 1)
-        is_re_tier2 = (re_cnt >= MIN_TRADES and re_pnl > 0.0 and re_p1st > 0.0 and re_p2nd > re_p1st)
+        is_re_tier1 = (re_cnt >= MIN_TRADES and re_p1st > 0.0 and re_p2nd > re_p1st and re_p7d > 0.0 and re_c7d >= 1)
+        is_re_tier2 = (re_cnt >= MIN_TRADES and re_p1st > 0.0 and re_p2nd > re_p1st)
         if is_re_tier1:
-            re_score = 1000.0 + re_p7d * 2.0 + re_p2nd + re_pnl * 0.1
+            re_score = 1000.0 + re_p2nd * 1.0 + re_p7d * 1.0 + re_pnl * 0.2
         elif is_re_tier2:
             re_score = 500.0 + re_p2nd + re_pnl * 0.1
         elif re_cnt >= 5 and re_pnl > 0.0:
@@ -4003,9 +4021,9 @@ def run_interval_comparison(df_5m: pd.DataFrame, lot: float = 1.0, data_equity: 
         c_pnl_2nd = float(c.get('pnl_second_half', 0.0))
         c_pnl_7d = float(c.get('pnl_recent_7d', 0.0))
         c_cnt_7d = int(c.get('trades_recent_7d', 0))
-        if c_cnt >= MIN_TRADES and c_pnl > 0.0 and c_pnl_7d > 0.0 and c_cnt_7d >= 1:
-            valid_cands_tier1.append((c_pnl_7d * 2.0 + c_pnl_2nd + c_pnl * 0.1, c))
-        elif c_cnt >= MIN_TRADES and c_pnl > 0.0 and c_pnl_1st > 0.0 and c_pnl_2nd > c_pnl_1st:
+        if c_cnt >= MIN_TRADES and c_pnl_1st > 0.0 and c_pnl_2nd > c_pnl_1st and c_pnl_7d > 0.0 and c_cnt_7d >= 1:
+            valid_cands_tier1.append((c_pnl_2nd * 1.0 + c_pnl_7d * 1.0 + c_pnl * 0.2, c))
+        elif c_cnt >= MIN_TRADES and c_pnl_1st > 0.0 and c_pnl_2nd > c_pnl_1st:
             valid_cands_tier2.append((c_pnl_2nd, c))
 
     if valid_cands_tier1:

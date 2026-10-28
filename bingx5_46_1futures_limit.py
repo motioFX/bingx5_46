@@ -1117,9 +1117,19 @@ async def validate_profitable_candidates(trade_side: str, mode: str, base_symbol
                 }
                 symbol_params_map[cand] = cand_params
 
-                # 三段階頑健性フィルター (Tier 1: 直近7日黒字 & 取引発生 を最優先、または Tier 2: 二重頑健性クリア)
-                is_tier1 = bool(trade_cnt >= 10 and cand_pnl > 0.0 and pnl_7d > 0.0 and cnt_7d >= 1)
-                is_tier2 = bool(cand_params.get("is_qualified", False) and trade_cnt >= 10 and pnl_1st > 0.0 and pnl_2nd > pnl_1st)
+                # 4大完全必須条件: 前半黒字 & 後半加速(後半>前半) & 直近7日取引1回以上 & 直近7日黒字
+                is_tier1 = bool(
+                    trade_cnt >= 10
+                    and pnl_1st > 0.0
+                    and pnl_2nd > pnl_1st
+                    and pnl_7d > 0.0
+                    and cnt_7d >= 1
+                )
+                is_tier2 = bool(
+                    trade_cnt >= 10
+                    and pnl_1st > 0.0
+                    and pnl_2nd > pnl_1st
+                )
                 is_qual = is_tier1 or is_tier2
                 if is_qual:
                     dyn_sl_disp = cand_params.get("dynamic_mae_stop", -0.025)
@@ -1132,7 +1142,7 @@ async def validate_profitable_candidates(trade_side: str, mode: str, base_symbol
                     s_pnl = cand_params.get('single_pnl', cand_pnl)
                     s_cnt = cand_params.get('single_trades', trade_cnt)
                     s_win = cand_params.get('single_win_rate', win_rt)
-                    qual_tag = "Tier1(直近7d黒字)" if is_tier1 else "Tier2(後半加速)"
+                    qual_tag = "Tier1(直近7d黒字&後半加速)" if is_tier1 else "Tier2(後半加速)"
                     discord.print_log(
                         f"   [合格 🟢 - {qual_tag}] {cand}: 戦略={cand_strat.upper()} ({cand_inv}m / {detail_str}) -> "
                         f"純利益: +${cand_pnl:.2f} USDT [前半: +${pnl_1st:.2f} / 後半: +${pnl_2nd:.2f} / 直近7d: +${pnl_7d:.2f}({cnt_7d}回), 取引: {trade_cnt}回, 勝率: {win_rt:.1f}%, DD: {max_dd:.2f} USDT ({max_dd:.1f}%)] "
@@ -1140,7 +1150,7 @@ async def validate_profitable_candidates(trade_side: str, mode: str, base_symbol
                     )
                     profitable_cands.append(cand)
                 else:
-                    discord.print_log(f"   [不合格 🔴] {cand}: PnL = ${cand_pnl:+.2f} USDT [前半: ${pnl_1st:+.2f} / 後半: ${pnl_2nd:+.2f} / 直近7d: ${pnl_7d:+.2f}({cnt_7d}回)] (取引: {trade_cnt}回 / 三段階頑健性未達: 直近7d黒字または後半加速が必須)")
+                    discord.print_log(f"   [不合格 🔴] {cand}: PnL = ${cand_pnl:+.2f} USDT [前半: ${pnl_1st:+.2f} / 後半: ${pnl_2nd:+.2f} / 直近7d: ${pnl_7d:+.2f}({cnt_7d}回)] (取引: {trade_cnt}回 / 二重頑健性未達: 前半黒字かつ後半加速が必須)")
 
             except Exception as opt_err:
                 discord.print_log(f"   [最適化エラー] {cand}: {opt_err}")
@@ -1160,8 +1170,14 @@ async def validate_profitable_candidates(trade_side: str, mode: str, base_symbol
             # 30日総合純利益に最大ウェイト(1.0)、後半加速(0.5)、直近7日利益(0.5)、勝率ボーナス(win_rt*0.05)
             return pnl_tot * 1.0 + pnl_2nd * 0.5 + pnl_7d * 0.5 + (win_rt * 0.05)
 
-        # Tier 1: 直近7日黒字かつ取引発生銘柄を最優先選抜
-        tier1_cands = [s for s in target_pool if symbol_params_map[s].get("pnl_recent_7d", 0.0) > 0 and symbol_params_map[s].get("trades_recent_7d", 0) >= 1]
+        # Tier 1: 4大完全必須条件 (前半黒字 & 後半加速 & 直近7日取引1回以上 & 直近7日黒字) クリア銘柄を最優先選抜
+        tier1_cands = [
+            s for s in target_pool
+            if symbol_params_map[s].get("pnl_first_half", 0.0) > 0
+            and symbol_params_map[s].get("pnl_second_half", 0.0) > symbol_params_map[s].get("pnl_first_half", 0.0)
+            and symbol_params_map[s].get("pnl_recent_7d", 0.0) > 0
+            and symbol_params_map[s].get("trades_recent_7d", 0) >= 1
+        ]
         if tier1_cands:
             best_sym = max(tier1_cands, key=_calc_overall_best_score)
         else:
