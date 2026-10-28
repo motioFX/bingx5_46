@@ -1091,22 +1091,15 @@ async def validate_profitable_candidates(trade_side: str, mode: str, base_symbol
                 win_rt = float(best_params_dict.get("win_rate", 0.0))
                 max_dd = float(best_params_dict.get("DD_max", 0.0))
 
+                pnl_7d = float(best_params_dict.get("pnl_recent_7d", 0.0))
+                cnt_7d = int(best_params_dict.get("trades_recent_7d", 0))
+                pnl_1st = float(best_params_dict.get("pnl_first_half", 0.0))
+                pnl_2nd = float(best_params_dict.get("pnl_second_half", 0.0))
                 cand_params = {
                     "strategy": cand_strat,
                     "interval": cand_inv,
                     "mp": cand_mp,
                     "margin": cand_margin,
-                    "num_bins": best_params_dict.get("num_bins", 50),
-                    "value_area_pct": best_params_dict.get("value_area_pct", 0.70),
-                    "target_ratio": float(best_params_dict.get("target_ratio", 0.70)),
-                    "ma_type": best_params_dict.get("ma_type", "EMA"),
-                    "ma_condition": best_params_dict.get("ma_condition", "close_below" if actual_side == "short" else "close_above"),
-                    "l_ep": best_params_dict.get("l_ep", 40.0),
-                    "l_cp": best_params_dict.get("l_cp", 60.0),
-                    "s_ep": best_params_dict.get("s_ep", 60.0),
-                    "s_cp": best_params_dict.get("s_cp", 40.0),
-                    "sl_pct": best_params_dict.get("sl_pct", 0.025),
-                    "dynamic_mae_stop": float(best_params_dict.get("dynamic_mae_stop", -0.025)),
                     "pnl": cand_pnl,
                     "trade_count": trade_cnt,
                     "win_rate": win_rt,
@@ -1114,37 +1107,40 @@ async def validate_profitable_candidates(trade_side: str, mode: str, base_symbol
                     "single_pnl": best_params_dict.get("single_pnl", cand_pnl),
                     "single_trades": best_params_dict.get("single_trades", trade_cnt),
                     "single_win_rate": best_params_dict.get("single_win_rate", win_rt),
-                    "pnl_first_half": float(best_params_dict.get("pnl_first_half", 0.0)),
-                    "pnl_second_half": float(best_params_dict.get("pnl_second_half", 0.0)),
+                    "pnl_first_half": pnl_1st,
+                    "pnl_second_half": pnl_2nd,
+                    "pnl_recent_7d": pnl_7d,
+                    "trades_recent_7d": cnt_7d,
                     "is_qualified": bool(best_params_dict.get("is_qualified", False)),
                     "chart_df": best_params_dict.get("chart_df"),
                     "params": best_params_dict,
                 }
                 symbol_params_map[cand] = cand_params
 
-                # 二重頑健性フィルター (全体10回以上 & 前半純利益>0 & 後半純利益>前半純利益) クリアで合格
-                pnl_1st = float(cand_params.get("pnl_first_half", 0.0))
-                pnl_2nd = float(cand_params.get("pnl_second_half", 0.0))
-                is_qual = bool(cand_params.get("is_qualified", False) and trade_cnt >= 10 and pnl_1st > 0.0 and pnl_2nd > pnl_1st)
+                # 三段階頑健性フィルター (Tier 1: 直近7日黒字 & 取引発生 を最優先、または Tier 2: 二重頑健性クリア)
+                is_tier1 = bool(trade_cnt >= 10 and cand_pnl > 0.0 and pnl_7d > 0.0 and cnt_7d >= 1)
+                is_tier2 = bool(cand_params.get("is_qualified", False) and trade_cnt >= 10 and pnl_1st > 0.0 and pnl_2nd > pnl_1st)
+                is_qual = is_tier1 or is_tier2
                 if is_qual:
                     dyn_sl_disp = cand_params.get("dynamic_mae_stop", -0.025)
                     if "val_poc" in cand_strat or "vah_poc" in cand_strat:
-                        detail_str = f"MP={cand_mp}, Bins={cand_params['num_bins']}, VA={int(cand_params['value_area_pct']*100)}%, TR={int(cand_params['target_ratio']*100)}%, {cand_params['ma_type']}_{cand_params['ma_condition']}, 動的SL={dyn_sl_disp:.2%}"
+                        detail_str = f"MP={cand_mp}, Bins={cand_params.get('num_bins', 50)}, VA={int(cand_params.get('value_area_pct', 0.7)*100)}%, TR={int(cand_params.get('target_ratio', 0.7)*100)}%, {cand_params.get('ma_type', 'NONE')}_{cand_params.get('ma_condition', 'none')}, 動的SL={dyn_sl_disp:.2%}"
                     elif "short" in cand_strat:
-                        detail_str = f"EP={int(cand_params['s_ep'])}, CP={int(cand_params['s_cp'])}, 動的SL={dyn_sl_disp:.2%}"
+                        detail_str = f"EP={int(cand_params.get('s_ep', 60))}, CP={int(cand_params.get('s_cp', 40))}, 動的SL={dyn_sl_disp:.2%}"
                     else:
-                        detail_str = f"EP={int(cand_params['l_ep'])}, CP={int(cand_params['l_cp'])}, 動的SL={dyn_sl_disp:.2%}"
+                        detail_str = f"EP={int(cand_params.get('l_ep', 40))}, CP={int(cand_params.get('l_cp', 70))}, 動的SL={dyn_sl_disp:.2%}"
                     s_pnl = cand_params.get('single_pnl', cand_pnl)
                     s_cnt = cand_params.get('single_trades', trade_cnt)
                     s_win = cand_params.get('single_win_rate', win_rt)
+                    qual_tag = "Tier1(直近7d黒字)" if is_tier1 else "Tier2(後半加速)"
                     discord.print_log(
-                        f"   [合格 🟢] {cand}: 戦略={cand_strat.upper()} ({cand_inv}m / {detail_str}) -> "
-                        f"純利益: +${cand_pnl:.2f} USDT (前半: +${pnl_1st:.2f} / 後半: +${pnl_2nd:.2f}, 取引: {trade_cnt}回, 勝率: {win_rt:.1f}%, DD: {max_dd:.2f} USDT ({max_dd:.1f}%)) "
+                        f"   [合格 🟢 - {qual_tag}] {cand}: 戦略={cand_strat.upper()} ({cand_inv}m / {detail_str}) -> "
+                        f"純利益: +${cand_pnl:.2f} USDT [前半: +${pnl_1st:.2f} / 後半: +${pnl_2nd:.2f} / 直近7d: +${pnl_7d:.2f}({cnt_7d}回), 取引: {trade_cnt}回, 勝率: {win_rt:.1f}%, DD: {max_dd:.2f} USDT ({max_dd:.1f}%)] "
                         f"[シングル1枠: +${s_pnl:.2f} / {s_cnt}回 / {s_win:.1f}%]"
                     )
                     profitable_cands.append(cand)
                 else:
-                    discord.print_log(f"   [不合格 🔴] {cand}: PnL = ${cand_pnl:+.2f} USDT [前半: ${pnl_1st:+.2f} / 後半: ${pnl_2nd:+.2f}] (取引: {trade_cnt}回 / 二重頑健性未達: 前半黒字かつ後半加速が必須)")
+                    discord.print_log(f"   [不合格 🔴] {cand}: PnL = ${cand_pnl:+.2f} USDT [前半: ${pnl_1st:+.2f} / 後半: ${pnl_2nd:+.2f} / 直近7d: ${pnl_7d:+.2f}({cnt_7d}回)] (取引: {trade_cnt}回 / 三段階頑健性未達: 直近7d黒字または後半加速が必須)")
 
             except Exception as opt_err:
                 discord.print_log(f"   [最適化エラー] {cand}: {opt_err}")
