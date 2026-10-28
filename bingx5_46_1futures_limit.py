@@ -1151,12 +1151,16 @@ async def validate_profitable_candidates(trade_side: str, mode: str, base_symbol
 
         await asyncio.sleep(0.1)
 
-    # 1ヶ月間バックテスト 最優秀成績銘柄 チャート1枚出力 (PROJECT_RULES.md 準拠: 後半純利益最大を選抜)
+    # 1ヶ月間バックテスト 最優秀成績銘柄 チャート1枚出力 (PROJECT_RULES.md 準拠: 直近7日純利益最大を最優先選抜)
     best_sym = None
-    if profitable_cands:
-        best_sym = max(profitable_cands, key=lambda s: symbol_params_map[s].get("pnl_second_half", symbol_params_map[s].get("pnl", 0.0)))
-    elif symbol_params_map:
-        best_sym = max(symbol_params_map.keys(), key=lambda s: symbol_params_map[s].get("pnl_second_half", symbol_params_map[s].get("pnl", 0.0)))
+    target_pool = profitable_cands if profitable_cands else list(symbol_params_map.keys())
+    if target_pool:
+        # Tier 1: 直近7日黒字かつ取引発生銘柄を最優先選抜
+        tier1_cands = [s for s in target_pool if symbol_params_map[s].get("pnl_recent_7d", 0.0) > 0 and symbol_params_map[s].get("trades_recent_7d", 0) >= 1]
+        if tier1_cands:
+            best_sym = max(tier1_cands, key=lambda s: (symbol_params_map[s].get("pnl_recent_7d", 0.0), symbol_params_map[s].get("pnl_second_half", 0.0)))
+        else:
+            best_sym = max(target_pool, key=lambda s: symbol_params_map[s].get("pnl_second_half", symbol_params_map[s].get("pnl", 0.0)))
 
     if best_sym and best_sym in symbol_params_map:
         try:
@@ -1183,11 +1187,13 @@ async def validate_profitable_candidates(trade_side: str, mode: str, base_symbol
             chart_label = f"Best1Month_{strat_tag}_{best_inv}m"
             b_p1 = float(best_p.get('pnl_first_half', 0.0))
             b_p2 = float(best_p.get('pnl_second_half', 0.0))
+            b_p7 = float(best_p.get('pnl_recent_7d', 0.0))
+            b_c7 = int(best_p.get('trades_recent_7d', 0))
             discord.print_log(
-                f"🏆 **【バックテスト 最優秀成績銘柄 (1ヶ月間・二重頑健性クリア)】**\n"
+                f"🏆 **【バックテスト 最優秀成績銘柄 (直近1週間実効性 ＆ 後半加速クリア)】**\n"
                 f"・銘柄: `{best_sym}` (採用足種: `{best_inv}m足` / 戦略: `{strat_tag}`)\n"
-                f"・純利益: `+${best_pnl:.2f} USDT` [前半: +${b_p1:.2f} / 後半: +${b_p2:.2f}] (取引: {best_cnt}回, 勝率: {best_win:.1f}%, MaxDD: `-${best_dd:.2f} USDT (-{best_dd:.1f}%)`)\n"
-                f"・最優秀成績チャート1枚を出力します。"
+                f"・純利益: `+${best_pnl:.2f} USDT` [前半: +${b_p1:.2f} / 後半: +${b_p2:.2f} / 直近7d: `+${b_p7:.2f}` ({b_c7}回)] (取引: {best_cnt}回, 勝率: {best_win:.1f}%, MaxDD: `-${best_dd:.2f} USDT (-{best_dd:.1f}%)`)\n"
+                f"・直近モメンタム最優秀成績チャート1枚を出力します。"
             )
             discord.plot_backtest(label=chart_label, csv_file=bg_csv, symbol=best_sym)
         except Exception as ch_err:
