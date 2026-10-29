@@ -1361,6 +1361,35 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
         await asyncio.sleep(1)
 
 
+def acquire_single_instance_lock(lock_file_path: Path):
+    """シングルインスタンス排他ロックを取得。多重起動時は即時安全終了。"""
+    try:
+        lock_file_path.parent.mkdir(parents=True, exist_ok=True)
+        fp = open(lock_file_path, "a+", encoding="utf-8")
+        if sys.platform != "win32":
+            import fcntl
+            try:
+                fcntl.flock(fp.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except (IOError, BlockingIOError):
+                print(f"[SingleInstance Guard] ⚠️ 既に別のボットプロセスが稼働中です。二重起動を防止して終了します。")
+                sys.exit(0)
+        else:
+            try:
+                import msvcrt
+                msvcrt.locking(fp.fileno(), msvcrt.LK_NBLCK, 1)
+            except Exception:
+                print("[SingleInstance Guard] ⚠️ 既に別のボットプロセスが稼働中です。二重起動を防止して終了します。")
+                sys.exit(0)
+        fp.seek(0)
+        fp.truncate()
+        fp.write(str(os.getpid()) + "\n")
+        fp.flush()
+        return fp
+    except Exception as e:
+        print(f"[SingleInstance Guard Warning] ロック取得例外: {e}")
+        return None
+
+
 async def main():
     mode = 'live' if BITBANK_IS_LIVE else 'demo'
     max_lot = 10.0
@@ -1369,8 +1398,8 @@ async def main():
 
 
 if __name__ == "__main__":
+    _bot_lock_fp = acquire_single_instance_lock(BASE_DIR / "Data" / "bot.pid")
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
         print("\nProgram stopped by user.")
-

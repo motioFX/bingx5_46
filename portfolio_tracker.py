@@ -26,6 +26,50 @@ from bitbank5_46_3logic import discord
 
 JST = timezone(timedelta(hours=9))
 
+# 建値キャッシュファイルおよび既知確定建値のフォールバック
+ENTRY_PRICES_CACHE_FILE = BASE_DIR / "Data" / "last_known_entry_prices.json"
+
+DEFAULT_KNOWN_ENTRY_PRICES: Dict[str, float] = {
+    "BTC": 12794387.0,
+    "RENDER": 324.088,
+    "NEAR": 834.88,
+}
+
+
+def load_cached_entry_price(asset: str) -> float:
+    """保存済みの既知建値をロード（ファイルキャッシュ ➔ デフォルト既知建値）"""
+    asset_u = asset.upper()
+    if ENTRY_PRICES_CACHE_FILE.exists():
+        try:
+            with open(ENTRY_PRICES_CACHE_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                if asset_u in data and float(data[asset_u]) > 0:
+                    return float(data[asset_u])
+        except Exception:
+            pass
+    return DEFAULT_KNOWN_ENTRY_PRICES.get(asset_u, 0.0)
+
+
+def save_cached_entry_price(asset: str, price: float) -> None:
+    """建値をファイルへ安全に永続保存"""
+    if price <= 0:
+        return
+    asset_u = asset.upper()
+    try:
+        ENTRY_PRICES_CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        data = {}
+        if ENTRY_PRICES_CACHE_FILE.exists():
+            try:
+                with open(ENTRY_PRICES_CACHE_FILE, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+            except Exception:
+                data = {}
+        data[asset_u] = round(price, 4)
+        with open(ENTRY_PRICES_CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+    except Exception:
+        pass
+
 
 # =====================================================================
 # 1. Bitbank ポジション & 指値監査
@@ -93,37 +137,47 @@ async def fetch_bitbank_portfolio(mode: str = "live") -> Dict[str, Any]:
         except Exception:
             pass
 
-        # 約定履歴から移動加重平均建値を計算
+        # 約定履歴から移動加重平均建値を計算（リトライ＆永続キャッシュフォールバック）
         avg_entry = 0.0
-        try:
-            # BTCの場合は既存の長期BTC建値設定を参照
-            if ca["asset"] == "BTC":
-                from long_term_btc_tracker import KNOWN_ENTRY_PRICE
-                avg_entry = KNOWN_ENTRY_PRICE
-            else:
-                res_trades = await helper._request_private("GET", f"/v1/user/spot/trade_history?pair={pair}&count=100")
-                if res_trades.get("success") == 1:
-                    trades = res_trades.get("data", {}).get("trades", [])
-                    sorted_trades = sorted(trades, key=lambda x: x.get("executed_at", 0))
-                    t_qty = 0.0
-                    t_cost = 0.0
-                    for t in sorted_trades:
-                        px = float(t.get("price", 0.0))
-                        amt = float(t.get("amount", 0.0))
-                        side = t.get("side", "").lower()
-                        if side == "buy":
-                            t_qty += amt
-                            t_cost += px * amt
-                        elif side == "sell":
-                            if t_qty > 0:
-                                current_avg = t_cost / t_qty
-                                sell_amt = min(amt, t_qty)
-                                t_qty -= sell_amt
-                                t_cost = t_qty * current_avg
-                    if t_qty > 0:
-                        avg_entry = t_cost / t_qty
-        except Exception:
-            pass
+        if ca["asset"] == "BTC":
+            from long_term_btc_tracker import KNOWN_ENTRY_PRICE
+            avg_entry = KNOWN_ENTRY_PRICE
+        else:
+            for attempt in range(3):
+                try:
+                    res_trades = await helper._request_private("GET", f"/v1/user/spot/trade_history?pair={pair}&count=100")
+                    if res_trades.get("success") == 1:
+                        trades = res_trades.get("data", {}).get("trades", [])
+                        sorted_trades = sorted(trades, key=lambda x: x.get("executed_at", 0))
+                        t_qty = 0.0
+                        t_cost = 0.0
+                        for t in sorted_trades:
+                            px = float(t.get("price", 0.0))
+                            amt = float(t.get("amount", 0.0))
+                            side = t.get("side", "").lower()
+                            if side == "buy":
+                                t_qty += amt
+                                t_cost += px * amt
+                            elif side == "sell":
+                                if t_qty > 0:
+                                    current_avg = t_cost / t_qty
+                                    sell_amt = min(amt, t_qty)
+                                    t_qty -= sell_amt
+                                    t_cost = t_qty * current_avg
+                        if t_qty > 0:
+                            avg_entry = t_cost / t_qty
+                            save_cached_entry_price(ca["asset"], avg_entry)
+                        break
+                    else:
+                        await asyncio.sleep(0.5)
+                except Exception:
+                    await asyncio.sleep(0.5)
+
+            # APIで建値が取得できなかった場合の堅牢フォールバック（永続キャッシュまたは既知建値）
+            if avg_entry <= 0:
+                fallback_price = load_cached_entry_price(ca["asset"])
+                if fallback_price > 0:
+                    avg_entry = fallback_price
 
         # 評価額と損益
         valuation = amount * current_price if current_price > 0 else 0.0
@@ -254,8 +308,14 @@ def fetch_binance_portfolio() -> Dict[str, Any]:
                             t_cost = t_qty * current_avg
                 if t_qty > 0:
                     avg_entry = t_cost / t_qty
+                    save_cached_entry_price(ca["asset"], avg_entry)
         except Exception:
             pass
+
+        if avg_entry <= 0:
+            fallback_price = load_cached_entry_price(ca["asset"])
+            if fallback_price > 0:
+                avg_entry = fallback_price
 
         valuation = amount * current_price if current_price > 0 else 0.0
         cost = amount * avg_entry if avg_entry > 0 else valuation

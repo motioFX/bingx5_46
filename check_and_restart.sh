@@ -1,5 +1,11 @@
 #!/bin/bash
 
+# スクリプト自身の多重起動防止 (flock)
+exec 200>/tmp/bitbank_check_and_restart.lock
+if ! flock -n 200; then
+    exit 0
+fi
+
 # 監視対象のプロセス名
 PROCESS_NAME="bitbank5_46_1spot_limit.py"
 PYTHON_BIN="/home/ubuntu/pybot-env310/bin/python"
