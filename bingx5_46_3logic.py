@@ -5362,9 +5362,13 @@ def check_vah_poc_signals(
     # ショート利確目標価格: VAH - (VAH - VAL) * target_ratio
     va_diff = (curr_vah - curr_val) if (curr_vah > curr_val and curr_val > 0) else 0.0
     va_spacing = va_diff * target_ratio if va_diff > 0 else 0.0
-    target_tp = curr_vah - va_spacing if va_spacing > 0 else curr_poc
+    raw_target_tp = curr_vah - va_spacing if va_spacing > 0 else curr_poc
 
-    spo = (current_pos_qty < 0 or (current_pos_qty > 0 and current_trades_count > 0 and avg_entry_price > 0))  # ショートポジション保有中
+    spo = (current_pos_qty < 0 or (current_pos_qty > 0 and current_trades_count > 0 and avg_entry_price > 0))
+    if spo and avg_entry_price > 0:
+        target_tp = min(raw_target_tp, avg_entry_price * 0.9960)
+    else:
+        target_tp = raw_target_tp  # ショートポジション保有中
     poz = (current_pos_qty == 0 and current_trades_count == 0)
 
     metrics = {

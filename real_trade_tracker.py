@@ -1177,7 +1177,7 @@ def plot_entry_chart(
         CHARTS_DIR.mkdir(parents=True, exist_ok=True)
         now_str = datetime.now(timezone.utc).astimezone().strftime("%Y%m%d_%H%M%S")
         archive_file = CHARTS_DIR / f"{now_str}_ENTRY_{symbol}.png"
-        plt.savefig(archive_file, dpi=150, facecolor=fig.get_facecolor(), edgecolor="none")
+        plt.savefig(archive_file, dpi=150, facecolor=fig.get_facecolor(), edgecolor="none", bbox_inches="tight")
     except Exception:
         pass
 
@@ -1203,7 +1203,7 @@ def plot_exit_chart(
     lookback_bars: int = 48,
     interval_label: str = "",
 ) -> Optional[Path]:
-    """決済(Exit/Close)時点のローソク足、Volume Profile履歴バンド、エントリー＆エグジット軌跡を描画して保存する"""
+    """決済(Exit/Close)時点のローソク足、高精度Volume Profile履歴バンド、RSI/RSIMAサブプロット、トレード軌跡を描画して保存する"""
     if df is None or df.empty:
         return None
 
@@ -1211,41 +1211,47 @@ def plot_exit_chart(
     out_file = DATA_DIR / f"exit_chart_{symbol}.png"
 
     work_df = df.copy()
-    if not all(col in work_df.columns for col in ['VAH', 'VAL', 'POC']):
-        work_df = compute_volume_profile_bands(work_df, period=lookback_bars)
+    # 既存の古い VAH/VAL/POC カラムは破棄（チャート表示期間に合わせて高精度再計算するため）
+    for col in ['VAH', 'VAL', 'POC']:
+        if col in work_df.columns:
+            work_df = work_df.drop(columns=[col])
 
-    plot_df = work_df.tail(lookback_bars).reset_index(drop=True)
-    if len(plot_df) == 0:
-        return None
-
-    if "timestamp" in plot_df.columns:
-        plot_df["dt"] = pd.to_datetime(plot_df["timestamp"], utc=True)
-    elif "date" in plot_df.columns:
-        plot_df["dt"] = pd.to_datetime(plot_df["date"], utc=True)
+    # タイムスタンプの正規化（Asia/Tokyo）
+    if "timestamp" in work_df.columns:
+        work_df["dt"] = pd.to_datetime(work_df["timestamp"], utc=True).dt.tz_convert("Asia/Tokyo")
+    elif "date" in work_df.columns:
+        work_df["dt"] = pd.to_datetime(work_df["date"], utc=True).dt.tz_convert("Asia/Tokyo")
     else:
-        plot_df["dt"] = pd.date_range(end=pd.Timestamp.now(tz="UTC"), periods=len(plot_df), freq="5min")
+        work_df["dt"] = pd.date_range(end=pd.Timestamp.now(tz="Asia/Tokyo"), periods=len(work_df), freq="5min")
 
-    plot_df["dt"] = plot_df["dt"].dt.tz_convert("Asia/Tokyo")
-
-    if not interval_label and len(plot_df) >= 2:
+    # 足間隔（分）の特定
+    gran_min = 5
+    if len(work_df) >= 2:
         try:
-            diff_sec = (plot_df["dt"].iloc[-1] - plot_df["dt"].iloc[-2]).total_seconds()
-            diff_min = int(round(diff_sec / 60))
-            if diff_min in (5, 15, 30):
-                interval_label = f"{diff_min}m"
-            elif diff_min == 60:
-                interval_label = "1h"
-            elif diff_min > 0:
-                interval_label = f"{diff_min}m"
+            diff_sec = (work_df["dt"].iloc[-1] - work_df["dt"].iloc[-2]).total_seconds()
+            diff_m = int(round(diff_sec / 60))
+            if diff_m in (5, 15, 30, 60):
+                gran_min = diff_m
+            elif diff_m > 0:
+                gran_min = diff_m
         except Exception:
             pass
 
+    if not interval_label:
+        interval_label = f"{gran_min}m" if gran_min < 60 else f"{gran_min // 60}h"
+
+    # トレード履歴から直近のエントリーおよび決済情報を取得
     trades = load_real_trades()
     entry_trade = None
+    exit_trade = None
     for t in reversed(trades):
-        if t.get("symbol") == symbol and t.get("action") == "ENTRY":
-            entry_trade = t
-            break
+        if t.get("symbol") == symbol:
+            if not exit_trade and t.get("action") == "CLOSE":
+                exit_trade = t
+            elif not entry_trade and t.get("action") == "ENTRY":
+                entry_trade = t
+            if entry_trade and exit_trade:
+                break
 
     if entry_trade:
         rec_px = float(entry_trade.get("price", 0))
@@ -1253,25 +1259,90 @@ def plot_exit_chart(
             if (entry_price is None or entry_price <= 0) or (abs(entry_price - rec_px) / max(entry_price, rec_px) > 0.15):
                 entry_price = rec_px
 
-    last_close = float(plot_df["close"].iloc[-1])
+    last_close = float(work_df["close"].iloc[-1])
     if entry_price is None or entry_price <= 0:
-        entry_price = float(plot_df["open"].iloc[max(0, len(plot_df) - 5)])
+        entry_price = float(work_df["open"].iloc[max(0, len(work_df) - 5)])
 
     if last_close > 0 and (exit_price is None or exit_price <= 0 or abs(exit_price - last_close) / last_close > 0.20):
         exit_price = last_close
 
+    # 決済時刻（Exit dt）の特定と未確定足の補完
+    now_jst = pd.Timestamp.now(tz="Asia/Tokyo")
+    exit_dt = now_jst
+    if exit_trade:
+        ex_time_val = exit_trade.get("dt_jst") or exit_trade.get("timestamp")
+        if ex_time_val:
+            try:
+                exit_dt = pd.to_datetime(ex_time_val, utc=True).tz_convert("Asia/Tokyo")
+            except Exception:
+                pass
+
+    last_candle_start = work_df["dt"].iloc[-1]
+    last_candle_end = last_candle_start + pd.Timedelta(minutes=gran_min)
+
+    # 決済時刻が最終確定足より後の場合、決済足（未確定足）を末尾に正しく追加
+    if exit_dt >= last_candle_end:
+        new_row = {
+            "dt": last_candle_end,
+            "open": float(work_df["close"].iloc[-1]),
+            "high": max(float(work_df["close"].iloc[-1]), exit_price),
+            "low": min(float(work_df["close"].iloc[-1]), exit_price),
+            "close": exit_price,
+            "volume": float(work_df["volume"].iloc[-1]) * 0.5 if "volume" in work_df.columns else 1.0,
+        }
+        work_df = pd.concat([work_df, pd.DataFrame([new_row])], ignore_index=True)
+    elif exit_dt >= last_candle_start:
+        work_df.loc[work_df.index[-1], "close"] = exit_price
+        work_df.loc[work_df.index[-1], "high"] = max(float(work_df["high"].iloc[-1]), exit_price)
+        work_df.loc[work_df.index[-1], "low"] = min(float(work_df["low"].iloc[-1]), exit_price)
+
+    # RSI (期間9) および RSI-EMA (期間7) の計算（十分な母数を持つ work_df 全体から高精度計算）
+    delta = work_df["close"].diff()
+    gain = (delta.where(delta > 0, 0.0)).ewm(alpha=1.0 / 9.0, adjust=False).mean()
+    loss = (-delta.where(delta < 0, 0.0)).ewm(alpha=1.0 / 9.0, adjust=False).mean()
+    rs = gain / (loss + 1e-12)
+    work_df["rsi"] = 100.0 - (100.0 / (1.0 + rs))
+    work_df["rsi_ema"] = work_df["rsi"].ewm(span=7, adjust=False).mean()
+
+    # エントリー足と表示バー数の動的決定（エントリーが見切れないように自動拡張）
+    entry_dt = None
+    if entry_trade:
+        en_time_val = entry_trade.get("dt_jst") or entry_trade.get("timestamp")
+        if en_time_val:
+            try:
+                entry_dt = pd.to_datetime(en_time_val, utc=True).tz_convert("Asia/Tokyo")
+            except Exception:
+                pass
+
+    bars_needed = lookback_bars
+    if entry_dt:
+        elapsed_min = max(0, (exit_dt - entry_dt).total_seconds() / 60)
+        e_bars = int(elapsed_min // gran_min) + 12
+        bars_needed = max(lookback_bars, min(len(work_df), e_bars))
+
+    plot_df = work_df.tail(bars_needed).reset_index(drop=True)
+
+    # 画面に表示されるローソク足範囲に基づき、ボリュームプロファイルを正確に再計算（上下乖離を完全根絶）
+    vp_period = min(len(plot_df), max(24, lookback_bars))
+    plot_df = compute_volume_profile_bands(plot_df, period=vp_period, value_area_pct=0.70, num_bins=80)
+
+    # エントリー足・エグジット足のインデックス厳密特定
     exit_idx = len(plot_df) - 1
     entry_idx = max(0, exit_idx - 4)
-
-    if entry_trade and "timestamp" in entry_trade:
-        try:
-            entry_dt = pd.to_datetime(entry_trade["timestamp"], utc=True).tz_convert("Asia/Tokyo")
+    if entry_dt:
+        matched = False
+        for idx, row in plot_df.iterrows():
+            b_start = row["dt"]
+            b_end = b_start + pd.Timedelta(minutes=gran_min)
+            if b_start <= entry_dt < b_end:
+                entry_idx = idx
+                matched = True
+                break
+        if not matched:
             time_diffs = (plot_df["dt"] - entry_dt).abs()
             nearest_idx = int(time_diffs.argmin())
             if nearest_idx < exit_idx:
                 entry_idx = nearest_idx
-        except Exception:
-            pass
 
     if pnl_pct is None and entry_price > 0:
         if side.upper() == "LONG":
@@ -1279,73 +1350,109 @@ def plot_exit_chart(
         else:
             pnl_pct = ((entry_price - exit_price) / entry_price) * 100.0
 
-    fig, ax = plt.subplots(figsize=(12, 6.5), dpi=150)
-    fig.patch.set_facecolor("#131722")
-    ax.set_facecolor("#1e222d")
+    # 戦略タイプ判定: RSIMAかVPか
+    is_rsima = ("RSIMA" in exit_reason.upper() or "rsima" in symbol.lower() or "rsima" in interval_label.lower())
 
-    x_indices = _draw_candles_and_vp(ax, plot_df)
+    # 日本語フォント設定（文字化け・警告防止）
+    import matplotlib.font_manager as fm
+    for font_name in ['Noto Sans CJK JP', 'IPAexGothic', 'IPAGothic', 'Hiragino Sans', 'Meiryo', 'Yu Gothic', 'DejaVu Sans']:
+        if any(f.name == font_name for f in fm.fontManager.ttflist):
+            plt.rcParams['font.family'] = font_name
+            break
+
+    # 2段構成プロット (メイン: ローソク足+VP、サブ: RSI/RSIMA または Volume)
+    fig, (ax_main, ax_sub) = plt.subplots(
+        2, 1, figsize=(12, 7.8), dpi=150,
+        gridspec_kw={"height_ratios": [3.2, 1.2], "hspace": 0.08},
+        sharex=True
+    )
+    fig.patch.set_facecolor("#131722")
+    ax_main.set_facecolor("#1e222d")
+    ax_sub.set_facecolor("#1e222d")
+
+    x_indices = _draw_candles_and_vp(ax_main, plot_df)
 
     entry_marker_color = "#ff5252" if side.upper() == "SHORT" else "#00e676"
     entry_marker_shape = "v" if side.upper() == "SHORT" else "^"
-    ax.scatter([entry_idx], [entry_price], color=entry_marker_color, s=160, marker=entry_marker_shape, edgecolors="#ffffff", linewidths=1.5, zorder=6, label=f"Entry ({side.upper()}) @ ${entry_price:.4f}")
+    ax_main.scatter([entry_idx], [entry_price], color=entry_marker_color, s=160, marker=entry_marker_shape,
+                    edgecolors="#ffffff", linewidths=1.5, zorder=6, label=f"Entry ({side.upper()}) @ ${entry_price:.4f}")
     exit_marker_color = "#26a69a" if pnl >= 0 else "#ef5350"
-    ax.scatter([exit_idx], [exit_price], color=exit_marker_color, s=160, marker="v", edgecolors="#ffffff", linewidths=1.5, zorder=6, label=f"Exit @ ${exit_price:.4f}")
+    ax_main.scatter([exit_idx], [exit_price], color=exit_marker_color, s=160, marker="v",
+                    edgecolors="#ffffff", linewidths=1.5, zorder=6, label=f"Exit @ ${exit_price:.4f}")
 
     line_color = "#26a69a" if pnl >= 0 else "#ef5350"
-    ax.plot([entry_idx, exit_idx], [entry_price, exit_price], color=line_color, linestyle=":", linewidth=2.0, alpha=0.9, zorder=5)
+    ax_main.plot([entry_idx, exit_idx], [entry_price, exit_price], color=line_color, linestyle=":", linewidth=2.0, alpha=0.9, zorder=5)
 
     pnl_sign = "+" if pnl > 0 else ""
     pnl_str = f"PnL: {pnl_sign}${pnl:.2f} ({pnl_pct:+.2f}%)" if pnl_pct is not None else f"PnL: {pnl_sign}${pnl:.2f}"
     reason_str = f"\nReason: {exit_reason}" if exit_reason else ""
-
     bg_color = "#1b5e20" if pnl >= 0 else "#b71c1c"
 
-    ax.annotate(
+    ax_main.annotate(
         f" ▼ {side} EXIT\n {pnl_str}{reason_str}",
         xy=(exit_idx, exit_price),
         xytext=(exit_idx + 1.2, exit_price),
-        arrowprops=dict(
-            arrowstyle="->",
-            facecolor=exit_marker_color,
-            edgecolor=exit_marker_color,
-            lw=1.5,
-            shrinkA=3,
-            shrinkB=5
-        ),
+        arrowprops=dict(arrowstyle="->", facecolor=exit_marker_color, edgecolor=exit_marker_color, lw=1.5, shrinkA=3, shrinkB=5),
         bbox=dict(boxstyle="round,pad=0.5", facecolor=bg_color, edgecolor=exit_marker_color, alpha=0.95),
-        fontsize=9,
-        color="#ffffff",
-        weight="bold",
-        verticalalignment="center",
-        zorder=7
+        fontsize=9, color="#ffffff", weight="bold", verticalalignment="center", zorder=7
     )
-
-    _setup_time_axis(ax, plot_df, x_indices, right_margin_bars=8)
 
     title_exit_str = f"${exit_price:.6f}" if exit_price < 1 else f"${exit_price:.4f}"
     title_entry_str = f"${entry_price:.6f}" if entry_price < 1 else f"${entry_price:.4f}"
     result_tag = "PROFIT" if pnl >= 0 else "LOSS CUT"
-
     inv_str = f" [{interval_label}]" if interval_label else ""
-    ax.set_title(
+    ax_main.set_title(
         f"[{result_tag}] {symbol} ({side} CLOSE){inv_str} - Trade Execution Chart\nEntry: {title_entry_str} -> Exit: {title_exit_str} | Realized PnL: {pnl_sign}${pnl:.2f} USDT ({pnl_pct:+.2f}%)",
-        fontsize=11,
-        color="#ffffff",
-        weight="bold",
-        pad=15
+        fontsize=11, color="#ffffff", weight="bold", pad=12
     )
+    ax_main.margins(y=0.08)
+    ax_main.legend(loc="upper left", facecolor="#1e222d", edgecolor="#363c4e", fontsize=8, labelcolor="#ffffff", framealpha=0.75)
 
-    ax.margins(y=0.08)
-    ax.legend(loc="upper left", facecolor="#1e222d", edgecolor="#363c4e", fontsize=8, labelcolor="#ffffff", framealpha=0.75)
-    plt.tight_layout()
+    # --- サブプロット描画 ---
+    if is_rsima:
+        rsi_vals = plot_df["rsi"].values
+        rsi_ema_vals = plot_df["rsi_ema"].values
+        ax_sub.plot(x_indices, rsi_vals, color="#ffeb3b", linewidth=1.5, label="RSI(9)", zorder=3)
+        ax_sub.plot(x_indices, rsi_ema_vals, color="#00e5ff", linewidth=1.3, linestyle="--", label="RSI-EMA(7)", zorder=3)
 
-    plt.savefig(out_file, dpi=150, facecolor=fig.get_facecolor(), edgecolor="none")
+        if side.upper() == "SHORT":
+            ax_sub.axhline(60.0, color="#ef5350", linestyle=":", linewidth=1.2, alpha=0.8, label="Short Entry Threshold (60)")
+            ax_sub.axhline(40.0, color="#26a69a", linestyle=":", linewidth=1.2, alpha=0.8, label="Short TP Threshold (40)")
+        else:
+            ax_sub.axhline(40.0, color="#26a69a", linestyle=":", linewidth=1.2, alpha=0.8, label="Long Entry Threshold (40)")
+            ax_sub.axhline(60.0, color="#ef5350", linestyle=":", linewidth=1.2, alpha=0.8, label="Long TP Threshold (60)")
+
+        ax_sub.axhline(70, color="#555555", linestyle="--", linewidth=0.8, alpha=0.6)
+        ax_sub.axhline(30, color="#555555", linestyle="--", linewidth=0.8, alpha=0.6)
+
+        ax_sub.scatter([entry_idx], [rsi_vals[entry_idx]], color=entry_marker_color, s=60, zorder=5)
+        ax_sub.scatter([exit_idx], [rsi_vals[exit_idx]], color=exit_marker_color, s=60, zorder=5)
+
+        ax_sub.set_ylim(15, 85)
+        ax_sub.set_yticks([20, 40, 60, 80])
+        ax_sub.set_ylabel("RSI", color="#b2b5be", fontsize=8)
+        ax_sub.legend(loc="upper left", facecolor="#1e222d", edgecolor="#363c4e", fontsize=7.5, labelcolor="#ffffff", framealpha=0.75, ncol=2)
+    else:
+        vols = plot_df["volume"].values if "volume" in plot_df.columns else np.ones(len(plot_df))
+        closes = plot_df["close"].values
+        opens = plot_df["open"].values
+        vol_colors = ["#26a69a" if c >= o else "#ef5350" for c, o in zip(closes, opens)]
+        ax_sub.bar(x_indices, vols, color=vol_colors, alpha=0.65, width=0.6, label="Volume")
+        if len(vols) >= 10:
+            vol_ma = pd.Series(vols).rolling(min(20, len(vols)), min_periods=3).mean().values
+            ax_sub.plot(x_indices, vol_ma, color="#ff9800", linewidth=1.2, label="Vol MA(20)")
+        ax_sub.set_ylabel("Volume", color="#b2b5be", fontsize=8)
+        ax_sub.legend(loc="upper left", facecolor="#1e222d", edgecolor="#363c4e", fontsize=7.5, labelcolor="#ffffff", framealpha=0.75)
+
+    _setup_time_axis(ax_sub, plot_df, x_indices, right_margin_bars=8)
+
+    plt.savefig(out_file, dpi=150, facecolor=fig.get_facecolor(), edgecolor="none", bbox_inches="tight")
 
     try:
         CHARTS_DIR.mkdir(parents=True, exist_ok=True)
         now_str = datetime.now(timezone.utc).astimezone().strftime("%Y%m%d_%H%M%S")
         archive_file = CHARTS_DIR / f"{now_str}_EXIT_{symbol}.png"
-        plt.savefig(archive_file, dpi=150, facecolor=fig.get_facecolor(), edgecolor="none")
+        plt.savefig(archive_file, dpi=150, facecolor=fig.get_facecolor(), edgecolor="none", bbox_inches="tight")
     except Exception:
         pass
 
@@ -1354,5 +1461,5 @@ def plot_exit_chart(
     import gc
     gc.collect()
 
-    print(f"[Real Trade Tracker] エグジットチャート（履歴バンド付き）生成完了: {out_file}")
+    print(f"[Real Trade Tracker] エグジットチャート（同期VP＆サブプロット付き）生成完了: {out_file}")
     return out_file
