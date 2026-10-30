@@ -1889,12 +1889,14 @@ async def _async_post_entry_reporting(
             target_tp_val = vah_val - (vah_val - val_val) * 0.50 if (vah_val > val_val and val_val > 0) else poc_val
             target_tp_desc = f"VAH-VAL 50%水準 (${target_tp_val:.6f}) / RSI冷却利確"
             nanpin_desc = "単発1本固定 (ナンピン完全なし)"
+            sl_desc = "直近高値確定足ストップ (Swing High SL) ＋ 24hクールダウン"
             side_badge = "SHORT 🔴"
             header_title = f"🚀🚀🚀 **【新規ショートエントリー約定 [{interval_label}足]】** 🚀🚀🚀"
         else:
             target_tp_val = val_val + (vah_val - val_val) * 0.50 if (vah_val > val_val and val_val > 0) else poc_val
             target_tp_desc = f"VAL-VAH 50%水準 (${target_tp_val:.6f}) / RSI過熱利確"
             nanpin_desc = "VA 50%間隔・均等1倍ロット (最大2回追加 / 合計最大3枠)"
+            sl_desc = "動的MAEストップ (直近30d 95%ile) ＋ 24hクールダウン"
             side_badge = "LONG 🟢"
             header_title = f"🚀🚀🚀 **【新規ロングエントリー約定 [{interval_label}足]】** 🚀🚀🚀"
 
@@ -1908,7 +1910,7 @@ async def _async_post_entry_reporting(
             f"⚙️ **適用戦略**: `{strat_desc}`\n"
             f"🎯 **利確目標**: `{target_tp_desc}`\n"
             f"📉 **ナンピン設計**: `{nanpin_desc}`\n"
-            f"🛑 **損切り仕様**: `動的MAEストップ (直近30d 95%ile) ＋ 24hクールダウン`\n"
+            f"🛑 **損切り仕様**: `{sl_desc}`\n"
             f"🐋 **クジラ判定**: `{whale_sig}` (流入: `${whale_flow_val:+,.0f}`)\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
         )
@@ -2360,12 +2362,27 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                     last_trade_time[sym] = time.time()
                     last_nanpin_time[sym] = time.time()
                     tracked_active_positions.add(sym)
+
+                    # ショートの場合、直近高値と確定足SLを算出
+                    rec_h_val = 0.0
+                    sl_px_val = 0.0
+                    if is_short_pos and df_sym is not None and not df_sym.empty:
+                        opt_inv_p = p_order.get("interval", 5)
+                        df_p_eval = resample_candles(df_sym, opt_inv_p) if opt_inv_p > 5 else df_sym.copy()
+                        h_eval = df_p_eval["high"].astype(float) if "high" in df_p_eval.columns else df_p_eval["close"].astype(float)
+                        rec_h_val = float(h_eval.iloc[-8:].max()) if len(h_eval) >= 8 else float(h_eval.max())
+                        sym_params_p = symbol_params_map.get(sym, best_params)
+                        dyn_sl_p = float(sym_params_p.get("dynamic_mae_stop", -0.025))
+                        sl_px_val = min(max(rec_h_val, entry_px * 1.0060), entry_px * (1.0 + abs(dyn_sl_p)))
+
                     scale_state_new = {
                         "nanpin_count": 0,
                         "last_entry_price": entry_px,
                         "avg_price": entry_px,
                         "initial_entry_time": time.time(),
-                        "side": "short" if is_short_pos else "long"
+                        "side": "short" if is_short_pos else "long",
+                        "recent_high": rec_h_val,
+                        "sl_price": sl_px_val,
                     }
                     scale_in_states[sym] = scale_state_new
                     save_scale_in_states(scale_in_states)
@@ -2485,6 +2502,16 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                 # ロング保有中かつ非BUY ➔ 建値+0.20%撤退 / ショート保有中かつ非SELL ➔ 建値-0.20%撤退
                 pos_emergency_be = (overall_regime != "SELL") if is_short_pos else (overall_regime != "BUY")
 
+                # ショートポジションの直近高値(Swing High)復元・自動補完
+                recent_high_val = float(scale_state_cur.get("recent_high", 0.0) or 0.0)
+                if is_short_pos and recent_high_val <= 0.0 and df_eval is not None and not df_eval.empty:
+                    h_eval = df_eval["high"].astype(float) if "high" in df_eval.columns else df_eval["close"].astype(float)
+                    recent_high_val = float(h_eval.iloc[-8:].max()) if len(h_eval) >= 8 else float(h_eval.max())
+                    scale_state_cur["recent_high"] = recent_high_val
+                    scale_state_cur["sl_price"] = min(max(recent_high_val, entry_px * 1.0060), entry_px * (1.0 + abs(dyn_sl_pct)))
+                    scale_in_states[sym] = scale_state_cur
+                    save_scale_in_states(scale_in_states)
+
                 # 戦略シグナル評価 (ロング・ショート完全分岐)
                 if is_short_pos:
                     # ===== SHORT ポジション監視 =====
@@ -2497,6 +2524,7 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                             avg_entry_price=entry_px,
                             last_entry_price=last_px_cur,
                             current_price=cur_px,
+                            recent_high=recent_high_val,
                             vp_period=int(sym_params.get("mp", 200)),
                             num_bins=int(sym_params.get("num_bins", 50)),
                             value_area_pct=float(sym_params.get("value_area_pct", 0.70)),
@@ -2520,6 +2548,7 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                             current_trades_count=1,
                             avg_entry_price=entry_px,
                             current_price=cur_px,
+                            recent_high=recent_high_val,
                             rsi_len=9,
                             ema_len=7,
                             s_ep=float(sym_params.get("s_ep", 60.0)),
@@ -2857,12 +2886,21 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                                 trade_counts[sym] = 1
                                 last_nanpin_time[sym] = time.time()
                                 tracked_active_positions.add(sym)
+
+                                # ショート直近高値(Swing High) & 確定足SL基準価格の算出
+                                h_eval = df_entry_eval["high"].astype(float) if "high" in df_entry_eval.columns else df_entry_eval["close"].astype(float)
+                                rec_h_val = float(h_eval.iloc[-8:].max()) if len(h_eval) >= 8 else float(h_eval.max())
+                                dyn_sl_pct_e = float(sym_params_e.get("dynamic_mae_stop", -0.025))
+                                sl_px_val = min(max(rec_h_val, actual_fill_px * 1.0060), actual_fill_px * (1.0 + abs(dyn_sl_pct_e)))
+
                                 scale_state_new = {
                                     "nanpin_count": 0,
                                     "last_entry_price": actual_fill_px,
                                     "avg_price": actual_fill_px,
                                     "initial_entry_time": time.time(),
-                                    "side": "short"
+                                    "side": "short",
+                                    "recent_high": rec_h_val,
+                                    "sl_price": sl_px_val,
                                 }
                                 scale_in_states[sym] = scale_state_new
                                 save_scale_in_states(scale_in_states)

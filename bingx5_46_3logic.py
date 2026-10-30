@@ -1736,6 +1736,7 @@ def simulate_val_poc_fast(
     pos_qty = 0.0
     pos_cost = 0.0
     avg_price = 0.0
+    entry_sl_px = 0.0
     pos_count = 0
     last_entry = 0.0
     entry_bar_idx = -1
@@ -1842,6 +1843,7 @@ def simulate_val_poc_fast(
                         pos_qty = 0.0
                         pos_cost = 0.0
                         avg_price = 0.0
+                        entry_sl_px = 0.0
                         pos_count = 0
                         last_entry = 0.0
                         entry_bar_idx = -1
@@ -1964,6 +1966,8 @@ def simulate_vah_poc_fast(
                 avg_price = px
                 pos_count = 1
                 entry_bar_idx = i
+                rec_h = float(np.max(highs[max(0, i - 8):i + 1]))
+                entry_sl_px = min(max(rec_h, avg_price * 1.0060), avg_price * (1.0 + sl_pct))
                 if record_chart and exec_sell is not None:
                     exec_sell[i] = px
             pending_limit = -1.0
@@ -1973,15 +1977,21 @@ def simulate_vah_poc_fast(
             va_diff = (vah - val) if (not np.isnan(val) and not np.isnan(vah) and vah > val) else 0.0
             va_spacing = va_diff * target_ratio if va_diff > 0 else (avg_price * nanpin_drop_pct)
 
-            # 損切り: 動的ストップ (sl_pct 逆行上昇) または 4時間タイムアウト (timeout_bars本経過で含み損=価格上昇)
+            # 損切り: 直近高値を上抜けた確定足終値 (c > entry_sl_px) または リアルタイム急変 (+3.0%) または タイムアウト
             is_sl = False
-            if sl_pct > 0 and c >= avg_price * (1.0 + sl_pct):
+            sl_exec_px = c
+            if entry_sl_px > 0 and c > entry_sl_px:
                 is_sl = True
+                sl_exec_px = c
+            elif h >= avg_price * 1.030:
+                is_sl = True
+                sl_exec_px = avg_price * 1.030
             elif entry_bar_idx > 0 and (i - entry_bar_idx) >= timeout_bars and c > avg_price:
                 is_sl = True
+                sl_exec_px = c
 
             if is_sl:
-                buy_val = pos_qty * c
+                buy_val = pos_qty * sl_exec_px
                 fee = buy_val * fee_rate
                 entry_fee = pos_cost * maker_fee
                 pnl = pos_cost - buy_val - fee - entry_fee
@@ -1995,10 +2005,11 @@ def simulate_vah_poc_fast(
                     trades_recent_7d += 1
                 trades.append(pnl)
                 if record_chart and exec_buy is not None:
-                    exec_buy[i] = c
+                    exec_buy[i] = sl_exec_px
                 pos_qty = 0.0
                 pos_cost = 0.0
                 avg_price = 0.0
+                entry_sl_px = 0.0
                 pos_count = 0
                 entry_bar_idx = -1
                 cooldown_until = i + cooldown_bars
@@ -2366,6 +2377,7 @@ def optimize_rsima3_short_fast(
             pos_qty = 0.0
             pos_cost = 0.0
             avg_px = 0.0
+            entry_sl_px = 0.0
             pos_cnt = 0
             entry_bar_idx = -1
             cum_pnl = 0.0
@@ -2408,18 +2420,26 @@ def optimize_rsima3_short_fast(
                         avg_px = px
                         pos_cnt = 1
                         entry_bar_idx = i
+                        rec_h = float(np.max(highs[max(0, i - 8):i + 1]))
+                        entry_sl_px = min(max(rec_h, avg_px * 1.0060), avg_px * (1.0 + default_sl_pct))
                     pending_px = -1.0
 
                 if pos_qty > 0:
-                    # 損切り判定: 動的ストップ率 default_sl_pct 逆行上昇 または 4時間タイムアウト
+                    # 損切り判定: 直近高値を上抜けた確定足終値 (c > entry_sl_px) または リアルタイム急変 (+3.0%) または タイムアウト
                     is_sl = False
-                    if default_sl_pct > 0 and c >= avg_px * (1.0 + default_sl_pct):
+                    sl_exec_px = c
+                    if entry_sl_px > 0 and c > entry_sl_px:
                         is_sl = True
+                        sl_exec_px = c
+                    elif h >= avg_px * 1.030:
+                        is_sl = True
+                        sl_exec_px = avg_px * 1.030
                     elif entry_bar_idx > 0 and (i - entry_bar_idx) >= timeout_bars and c > avg_px:
                         is_sl = True
+                        sl_exec_px = c
 
                     if is_sl:
-                        buy_val = pos_qty * c
+                        buy_val = pos_qty * sl_exec_px
                         fee = buy_val * taker_fee
                         entry_fee = pos_cost * maker_fee
                         pnl = pos_cost - buy_val - fee - entry_fee
@@ -2437,6 +2457,7 @@ def optimize_rsima3_short_fast(
                         pos_qty = 0.0
                         pos_cost = 0.0
                         avg_px = 0.0
+                        entry_sl_px = 0.0
                         pos_cnt = 0
                         entry_bar_idx = -1
                         cooldown_until = i + cooldown_bars
@@ -2466,6 +2487,7 @@ def optimize_rsima3_short_fast(
                         pos_qty = 0.0
                         pos_cost = 0.0
                         avg_px = 0.0
+                        entry_sl_px = 0.0
                         pos_cnt = 0
                         entry_bar_idx = -1
                         cur_eq = initial_equity + cum_pnl
@@ -2568,6 +2590,7 @@ def build_rsima3_short_chart_df(
     pos_qty = 0.0
     pos_cost = 0.0
     avg_px = 0.0
+    entry_sl_px = 0.0
     pos_cnt = 0
     cum_pnl = 0.0
     pending_px = -1.0
@@ -2587,26 +2610,35 @@ def build_rsima3_short_chart_df(
                 avg_px = px
                 pos_cnt = 1
                 entry_bar_idx = i
+                rec_h = float(np.max(highs[max(0, i - 8):i + 1]))
+                entry_sl_px = min(max(rec_h, avg_px * 1.0060), avg_px * (1.0 + sl))
                 exec_sell[i] = px
             pending_px = -1.0
 
         if pos_qty > 0:
             is_sl = False
-            if sl > 0 and c >= avg_px * (1.0 + sl):
+            sl_exec_px = c
+            if entry_sl_px > 0 and c > entry_sl_px:
                 is_sl = True
+                sl_exec_px = c
+            elif h >= avg_px * 1.030:
+                is_sl = True
+                sl_exec_px = avg_px * 1.030
             elif entry_bar_idx > 0 and (i - entry_bar_idx) >= timeout_bars and c > avg_px:
                 is_sl = True
+                sl_exec_px = c
 
             if is_sl:
-                buy_val = pos_qty * c
+                buy_val = pos_qty * sl_exec_px
                 fee = buy_val * taker_fee
                 entry_fee = pos_cost * maker_fee
                 pnl = pos_cost - buy_val - fee - entry_fee
                 cum_pnl += pnl
-                exec_buy[i] = c
+                exec_buy[i] = sl_exec_px
                 pos_qty = 0.0
                 pos_cost = 0.0
                 avg_px = 0.0
+                entry_sl_px = 0.0
                 pos_cnt = 0
                 entry_bar_idx = -1
                 cooldown_until = i + cooldown_bars
@@ -2620,6 +2652,7 @@ def build_rsima3_short_chart_df(
                 pos_qty = 0.0
                 pos_cost = 0.0
                 avg_px = 0.0
+                entry_sl_px = 0.0
                 pos_cnt = 0
                 entry_bar_idx = -1
         elif pending_px < 0 and ep_sig[i] and i >= cooldown_until:
@@ -5286,6 +5319,7 @@ def check_vah_poc_signals(
     avg_entry_price: float,
     last_entry_price: float,
     current_price: float,
+    recent_high: Optional[float] = None,
     vp_period: int = 150,
     num_bins: int = 50,
     value_area_pct: float = 0.70,
@@ -5390,14 +5424,29 @@ def check_vah_poc_signals(
         "is_emergency_breakeven": is_emergency_breakeven,
     }
 
-    # === [1] ショート動的 MAE ストップロス判定 (価格上昇逆行) ===
+    # === [1] ショート直近高値（Swing High）確定足ストップロス判定 & 急変フェイルセーフ ===
     if spo and avg_entry_price > 0:
         eff_sl_pct = abs(dynamic_sl_pct) if dynamic_sl_pct != 0 else 0.025
-        sl_price_dyn = avg_entry_price * (1.0 + eff_sl_pct)
-        if current_price >= sl_price_dyn:
+        if recent_high is not None and recent_high > 0:
+            rec_h = float(recent_high)
+        else:
+            h_s = df_5m["high"].astype(float) if "high" in df_5m.columns else df_5m["close"].astype(float)
+            rec_h = float(h_s.iloc[-8:].max()) if len(h_s) >= 8 else float(h_s.max())
+        sl_price_dyn = min(max(rec_h, avg_entry_price * 1.0060), avg_entry_price * (1.0 + eff_sl_pct))
+
+        # 1-A. 確定足終値での直近高値上抜け損切り判定 (確定足終値 curr_c > sl_price_dyn)
+        if curr_c > sl_price_dyn:
+            trigger_px = curr_c
+            loss_pct = (avg_entry_price - trigger_px) / avg_entry_price
+            reason = f"VAH_POC_SWING_HIGH_SL: 確定終値(${curr_c:.4f}) > 直近高値SL(${sl_price_dyn:.4f}, 損失{loss_pct:.2%})"
+            return {"action": "STOP_LOSS", "reason": reason, "lot_multiplier": 1.0, "metrics": metrics}
+
+        # 1-B. 突発急騰リアルタイム成行フェイルセーフ (+3.0% ガード)
+        emergency_sl = avg_entry_price * 1.030
+        if current_price >= emergency_sl:
             trigger_px = current_price
             loss_pct = (avg_entry_price - trigger_px) / avg_entry_price
-            reason = f"VAH_POC_DYNAMIC_MAE_SL: 価格(${trigger_px:.4f}) >= 動的SL(${sl_price_dyn:.4f}, SL率+{eff_sl_pct:.2%}, 損失{loss_pct:.2%})"
+            reason = f"VAH_POC_EMERGENCY_SPIKE_SL: リアルタイム急騰(${trigger_px:.4f} >= ${emergency_sl:.4f}, 損失{loss_pct:.2%})"
             return {"action": "STOP_LOSS", "reason": reason, "lot_multiplier": 1.0, "metrics": metrics}
 
     # === [1-1] 動的タイムアウト微損撤退判定 (timeout_bars本経過で含み損なら成行買戻し撤退) ===
@@ -5448,6 +5497,7 @@ def check_rsima3_short_signals(
     current_trades_count: int,
     avg_entry_price: float,
     current_price: float,
+    recent_high: Optional[float] = None,
     rsi_len: int = 9,
     ema_len: int = 7,
     s_ep: float = 60.0,
@@ -5521,14 +5571,29 @@ def check_rsima3_short_signals(
         "is_emergency_breakeven": is_emergency_breakeven,
     }
 
-    # === [1] 動的 MAE ストップロス判定 (価格上昇逆行) ===
+    # === [1] ショート直近高値（Swing High）確定足ストップロス判定 & 急変フェイルセーフ ===
     if spo and avg_entry_price > 0:
         eff_sl_pct = abs(dynamic_sl_pct) if dynamic_sl_pct != 0 else 0.025
-        sl_price_dyn = avg_entry_price * (1.0 + eff_sl_pct)
-        if current_price >= sl_price_dyn:
+        if recent_high is not None and recent_high > 0:
+            rec_h = float(recent_high)
+        else:
+            h_s = df_5m["high"].astype(float) if "high" in df_5m.columns else df_5m["close"].astype(float)
+            rec_h = float(h_s.iloc[-8:].max()) if len(h_s) >= 8 else float(h_s.max())
+        sl_price_dyn = min(max(rec_h, avg_entry_price * 1.0060), avg_entry_price * (1.0 + eff_sl_pct))
+
+        # 1-A. 確定足終値での直近高値上抜け損切り判定 (確定足終値 curr_close > sl_price_dyn)
+        if curr_close > sl_price_dyn:
+            trigger_px = curr_close
+            loss_pct = (avg_entry_price - trigger_px) / avg_entry_price
+            reason = f"RSIMA_SHORT_SWING_HIGH_SL: 確定終値(${curr_close:.4f}) > 直近高値SL(${sl_price_dyn:.4f}, 損失{loss_pct:.2%})"
+            return {"action": "STOP_LOSS", "reason": reason, "lot_multiplier": 1.0, "metrics": metrics}
+
+        # 1-B. 突発急騰リアルタイム成行フェイルセーフ (+3.0% ガード)
+        emergency_sl = avg_entry_price * 1.030
+        if current_price >= emergency_sl:
             trigger_px = current_price
             loss_pct = (avg_entry_price - trigger_px) / avg_entry_price
-            reason = f"RSIMA_SHORT_DYNAMIC_MAE_SL: 価格(${trigger_px:.4f}) >= 動的SL(${sl_price_dyn:.4f}, SL率+{eff_sl_pct:.2%}, 損失{loss_pct:.2%})"
+            reason = f"RSIMA_SHORT_EMERGENCY_SPIKE_SL: リアルタイム急騰(${trigger_px:.4f} >= ${emergency_sl:.4f}, 損失{loss_pct:.2%})"
             return {"action": "STOP_LOSS", "reason": reason, "lot_multiplier": 1.0, "metrics": metrics}
 
     # === [1-1] 動的タイムアウト微損撤退判定 ===
