@@ -1860,7 +1860,10 @@ def simulate_val_poc_fast(
         if pending_limit < 0:
             if pos_count == 0 and i >= cooldown_until:
                 if not np.isnan(val) and not np.isnan(vals[i-1]):
-                    val_gc = (closes[i-1] <= vals[i-1]) and (c > val)
+                    recent_l_min = float(np.min(lows[max(0, i-3):i+1]))
+                    val_crossover = (closes[i-1] <= vals[i-1] or recent_l_min <= val) and (c > val)
+                    is_lower = c <= (val + (vah - val) * 0.50) if vah > val else True
+                    val_gc = val_crossover and is_lower
                     va_width = (vah - val) / val if val > 0 else 0.0
                     if val_gc and (va_width >= 0.015) and (ma_filter is None or ma_filter[i]):
                         pending_limit = c * 0.9998
@@ -5209,7 +5212,14 @@ def check_val_poc_signals(
     curr_l = float(l.iloc[-1])
 
     va_width_pct = ((curr_vah - curr_val) / curr_val) if curr_val > 0 else 0.0
-    val_gc = (prev_c <= prev_val) and (curr_c > curr_val)
+    # VAL下から上への真のクロスオーバー（押し目買い反発）:
+    # 1. 1本前の終値がVAL以下、または直近3本の安値がVAL以下まで売られていた（下抜け押し目確認）
+    # 2. 現在の確定終値がVALを上抜けている（下から上へクロスオーバー）
+    # 3. 現在の終値がバリューエリアの半値以下（安値圏・押し目ゾーン）に位置し、天井圏での高値掴みを物理完全遮断
+    recent_low_reached_val = float(l.iloc[-3:].min()) <= curr_val if len(l) >= 3 else (prev_c <= prev_val)
+    val_crossover = (prev_c <= prev_val or recent_low_reached_val) and (curr_c > curr_val)
+    is_lower_half = curr_c <= (curr_val + (curr_vah - curr_val) * 0.50) if curr_vah > curr_val else True
+    val_gc = val_crossover and is_lower_half
 
     # トレンド条件判定: use_ema_filter が False の場合はフィルターなし (Pure VAL_POC)
     cond = str(ma_condition).lower()
