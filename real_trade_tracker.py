@@ -16,6 +16,20 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
+import matplotlib.font_manager as _fm
+
+def _configure_japanese_font():
+    for _font_name in [
+        'Noto Sans CJK JP', 'IPAexGothic', 'IPAGothic',
+        'TakaoPGothic', 'TakaoGothic', 'VL PGothic', 'VL Gothic',
+        'Hiragino Sans', 'Meiryo', 'Yu Gothic', 'Droid Sans Fallback', 'DejaVu Sans'
+    ]:
+        if any(f.name == _font_name for f in _fm.fontManager.ttflist):
+            plt.rcParams['font.family'] = _font_name
+            break
+    plt.rcParams['axes.unicode_minus'] = False
+
+_configure_japanese_font()
 
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "Data"
@@ -1354,11 +1368,7 @@ def plot_exit_chart(
     is_rsima = ("RSIMA" in exit_reason.upper() or "rsima" in symbol.lower() or "rsima" in interval_label.lower())
 
     # 日本語フォント設定（文字化け・警告防止）
-    import matplotlib.font_manager as fm
-    for font_name in ['Noto Sans CJK JP', 'IPAexGothic', 'IPAGothic', 'Hiragino Sans', 'Meiryo', 'Yu Gothic', 'DejaVu Sans']:
-        if any(f.name == font_name for f in fm.fontManager.ttflist):
-            plt.rcParams['font.family'] = font_name
-            break
+    _configure_japanese_font()
 
     # 2段構成プロット (メイン: ローソク足+VP、サブ: RSI/RSIMA または Volume)
     fig, (ax_main, ax_sub) = plt.subplots(
@@ -1385,7 +1395,8 @@ def plot_exit_chart(
 
     pnl_sign = "+" if pnl > 0 else ""
     pnl_str = f"PnL: {pnl_sign}${pnl:.2f} ({pnl_pct:+.2f}%)" if pnl_pct is not None else f"PnL: {pnl_sign}${pnl:.2f}"
-    reason_str = f"\nReason: {exit_reason}" if exit_reason else ""
+    clean_exit_reason = str(exit_reason).replace("➔", "->").replace("➡", "->") if exit_reason else ""
+    reason_str = f"\nReason: {clean_exit_reason}" if clean_exit_reason else ""
     bg_color = "#1b5e20" if pnl >= 0 else "#b71c1c"
 
     ax_main.annotate(

@@ -1096,6 +1096,7 @@ async def validate_profitable_candidates(trade_side: str, mode: str, base_symbol
                 pnl_1st = float(best_params_dict.get("pnl_first_half", 0.0))
                 pnl_2nd = float(best_params_dict.get("pnl_second_half", 0.0))
                 cand_params = {
+                    **best_params_dict,
                     "strategy": cand_strat,
                     "interval": cand_inv,
                     "mp": cand_mp,
@@ -1594,7 +1595,7 @@ async def run_screening_and_optimization(mode: str, send_charts: bool = False, s
     from bingx5_46_2api import api_bingx
 
     # 1. 銘柄スクリーニング実行
-    print("\n[Phase A] 銘柄スクリーニング・パラメータ最適化を開始します (LONG ONLY)...")
+    print("\n[Phase A] 銘柄スクリーニング・パラメータ最適化を開始します (3-Regime Adaptive)...")
     mix_script = Path(__file__).resolve().parent / "bingx5_46_4mix_candle_Merged_Alt10.py"
     if mix_script.exists():
         try:
@@ -2166,7 +2167,7 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
             cached_5m_dfs.clear()
 
             last_screening_slot = current_slot
-            discord.print_log(f"[Periodic Reset Complete] 新しい選定銘柄 (LONG ONLY): {', '.join(selected_symbols)} | 現在の全監視対象: {', '.join(symbol_apis.keys())}")
+            discord.print_log(f"[Periodic Reset Complete] 新しい選定銘柄 ({trade_side.upper()}): {', '.join(selected_symbols)} | 現在の全監視対象: {', '.join(symbol_apis.keys())}")
 
             # 8時間ごとの実運用トレード実績レポート
             await send_periodic_performance_report(symbol_apis, mode, label="8時間定期レポート")
@@ -2355,73 +2356,6 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                 else:
                     missing_position_counts.pop(sym, None)
 
-                # 保有中: 出しっぱなし指値の約定検知！
-                if sym in pending_entry_orders:
-                    p_order = pending_entry_orders.pop(sym)
-                    trade_counts[sym] = 1
-                    last_trade_time[sym] = time.time()
-                    last_nanpin_time[sym] = time.time()
-                    tracked_active_positions.add(sym)
-
-                    # ショートの場合、直近高値と確定足SLを算出
-                    rec_h_val = 0.0
-                    sl_px_val = 0.0
-                    if is_short_pos and df_sym is not None and not df_sym.empty:
-                        opt_inv_p = p_order.get("interval", 5)
-                        df_p_eval = resample_candles(df_sym, opt_inv_p) if opt_inv_p > 5 else df_sym.copy()
-                        h_eval = df_p_eval["high"].astype(float) if "high" in df_p_eval.columns else df_p_eval["close"].astype(float)
-                        rec_h_val = float(h_eval.iloc[-8:].max()) if len(h_eval) >= 8 else float(h_eval.max())
-                        sym_params_p = symbol_params_map.get(sym, best_params)
-                        dyn_sl_p = float(sym_params_p.get("dynamic_mae_stop", -0.025))
-                        sl_px_val = min(max(rec_h_val, entry_px * 1.0060), entry_px * (1.0 + abs(dyn_sl_p)))
-
-                    pos_strat_p = str(p_order.get("strategy", "") or sym_params_p.get("strategy", "rsima")).lower()
-                    scale_state_new = {
-                        "nanpin_count": 0,
-                        "last_entry_price": entry_px,
-                        "avg_price": entry_px,
-                        "initial_entry_time": time.time(),
-                        "side": "short" if is_short_pos else "long",
-                        "interval": opt_inv_p,
-                        "strategy": pos_strat_p,
-                        "recent_high": rec_h_val,
-                        "sl_price": sl_px_val,
-                    }
-                    scale_in_states[sym] = scale_state_new
-                    save_scale_in_states(scale_in_states)
-                    entry_reason_val = p_order.get("reason", "指値約定")
-                    opt_inv_p = p_order.get("interval", 5)
-                    inv_label_p = f"{opt_inv_p}m" if opt_inv_p < 60 else f"{opt_inv_p // 60}h"
-
-                    # 余剰指値キャンセル
-                    try:
-                        await api.active_order_cancel()
-                    except Exception:
-                        pass
-
-                    # エントリー後非同期レポーティング
-                    vah_val = getattr(api, "entry_vah", entry_px * 1.02)
-                    val_val = getattr(api, "entry_val", entry_px * 0.98)
-                    poc_val = (vah_val + val_val) / 2.0
-                    whale_info = get_whale_sentiment_info(sym)
-                    whale_sig = whale_info.get("signal", "NEUTRAL")
-                    whale_flow_val = float(whale_info.get("net_flow", 0.0)) if whale_info else 0.0
-                    sym_params = symbol_params_map.get(sym, best_params)
-                    cur_strat = str(sym_params.get("strategy", "rsima")).upper()
-                    side_label = "SHORT" if is_short_pos else "LONG"
-                    strat_desc = f"{side_label} {cur_strat} ({inv_label_p}足 / MP={sym_params.get('mp', '-')})"
-
-                    df_report = cached_5m_dfs.get(sym, pd.DataFrame())
-                    asyncio.create_task(_async_post_entry_reporting(
-                        sym=sym, entry_px=entry_px, lot_size=pos_qty, entry_full_reason=entry_reason_val,
-                        df_chart=df_report, vah_val=vah_val, val_val=val_val, poc_val=poc_val,
-                        strat_desc=strat_desc, whale_sig=whale_sig, whale_flow_val=whale_flow_val,
-                        interval_label=inv_label_p, side=side_label
-                    ))
-
-                tracked_active_positions.add(sym)
-                active_positions[sym] = (has_pos, pos, entry_px, pos_qty, pnl_current)
-
                 # リアルタイム現在価格（WebSocket鮮度切れ時はREST気配値へ確実にフォールバック）
                 cur_px = ws_mgr.get_latest_price(sym)
                 if not cur_px or cur_px <= 0:
@@ -2448,28 +2382,109 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                         cached_5m_dfs[sym] = df_raw_init
                         df_sym = df_raw_init
 
+                # 保有中: 出しっぱなし指値の約定検知！
+                if sym in pending_entry_orders:
+                    p_order = pending_entry_orders.pop(sym)
+                    trade_counts[sym] = 1
+                    last_trade_time[sym] = time.time()
+                    last_nanpin_time[sym] = time.time()
+                    tracked_active_positions.add(sym)
+
+                    sym_params_p = symbol_params_map.get(sym, best_params)
+                    opt_inv_p = int(p_order.get("interval", 0) or sym_params_p.get("interval", 5) or 5)
+                    pos_strat_p = str(p_order.get("strategy", "") or sym_params_p.get("strategy", "rsima")).lower()
+                    dyn_sl_p = float(p_order.get("dynamic_mae_stop", sym_params_p.get("dynamic_mae_stop", -0.025)))
+                    dyn_to_p = int(p_order.get("dynamic_timeout_bars", sym_params_p.get("dynamic_timeout_bars", max(3, 240 // max(1, opt_inv_p)))))
+
+                    # ショートの場合、直近高値と確定足SLを算出
+                    rec_h_val = 0.0
+                    sl_px_val = 0.0
+                    if is_short_pos and df_sym is not None and not df_sym.empty:
+                        df_p_eval = resample_candles(df_sym, opt_inv_p, drop_unclosed=True) if opt_inv_p > 5 else df_sym.copy()
+                        h_eval = df_p_eval["high"].astype(float) if "high" in df_p_eval.columns else df_p_eval["close"].astype(float)
+                        rec_h_val = float(h_eval.iloc[-10:].max()) if len(h_eval) >= 10 else float(h_eval.max())
+                        sl_px_val = min(max(rec_h_val, entry_px * 1.0020), entry_px * (1.0 + abs(dyn_sl_p)))
+
+                    scale_state_new = {
+                        "nanpin_count": 0,
+                        "last_entry_price": entry_px,
+                        "avg_price": entry_px,
+                        "initial_entry_time": time.time(),
+                        "side": "short" if is_short_pos else "long",
+                        "interval": opt_inv_p,
+                        "strategy": pos_strat_p,
+                        "dynamic_mae_stop": dyn_sl_p,
+                        "dynamic_timeout_bars": dyn_to_p,
+                        "mp": int(p_order.get("mp", sym_params_p.get("mp", 200))),
+                        "target_ratio": float(p_order.get("target_ratio", sym_params_p.get("target_ratio", 0.70))),
+                        "s_ep": float(p_order.get("s_ep", sym_params_p.get("s_ep", 60.0))),
+                        "s_cp": float(p_order.get("s_cp", sym_params_p.get("s_cp", 40.0))),
+                        "l_ep": float(p_order.get("l_ep", sym_params_p.get("l_ep", 40.0))),
+                        "l_cp": float(p_order.get("l_cp", sym_params_p.get("l_cp", 60.0))),
+                        "recent_high": rec_h_val,
+                        "sl_price": sl_px_val,
+                    }
+                    scale_in_states[sym] = scale_state_new
+                    save_scale_in_states(scale_in_states)
+                    entry_reason_val = p_order.get("reason", "指値約定")
+                    inv_label_p = f"{opt_inv_p}m" if opt_inv_p < 60 else f"{opt_inv_p // 60}h"
+
+                    # 余剰指値キャンセル
+                    try:
+                        await api.active_order_cancel()
+                    except Exception:
+                        pass
+
+                    # エントリー後非同期レポーティング
+                    vah_val = getattr(api, "entry_vah", entry_px * 1.02)
+                    val_val = getattr(api, "entry_val", entry_px * 0.98)
+                    poc_val = (vah_val + val_val) / 2.0
+                    whale_info = get_whale_sentiment_info(sym)
+                    whale_sig = whale_info.get("signal", "NEUTRAL")
+                    whale_flow_val = float(whale_info.get("net_flow", 0.0)) if whale_info else 0.0
+                    cur_strat = pos_strat_p.upper()
+                    side_label = "SHORT" if is_short_pos else "LONG"
+                    strat_desc = f"{side_label} {cur_strat} ({inv_label_p}足 / MP={scale_state_new.get('mp', '-')})"
+
+                    df_report = cached_5m_dfs.get(sym, pd.DataFrame())
+                    asyncio.create_task(_async_post_entry_reporting(
+                        sym=sym, entry_px=entry_px, lot_size=pos_qty, entry_full_reason=entry_reason_val,
+                        df_chart=df_report, vah_val=vah_val, val_val=val_val, poc_val=poc_val,
+                        strat_desc=strat_desc, whale_sig=whale_sig, whale_flow_val=whale_flow_val,
+                        interval_label=inv_label_p, side=side_label
+                    ))
+
+                tracked_active_positions.add(sym)
+                active_positions[sym] = (has_pos, pos, entry_px, pos_qty, pnl_current)
+
                 if df_sym is None or df_sym.empty or len(df_sym) < 20:
                     continue
 
                 sym_params = symbol_params_map.get(sym, best_params)
                 scale_state_cur = scale_in_states.get(sym, {})
-                # ポジション保有中は、エントリー時の足種・戦略を最優先で維持する (すり替わり完全防止)
+                # ポジション保有中は、エントリー時の足種・戦略・パラメータを最優先で維持する (すり替わり完全防止)
                 pos_interval = int(scale_state_cur.get("interval", 0) or sym_params.get("interval", 5) or 5)
                 cand_interval = pos_interval
                 inv_label_p = f"{cand_interval}m" if cand_interval < 60 else f"{cand_interval // 60}h"
                 pos_strat = str(scale_state_cur.get("strategy", "") or sym_params.get("strategy", "rsima")).lower()
                 cand_strat = pos_strat
+                pos_mp = int(scale_state_cur.get("mp", 0) or sym_params.get("mp", 200))
+                pos_tr = float(scale_state_cur.get("target_ratio", 0.0) or sym_params.get("target_ratio", 0.70))
+                pos_s_ep = float(scale_state_cur.get("s_ep", 0.0) or sym_params.get("s_ep", 60.0))
+                pos_s_cp = float(scale_state_cur.get("s_cp", 0.0) or sym_params.get("s_cp", 40.0))
+                pos_l_ep = float(scale_state_cur.get("l_ep", 0.0) or sym_params.get("l_ep", 40.0))
+                pos_l_cp = float(scale_state_cur.get("l_cp", 0.0) or sym_params.get("l_cp", 60.0))
 
-                # 採用足リサンプリング
-                df_eval = resample_candles(df_sym, cand_interval) if cand_interval > 5 else df_sym.copy()
+                # 採用足リサンプリング (未確定足を除外し確定足のみで評価)
+                df_eval = resample_candles(df_sym, cand_interval, drop_unclosed=True) if cand_interval > 5 else df_sym.copy()
                 df_eval = logic.make_logic(
                     df_eval,
-                    market_profile_period=int(sym_params.get("mp", 200)),
+                    market_profile_period=pos_mp,
                     strategy_type=cand_strat,
                     num_bins=int(sym_params.get("num_bins", 50)),
                     value_area_pct=float(sym_params.get("value_area_pct", 0.70)),
-                    lEp=float(sym_params.get("l_ep", 40.0) if not is_short_pos else sym_params.get("s_ep", 60.0)),
-                    lCp=float(sym_params.get("l_cp", 60.0) if not is_short_pos else sym_params.get("s_cp", 40.0)),
+                    lEp=pos_l_ep if not is_short_pos else pos_s_ep,
+                    lCp=pos_l_cp if not is_short_pos else pos_s_cp,
                 )
 
                 vah = float(df_eval["VAH"].iloc[-1]) if "VAH" in df_eval.columns else cur_px * 1.02
@@ -2500,7 +2515,7 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                 elapsed_min = max(0.0, (time.time() - entry_ts) / 60.0)
                 # 採用足種 (cand_interval) で正確に経過バー数を算出 (単位不一致バグの完全根絶)
                 bars_held_cur = int(elapsed_min // max(1, cand_interval))
-                dyn_sl_pct = float(sym_params.get("dynamic_mae_stop", -0.025))
+                dyn_sl_pct = float(scale_state_cur.get("dynamic_mae_stop", 0.0) or sym_params.get("dynamic_mae_stop", -0.025))
                 dyn_to_bars = int(scale_state_cur.get("dynamic_timeout_bars", 0) or sym_params.get("dynamic_timeout_bars", max(3, 240 // max(1, cand_interval))))
 
                 in_cooldown, rem_h = is_in_sl_cooldown(sym)
@@ -2513,9 +2528,9 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                 recent_high_val = float(scale_state_cur.get("recent_high", 0.0) or 0.0)
                 if is_short_pos and recent_high_val <= 0.0 and df_eval is not None and not df_eval.empty:
                     h_eval = df_eval["high"].astype(float) if "high" in df_eval.columns else df_eval["close"].astype(float)
-                    recent_high_val = float(h_eval.iloc[-8:].max()) if len(h_eval) >= 8 else float(h_eval.max())
+                    recent_high_val = float(h_eval.iloc[-10:].max()) if len(h_eval) >= 10 else float(h_eval.max())
                     scale_state_cur["recent_high"] = recent_high_val
-                    scale_state_cur["sl_price"] = min(max(recent_high_val, entry_px * 1.0060), entry_px * (1.0 + abs(dyn_sl_pct)))
+                    scale_state_cur["sl_price"] = min(max(recent_high_val, entry_px * 1.0020), entry_px * (1.0 + abs(dyn_sl_pct)))
                     scale_in_states[sym] = scale_state_cur
                     save_scale_in_states(scale_in_states)
 
@@ -2532,13 +2547,13 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                             last_entry_price=last_px_cur,
                             current_price=cur_px,
                             recent_high=recent_high_val,
-                            vp_period=int(sym_params.get("mp", 200)),
+                            vp_period=pos_mp,
                             num_bins=int(sym_params.get("num_bins", 50)),
                             value_area_pct=float(sym_params.get("value_area_pct", 0.70)),
                             ma_type=str(sym_params.get("ma_type", "EMA" if use_ema_v else "NONE")),
                             ma_condition=str(sym_params.get("ma_condition", "close_below" if use_ema_v else "none")),
                             max_trades=1,
-                            target_ratio=float(sym_params.get("target_ratio", 0.70)),
+                            target_ratio=pos_tr,
                             sl_pct=abs(dyn_sl_pct),
                             is_cooldown_active=in_cooldown,
                             is_emergency_breakeven=pos_emergency_be,
@@ -2558,8 +2573,8 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                             recent_high=recent_high_val,
                             rsi_len=9,
                             ema_len=7,
-                            s_ep=float(sym_params.get("s_ep", 60.0)),
-                            s_cp=float(sym_params.get("s_cp", 40.0)),
+                            s_ep=pos_s_ep,
+                            s_cp=pos_s_cp,
                             sl_pct=abs(dyn_sl_pct),
                             max_trades=1,
                             last_entry_price=last_px_cur,
@@ -2582,13 +2597,13 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                             avg_entry_price=entry_px,
                             last_entry_price=last_px_cur,
                             current_price=cur_px,
-                            vp_period=int(sym_params.get("mp", 200)),
+                            vp_period=pos_mp,
                             num_bins=int(sym_params.get("num_bins", 50)),
                             value_area_pct=float(sym_params.get("value_area_pct", 0.70)),
                             ma_type=str(sym_params.get("ma_type", "EMA" if use_ema_v else "NONE")),
                             ma_condition=str(sym_params.get("ma_condition", "close_above" if use_ema_v else "none")),
                             max_trades=MAX_TRADES_COUNT,
-                            target_ratio=float(sym_params.get("target_ratio", 0.70)),
+                            target_ratio=pos_tr,
                             sl_pct=abs(dyn_sl_pct),
                             is_cooldown_active=in_cooldown,
                             is_emergency_breakeven=pos_emergency_be,
@@ -2607,8 +2622,8 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                             current_price=cur_px,
                             rsi_len=9,
                             ema_len=7,
-                            l_ep=float(sym_params.get("l_ep", 40.0)),
-                            l_cp=float(sym_params.get("l_cp", 60.0)),
+                            l_ep=pos_l_ep,
+                            l_cp=pos_l_cp,
                             sl_pct=abs(dyn_sl_pct),
                             max_trades=MAX_TRADES_COUNT,
                             last_entry_price=last_px_cur,
@@ -2750,7 +2765,7 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                     cand_interval_e = int(sym_params_e.get("interval", 5) or 5)
                     cand_strat_e = str(sym_params_e.get("strategy", "rsima")).lower()
 
-                    df_entry_eval = resample_candles(df_5m, cand_interval_e) if cand_interval_e > 5 else df_5m.copy()
+                    df_entry_eval = resample_candles(df_5m, cand_interval_e, drop_unclosed=True) if cand_interval_e > 5 else df_5m.copy()
                     try:
                         from bingx_oi_collector import enrich_candles_with_oi_fr
                         df_entry_eval = enrich_candles_with_oi_fr(df_entry_eval, sym, auto_sync=False)
@@ -2834,10 +2849,44 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                                         if entered_re:
                                             new_pos = await api.get_positions()
                                             if float(new_pos.get("sell", 0.0)) > 0:
+                                                actual_fill_px = float(new_pos.get("sell_pos", 0.0)) or cur_px
                                                 pending_entry_orders.pop(sym, None)
                                                 trade_counts[sym] = 1
                                                 last_trade_time[sym] = time.time()
+                                                last_nanpin_time[sym] = time.time()
                                                 tracked_active_positions.add(sym)
+                                                h_eval = df_entry_eval["high"].astype(float) if "high" in df_entry_eval.columns else df_entry_eval["close"].astype(float)
+                                                rec_h_val = float(h_eval.iloc[-10:].max()) if len(h_eval) >= 10 else float(h_eval.max())
+                                                dyn_sl_pct_e = float(sym_params_e.get("dynamic_mae_stop", -0.025))
+                                                dyn_to_bars_e = int(sym_params_e.get("dynamic_timeout_bars", max(3, 240 // max(1, cand_interval_e))))
+                                                sl_px_val = min(max(rec_h_val, actual_fill_px * 1.0020), actual_fill_px * (1.0 + abs(dyn_sl_pct_e)))
+                                                scale_in_states[sym] = {
+                                                    "nanpin_count": 0,
+                                                    "last_entry_price": actual_fill_px,
+                                                    "avg_price": actual_fill_px,
+                                                    "initial_entry_time": time.time(),
+                                                    "side": "short",
+                                                    "interval": cand_interval_e,
+                                                    "strategy": cand_strat_e,
+                                                    "dynamic_mae_stop": dyn_sl_pct_e,
+                                                    "dynamic_timeout_bars": dyn_to_bars_e,
+                                                    "mp": int(sym_params_e.get("mp", 200)),
+                                                    "target_ratio": float(sym_params_e.get("target_ratio", 0.70)),
+                                                    "s_ep": float(sym_params_e.get("s_ep", 60.0)),
+                                                    "s_cp": float(sym_params_e.get("s_cp", 40.0)),
+                                                    "recent_high": rec_h_val,
+                                                    "sl_price": sl_px_val,
+                                                }
+                                                save_scale_in_states(scale_in_states)
+                                                inv_label_e = f"{cand_interval_e}m" if cand_interval_e < 60 else f"{cand_interval_e // 60}h"
+                                                whale_flow_val = float(whale_info.get("net_flow", 0.0)) if whale_info else 0.0
+                                                strat_desc = f"SHORT {cand_strat_e.upper()} ({inv_label_e}足 / MP={sym_params_e.get('mp', '-')})"
+                                                asyncio.create_task(_async_post_entry_reporting(
+                                                    sym=sym, entry_px=actual_fill_px, lot_size=lot_size, entry_full_reason=entry_reason,
+                                                    df_chart=df_entry_eval, vah_val=vah_e, val_val=val_e, poc_val=poc_e,
+                                                    strat_desc=strat_desc, whale_sig=whale_sig, whale_flow_val=whale_flow_val,
+                                                    interval_label=inv_label_e, side="SHORT"
+                                                ))
                                             else:
                                                 pending_entry_orders[sym]["price"] = cur_px
                                                 discord.print_log(f"📌 [{sym}] 新しいショート指値に更新完了 (Best Ask 待機継続: 約 ${cur_px:.4f})")
@@ -2896,9 +2945,10 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
 
                                 # ショート直近高値(Swing High) & 確定足SL基準価格の算出
                                 h_eval = df_entry_eval["high"].astype(float) if "high" in df_entry_eval.columns else df_entry_eval["close"].astype(float)
-                                rec_h_val = float(h_eval.iloc[-8:].max()) if len(h_eval) >= 8 else float(h_eval.max())
+                                rec_h_val = float(h_eval.iloc[-10:].max()) if len(h_eval) >= 10 else float(h_eval.max())
                                 dyn_sl_pct_e = float(sym_params_e.get("dynamic_mae_stop", -0.025))
-                                sl_px_val = min(max(rec_h_val, actual_fill_px * 1.0060), actual_fill_px * (1.0 + abs(dyn_sl_pct_e)))
+                                dyn_to_bars_e = int(sym_params_e.get("dynamic_timeout_bars", max(3, 240 // max(1, cand_interval_e))))
+                                sl_px_val = min(max(rec_h_val, actual_fill_px * 1.0020), actual_fill_px * (1.0 + abs(dyn_sl_pct_e)))
 
                                 scale_state_new = {
                                     "nanpin_count": 0,
@@ -2908,6 +2958,12 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                                     "side": "short",
                                     "interval": cand_interval_e,
                                     "strategy": cand_strat_e,
+                                    "dynamic_mae_stop": dyn_sl_pct_e,
+                                    "dynamic_timeout_bars": dyn_to_bars_e,
+                                    "mp": int(sym_params_e.get("mp", 200)),
+                                    "target_ratio": float(sym_params_e.get("target_ratio", 0.70)),
+                                    "s_ep": float(sym_params_e.get("s_ep", 60.0)),
+                                    "s_cp": float(sym_params_e.get("s_cp", 40.0)),
                                     "recent_high": rec_h_val,
                                     "sl_price": sl_px_val,
                                 }
@@ -2930,6 +2986,13 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                                     "lot": lot_size,
                                     "reason": entry_reason,
                                     "interval": cand_interval_e,
+                                    "strategy": cand_strat_e,
+                                    "dynamic_mae_stop": float(sym_params_e.get("dynamic_mae_stop", -0.025)),
+                                    "dynamic_timeout_bars": int(sym_params_e.get("dynamic_timeout_bars", max(3, 240 // max(1, cand_interval_e)))),
+                                    "mp": int(sym_params_e.get("mp", 200)),
+                                    "target_ratio": float(sym_params_e.get("target_ratio", 0.70)),
+                                    "s_ep": float(sym_params_e.get("s_ep", 60.0)),
+                                    "s_cp": float(sym_params_e.get("s_cp", 40.0)),
                                     "side": "short"
                                 }
                                 total_active_count += 1
@@ -2996,10 +3059,39 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                                         if entered_re:
                                             new_pos = await api.get_positions()
                                             if float(new_pos.get("buy", 0.0)) > 0:
+                                                actual_fill_px = float(new_pos.get("buy_pos", 0.0)) or cur_px
                                                 pending_entry_orders.pop(sym, None)
                                                 trade_counts[sym] = 1
                                                 last_trade_time[sym] = time.time()
+                                                last_nanpin_time[sym] = time.time()
                                                 tracked_active_positions.add(sym)
+                                                dyn_sl_pct_e = float(sym_params_e.get("dynamic_mae_stop", -0.025))
+                                                dyn_to_bars_e = int(sym_params_e.get("dynamic_timeout_bars", max(3, 240 // max(1, cand_interval_e))))
+                                                scale_in_states[sym] = {
+                                                    "nanpin_count": 0,
+                                                    "last_entry_price": actual_fill_px,
+                                                    "avg_price": actual_fill_px,
+                                                    "initial_entry_time": time.time(),
+                                                    "side": "long",
+                                                    "interval": cand_interval_e,
+                                                    "strategy": cand_strat_e,
+                                                    "dynamic_mae_stop": dyn_sl_pct_e,
+                                                    "dynamic_timeout_bars": dyn_to_bars_e,
+                                                    "mp": int(sym_params_e.get("mp", 200)),
+                                                    "target_ratio": float(sym_params_e.get("target_ratio", 0.70)),
+                                                    "l_ep": float(sym_params_e.get("l_ep", 40.0)),
+                                                    "l_cp": float(sym_params_e.get("l_cp", 60.0)),
+                                                }
+                                                save_scale_in_states(scale_in_states)
+                                                inv_label_e = f"{cand_interval_e}m" if cand_interval_e < 60 else f"{cand_interval_e // 60}h"
+                                                whale_flow_val = float(whale_info.get("net_flow", 0.0)) if whale_info else 0.0
+                                                strat_desc = f"{cand_strat_e.upper()} ({inv_label_e}足 / MP={sym_params_e.get('mp', '-')})"
+                                                asyncio.create_task(_async_post_entry_reporting(
+                                                    sym=sym, entry_px=actual_fill_px, lot_size=lot_size, entry_full_reason=entry_reason,
+                                                    df_chart=df_entry_eval, vah_val=vah_e, val_val=val_e, poc_val=poc_e,
+                                                    strat_desc=strat_desc, whale_sig=whale_sig, whale_flow_val=whale_flow_val,
+                                                    interval_label=inv_label_e, side="LONG"
+                                                ))
                                             else:
                                                 pending_entry_orders[sym]["price"] = cur_px
                                                 discord.print_log(f"📌 [{sym}] 新しい指値に更新完了 (Best Bid 待機継続: 約 ${cur_px:.4f})")
@@ -3055,6 +3147,8 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                                 trade_counts[sym] = 1
                                 last_nanpin_time[sym] = time.time()
                                 tracked_active_positions.add(sym)
+                                dyn_sl_pct_e = float(sym_params_e.get("dynamic_mae_stop", -0.025))
+                                dyn_to_bars_e = int(sym_params_e.get("dynamic_timeout_bars", max(3, 240 // max(1, cand_interval_e))))
                                 scale_state_new = {
                                     "nanpin_count": 0,
                                     "last_entry_price": actual_fill_px,
@@ -3063,6 +3157,12 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                                     "side": "long",
                                     "interval": cand_interval_e,
                                     "strategy": cand_strat_e,
+                                    "dynamic_mae_stop": dyn_sl_pct_e,
+                                    "dynamic_timeout_bars": dyn_to_bars_e,
+                                    "mp": int(sym_params_e.get("mp", 200)),
+                                    "target_ratio": float(sym_params_e.get("target_ratio", 0.70)),
+                                    "l_ep": float(sym_params_e.get("l_ep", 40.0)),
+                                    "l_cp": float(sym_params_e.get("l_cp", 60.0)),
                                 }
                                 scale_in_states[sym] = scale_state_new
                                 save_scale_in_states(scale_in_states)
@@ -3083,6 +3183,13 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                                     "lot": lot_size,
                                     "reason": entry_reason,
                                     "interval": cand_interval_e,
+                                    "strategy": cand_strat_e,
+                                    "dynamic_mae_stop": float(sym_params_e.get("dynamic_mae_stop", -0.025)),
+                                    "dynamic_timeout_bars": int(sym_params_e.get("dynamic_timeout_bars", max(3, 240 // max(1, cand_interval_e)))),
+                                    "mp": int(sym_params_e.get("mp", 200)),
+                                    "target_ratio": float(sym_params_e.get("target_ratio", 0.70)),
+                                    "l_ep": float(sym_params_e.get("l_ep", 40.0)),
+                                    "l_cp": float(sym_params_e.get("l_cp", 60.0)),
                                     "side": "long"
                                 }
                                 total_active_count += 1

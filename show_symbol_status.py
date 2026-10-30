@@ -168,18 +168,22 @@ def build_symbols_status_summary(
             badge = "🟢 【トレード選定・監視中】"
             category = "SELECTED"
             counts["SELECTED"] += 1
-            if strat in ("VAL_POC", "VP_VAL_GC"):
+            is_short_strat = ("SHORT" in strat or "VAH" in strat or is_sell_mode)
+            dyn_sl = abs(float(opt_info.get("dynamic_mae_stop", opt_info.get("sl_pct", 0.025))))
+            dyn_to = int(opt_info.get("dynamic_timeout_bars", max(3, 240 // max(1, int(interval_val or 5)))))
+            if strat.startswith("VAL_POC") or strat.startswith("VAH_POC") or strat == "VP_VAL_GC":
                 mp_val = opt_info.get("mp", 200)
                 bins_val = opt_info.get("num_bins", 50)
                 va_pct = int(float(opt_info.get("value_area_pct", 0.70)) * 100)
-                ma_cond = f"{opt_info.get('ma_type', 'EMA')}_{opt_info.get('ma_condition', 'close_above')}"
-                dyn_sl = float(opt_info.get("dynamic_mae_stop", opt_info.get("sl_pct", 0.025)))
-                detail_reason = f"戦略={strat} ({interval_val}m / MP={mp_val}, Bins={bins_val}, VA={va_pct}%, {ma_cond}, 動的SL={dyn_sl:.2%})"
+                tr_pct = int(float(opt_info.get("target_ratio", 0.70)) * 100)
+                ma_cond = f"{opt_info.get('ma_type', 'EMA' if 'EMA' in strat else 'NONE')}_{opt_info.get('ma_condition', 'close_below' if is_short_strat else 'close_above')}"
+                sl_label = f"直近高値確定足SL(最大{dyn_sl:.2%})" if is_short_strat else f"動的SL={dyn_sl:.2%}"
+                detail_reason = f"戦略={strat} ({interval_val}m / MP={mp_val}, Bins={bins_val}, VA={va_pct}%, TR={tr_pct}%, {ma_cond}, {sl_label}, TO={dyn_to}本)"
             else:
-                l_ep = int(float(opt_info.get("l_ep", 40)))
-                l_cp = int(float(opt_info.get("l_cp", 60)))
-                dyn_sl = float(opt_info.get("dynamic_mae_stop", opt_info.get("sl_pct", 0.025)))
-                detail_reason = f"戦略={strat or 'RSIMA'} ({interval_val}m / R9, M7, EP={l_ep}, CP={l_cp}, 動的SL={dyn_sl:.2%})"
+                ep_val = int(float(opt_info.get("s_ep" if is_short_strat else "l_ep", 60 if is_short_strat else 40)))
+                cp_val = int(float(opt_info.get("s_cp" if is_short_strat else "l_cp", 40 if is_short_strat else 60)))
+                sl_label = f"直近高値確定足SL(最大{dyn_sl:.2%})" if is_short_strat else f"動的SL={dyn_sl:.2%}"
+                detail_reason = f"戦略={strat or 'RSIMA'} ({interval_val}m / R9, M7, EP={ep_val}, CP={cp_val}, {sl_label}, TO={dyn_to}本)"
             if is_peak_dropped:
                 detail_reason += " [※3期間比較:前半高値警戒]"
         elif not is_sell_mode and whale_sig == "SHORT_ONLY":

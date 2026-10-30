@@ -1349,7 +1349,7 @@ class backtester:
         return df_sorted 
 
 
-def resample_candles(df, interval_minutes):
+def resample_candles(df, interval_minutes, drop_unclosed: bool = False):
     if df is None or df.empty or interval_minutes <= 5:
         return df.copy() if df is not None else df
     
@@ -1385,6 +1385,14 @@ def resample_candles(df, interval_minutes):
     resampled = df_copy.resample(rule, closed='left', label='left').agg(agg_dict)
     resampled = resampled.dropna(subset=['open', 'close'])
     resampled = resampled.reset_index()
+    
+    if drop_unclosed and not resampled.empty and len(resampled) > 1:
+        try:
+            last_ts = pd.to_datetime(resampled['timestamp'].iloc[-1], utc=True)
+            if last_ts + pd.Timedelta(minutes=interval_minutes) > pd.Timestamp.now(tz='UTC'):
+                resampled = resampled.iloc[:-1].reset_index(drop=True)
+        except Exception:
+            pass
     
     return resampled
 
@@ -1966,8 +1974,8 @@ def simulate_vah_poc_fast(
                 avg_price = px
                 pos_count = 1
                 entry_bar_idx = i
-                rec_h = float(np.max(highs[max(0, i - 8):i + 1]))
-                entry_sl_px = min(max(rec_h, avg_price * 1.0060), avg_price * (1.0 + sl_pct))
+                rec_h = float(np.max(highs[max(0, i - 10):i + 1]))
+                entry_sl_px = min(max(rec_h, avg_price * 1.0020), avg_price * (1.0 + sl_pct))
                 if record_chart and exec_sell is not None:
                     exec_sell[i] = px
             pending_limit = -1.0
@@ -2420,8 +2428,8 @@ def optimize_rsima3_short_fast(
                         avg_px = px
                         pos_cnt = 1
                         entry_bar_idx = i
-                        rec_h = float(np.max(highs[max(0, i - 8):i + 1]))
-                        entry_sl_px = min(max(rec_h, avg_px * 1.0060), avg_px * (1.0 + default_sl_pct))
+                        rec_h = float(np.max(highs[max(0, i - 10):i + 1]))
+                        entry_sl_px = min(max(rec_h, avg_px * 1.0020), avg_px * (1.0 + default_sl_pct))
                     pending_px = -1.0
 
                 if pos_qty > 0:
@@ -2610,8 +2618,8 @@ def build_rsima3_short_chart_df(
                 avg_px = px
                 pos_cnt = 1
                 entry_bar_idx = i
-                rec_h = float(np.max(highs[max(0, i - 8):i + 1]))
-                entry_sl_px = min(max(rec_h, avg_px * 1.0060), avg_px * (1.0 + sl))
+                rec_h = float(np.max(highs[max(0, i - 10):i + 1]))
+                entry_sl_px = min(max(rec_h, avg_px * 1.0020), avg_px * (1.0 + sl))
                 exec_sell[i] = px
             pending_px = -1.0
 
@@ -5431,8 +5439,8 @@ def check_vah_poc_signals(
             rec_h = float(recent_high)
         else:
             h_s = df_5m["high"].astype(float) if "high" in df_5m.columns else df_5m["close"].astype(float)
-            rec_h = float(h_s.iloc[-8:].max()) if len(h_s) >= 8 else float(h_s.max())
-        sl_price_dyn = min(max(rec_h, avg_entry_price * 1.0060), avg_entry_price * (1.0 + eff_sl_pct))
+            rec_h = float(h_s.iloc[-10:].max()) if len(h_s) >= 10 else float(h_s.max())
+        sl_price_dyn = min(max(rec_h, avg_entry_price * 1.0020), avg_entry_price * (1.0 + eff_sl_pct))
 
         # 1-A. 確定足終値での直近高値上抜け損切り判定 (確定足終値 curr_c > sl_price_dyn)
         if curr_c > sl_price_dyn:
@@ -5578,8 +5586,8 @@ def check_rsima3_short_signals(
             rec_h = float(recent_high)
         else:
             h_s = df_5m["high"].astype(float) if "high" in df_5m.columns else df_5m["close"].astype(float)
-            rec_h = float(h_s.iloc[-8:].max()) if len(h_s) >= 8 else float(h_s.max())
-        sl_price_dyn = min(max(rec_h, avg_entry_price * 1.0060), avg_entry_price * (1.0 + eff_sl_pct))
+            rec_h = float(h_s.iloc[-10:].max()) if len(h_s) >= 10 else float(h_s.max())
+        sl_price_dyn = min(max(rec_h, avg_entry_price * 1.0020), avg_entry_price * (1.0 + eff_sl_pct))
 
         # 1-A. 確定足終値での直近高値上抜け損切り判定 (確定足終値 curr_close > sl_price_dyn)
         if curr_close > sl_price_dyn:
