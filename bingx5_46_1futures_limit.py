@@ -1933,7 +1933,8 @@ async def _async_post_exit_reporting(
     df_chart: pd.DataFrame,
     whale_sig: str,
     cycle_balance: float,
-    interval_label: str = "5m"
+    interval_label: str = "5m",
+    mp_period: int = 100
 ):
     """決済完了後のトレード記録・チャート生成・Discord画像送信をメインループから隔離して完全非同期実行する"""
     try:
@@ -1949,7 +1950,7 @@ async def _async_post_exit_reporting(
             plot_exit_chart,
             symbol=sym, df=df_chart, exit_price=reported_exit_px, entry_price=entry_px,
             pnl=pnl, exit_reason=exit_reason, side=side_upper, whale_signal=whale_sig,
-            interval_label=interval_label
+            interval_label=interval_label, mp_period=mp_period
         )
         if exit_chart_file and Path(exit_chart_file).exists():
             discord.send_file(exit_chart_file, f"📊 【決済チャート】{sym} {side_upper} 決済完了 [{interval_label}足] (PnL: {pnl:+.2f} USDT)")
@@ -2706,7 +2707,7 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                         sym=sym, side=side_tag, close_qty=pos_qty, reported_exit_px=cur_px,
                         entry_px=entry_px, pnl=pnl_current, exit_reason=exit_reason,
                         df_chart=df_eval, whale_sig=whale_sig, cycle_balance=cycle_balance,
-                        interval_label=inv_label_p
+                        interval_label=inv_label_p, mp_period=pos_mp
                     ))
             except Exception as pos_err:
                 discord.print_log(f"⚠️ [{sym}] ポジション監視例外: {pos_err}", level="warning")

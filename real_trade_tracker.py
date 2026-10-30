@@ -1216,6 +1216,7 @@ def plot_exit_chart(
     whale_signal: str = "",
     lookback_bars: int = 48,
     interval_label: str = "",
+    mp_period: int = None,
 ) -> Optional[Path]:
     """決済(Exit/Close)時点のローソク足、高精度Volume Profile履歴バンド、RSI/RSIMAサブプロット、トレード軌跡を描画して保存する"""
     if df is None or df.empty:
@@ -1336,9 +1337,10 @@ def plot_exit_chart(
 
     plot_df = work_df.tail(bars_needed).reset_index(drop=True)
 
-    # 画面に表示されるローソク足範囲に基づき、ボリュームプロファイルを正確に再計算（上下乖離を完全根絶）
-    vp_period = min(len(plot_df), max(24, lookback_bars))
-    plot_df = compute_volume_profile_bands(plot_df, period=vp_period, value_area_pct=0.70, num_bins=80)
+    # 戦略本来の Market Profile 期間（mp_period）と完全同期してボリュームプロファイルを描画
+    eff_mp = mp_period if (mp_period is not None and mp_period > 0) else min(len(work_df), max(100, lookback_bars))
+    work_df_vp = compute_volume_profile_bands(work_df, period=eff_mp, value_area_pct=0.70, num_bins=80)
+    plot_df = work_df_vp.tail(bars_needed).reset_index(drop=True)
 
     # エントリー足・エグジット足のインデックス厳密特定
     exit_idx = len(plot_df) - 1

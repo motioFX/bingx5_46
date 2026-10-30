@@ -2052,7 +2052,10 @@ def simulate_vah_poc_fast(
         if pending_limit < 0:
             if pos_count == 0 and i >= cooldown_until:
                 if not np.isnan(vah) and not np.isnan(vahs[i-1]):
-                    vah_dc = (closes[i-1] >= vahs[i-1]) and (c < vah)  # VAH下抜け
+                    recent_h_max = float(np.max(highs[max(0, i-3):i+1]))
+                    vah_crossunder = (closes[i-1] >= vahs[i-1] or recent_h_max >= vah) and (c < vah)
+                    is_upper = c >= (val + (vah - val) * 0.50) if vah > val else True
+                    vah_dc = vah_crossunder and is_upper  # VAH下抜け
                     va_width = (vah - val) / val if val > 0 else 0.0
                     if vah_dc and (va_width >= 0.015) and (ma_filter is None or ma_filter[i]):
                         pending_limit = c * 1.0002  # Best Ask 相当の指値待機
@@ -5388,7 +5391,14 @@ def check_vah_poc_signals(
     curr_l = float(l.iloc[-1])
 
     va_width_pct = ((curr_vah - curr_val) / curr_val) if curr_val > 0 else 0.0
-    vah_dc = (prev_c >= prev_vah) and (curr_c < curr_vah)  # VAH下抜けブレイクダウン
+    # VAH上から下への真のクロスアンダー（戻り売り）:
+    # 1. 1本前の終値がVAH以上、または直近3本の高値がVAH以上まで買われていた（上抜け確認）
+    # 2. 現在の終値がVAHを下抜けている（上から下へクロスアンダー）
+    # 3. 現在の終値がバリューエリアの半値以上（天井圏・上位）に位置し、安値ブレイクアウトでの誤発動を完全遮断
+    recent_high_reached_vah = float(h.iloc[-3:].max()) >= curr_vah if len(h) >= 3 else (prev_c >= prev_vah)
+    vah_crossunder = (prev_c >= prev_vah or recent_high_reached_vah) and (curr_c < curr_vah)
+    is_upper_half = curr_c >= (curr_val + (curr_vah - curr_val) * 0.50) if curr_vah > curr_val else True
+    vah_dc = vah_crossunder and is_upper_half  # VAH下抜けブレイクダウン
 
     # トレンド条件判定
     cond = str(ma_condition).lower()
