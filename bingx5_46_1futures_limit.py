@@ -2375,12 +2375,15 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                         dyn_sl_p = float(sym_params_p.get("dynamic_mae_stop", -0.025))
                         sl_px_val = min(max(rec_h_val, entry_px * 1.0060), entry_px * (1.0 + abs(dyn_sl_p)))
 
+                    pos_strat_p = str(p_order.get("strategy", "") or sym_params_p.get("strategy", "rsima")).lower()
                     scale_state_new = {
                         "nanpin_count": 0,
                         "last_entry_price": entry_px,
                         "avg_price": entry_px,
                         "initial_entry_time": time.time(),
                         "side": "short" if is_short_pos else "long",
+                        "interval": opt_inv_p,
+                        "strategy": pos_strat_p,
                         "recent_high": rec_h_val,
                         "sl_price": sl_px_val,
                     }
@@ -2449,9 +2452,13 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                     continue
 
                 sym_params = symbol_params_map.get(sym, best_params)
-                cand_interval = int(sym_params.get("interval", 5) or 5)
+                scale_state_cur = scale_in_states.get(sym, {})
+                # ポジション保有中は、エントリー時の足種・戦略を最優先で維持する (すり替わり完全防止)
+                pos_interval = int(scale_state_cur.get("interval", 0) or sym_params.get("interval", 5) or 5)
+                cand_interval = pos_interval
                 inv_label_p = f"{cand_interval}m" if cand_interval < 60 else f"{cand_interval // 60}h"
-                cand_strat = str(sym_params.get("strategy", "rsima")).lower()
+                pos_strat = str(scale_state_cur.get("strategy", "") or sym_params.get("strategy", "rsima")).lower()
+                cand_strat = pos_strat
 
                 # 採用足リサンプリング
                 df_eval = resample_candles(df_sym, cand_interval) if cand_interval > 5 else df_sym.copy()
@@ -2491,10 +2498,10 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                     scale_in_states[sym] = scale_state_cur
                     save_scale_in_states(scale_in_states)
                 elapsed_min = max(0.0, (time.time() - entry_ts) / 60.0)
-                bars_held_cur = int(elapsed_min // 5)
+                # 採用足種 (cand_interval) で正確に経過バー数を算出 (単位不一致バグの完全根絶)
+                bars_held_cur = int(elapsed_min // max(1, cand_interval))
                 dyn_sl_pct = float(sym_params.get("dynamic_mae_stop", -0.025))
-                cand_interval = int(sym_params.get("interval", 5))
-                dyn_to_bars = int(sym_params.get("dynamic_timeout_bars", max(3, 240 // cand_interval)))
+                dyn_to_bars = int(scale_state_cur.get("dynamic_timeout_bars", 0) or sym_params.get("dynamic_timeout_bars", max(3, 240 // max(1, cand_interval))))
 
                 in_cooldown, rem_h = is_in_sl_cooldown(sym)
 
@@ -2899,6 +2906,8 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                                     "avg_price": actual_fill_px,
                                     "initial_entry_time": time.time(),
                                     "side": "short",
+                                    "interval": cand_interval_e,
+                                    "strategy": cand_strat_e,
                                     "recent_high": rec_h_val,
                                     "sl_price": sl_px_val,
                                 }
@@ -3051,7 +3060,9 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                                     "last_entry_price": actual_fill_px,
                                     "avg_price": actual_fill_px,
                                     "initial_entry_time": time.time(),
-                                    "side": "long"
+                                    "side": "long",
+                                    "interval": cand_interval_e,
+                                    "strategy": cand_strat_e,
                                 }
                                 scale_in_states[sym] = scale_state_new
                                 save_scale_in_states(scale_in_states)
