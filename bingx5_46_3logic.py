@@ -1415,8 +1415,8 @@ def build_entry_precision_filter(df_inv: pd.DataFrame, side: str = "short", is_v
         with np.errstate(divide='ignore', invalid='ignore'):
             vol_r = np.where((v_ma20 > 0) & (~np.isnan(v_ma20)), v / v_ma20, 1.0)
         if is_breakout:
-            # ブレイクアウト系 (VAH_BREAK / VAL_BREAK): 実需出来高 (0.8x〜4.0x) を伴うブレイクを採用し薄商いダマシを遮断
-            mask &= (vol_r >= 0.8) & (vol_r <= 4.0)
+            # ブレイクアウト系 (VAH_BREAK / VAL_BREAK): アルト垂直ロケットを掴むため出来高急増 (1.3x〜4.0x) を必須化
+            mask &= (vol_r >= 1.3) & (vol_r <= 4.0)
         else:
             # レンジ逆張り・RSIMA系: 異常スパイク足 (> 2.5x) を遮断
             mask &= (vol_r <= 2.5)
@@ -1425,12 +1425,16 @@ def build_entry_precision_filter(df_inv: pd.DataFrame, side: str = "short", is_v
                 mask &= (vol_r >= 0.6)
 
     # 2. OI 4時間変化率条件 (oi_chg_4h, %)
-    if 'oi_chg_4h' in df_inv.columns:
-        oi_c = pd.to_numeric(df_inv['oi_chg_4h'], errors='coerce').fillna(0.0).values
-        if side_lower == "short":
-            mask &= (oi_c >= -3.0) & (oi_c <= 3.0)
+    if "oi_chg_4h" in df_inv.columns:
+        oi_c = pd.to_numeric(df_inv["oi_chg_4h"], errors="coerce").fillna(0.0).values
+        if is_breakout:
+            # ブレイクアウト系: 大口の新規建てによる本物の燃料点火 (+0.8%〜+5.0%) を必須化
+            mask &= (oi_c >= 0.8) & (oi_c <= 5.0)
         else:
-            mask &= (oi_c >= -3.0) & (oi_c <= 5.0)
+            if side_lower == "short":
+                mask &= (oi_c >= -3.0) & (oi_c <= 3.0)
+            else:
+                mask &= (oi_c >= -3.0) & (oi_c <= 5.0)
 
     # 3. ファンディングレート条件 (fundingRate: 8h decimal rate, e.g. 0.0001 = +0.01%)
     if 'fundingRate' in df_inv.columns:
@@ -1465,8 +1469,8 @@ def evaluate_entry_precision_gate(df_eval: pd.DataFrame, side: str = "short", is
         if is_breakout:
             if vol_r > 4.0:
                 return False, f"VOL_CLIMAX_BLOCK(Vol={vol_r:.2f}x > 4.0x)", info
-            if vol_r < 0.8:
-                return False, f"VOL_THIN_BREAK_BLOCK(Vol={vol_r:.2f}x < 0.8x)", info
+            if vol_r < 1.3:
+                return False, f"VOL_INSUFFICIENT_BREAK_BLOCK(Vol={vol_r:.2f}x < 1.3x)", info
         else:
             if vol_r > 2.5:
                 return False, f"VOL_SPIKE_BLOCK(Vol={vol_r:.2f}x > 2.5x)", info
@@ -1479,10 +1483,14 @@ def evaluate_entry_precision_gate(df_eval: pd.DataFrame, side: str = "short", is
         if pd.notna(val_oi):
             oi_c = float(val_oi)
             info["oi_chg_4h"] = round(oi_c, 2)
-            if side_lower == "short" and not (-3.0 <= oi_c <= 3.0):
-                return False, f"OI_SURGE_BLOCK(dOI_4h={oi_c:+.2f}% outside [-3%,+3%])", info
-            if side_lower != "short" and not (-3.0 <= oi_c <= 5.0):
-                return False, f"OI_ANOMALY_BLOCK(dOI_4h={oi_c:+.2f}% outside [-3%,+5%])", info
+            if is_breakout:
+                if not (0.8 <= oi_c <= 5.0):
+                    return False, f"OI_FUEL_MISSING_BLOCK(dOI_4h={oi_c:+.2f}% not in [+0.8%,+5.0%])", info
+            else:
+                if side_lower == "short" and not (-3.0 <= oi_c <= 3.0):
+                    return False, f"OI_SURGE_BLOCK(dOI_4h={oi_c:+.2f}% outside [-3%,+3%])", info
+                if side_lower != "short" and not (-3.0 <= oi_c <= 5.0):
+                    return False, f"OI_ANOMALY_BLOCK(dOI_4h={oi_c:+.2f}% outside [-3%,+5%])", info
 
     # 3. Funding Rate 判定
     if "fundingRate" in df_eval.columns:
