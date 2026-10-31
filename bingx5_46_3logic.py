@@ -1860,8 +1860,8 @@ def simulate_val_poc_fast(
         if pending_limit < 0:
             if pos_count == 0 and i >= cooldown_until:
                 if not np.isnan(val) and not np.isnan(vals[i-1]):
-                    recent_l_min = float(np.min(lows[max(0, i-3):i+1]))
-                    val_crossover = (closes[i-1] <= vals[i-1] or recent_l_min <= val) and (c > val)
+                    # VAL下から上への確定終値ベース厳格クロスオーバー (レンジ内回帰押し目買い)
+                    val_crossover = (closes[i-1] <= vals[i-1]) and (c > val)
                     is_lower = c <= (val + (vah - val) * 0.50) if vah > val else True
                     val_gc = val_crossover and is_lower
                     va_width = (vah - val) / val if val > 0 else 0.0
@@ -2055,8 +2055,8 @@ def simulate_vah_poc_fast(
         if pending_limit < 0:
             if pos_count == 0 and i >= cooldown_until:
                 if not np.isnan(vah) and not np.isnan(vahs[i-1]):
-                    recent_h_max = float(np.max(highs[max(0, i-3):i+1]))
-                    vah_crossunder = (closes[i-1] >= vahs[i-1] or recent_h_max >= vah) and (c < vah)
+                    # VAH上から下への確定終値ベース厳格クロスアンダー (レンジ内回帰戻り売り)
+                    vah_crossunder = (closes[i-1] >= vahs[i-1]) and (c < vah)
                     is_upper = c >= (val + (vah - val) * 0.50) if vah > val else True
                     vah_dc = vah_crossunder and is_upper  # VAH下抜け
                     va_width = (vah - val) / val if val > 0 else 0.0
@@ -5216,8 +5216,11 @@ def check_val_poc_signals(
     # 1. 1本前の終値がVAL以下、または直近3本の安値がVAL以下まで売られていた（下抜け押し目確認）
     # 2. 現在の確定終値がVALを上抜けている（下から上へクロスオーバー）
     # 3. 現在の終値がバリューエリアの半値以下（安値圏・押し目ゾーン）に位置し、天井圏での高値掴みを物理完全遮断
-    recent_low_reached_val = float(l.iloc[-3:].min()) <= curr_val if len(l) >= 3 else (prev_c <= prev_val)
-    val_crossover = (prev_c <= prev_val or recent_low_reached_val) and (curr_c > curr_val)
+    # VAL下から上への確定終値ベース厳格クロスオーバー (レンジ内回帰押し目買い):
+    # 1. 1本前の確定終値がVAL以下（prev_c <= prev_val: レンジ外側滞在）
+    # 2. 現在の確定終値がVAL超（curr_c > curr_val: レンジ内側への確定足回帰）
+    # 3. 現在の終値がバリューエリアの半値以下（安値圏・押し目ゾーン）
+    val_crossover = (prev_c <= prev_val) and (curr_c > curr_val)
     is_lower_half = curr_c <= (curr_val + (curr_vah - curr_val) * 0.50) if curr_vah > curr_val else True
     val_gc = val_crossover and is_lower_half
 
@@ -5405,8 +5408,11 @@ def check_vah_poc_signals(
     # 1. 1本前の終値がVAH以上、または直近3本の高値がVAH以上まで買われていた（上抜け確認）
     # 2. 現在の終値がVAHを下抜けている（上から下へクロスアンダー）
     # 3. 現在の終値がバリューエリアの半値以上（天井圏・上位）に位置し、安値ブレイクアウトでの誤発動を完全遮断
-    recent_high_reached_vah = float(h.iloc[-3:].max()) >= curr_vah if len(h) >= 3 else (prev_c >= prev_vah)
-    vah_crossunder = (prev_c >= prev_vah or recent_high_reached_vah) and (curr_c < curr_vah)
+    # VAH上から下への確定終値ベース厳格クロスアンダー (レンジ内回帰戻り売り):
+    # 1. 1本前の確定終値がVAH以上（prev_c >= prev_vah: レンジ外側滞在）
+    # 2. 現在の確定終値がVAH未満（curr_c < curr_vah: レンジ内側への確定足回帰）
+    # 3. 現在の終値がバリューエリアの半値以上（天井圏・上位）
+    vah_crossunder = (prev_c >= prev_vah) and (curr_c < curr_vah)
     is_upper_half = curr_c >= (curr_val + (curr_vah - curr_val) * 0.50) if curr_vah > curr_val else True
     vah_dc = vah_crossunder and is_upper_half  # VAH下抜けブレイクダウン
 
