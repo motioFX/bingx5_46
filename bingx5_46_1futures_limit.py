@@ -2555,13 +2555,20 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                         save_scale_in_states(scale_in_states)
 
                     if is_ny_session and entry_px > 0:
-                        # ショート含み益ピークが +0.60% (lowest <= entry * 0.994) 到達でトレール有効
-                        if lowest_px <= entry_px * (1.0 - trail_act_pct):
-                            trail_stop_px = min(lowest_px * (1.0 + trail_dist_pct), entry_px * 0.9980)
+                        # ショート: VAL境界線トレーリング (VAL上抜け逆戻りで即座に利確撤退、最低でも建値-0.20%確保)
+                        if cand_strat == "val_break":
+                            trail_stop_px = min(val, entry_px * 0.9980)
                             if cur_px >= trail_stop_px:
                                 ny_trail_triggered = True
                                 pnl_pct_trail = (entry_px - cur_px) / entry_px
-                                ny_trail_reason = f"NY_SESSION_TRAILING_STOP: 米国時間トレール利確 (最安値=${lowest_px:.4f}から0.4%戻し到達=${trail_stop_px:.4f}, PnL={pnl_pct_trail:+.2%})"
+                                ny_trail_reason = f"NY_VAL_TRAIL_TP: 米国時間VAL境界線トレール利確 (VAL=${val:.4f}復帰到達=${trail_stop_px:.4f}, PnL={pnl_pct_trail:+.2%})"
+                        else:
+                            if lowest_px <= entry_px * (1.0 - trail_act_pct):
+                                trail_stop_px = min(lowest_px * (1.0 + trail_dist_pct), entry_px * 0.9980)
+                                if cur_px >= trail_stop_px:
+                                    ny_trail_triggered = True
+                                    pnl_pct_trail = (entry_px - cur_px) / entry_px
+                                    ny_trail_reason = f"NY_SESSION_TRAILING_STOP: 米国時間トレール利確 (最安値=${lowest_px:.4f}から0.4%戻し到達=${trail_stop_px:.4f}, PnL={pnl_pct_trail:+.2%})"
                 else:
                     highest_px = float(scale_state_cur.get("peak_trough_price", entry_px) or entry_px)
                     if cur_px > highest_px:
@@ -2571,13 +2578,20 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                         save_scale_in_states(scale_in_states)
 
                     if is_ny_session and entry_px > 0:
-                        # ロング含み益ピークが +0.60% (highest >= entry * 1.006) 到達でトレール有効
-                        if highest_px >= entry_px * (1.0 + trail_act_pct):
-                            trail_stop_px = max(highest_px * (1.0 - trail_dist_pct), entry_px * 1.0020)
+                        # ロング: VAH境界線トレーリング (VAH割れ逆戻りで即座に利確撤退、最低でも建値+0.20%確保)
+                        if cand_strat == "vah_break":
+                            trail_stop_px = max(vah, entry_px * 1.0020)
                             if cur_px <= trail_stop_px:
                                 ny_trail_triggered = True
                                 pnl_pct_trail = (cur_px - entry_px) / entry_px
-                                ny_trail_reason = f"NY_SESSION_TRAILING_STOP: 米国時間トレール利確 (最高値=${highest_px:.4f}から0.4%押し到達=${trail_stop_px:.4f}, PnL={pnl_pct_trail:+.2%})"
+                                ny_trail_reason = f"NY_VAH_TRAIL_TP: 米国時間VAH境界線トレール利確 (VAH=${vah:.4f}割れ到達=${trail_stop_px:.4f}, PnL={pnl_pct_trail:+.2%})"
+                        else:
+                            if highest_px >= entry_px * (1.0 + trail_act_pct):
+                                trail_stop_px = max(highest_px * (1.0 - trail_dist_pct), entry_px * 1.0020)
+                                if cur_px <= trail_stop_px:
+                                    ny_trail_triggered = True
+                                    pnl_pct_trail = (cur_px - entry_px) / entry_px
+                                    ny_trail_reason = f"NY_SESSION_TRAILING_STOP: 米国時間トレール利確 (最高値=${highest_px:.4f}から0.4%押し到達=${trail_stop_px:.4f}, PnL={pnl_pct_trail:+.2%})"
 
                 # ショートポジションの直近高値(Swing High)復元・自動補完
                 recent_high_val = float(scale_state_cur.get("recent_high", 0.0) or 0.0)

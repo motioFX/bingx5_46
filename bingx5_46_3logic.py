@@ -6008,15 +6008,16 @@ def check_vah_break_signals(
     not_overextended = (curr_c <= curr_vah + va_diff * 0.35) if va_diff > 0 else True
     vah_brk_ok = vah_breakout and not_overextended
 
-    # ロング上方拡張利確目標: VAH + (VAH - VAL) * target_ratio
-    va_ext = va_diff * target_ratio if va_diff > 0 else (curr_vah * 0.015)
-    raw_target_tp = curr_vah + va_ext
-
+    # POC直上防衛SL (max(VAH - VA幅*0.35, POC*1.001)) ＆ RR 1:2 完全保証設計
     lpo = (current_pos_qty > 0 and current_trades_count > 0)
-    if lpo and avg_entry_price > 0:
-        target_tp = max(raw_target_tp, avg_entry_price * 1.0040)
-    else:
-        target_tp = raw_target_tp
+    ref_entry_px = avg_entry_price if (lpo and avg_entry_price > 0) else curr_c
+    raw_sl_px = curr_vah - va_diff * 0.35 if va_diff > 0 else ref_entry_px * 0.985
+    poc_floor = curr_poc * 1.001 if (curr_poc > 0 and curr_poc < ref_entry_px) else raw_sl_px
+    calc_sl_px = max(raw_sl_px, poc_floor)
+    sl_dist = max(ref_entry_px * 0.004, ref_entry_px - calc_sl_px)
+    final_sl_px = ref_entry_px - sl_dist
+    # リスクリワード 1:2 保証利確目標
+    target_tp = ref_entry_px + sl_dist * 2.0
     poz = (current_pos_qty == 0 and current_trades_count == 0)
 
     metrics = {
@@ -6029,6 +6030,7 @@ def check_vah_break_signals(
         "poc": curr_poc,
         "va_width_pct": va_width_pct,
         "vah_brk_ok": vah_brk_ok,
+        "sl_price": final_sl_px,
         "target_tp": target_tp,
         "avg_entry_price": avg_entry_price,
         "last_entry_price": last_entry_price,
@@ -6036,14 +6038,12 @@ def check_vah_break_signals(
         "is_emergency_breakeven": is_emergency_breakeven,
     }
 
-    # === [1] 損切り判定 (動的MAEストップ & ブレイク否定POC割れ撤退) ===
+    # === [1] 損切り判定 (POC直上防衛SL & 動的SL & ブレイク否定POC割れ) ===
     if lpo and avg_entry_price > 0:
-        eff_sl_pct = abs(dynamic_sl_pct) if dynamic_sl_pct != 0 else 0.025
-        sl_price_dyn = avg_entry_price * (1.0 - eff_sl_pct)
-        if (current_price <= sl_price_dyn) or (curr_c <= sl_price_dyn):
+        if (current_price <= final_sl_px) or (curr_c <= final_sl_px):
             trigger_px = min(current_price, curr_c)
             loss_pct = (trigger_px - avg_entry_price) / avg_entry_price
-            reason = f"VAH_BREAK_DYNAMIC_SL: 価格(${trigger_px:.4f}) <= 動的SL(${sl_price_dyn:.4f}, 損失{loss_pct:.2%})"
+            reason = f"VAH_BREAK_POC_SL: 価格(${trigger_px:.4f}) <= POC防衛SL(${final_sl_px:.4f}, 損失{loss_pct:.2%})"
             return {"action": "STOP_LOSS", "reason": reason, "lot_multiplier": 1.0, "metrics": metrics}
 
         # ブレイク否定(ダマシ)POC割れ早期カット
@@ -6153,15 +6153,16 @@ def check_val_break_signals(
     not_overextended = (curr_c >= curr_val - va_diff * 0.35) if va_diff > 0 else True
     val_brk_ok = val_breakdown and not_overextended
 
-    # ショート下方拡張利確目標: VAL - (VAH - VAL) * target_ratio
-    va_ext = va_diff * target_ratio if va_diff > 0 else (curr_val * 0.015)
-    raw_target_tp = max(curr_val * 0.50, curr_val - va_ext)
-
+    # POC直下防衛SL (min(VAL + VA幅*0.35, POC*0.999)) ＆ RR 1:2 完全保証設計
     spo = (current_pos_qty < 0 or (current_pos_qty > 0 and current_trades_count > 0 and avg_entry_price > 0))
-    if spo and avg_entry_price > 0:
-        target_tp = min(raw_target_tp, avg_entry_price * 0.9960)
-    else:
-        target_tp = raw_target_tp
+    ref_entry_px = avg_entry_price if (spo and avg_entry_price > 0) else curr_c
+    raw_sl_px = curr_val + va_diff * 0.35 if va_diff > 0 else ref_entry_px * 1.015
+    poc_ceiling = curr_poc * 0.999 if (curr_poc > 0 and curr_poc > ref_entry_px) else raw_sl_px
+    calc_sl_px = min(raw_sl_px, poc_ceiling)
+    sl_dist = max(ref_entry_px * 0.004, calc_sl_px - ref_entry_px)
+    final_sl_px = ref_entry_px + sl_dist
+    # リスクリワード 1:2 保証利確目標
+    target_tp = max(curr_val * 0.50, ref_entry_px - sl_dist * 2.0)
     poz = (current_pos_qty == 0 and current_trades_count == 0)
 
     metrics = {
@@ -6174,6 +6175,7 @@ def check_val_break_signals(
         "poc": curr_poc,
         "va_width_pct": va_width_pct,
         "val_brk_ok": val_brk_ok,
+        "sl_price": final_sl_px,
         "target_tp": target_tp,
         "avg_entry_price": avg_entry_price,
         "last_entry_price": last_entry_price,
@@ -6181,20 +6183,12 @@ def check_val_break_signals(
         "is_emergency_breakeven": is_emergency_breakeven,
     }
 
-    # === [1] ショート直近高値（Swing High）確定足ストップロス判定 & ブレイク否定POC回帰 & 急騰ガード ===
+    # === [1] ショート損切り判定 (POC直下防衛SL & ブレイク否定POC回帰 & 急騰ガード) ===
     if spo and avg_entry_price > 0:
-        eff_sl_pct = abs(dynamic_sl_pct) if dynamic_sl_pct != 0 else 0.025
-        if recent_high is not None and recent_high > 0:
-            rec_h = float(recent_high)
-        else:
-            h_s = df_5m["high"].astype(float) if "high" in df_5m.columns else df_5m["close"].astype(float)
-            rec_h = float(h_s.iloc[-10:].max()) if len(h_s) >= 10 else float(h_s.max())
-        sl_price_dyn = min(max(rec_h, avg_entry_price * 1.0020), avg_entry_price * (1.0 + eff_sl_pct))
-
-        if curr_c > sl_price_dyn:
-            trigger_px = curr_c
+        if (current_price >= final_sl_px) or (curr_c >= final_sl_px):
+            trigger_px = max(current_price, curr_c)
             loss_pct = (avg_entry_price - trigger_px) / avg_entry_price
-            reason = f"VAL_BREAK_SWING_HIGH_SL: 確定終値(${curr_c:.4f}) > 直近高値SL(${sl_price_dyn:.4f}, 損失{loss_pct:.2%})"
+            reason = f"VAL_BREAK_POC_SL: 価格(${trigger_px:.4f}) >= POC防衛SL(${final_sl_px:.4f}, 損失{loss_pct:.2%})"
             return {"action": "STOP_LOSS", "reason": reason, "lot_multiplier": 1.0, "metrics": metrics}
 
         # ブレイク否定(ダマシ)POC上抜け早期カット
