@@ -235,6 +235,8 @@ from bingx5_46_3logic import (
     check_rsima3_signals,
     check_vah_poc_signals,
     check_rsima3_short_signals,
+    check_vah_break_signals,
+    check_val_break_signals,
     check_normalized_peak_timing,
     check_market_regime_safe,
 )
@@ -1013,7 +1015,7 @@ async def validate_profitable_candidates(trade_side: str, mode: str, base_symbol
 
         discord.print_log(
             f"【全体地合い判定: BUY 🟢】3期間買い推奨銘柄（計 {len(all_candidates)} 銘柄: {', '.join(all_candidates) if all_candidates else 'なし'}）"
-            f"のロングPure個別最適化（72通り: 単発厳選 ➔ 3枠ナンピン検証）を開始します..."
+            f"のロングPure3大戦略個別最適化（108通り: 単発厳選 ➔ 3枠ナンピン検証 ※ブレイクは単発固定）を開始します..."
         )
     elif overall_reg == "SELL":
         actual_side = "short"
@@ -1037,7 +1039,7 @@ async def validate_profitable_candidates(trade_side: str, mode: str, base_symbol
 
         discord.print_log(
             f"【全体地合い判定: SELL 🔴】3期間売り推奨銘柄（計 {len(all_candidates)} 銘柄: {', '.join(all_candidates) if all_candidates else 'なし'}）"
-            f"のショートPure個別最適化（72通り: 単発1本固定・ナンピン完全なし）を開始します..."
+            f"のショートPure3大戦略個別最適化（108通り: 単発1本固定・ナンピン完全なし）を開始します..."
         )
     else:
         # NEUTRAL (中立): 新規エントリー完全停止 ＆ 最適化スキップ (ノーポジ待機)
@@ -1134,7 +1136,7 @@ async def validate_profitable_candidates(trade_side: str, mode: str, base_symbol
                 is_qual = is_tier1 or is_tier2
                 if is_qual:
                     dyn_sl_disp = cand_params.get("dynamic_mae_stop", -0.025)
-                    if "val_poc" in cand_strat or "vah_poc" in cand_strat:
+                    if any(k in cand_strat for k in ("val_poc", "vah_poc", "vah_break", "val_break")):
                         detail_str = f"MP={cand_mp}, Bins={cand_params.get('num_bins', 50)}, VA={int(cand_params.get('value_area_pct', 0.7)*100)}%, TR={int(cand_params.get('target_ratio', 0.7)*100)}%, {cand_params.get('ma_type', 'NONE')}_{cand_params.get('ma_condition', 'none')}, 動的SL={dyn_sl_disp:.2%}"
                     elif "short" in cand_strat:
                         detail_str = f"EP={int(cand_params.get('s_ep', 60))}, CP={int(cand_params.get('s_cp', 40))}, 動的SL={dyn_sl_disp:.2%}"
@@ -1692,8 +1694,8 @@ async def run_screening_and_optimization(mode: str, send_charts: bool = False, s
 
     # 選定銘柄の個別最適化パラメータをDiscordログ表示
     if selected_symbols:
-        side_strat_label = "ショートPure2大戦略 (VAH_POC / RSIMA_SHORT)" if trade_side == "short" else "ロングPure2大戦略 (VAL_POC / RSIMA)"
-        discord.print_log(f"\n★ 【合格銘柄 個別最適化パラメータ一覧 ({side_strat_label} 72通り検証)】")
+        side_strat_label = "ショートPure3大戦略 (VAH_POC / VAL_BREAK / RSIMA_SHORT)" if trade_side == "short" else "ロングPure3大戦略 (VAL_POC / VAH_BREAK / RSIMA)"
+        discord.print_log(f"\n★ 【合格銘柄 個別最適化パラメータ一覧 ({side_strat_label} 108通り検証)】")
         for sym in selected_symbols:
             p = symbol_params_map.get(sym, default_best_params)
             pnl_val = p.get('pnl', 0.0)
@@ -1702,10 +1704,17 @@ async def run_screening_and_optimization(mode: str, send_charts: bool = False, s
             dd_val = p.get('max_dd', 0.0)
             strat = p.get('strategy', 'rsima').upper()
             inv_val = int(p.get('interval', 5))
-            is_short_strat = ("SHORT" in strat or "VAH" in strat or trade_side == "short")
-            max_trades_label = "単発1本固定/ナンピンなし" if is_short_strat else f"最大{MAX_TRADES_COUNT}枠/1x均等"
+            is_short_strat = ("SHORT" in strat or strat.startswith("VAH_POC") or strat == "VAL_BREAK" or trade_side == "short")
+            is_single_fixed = is_short_strat or strat in ("VAH_BREAK", "VAL_BREAK")
+            max_trades_label = "単発1本固定/ナンピンなし" if is_single_fixed else f"最大{MAX_TRADES_COUNT}枠/1x均等"
             
-            if strat.startswith("VAH_POC") or strat in ("VAL_POC", "VP_VAL_GC"):
+            if strat in ("VAH_BREAK", "VAL_BREAK"):
+                mp_v = p.get('mp', 200)
+                bins_v = p.get('num_bins', 50)
+                va_v = int(float(p.get('value_area_pct', 0.70)) * 100)
+                tr_v = int(float(p.get('target_ratio', 0.70)) * 100)
+                param_str = f"{inv_val}m / MP={mp_v}, Bins={bins_v}, VA={va_v}%, TR={tr_v}% ➔ 単発固定 ➔ VA拡張{tr_v}%利確"
+            elif strat.startswith("VAH_POC") or strat in ("VAL_POC", "VP_VAL_GC"):
                 mp_v = p.get('mp', 200)
                 bins_v = p.get('num_bins', 50)
                 va_v = int(float(p.get('value_area_pct', 0.70)) * 100)
@@ -2538,7 +2547,26 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                 # 戦略シグナル評価 (ロング・ショート完全分岐)
                 if is_short_pos:
                     # ===== SHORT ポジション監視 =====
-                    if cand_strat.startswith("vah_poc"):
+                    if cand_strat == "val_break":
+                        sig_eval = check_val_break_signals(
+                            df_5m=df_eval,
+                            current_pos_qty=pos_qty,
+                            current_trades_count=1,
+                            avg_entry_price=entry_px,
+                            last_entry_price=last_px_cur,
+                            current_price=cur_px,
+                            recent_high=recent_high_val,
+                            vp_period=pos_mp,
+                            num_bins=int(sym_params.get("num_bins", 50)),
+                            value_area_pct=float(sym_params.get("value_area_pct", 0.70)),
+                            target_ratio=pos_tr,
+                            is_cooldown_active=in_cooldown,
+                            is_emergency_breakeven=pos_emergency_be,
+                            dynamic_sl_pct=dyn_sl_pct,
+                            bars_held=bars_held_cur,
+                            timeout_bars=dyn_to_bars,
+                        )
+                    elif cand_strat.startswith("vah_poc"):
                         use_ema_v = ("ema" in cand_strat)
                         sig_eval = check_vah_poc_signals(
                             df_5m=df_eval,
@@ -2589,7 +2617,25 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                         )
                 else:
                     # ===== LONG ポジション監視 =====
-                    if cand_strat.startswith("val_poc"):
+                    if cand_strat == "vah_break":
+                        sig_eval = check_vah_break_signals(
+                            df_5m=df_eval,
+                            current_pos_qty=buy_qty,
+                            current_trades_count=t_count,
+                            avg_entry_price=entry_px,
+                            last_entry_price=last_px_cur,
+                            current_price=cur_px,
+                            vp_period=pos_mp,
+                            num_bins=int(sym_params.get("num_bins", 50)),
+                            value_area_pct=float(sym_params.get("value_area_pct", 0.70)),
+                            target_ratio=pos_tr,
+                            is_cooldown_active=in_cooldown,
+                            is_emergency_breakeven=pos_emergency_be,
+                            dynamic_sl_pct=dyn_sl_pct,
+                            bars_held=bars_held_cur,
+                            timeout_bars=dyn_to_bars,
+                        )
+                    elif cand_strat.startswith("val_poc"):
                         use_ema_v = ("ema" in cand_strat)
                         sig_eval = check_val_poc_signals(
                             df_5m=df_eval,
@@ -2793,7 +2839,21 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                         # --------------------------------------------------
                         # 【BEAR相場】ショート新規エントリー判定 (単発1本固定)
                         # --------------------------------------------------
-                        if cand_strat_e.startswith("vah_poc"):
+                        if cand_strat_e == "val_break":
+                            sig_entry = check_val_break_signals(
+                                df_5m=df_entry_eval,
+                                current_pos_qty=0.0,
+                                current_trades_count=0,
+                                avg_entry_price=0.0,
+                                last_entry_price=0.0,
+                                current_price=cur_px,
+                                vp_period=int(sym_params_e.get("mp", 200)),
+                                num_bins=int(sym_params_e.get("num_bins", 50)),
+                                value_area_pct=float(sym_params_e.get("value_area_pct", 0.70)),
+                                target_ratio=float(sym_params_e.get("target_ratio", 0.70)),
+                                is_cooldown_active=in_cooldown,
+                            )
+                        elif cand_strat_e.startswith("vah_poc"):
                             use_ema_v = ("ema" in cand_strat_e)
                             sig_entry = check_vah_poc_signals(
                                 df_5m=df_entry_eval,
@@ -3001,9 +3061,23 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
 
                     else:
                         # --------------------------------------------------
-                        # 【BULL相場】ロング新規エントリー判定 (最大3枠ナンピン)
+                        # 【BULL相場】ロング新規エントリー判定 (最大3枠ナンピン ※VAH_BREAKは単発固定)
                         # --------------------------------------------------
-                        if cand_strat_e.startswith("val_poc"):
+                        if cand_strat_e == "vah_break":
+                            sig_entry = check_vah_break_signals(
+                                df_5m=df_entry_eval,
+                                current_pos_qty=0.0,
+                                current_trades_count=0,
+                                avg_entry_price=0.0,
+                                last_entry_price=0.0,
+                                current_price=cur_px,
+                                vp_period=int(sym_params_e.get("mp", 200)),
+                                num_bins=int(sym_params_e.get("num_bins", 50)),
+                                value_area_pct=float(sym_params_e.get("value_area_pct", 0.70)),
+                                target_ratio=float(sym_params_e.get("target_ratio", 0.70)),
+                                is_cooldown_active=in_cooldown,
+                            )
+                        elif cand_strat_e.startswith("val_poc"):
                             use_ema_v = ("ema" in cand_strat_e)
                             sig_entry = check_val_poc_signals(
                                 df_5m=df_entry_eval,

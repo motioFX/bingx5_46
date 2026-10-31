@@ -168,10 +168,10 @@ def build_symbols_status_summary(
             badge = "🟢 【トレード選定・監視中】"
             category = "SELECTED"
             counts["SELECTED"] += 1
-            is_short_strat = ("SHORT" in strat or "VAH" in strat or is_sell_mode)
+            is_short_strat = ("SHORT" in strat or strat.startswith("VAH_POC") or strat == "VAL_BREAK" or is_sell_mode)
             dyn_sl = abs(float(opt_info.get("dynamic_mae_stop", opt_info.get("sl_pct", 0.025))))
             dyn_to = int(opt_info.get("dynamic_timeout_bars", max(3, 240 // max(1, int(interval_val or 5)))))
-            if strat.startswith("VAL_POC") or strat.startswith("VAH_POC") or strat == "VP_VAL_GC":
+            if strat in ("VAH_BREAK", "VAL_BREAK") or strat.startswith("VAL_POC") or strat.startswith("VAH_POC") or strat == "VP_VAL_GC":
                 mp_val = opt_info.get("mp", 200)
                 bins_val = opt_info.get("num_bins", 50)
                 va_pct = int(float(opt_info.get("value_area_pct", 0.70)) * 100)
