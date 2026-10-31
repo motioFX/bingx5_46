@@ -1875,7 +1875,13 @@ def simulate_val_poc_fast(
                     is_lower = c <= (val + (vah - val) * 0.50) if vah > val else True
                     val_gc = val_crossover and is_lower
                     va_width = (vah - val) / val if val > 0 else 0.0
-                    if val_gc and (va_width >= 0.015) and (ma_filter is None or ma_filter[i]):
+                    # 直近レンジ滞在率 70% ゲート (MP期間の25%, 15〜40本)
+                    w_len = max(15, min(40, int(len(closes) * 0.05))) if n > 0 else 20
+                    w_start = max(0, i - w_len)
+                    w_closes = closes[w_start:i+1]
+                    in_range_cnt = np.sum((w_closes >= val * 0.998) & (w_closes <= vah * 1.002))
+                    residency_ratio = in_range_cnt / len(w_closes) if len(w_closes) > 0 else 1.0
+                    if val_gc and (va_width >= 0.015) and (residency_ratio >= 0.70) and (ma_filter is None or ma_filter[i]):
                         pending_limit = c * 0.9998
             elif 1 <= pos_count < max_trades:
                 va_diff = (vah - val) if (not np.isnan(val) and not np.isnan(vah) and vah > val) else 0.0
@@ -2070,7 +2076,13 @@ def simulate_vah_poc_fast(
                     is_upper = c >= (val + (vah - val) * 0.50) if vah > val else True
                     vah_dc = vah_crossunder and is_upper  # VAH下抜け
                     va_width = (vah - val) / val if val > 0 else 0.0
-                    if vah_dc and (va_width >= 0.015) and (ma_filter is None or ma_filter[i]):
+                    # 直近レンジ滞在率 70% ゲート (MP期間の25%, 15〜40本)
+                    w_len = max(15, min(40, int(len(closes) * 0.05))) if n > 0 else 20
+                    w_start = max(0, i - w_len)
+                    w_closes = closes[w_start:i+1]
+                    in_range_cnt = np.sum((w_closes >= val * 0.998) & (w_closes <= vah * 1.002))
+                    residency_ratio = in_range_cnt / len(w_closes) if len(w_closes) > 0 else 1.0
+                    if vah_dc and (va_width >= 0.015) and (residency_ratio >= 0.70) and (ma_filter is None or ma_filter[i]):
                         pending_limit = c * 1.0002  # Best Ask 相当の指値待機
 
         if pos_qty > 0:
@@ -5552,9 +5564,16 @@ def check_val_poc_signals(
             reason = f"VAL_POC_TP (TR={target_ratio:.2f}): 目標(${target_tp:.4f})到達 & 建値利益(PnL={pnl_pct:+.2%})"
             return {"action": "CLOSE_ALL", "reason": reason, "lot_multiplier": 1.0, "metrics": metrics}
 
-    # === [3] 新規エントリー判定 (VALゴールデンクロス ＆ MA200 ＆ バリュー幅>=1.5% ＆ 3要素フィルター ＆ クールダウン解除) ===
+    # レンジ滞在率 70% ゲート算出 (MP期間の25%: 15〜40本)
+    w_len = max(15, min(40, int(vp_period * 0.25)))
+    c_window = c.iloc[-w_len:] if len(c) >= w_len else c
+    in_range_cnt = ((c_window >= curr_val * 0.998) & (c_window <= curr_vah * 1.002)).sum()
+    residency_ratio = (in_range_cnt / len(c_window)) if len(c_window) > 0 else 1.0
+    metrics["residency_ratio"] = round(float(residency_ratio), 2)
+
+    # === [3] 新規エントリー判定 (VALゴールデンクロス ＆ レンジ滞在率>=70% ＆ バリュー幅>=1.5% ＆ 3要素フィルター ＆ クールダウン解除) ===
     if poz and not is_cooldown_active:
-        if val_gc and (va_width_pct >= min_va_width) and trend_ok:
+        if val_gc and (residency_ratio >= 0.70) and (va_width_pct >= min_va_width) and trend_ok:
             prec_ok, prec_msg, prec_info = evaluate_entry_precision_gate(df_5m, side="long", is_vp=True)
             metrics.update(prec_info)
             if prec_ok:
@@ -5750,9 +5769,16 @@ def check_vah_poc_signals(
             reason = f"VAH_POC_TP (TR={target_ratio:.2f}): 目標(${target_tp:.4f})到達 & 建値利益(PnL={pnl_pct:+.2%})"
             return {"action": "CLOSE_ALL", "reason": reason, "lot_multiplier": 1.0, "metrics": metrics}
 
-    # === [3] 新規ショートエントリー判定 (VAHデッドクロス ＆ MA200 ＆ バリュー幅>=1.5% ＆ 3要素フィルター ＆ クールダウン解除) ===
+    # レンジ滞在率 70% ゲート算出 (MP期間の25%: 15〜40本)
+    w_len = max(15, min(40, int(vp_period * 0.25)))
+    c_window = c.iloc[-w_len:] if len(c) >= w_len else c
+    in_range_cnt = ((c_window >= curr_val * 0.998) & (c_window <= curr_vah * 1.002)).sum()
+    residency_ratio = (in_range_cnt / len(c_window)) if len(c_window) > 0 else 1.0
+    metrics["residency_ratio"] = round(float(residency_ratio), 2)
+
+    # === [3] 新規ショートエントリー判定 (VAHデッドクロス ＆ レンジ滞在率>=70% ＆ バリュー幅>=1.5% ＆ 3要素フィルター ＆ クールダウン解除) ===
     if poz and not is_cooldown_active:
-        if vah_dc and (va_width_pct >= min_va_width) and trend_ok:
+        if vah_dc and (residency_ratio >= 0.70) and (va_width_pct >= min_va_width) and trend_ok:
             prec_ok, prec_msg, prec_info = evaluate_entry_precision_gate(df_5m, side="short", is_vp=True)
             metrics.update(prec_info)
             if prec_ok:
