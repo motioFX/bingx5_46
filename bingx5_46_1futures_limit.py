@@ -1013,7 +1013,7 @@ async def validate_profitable_candidates(trade_side: str, mode: str, base_symbol
 
         discord.print_log(
             f"【全体地合い判定: BUY 🟢】3期間買い推奨銘柄（計 {len(all_candidates)} 銘柄: {', '.join(all_candidates) if all_candidates else 'なし'}）"
-            f"のロング個別最適化（144通り: 単発厳選 ➔ 3枠ナンピン検証）を開始します..."
+            f"のロングPure個別最適化（72通り: 単発厳選 ➔ 3枠ナンピン検証）を開始します..."
         )
     elif overall_reg == "SELL":
         actual_side = "short"
@@ -1037,7 +1037,7 @@ async def validate_profitable_candidates(trade_side: str, mode: str, base_symbol
 
         discord.print_log(
             f"【全体地合い判定: SELL 🔴】3期間売り推奨銘柄（計 {len(all_candidates)} 銘柄: {', '.join(all_candidates) if all_candidates else 'なし'}）"
-            f"のショート個別最適化（144通り: 単発1本固定・ナンピン完全なし）を開始します..."
+            f"のショートPure個別最適化（72通り: 単発1本固定・ナンピン完全なし）を開始します..."
         )
     else:
         # NEUTRAL (中立): 新規エントリー完全停止 ＆ 最適化スキップ (ノーポジ待機)
@@ -1692,8 +1692,8 @@ async def run_screening_and_optimization(mode: str, send_charts: bool = False, s
 
     # 選定銘柄の個別最適化パラメータをDiscordログ表示
     if selected_symbols:
-        side_strat_label = "ショート4大基本戦略 (VAH_POC / RSIMA_SHORT)" if trade_side == "short" else "ロング4大基本戦略 (VAL_POC / RSIMA)"
-        discord.print_log(f"\n★ 【合格銘柄 個別最適化パラメータ一覧 ({side_strat_label} 144通り検証)】")
+        side_strat_label = "ショートPure2大戦略 (VAH_POC / RSIMA_SHORT)" if trade_side == "short" else "ロングPure2大戦略 (VAL_POC / RSIMA)"
+        discord.print_log(f"\n★ 【合格銘柄 個別最適化パラメータ一覧 ({side_strat_label} 72通り検証)】")
         for sym in selected_symbols:
             p = symbol_params_map.get(sym, default_best_params)
             pnl_val = p.get('pnl', 0.0)
