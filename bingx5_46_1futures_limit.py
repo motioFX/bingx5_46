@@ -126,7 +126,8 @@ MAX_ACTIVE_POSITIONS: int = 2  # 最大同時保有ポジション数 (資金効
 MAX_SELECTED_SYMBOLS: int = 20  # 最大選定・監視銘柄数 (Hyperliquid完全統一: バックテスト合格全銘柄を同時監視)
 
 # [ 4 ] ナンピン数設定 (初期1回 + ナンピン最大2回 = 最大3枠厳守)
-MAX_TRADES_COUNT: int = 3
+# [ 4 ] ナンピン完全撤廃・全戦略単発1本固定 (PROJECT_RULES.md 準拠: max_trades=1)
+MAX_TRADES_COUNT: int = 1
 
 # [ 5 ] 固定選定銘柄 (主要アルトコイン20銘柄 / Hyperliquid hype5_45 完全統一)
 FIXED_SYMBOLS: List[str] = [
@@ -1705,8 +1706,8 @@ async def run_screening_and_optimization(mode: str, send_charts: bool = False, s
             strat = p.get('strategy', 'rsima').upper()
             inv_val = int(p.get('interval', 5))
             is_short_strat = ("SHORT" in strat or strat.startswith("VAH_POC") or strat == "VAL_BREAK" or trade_side == "short")
-            is_single_fixed = is_short_strat or strat in ("VAH_BREAK", "VAL_BREAK")
-            max_trades_label = "単発1本固定/ナンピンなし" if is_single_fixed else f"最大{MAX_TRADES_COUNT}枠/1x均等"
+            is_single_fixed = True
+            max_trades_label = "単発1本固定/ナンピンなし"
             
             if strat in ("VAH_BREAK", "VAL_BREAK"):
                 mp_v = p.get('mp', 200)
@@ -2767,6 +2768,9 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                     await flatten_current_position_bingx(sym, "USDT", mode, exit_reason, force_market=True)
                     closed = True
                 elif pos_action == "ADD_ENTRY" and not is_short_pos:
+                    # 全戦略単発1本固定 (ナンピン完全停止)
+                    if MAX_TRADES_COUNT <= 1:
+                        pass
                     # ナンピンはロングのみ許可 (ショートは単発固定)
                     if pos_emergency_be:
                         pass

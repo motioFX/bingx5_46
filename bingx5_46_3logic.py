@@ -31,6 +31,14 @@ from bingx5_46_5backtest_mm import make_mm_pl, Backtest, AirExchange
 from config_loader import get_webhook_url
 
 
+def _touch_bot_heartbeat():
+    try:
+        from pathlib import Path
+        Path("bot_heartbeat.tmp").touch()
+    except Exception:
+        pass
+
+
 def calc_add_pct(n: int, strategy: str = "val_poc") -> float:
     """Return add-on percentage based on position count.
     VAL_POC: 3.0% (BingX実証最適値: 浅いノイズでの建玉肥大化を防ぎ損失リスク半減)
@@ -2147,13 +2155,15 @@ def simulate_vah_break_fast(
     maker_fee: float = 0.0002,
     record_chart: bool = False
 ) -> Dict[str, Any]:
-    """VAH_BREAK 高速ロングブレイクアウトシミュレータ (VAH上抜け順張り・単発1本固定・POC逆戻り否定SL・動的ストップ・4時間タイムアウト)"""
+    """VAH_BREAK 高速ロングブレイクアウトシミュレータ (VAH上抜け順張り・単発1本固定・POC直上防衛SL・RR 1:2目標・4時間タイムアウト)"""
     n = len(closes)
     half_idx = n // 2
-    trade_size = initial_equity  # ブレイクアウトは高値掴みナンピン防止のため単発100%フルサイズ固定
+    trade_size = initial_equity
     pos_qty = 0.0
     pos_cost = 0.0
     avg_price = 0.0
+    entry_sl_px = 0.0
+    target_tp = 0.0
     pos_count = 0
     entry_bar_idx = -1
     cooldown_until = -1
@@ -2185,7 +2195,7 @@ def simulate_vah_break_fast(
         vah = vahs[i]
         poc = pocs[i]
 
-        # 0. ロング指値約定チェック (安値が指値以下で買い約定)
+        # 0. ロング指値約定チェック
         if pending_limit > 0:
             if l <= pending_limit:
                 px = pending_limit
@@ -2196,26 +2206,37 @@ def simulate_vah_break_fast(
                 avg_price = pos_cost / pos_qty
                 pos_count = 1
                 entry_bar_idx = i
+                # POC直上防衛SL (max(VAH - VA幅*0.35, POC*1.001)) ＆ RR 1:2 完全保証設計
+                va_diff_e = (vah - val) if (not np.isnan(val) and not np.isnan(vah) and vah > val) else 0.0
+                raw_sl = vah - va_diff_e * 0.35 if va_diff_e > 0 else avg_price * 0.985
+                poc_floor = poc * 1.001 if (not np.isnan(poc) and poc > 0 and poc < avg_price) else raw_sl
+                calc_sl = max(raw_sl, poc_floor)
+                sl_dist = max(avg_price * 0.004, avg_price - calc_sl)
+                entry_sl_px = avg_price - sl_dist
+                target_tp = avg_price + sl_dist * 2.0
                 if record_chart and exec_buy is not None:
                     exec_buy[i] = px
             pending_limit = -1.0
 
         # 1. ロング決済チェック
         if pos_qty > 0:
-            va_diff = (vah - val) if (not np.isnan(val) and not np.isnan(vah) and vah > val) else 0.0
-            va_ext = va_diff * target_ratio if va_diff > 0 else (avg_price * 0.015)
-
-            # 損切り: (A) 動的ストップ割れ, (B) 確定終値がPOC未満へ逆戻り(ブレイク失敗否定かつ含み損), (C) 4時間タイムアウト
             is_sl = False
-            if sl_pct > 0 and c <= avg_price * (1.0 - sl_pct):
+            sl_exec_px = c
+            if entry_sl_px > 0 and c <= entry_sl_px:
                 is_sl = True
+                sl_exec_px = min(c, entry_sl_px)
+            elif sl_pct > 0 and c <= avg_price * (1.0 - sl_pct):
+                is_sl = True
+                sl_exec_px = c
             elif not np.isnan(poc) and poc > 0 and c < poc and c < avg_price * 0.9960:
                 is_sl = True
+                sl_exec_px = c
             elif entry_bar_idx > 0 and (i - entry_bar_idx) >= timeout_bars and c < avg_price:
                 is_sl = True
+                sl_exec_px = c
 
             if is_sl:
-                sell_val = pos_qty * c
+                sell_val = pos_qty * sl_exec_px
                 fee = sell_val * fee_rate
                 pnl = sell_val - pos_cost - fee
                 cum_pnl += pnl
@@ -2228,16 +2249,17 @@ def simulate_vah_break_fast(
                     trades_recent_7d += 1
                 trades.append(pnl)
                 if record_chart and exec_sell is not None:
-                    exec_sell[i] = c
+                    exec_sell[i] = sl_exec_px
                 pos_qty = 0.0
                 pos_cost = 0.0
                 avg_price = 0.0
+                entry_sl_px = 0.0
+                target_tp = 0.0
                 pos_count = 0
                 entry_bar_idx = -1
                 cooldown_until = i + cooldown_bars
             else:
-                # ロングブレイク利確: VAH + (VAH - VAL) * target_ratio 到達かつ建値+0.40%以上利益
-                target_tp = vah + va_ext if (not np.isnan(vah) and vah > 0) else avg_price * 1.015
+                # ロングブレイク利確: RR 1:2 到達かつ建値+0.40%以上利益
                 if (h >= target_tp or c >= target_tp) and target_tp > 0:
                     exit_px = max(c, target_tp) if h >= target_tp else c
                     if exit_px >= avg_price * 1.0040:
@@ -2258,6 +2280,8 @@ def simulate_vah_break_fast(
                         pos_qty = 0.0
                         pos_cost = 0.0
                         avg_price = 0.0
+                        entry_sl_px = 0.0
+                        target_tp = 0.0
                         pos_count = 0
                         entry_bar_idx = -1
 
@@ -2301,11 +2325,10 @@ def simulate_vah_break_fast(
         'DD_max': float(max_dd)
     }
     if record_chart:
-        res_dict['exec_buy_price'] = exec_buy
-        res_dict['exec_sell_price'] = exec_sell
+        res_dict['exec_buy'] = exec_buy
+        res_dict['exec_sell'] = exec_sell
         res_dict['pnl_curve'] = pnl_curve
     return res_dict
-
 
 def simulate_val_break_fast(
     closes: np.ndarray,
@@ -2317,7 +2340,6 @@ def simulate_val_break_fast(
     ma_filter: Optional[np.ndarray] = None,
     initial_equity: float = 100.0,
     max_trades: int = 1,
-    nanpin_drop_pct: float = 0.030,
     sl_pct: float = 0.025,
     target_ratio: float = 0.70,
     cooldown_bars: int = 96,
@@ -2326,14 +2348,15 @@ def simulate_val_break_fast(
     maker_fee: float = 0.0002,
     record_chart: bool = False
 ) -> Dict[str, Any]:
-    """VAL_BREAK 高速ショートブレイクダウンシミュレータ (VAL下抜け順張り・単発1本固定・POC踏み上げ否定SL・動的ストップ・4時間タイムアウト)"""
+    """VAL_BREAK 高速ショートブレイクダウンシミュレータ (VAL下抜け順張り・単発1本固定・POC直下防衛SL・RR 1:2目標・4時間タイムアウト)"""
     n = len(closes)
     half_idx = n // 2
-    trade_size = initial_equity  # ショートはナンピンなし・単発100%フルサイズ固定
+    trade_size = initial_equity
     pos_qty = 0.0
     pos_cost = 0.0
     avg_price = 0.0
     entry_sl_px = 0.0
+    target_tp = 0.0
     pos_count = 0
     entry_bar_idx = -1
     cooldown_until = -1
@@ -2349,12 +2372,12 @@ def simulate_val_break_fast(
     max_dd = 0.0
 
     if record_chart:
-        exec_sell = np.full(n, np.nan)
         exec_buy = np.full(n, np.nan)
+        exec_sell = np.full(n, np.nan)
         pnl_curve = np.full(n, initial_equity, dtype=float)
     else:
-        exec_sell = None
         exec_buy = None
+        exec_sell = None
         pnl_curve = None
 
     for i in range(1, n):
@@ -2365,7 +2388,7 @@ def simulate_val_break_fast(
         vah = vahs[i]
         poc = pocs[i]
 
-        # 0. ショート指値約定チェック (高値が指値以上で売り約定)
+        # 0. ショート指値約定チェック
         if pending_limit > 0:
             if h >= pending_limit:
                 px = pending_limit
@@ -2375,23 +2398,25 @@ def simulate_val_break_fast(
                 avg_price = px
                 pos_count = 1
                 entry_bar_idx = i
-                rec_h = float(np.max(highs[max(0, i - 10):i + 1]))
-                entry_sl_px = min(max(rec_h, avg_price * 1.0020), avg_price * (1.0 + sl_pct))
+                # POC直下防衛SL (min(VAL + VA幅*0.35, POC*0.999)) ＆ RR 1:2 完全保証設計
+                va_diff_e = (vah - val) if (not np.isnan(val) and not np.isnan(vah) and vah > val) else 0.0
+                raw_sl = val + va_diff_e * 0.35 if va_diff_e > 0 else avg_price * 1.015
+                poc_ceiling = poc * 0.999 if (not np.isnan(poc) and poc > 0 and poc > avg_price) else raw_sl
+                calc_sl = min(raw_sl, poc_ceiling)
+                sl_dist = max(avg_price * 0.004, calc_sl - avg_price)
+                entry_sl_px = avg_price + sl_dist
+                target_tp = max(avg_price * 0.50, avg_price - sl_dist * 2.0)
                 if record_chart and exec_sell is not None:
                     exec_sell[i] = px
             pending_limit = -1.0
 
         # 1. ショート決済チェック
         if pos_qty > 0:
-            va_diff = (vah - val) if (not np.isnan(val) and not np.isnan(vah) and vah > val) else 0.0
-            va_ext = va_diff * target_ratio if va_diff > 0 else (avg_price * 0.015)
-
-            # 損切り: (A) 直近高値SL上抜け, (B) POC超への踏み上げ回帰(ブレイク失敗否定かつ含み損), (C) +3.0%急騰ガード, (D) タイムアウト
             is_sl = False
             sl_exec_px = c
-            if entry_sl_px > 0 and c > entry_sl_px:
+            if entry_sl_px > 0 and c >= entry_sl_px:
                 is_sl = True
-                sl_exec_px = c
+                sl_exec_px = max(c, entry_sl_px)
             elif not np.isnan(poc) and poc > 0 and c > poc and c > avg_price * 1.0040:
                 is_sl = True
                 sl_exec_px = c
@@ -2422,12 +2447,12 @@ def simulate_val_break_fast(
                 pos_cost = 0.0
                 avg_price = 0.0
                 entry_sl_px = 0.0
+                target_tp = 0.0
                 pos_count = 0
                 entry_bar_idx = -1
                 cooldown_until = i + cooldown_bars
             else:
-                # ショートブレイク利確: VAL - (VAH - VAL) * target_ratio 到達かつ建値-0.40%以下利益
-                target_tp = val - va_ext if (not np.isnan(val) and val > 0) else avg_price * 0.985
+                # ショートブレイク利確: RR 1:2 到達
                 if (l <= target_tp or c <= target_tp) and target_tp > 0:
                     exit_px = min(c, target_tp) if l <= target_tp else c
                     if exit_px <= avg_price * 0.9960:
@@ -2450,22 +2475,12 @@ def simulate_val_break_fast(
                         pos_cost = 0.0
                         avg_price = 0.0
                         entry_sl_px = 0.0
+                        target_tp = 0.0
                         pos_count = 0
                         entry_bar_idx = -1
 
-        # 2. ショート新規ブレイクダウンエントリー判定 (単発1本固定・ナンピンなし)
-        if pending_limit < 0:
-            if pos_count == 0 and i >= cooldown_until:
-                if not np.isnan(val) and not np.isnan(vals[i-1]) and not np.isnan(vah):
-                    va_diff_e = max(0.0, vah - val)
-                    val_breakdown = (closes[i-1] >= vals[i-1]) and (c < val)
-                    not_overextended = (c >= val - va_diff_e * 0.35) if va_diff_e > 0 else True
-                    va_width = va_diff_e / val if val > 0 else 0.0
-                    if val_breakdown and not_overextended and (va_width >= 0.015) and (ma_filter is None or ma_filter[i]):
-                        pending_limit = c * 1.0002  # Best Ask 相当の指値待機
-
         if pos_qty > 0:
-            unrealized = pos_cost - pos_qty * c
+            unrealized = pos_cost - (pos_qty * c)
             cur_eq = initial_equity + cum_pnl + unrealized
             if cur_eq > peak_eq:
                 peak_eq = cur_eq
@@ -2493,21 +2508,10 @@ def simulate_val_break_fast(
         'DD_max': float(max_dd)
     }
     if record_chart:
-        res_dict['exec_buy_price'] = exec_buy
-        res_dict['exec_sell_price'] = exec_sell
+        res_dict['exec_buy'] = exec_buy
+        res_dict['exec_sell'] = exec_sell
         res_dict['pnl_curve'] = pnl_curve
     return res_dict
-
-
-def _touch_bot_heartbeat():
-    """最適化ループ中も死活監視 (check_and_restart.sh) がハングアップと誤認しないようハートビートを更新"""
-    try:
-        hb_path = os.path.join("Data", "bot_heartbeat.json")
-        if os.path.exists(hb_path):
-            os.utime(hb_path, None)
-    except Exception:
-        pass
-
 
 def optimize_rsima3_fast(
     closes: np.ndarray,
@@ -3492,7 +3496,7 @@ def _run_interval_comparison_short(df_5m: pd.DataFrame, lot: float = 1.0, data_e
     discord.print_log(f"\n====== 🐻 [{symbol}] ショートPure3大基本戦略体系 (単発1本固定 / 計108通り) 低負荷ジェントル最適化 (5m足 {len(df_5m)}本 [30日分] / 最低取引{MIN_TRADES}回以上) ======")
 
     # 1. VAH_POC (レンジ回帰) & VAL_BREAK (下方ブレイクアウト) 最適化 (4足種 × MP 9種 × 2戦略 ＝ 72通り)
-    intervals = [5, 15, 30, 60] if not is_1h else [60]
+    intervals = [5, 15] if not is_1h else [60]  # 東京レンジ(5m/15m) & ロンドンブレイク(5m) 専用
     mp_periods = [100, 150, 200, 250, 300, 350, 400, 450, 500] if not is_1h else [24, 48, 72, 96]
     bins_fixed = 50
     va_pct_fixed = 0.70
@@ -3602,61 +3606,62 @@ def _run_interval_comparison_short(df_5m: pd.DataFrame, lot: float = 1.0, data_e
                     fallback_vp_none_pnl = vp_pnl
                     fallback_vp_none_cfg = cand_none
 
-                # --- [B] VAL_BREAK (下方ブレイクアウト / 単発1本固定 / EMAなし) ---
-                sim_vb = simulate_val_break_fast(
-                    c_inv, h_inv, l_inv, val_arr, vah_arr, pocs, ma_filter_vb,
-                    initial_equity=fixed_initial_equity, max_trades=1, cooldown_bars=cd_bars, timeout_bars=to_bars, target_ratio=tr
-                )
-                vp_eval_count += 1
-                lbl_vb = f"VAL_BREAK_{inv}m_MP{mp}_B{bins_fixed}_VA{va_name_fixed}_TR{int(tr*100)}_NoEMA"
-                results[lbl_vb] = {
-                    'strategy_type': 'val_break', 'df': pd.DataFrame(), 'final_pnl': fixed_initial_equity + sim_vb['final_pnl'],
-                    'interval': inv, 'mp_period': mp, 'num_bins': bins_fixed, 'value_area_pct': va_pct_fixed,
-                    'target_ratio': tr,
-                    'ma_type': 'NONE', 'ma_condition': 'none', 'atr_multi': 0.0, 'sl_center_margin': 9.0,
-                    'DD_max': sim_vb['DD_max'], 'win_rate': sim_vb['win_rate'], 'trade_count': sim_vb['trade_count'],
-                    'single_pnl': sim_vb['final_pnl'], 'single_trades': sim_vb['trade_count'], 'single_win_rate': sim_vb['win_rate']
-                }
-                cand_vb = {
-                    'strategy': 'val_break', 'interval': inv, 'mp_period': mp, 'num_bins': bins_fixed, 'va': va_name_fixed,
-                    'value_area_pct': va_pct_fixed, 'target_ratio': tr, 'ma_type': 'NONE', 'condition': 'none',
-                    'pnl': sim_vb['final_pnl'], 'pnl_first_half': sim_vb.get('pnl_first_half', 0.0), 'pnl_second_half': sim_vb.get('pnl_second_half', 0.0),
-                    'pnl_recent_7d': sim_vb.get('pnl_recent_7d', 0.0), 'trades_recent_7d': sim_vb.get('trades_recent_7d', 0),
-                    'trade_count': sim_vb['trade_count'],
-                    'win_rate': sim_vb['win_rate'], 'DD_max': sim_vb['DD_max'],
-                    'single_pnl': sim_vb['final_pnl'], 'single_trades': sim_vb['trade_count'], 'single_win_rate': sim_vb['win_rate']
-                }
-                vb_cnt = sim_vb['trade_count']
-                vb_pnl = sim_vb['final_pnl']
-                vb_p1st = sim_vb.get('pnl_first_half', 0.0)
-                vb_p2nd = sim_vb.get('pnl_second_half', 0.0)
-                vb_p7d = sim_vb.get('pnl_recent_7d', 0.0)
-                vb_c7d = sim_vb.get('trades_recent_7d', 0)
-                is_vb_tier1 = (vb_cnt >= MIN_TRADES and vb_p1st > 0.0 and vb_p2nd > vb_p1st and vb_p7d > 0.0 and vb_c7d >= 1)
-                is_vb_tier2 = (vb_cnt >= MIN_TRADES and vb_p1st > 0.0 and vb_p2nd > vb_p1st)
-                if is_vb_tier1:
-                    vb_score = 1000.0 + vb_p2nd * 1.0 + vb_p7d * 1.0 + vb_pnl * 0.2
-                elif is_vb_tier2:
-                    vb_score = 500.0 + vb_p2nd + vb_pnl * 0.1
-                elif vb_cnt >= 5 and vb_pnl > 0.0:
-                    vb_score = vb_pnl
-                else:
-                    vb_score = -1000.0 + vb_pnl
-
-                if vb_score > best_vb_none_pnl:
-                    best_vb_none_pnl = vb_score
-                    best_vb_none_cfg = cand_vb
-                if vb_cnt >= 5 and vb_pnl > fallback_vb_none_pnl:
-                    fallback_vb_none_pnl = vb_pnl
-                    fallback_vb_none_cfg = cand_vb
-
-        print(f"   [{symbol}] ショートVP系 (VAH_POC/VAL_BREAK) {inv}m足 ({len(df_inv)}本) 検証完了 (累計 {vp_eval_count} パターン評価済)", flush=True)
-        time.sleep(0.01)
-
-    if best_vp_none_cfg is None:
-        best_vp_none_cfg = fallback_vp_none_cfg
-    if best_vb_none_cfg is None:
-        best_vb_none_cfg = fallback_vb_none_cfg
+                                # --- [B] VAL_BREAK (下方ブレイクアウト / 単発1本固定 / ロンドン5m専用) ---
+                if inv == 5 or is_1h:
+                    sim_vb = simulate_val_break_fast(
+                        c_inv, h_inv, l_inv, val_arr, vah_arr, pocs, ma_filter_vb,
+                        initial_equity=fixed_initial_equity, max_trades=1, cooldown_bars=cd_bars, timeout_bars=to_bars, target_ratio=tr
+                    )
+                    vp_eval_count += 1
+                    lbl_vb = f"VAL_BREAK_{inv}m_MP{mp}_B{bins_fixed}_VA{va_name_fixed}_TR{int(tr*100)}_NoEMA"
+                    results[lbl_vb] = {
+                        'strategy_type': 'val_break', 'df': pd.DataFrame(), 'final_pnl': fixed_initial_equity + sim_vb['final_pnl'],
+                        'interval': inv, 'mp_period': mp, 'num_bins': bins_fixed, 'value_area_pct': va_pct_fixed,
+                        'target_ratio': tr,
+                        'ma_type': 'NONE', 'ma_condition': 'none', 'atr_multi': 0.0, 'sl_center_margin': 9.0,
+                        'DD_max': sim_vb['DD_max'], 'win_rate': sim_vb['win_rate'], 'trade_count': sim_vb['trade_count'],
+                        'single_pnl': sim_vb['final_pnl'], 'single_trades': sim_vb['trade_count'], 'single_win_rate': sim_vb['win_rate']
+                    }
+                    cand_vb = {
+                        'strategy': 'val_break', 'interval': inv, 'mp_period': mp, 'num_bins': bins_fixed, 'va': va_name_fixed,
+                        'value_area_pct': va_pct_fixed, 'target_ratio': tr, 'ma_type': 'NONE', 'condition': 'none',
+                        'pnl': sim_vb['final_pnl'], 'pnl_first_half': sim_vb.get('pnl_first_half', 0.0), 'pnl_second_half': sim_vb.get('pnl_second_half', 0.0),
+                        'pnl_recent_7d': sim_vb.get('pnl_recent_7d', 0.0), 'trades_recent_7d': sim_vb.get('trades_recent_7d', 0),
+                        'trade_count': sim_vb['trade_count'],
+                        'win_rate': sim_vb['win_rate'], 'DD_max': sim_vb['DD_max'],
+                        'single_pnl': sim_vb['final_pnl'], 'single_trades': sim_vb['trade_count'], 'single_win_rate': sim_vb['win_rate']
+                    }
+                    vb_cnt = sim_vb['trade_count']
+                    vb_pnl = sim_vb['final_pnl']
+                    vb_p1st = sim_vb.get('pnl_first_half', 0.0)
+                    vb_p2nd = sim_vb.get('pnl_second_half', 0.0)
+                    vb_p7d = sim_vb.get('pnl_recent_7d', 0.0)
+                    vb_c7d = sim_vb.get('trades_recent_7d', 0)
+                    is_vb_tier1 = (vb_cnt >= MIN_TRADES and vb_p1st > 0.0 and vb_p2nd > vb_p1st and vb_p7d > 0.0 and vb_c7d >= 1)
+                    is_vb_tier2 = (vb_cnt >= MIN_TRADES and vb_p1st > 0.0 and vb_p2nd > vb_p1st)
+                    if is_vb_tier1:
+                        vb_score = 1000.0 + vb_p2nd * 1.0 + vb_p7d * 1.0 + vb_pnl * 0.2
+                    elif is_vb_tier2:
+                        vb_score = 500.0 + vb_p2nd + vb_pnl * 0.1
+                    elif vb_cnt >= 5 and vb_pnl > 0.0:
+                        vb_score = vb_pnl
+                    else:
+                        vb_score = -1000.0 + vb_pnl
+    
+                    if vb_score > best_vb_none_pnl:
+                        best_vb_none_pnl = vb_score
+                        best_vb_none_cfg = cand_vb
+                    if vb_cnt >= 5 and vb_pnl > fallback_vb_none_pnl:
+                        fallback_vb_none_pnl = vb_pnl
+                        fallback_vb_none_cfg = cand_vb
+    
+            print(f"   [{symbol}] ショートVP系 (VAH_POC/VAL_BREAK) {inv}m足 ({len(df_inv)}本) 検証完了 (累計 {vp_eval_count} パターン評価済)", flush=True)
+            time.sleep(0.01)
+    
+        if best_vp_none_cfg is None:
+            best_vp_none_cfg = fallback_vp_none_cfg
+        if best_vb_none_cfg is None:
+            best_vb_none_cfg = fallback_vb_none_cfg
 
     # 2. RSIMA_SHORT 最適化 (4足種 × 9 パラメータ ＝ 36通り)
     best_rsi_none_pnl = -float('inf')
@@ -3996,7 +4001,7 @@ def run_interval_comparison(df_5m: pd.DataFrame, lot: float = 1.0, data_equity: 
     # ==============================================================================
     # 1. VAL_POC (レンジ回帰) & VAH_BREAK (上方ブレイクアウト) 最適化 (4足種 × MP 9種 × 2戦略 ＝ 72通り)
     # ==============================================================================
-    intervals = [5, 15, 30, 60] if not is_1h else [60]
+    intervals = [5, 15] if not is_1h else [60]  # 東京レンジ(5m/15m) & ロンドンブレイク(5m) 専用
     mp_periods = [100, 150, 200, 250, 300, 350, 400, 450, 500] if not is_1h else [24, 48, 72, 96]
     bins_fixed = 50
     va_pct_fixed = 0.70
@@ -4059,27 +4064,15 @@ def run_interval_comparison(df_5m: pd.DataFrame, lot: float = 1.0, data_equity: 
             vah_arr = mp_res['vah_70']
 
             for tr in target_ratios:
-                # --- [A] VAL_POC (レンジ回帰 / EMAなし) シミュレーション ---
-                sim_single_none = simulate_val_poc_fast(
+                # --- [A] VAL_POC (レンジ回帰 / EMAなし / 単発1本固定) シミュレーション ---
+                sim_none = simulate_val_poc_fast(
                     c_inv, h_inv, l_inv, val_arr, vah_arr, pocs, ma_filter_none,
                     initial_equity=fixed_initial_equity, max_trades=1, cooldown_bars=cd_bars, timeout_bars=to_bars, target_ratio=tr
                 )
                 vp_eval_count += 1
-                is_single_none_qual = (
-                    sim_single_none['trade_count'] >= MIN_TRADES
-                    and sim_single_none.get('pnl_first_half', 0.0) > 0.0
-                    and sim_single_none.get('pnl_second_half', 0.0) > sim_single_none.get('pnl_first_half', 0.0)
-                )
-                if is_single_none_qual:
-                    sim_none = simulate_val_poc_fast(
-                        c_inv, h_inv, l_inv, val_arr, vah_arr, pocs, ma_filter_none,
-                        initial_equity=fixed_initial_equity, max_trades=3, cooldown_bars=cd_bars, timeout_bars=to_bars, target_ratio=tr
-                    )
-                else:
-                    sim_none = sim_single_none
-                sim_none['single_pnl'] = sim_single_none['final_pnl']
-                sim_none['single_trades'] = sim_single_none['trade_count']
-                sim_none['single_win_rate'] = sim_single_none['win_rate']
+                sim_none['single_pnl'] = sim_none['final_pnl']
+                sim_none['single_trades'] = sim_none['trade_count']
+                sim_none['single_win_rate'] = sim_none['win_rate']
 
                 lbl_none = f"VAL_POC_{inv}m_MP{mp}_B{bins_fixed}_VA{va_name_fixed}_TR{int(tr*100)}_NoEMA"
                 results[lbl_none] = {
@@ -4123,53 +4116,54 @@ def run_interval_comparison(df_5m: pd.DataFrame, lot: float = 1.0, data_equity: 
                     fallback_vp_none_pnl = vp_pnl
                     fallback_vp_none_cfg = cand_none
 
-                # --- [B] VAH_BREAK (上方ブレイクアウト / 単発1本固定 / EMAなし) ---
-                sim_vb = simulate_vah_break_fast(
-                    c_inv, h_inv, l_inv, val_arr, vah_arr, pocs, ma_filter_vb,
-                    initial_equity=fixed_initial_equity, max_trades=1, cooldown_bars=cd_bars, timeout_bars=to_bars, target_ratio=tr
-                )
-                vp_eval_count += 1
-                lbl_vb = f"VAH_BREAK_{inv}m_MP{mp}_B{bins_fixed}_VA{va_name_fixed}_TR{int(tr*100)}_NoEMA"
-                results[lbl_vb] = {
-                    'strategy_type': 'vah_break', 'df': pd.DataFrame(), 'final_pnl': fixed_initial_equity + sim_vb['final_pnl'],
-                    'interval': inv, 'mp_period': mp, 'num_bins': bins_fixed, 'value_area_pct': va_pct_fixed,
-                    'target_ratio': tr,
-                    'ma_type': 'NONE', 'ma_condition': 'none', 'atr_multi': 0.0, 'sl_center_margin': 9.0,
-                    'DD_max': sim_vb['DD_max'], 'win_rate': sim_vb['win_rate'], 'trade_count': sim_vb['trade_count'],
-                    'single_pnl': sim_vb['final_pnl'], 'single_trades': sim_vb['trade_count'], 'single_win_rate': sim_vb['win_rate']
-                }
-                cand_vb = {
-                    'strategy': 'vah_break', 'interval': inv, 'mp_period': mp, 'num_bins': bins_fixed, 'va': va_name_fixed,
-                    'value_area_pct': va_pct_fixed, 'target_ratio': tr, 'ma_type': 'NONE', 'condition': 'none',
-                    'pnl': sim_vb['final_pnl'], 'pnl_first_half': sim_vb.get('pnl_first_half', 0.0), 'pnl_second_half': sim_vb.get('pnl_second_half', 0.0),
-                    'pnl_recent_7d': sim_vb.get('pnl_recent_7d', 0.0), 'trades_recent_7d': sim_vb.get('trades_recent_7d', 0),
-                    'trade_count': sim_vb['trade_count'],
-                    'win_rate': sim_vb['win_rate'], 'DD_max': sim_vb['DD_max'],
-                    'single_pnl': sim_vb['final_pnl'], 'single_trades': sim_vb['trade_count'], 'single_win_rate': sim_vb['win_rate']
-                }
-                vb_cnt = sim_vb['trade_count']
-                vb_pnl = sim_vb['final_pnl']
-                vb_p1st = sim_vb.get('pnl_first_half', 0.0)
-                vb_p2nd = sim_vb.get('pnl_second_half', 0.0)
-                vb_p7d = sim_vb.get('pnl_recent_7d', 0.0)
-                vb_c7d = sim_vb.get('trades_recent_7d', 0)
-                is_vb_tier1 = (vb_cnt >= MIN_TRADES and vb_p1st > 0.0 and vb_p2nd > vb_p1st and vb_p7d > 0.0 and vb_c7d >= 1)
-                is_vb_tier2 = (vb_cnt >= MIN_TRADES and vb_p1st > 0.0 and vb_p2nd > vb_p1st)
-                if is_vb_tier1:
-                    vb_score = 1000.0 + vb_p2nd * 1.0 + vb_p7d * 1.0 + vb_pnl * 0.2
-                elif is_vb_tier2:
-                    vb_score = 500.0 + vb_p2nd + vb_pnl * 0.1
-                elif vb_cnt >= 5 and vb_pnl > 0.0:
-                    vb_score = vb_pnl
-                else:
-                    vb_score = -1000.0 + vb_pnl
-
-                if vb_score > best_vb_none_pnl:
-                    best_vb_none_pnl = vb_score
-                    best_vb_none_cfg = cand_vb
-                if vb_cnt >= 5 and vb_pnl > fallback_vb_none_pnl:
-                    fallback_vb_none_pnl = vb_pnl
-                    fallback_vb_none_cfg = cand_vb
+                                # --- [B] VAH_BREAK (上方ブレイクアウト / 単発1本固定 / ロンドン5m専用) ---
+                if inv == 5 or is_1h:
+                    sim_vb = simulate_vah_break_fast(
+                        c_inv, h_inv, l_inv, val_arr, vah_arr, pocs, ma_filter_vb,
+                        initial_equity=fixed_initial_equity, max_trades=1, cooldown_bars=cd_bars, timeout_bars=to_bars, target_ratio=tr
+                    )
+                    vp_eval_count += 1
+                    lbl_vb = f"VAH_BREAK_{inv}m_MP{mp}_B{bins_fixed}_VA{va_name_fixed}_TR{int(tr*100)}_NoEMA"
+                    results[lbl_vb] = {
+                        'strategy_type': 'vah_break', 'df': pd.DataFrame(), 'final_pnl': fixed_initial_equity + sim_vb['final_pnl'],
+                        'interval': inv, 'mp_period': mp, 'num_bins': bins_fixed, 'value_area_pct': va_pct_fixed,
+                        'target_ratio': tr,
+                        'ma_type': 'NONE', 'ma_condition': 'none', 'atr_multi': 0.0, 'sl_center_margin': 9.0,
+                        'DD_max': sim_vb['DD_max'], 'win_rate': sim_vb['win_rate'], 'trade_count': sim_vb['trade_count'],
+                        'single_pnl': sim_vb['final_pnl'], 'single_trades': sim_vb['trade_count'], 'single_win_rate': sim_vb['win_rate']
+                    }
+                    cand_vb = {
+                        'strategy': 'vah_break', 'interval': inv, 'mp_period': mp, 'num_bins': bins_fixed, 'va': va_name_fixed,
+                        'value_area_pct': va_pct_fixed, 'target_ratio': tr, 'ma_type': 'NONE', 'condition': 'none',
+                        'pnl': sim_vb['final_pnl'], 'pnl_first_half': sim_vb.get('pnl_first_half', 0.0), 'pnl_second_half': sim_vb.get('pnl_second_half', 0.0),
+                        'pnl_recent_7d': sim_vb.get('pnl_recent_7d', 0.0), 'trades_recent_7d': sim_vb.get('trades_recent_7d', 0),
+                        'trade_count': sim_vb['trade_count'],
+                        'win_rate': sim_vb['win_rate'], 'DD_max': sim_vb['DD_max'],
+                        'single_pnl': sim_vb['final_pnl'], 'single_trades': sim_vb['trade_count'], 'single_win_rate': sim_vb['win_rate']
+                    }
+                    vb_cnt = sim_vb['trade_count']
+                    vb_pnl = sim_vb['final_pnl']
+                    vb_p1st = sim_vb.get('pnl_first_half', 0.0)
+                    vb_p2nd = sim_vb.get('pnl_second_half', 0.0)
+                    vb_p7d = sim_vb.get('pnl_recent_7d', 0.0)
+                    vb_c7d = sim_vb.get('trades_recent_7d', 0)
+                    is_vb_tier1 = (vb_cnt >= MIN_TRADES and vb_p1st > 0.0 and vb_p2nd > vb_p1st and vb_p7d > 0.0 and vb_c7d >= 1)
+                    is_vb_tier2 = (vb_cnt >= MIN_TRADES and vb_p1st > 0.0 and vb_p2nd > vb_p1st)
+                    if is_vb_tier1:
+                        vb_score = 1000.0 + vb_p2nd * 1.0 + vb_p7d * 1.0 + vb_pnl * 0.2
+                    elif is_vb_tier2:
+                        vb_score = 500.0 + vb_p2nd + vb_pnl * 0.1
+                    elif vb_cnt >= 5 and vb_pnl > 0.0:
+                        vb_score = vb_pnl
+                    else:
+                        vb_score = -1000.0 + vb_pnl
+    
+                    if vb_score > best_vb_none_pnl:
+                        best_vb_none_pnl = vb_score
+                        best_vb_none_cfg = cand_vb
+                    if vb_cnt >= 5 and vb_pnl > fallback_vb_none_pnl:
+                        fallback_vb_none_pnl = vb_pnl
+                        fallback_vb_none_cfg = cand_vb
 
         print(f"   [{symbol}] ロングVP系 (VAL_POC/VAH_BREAK) {inv}m足 ({len(df_inv)}本) 検証完了 (累計 {vp_eval_count} パターン評価済)", flush=True)
         time.sleep(0.01)
@@ -4222,29 +4216,15 @@ def run_interval_comparison(df_5m: pd.DataFrame, lot: float = 1.0, data_equity: 
         # --- [A] RSIMA (EMAなし) ---
         cd_bars_r = max(10, 1440 // r_inv) if not is_1h else 24
         to_bars_r = max(2, 240 // r_inv) if not is_1h else 4
-        res_r_none_single = optimize_rsima3_fast(
+        res_r_none = optimize_rsima3_fast(
             c_r, h_r, l_r, r_rsi.values, r_rsi_ma.values,
             initial_equity=fixed_initial_equity, max_trades=1, min_trades=MIN_TRADES,
             val_arr=val_arr_r, vah_arr=vah_arr_r, ma_filter=ma_filter_r_none,
             cooldown_bars=cd_bars_r, timeout_bars=to_bars_r
         )
-        is_single_r_none_qual = (
-            res_r_none_single['trade_count'] >= MIN_TRADES
-            and res_r_none_single.get('pnl_first_half', 0.0) > 0.0
-            and res_r_none_single.get('pnl_second_half', 0.0) > res_r_none_single.get('pnl_first_half', 0.0)
-        )
-        if is_single_r_none_qual:
-            res_r_none = optimize_rsima3_fast(
-                c_r, h_r, l_r, r_rsi.values, r_rsi_ma.values,
-                initial_equity=fixed_initial_equity, max_trades=3, min_trades=MIN_TRADES,
-                val_arr=val_arr_r, vah_arr=vah_arr_r, ma_filter=ma_filter_r_none,
-                cooldown_bars=cd_bars_r, timeout_bars=to_bars_r
-            )
-        else:
-            res_r_none = res_r_none_single
-        res_r_none['single_pnl'] = res_r_none_single['final_pnl']
-        res_r_none['single_trades'] = res_r_none_single['trade_count']
-        res_r_none['single_win_rate'] = res_r_none_single['win_rate']
+        res_r_none['single_pnl'] = res_r_none['final_pnl']
+        res_r_none['single_trades'] = res_r_none['trade_count']
+        res_r_none['single_win_rate'] = res_r_none['win_rate']
 
         rsima_none_key = f"RSIMA_{r_inv}m_EP{int(res_r_none['l_ep'])}_CP{int(res_r_none['l_cp'])}_NoEMA"
         results[rsima_none_key] = {
