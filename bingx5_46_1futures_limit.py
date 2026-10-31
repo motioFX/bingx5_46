@@ -2534,6 +2534,51 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                 # ロング保有中かつ非BUY ➔ 建値+0.20%撤退 / ショート保有中かつ非SELL ➔ 建値-0.20%撤退
                 pos_emergency_be = (overall_regime != "SELL") if is_short_pos else (overall_regime != "BUY")
 
+                # 【時間帯別3大ロール ＆ 米国時間トレーリングストップ判定】
+                # JST時間を算出 (東京: 09:00〜16:00 / 欧州: 16:00〜22:00 / 米国: 22:00〜翌09:00)
+                current_dt_jst = datetime.now(timezone.utc) + timedelta(hours=9)
+                cur_hour_jst = current_dt_jst.hour
+                is_ny_session = (cur_hour_jst >= 22 or cur_hour_jst < 9)
+
+                # 米国時間トレーリングストップ用ピーク価格の更新・保持
+                trail_act_pct = 0.006  # +0.60% でトレール発動
+                trail_dist_pct = 0.004 # ピークから 0.40% 戻しで利確
+                ny_trail_triggered = False
+                ny_trail_reason = ""
+
+                if is_short_pos:
+                    lowest_px = float(scale_state_cur.get("peak_trough_price", entry_px) or entry_px)
+                    if cur_px < lowest_px:
+                        lowest_px = cur_px
+                        scale_state_cur["peak_trough_price"] = lowest_px
+                        scale_in_states[sym] = scale_state_cur
+                        save_scale_in_states(scale_in_states)
+
+                    if is_ny_session and entry_px > 0:
+                        # ショート含み益ピークが +0.60% (lowest <= entry * 0.994) 到達でトレール有効
+                        if lowest_px <= entry_px * (1.0 - trail_act_pct):
+                            trail_stop_px = min(lowest_px * (1.0 + trail_dist_pct), entry_px * 0.9980)
+                            if cur_px >= trail_stop_px:
+                                ny_trail_triggered = True
+                                pnl_pct_trail = (entry_px - cur_px) / entry_px
+                                ny_trail_reason = f"NY_SESSION_TRAILING_STOP: 米国時間トレール利確 (最安値=${lowest_px:.4f}から0.4%戻し到達=${trail_stop_px:.4f}, PnL={pnl_pct_trail:+.2%})"
+                else:
+                    highest_px = float(scale_state_cur.get("peak_trough_price", entry_px) or entry_px)
+                    if cur_px > highest_px:
+                        highest_px = cur_px
+                        scale_state_cur["peak_trough_price"] = highest_px
+                        scale_in_states[sym] = scale_state_cur
+                        save_scale_in_states(scale_in_states)
+
+                    if is_ny_session and entry_px > 0:
+                        # ロング含み益ピークが +0.60% (highest >= entry * 1.006) 到達でトレール有効
+                        if highest_px >= entry_px * (1.0 + trail_act_pct):
+                            trail_stop_px = max(highest_px * (1.0 - trail_dist_pct), entry_px * 1.0020)
+                            if cur_px <= trail_stop_px:
+                                ny_trail_triggered = True
+                                pnl_pct_trail = (cur_px - entry_px) / entry_px
+                                ny_trail_reason = f"NY_SESSION_TRAILING_STOP: 米国時間トレール利確 (最高値=${highest_px:.4f}から0.4%押し到達=${trail_stop_px:.4f}, PnL={pnl_pct_trail:+.2%})"
+
                 # ショートポジションの直近高値(Swing High)復元・自動補完
                 recent_high_val = float(scale_state_cur.get("recent_high", 0.0) or 0.0)
                 if is_short_pos and recent_high_val <= 0.0 and df_eval is not None and not df_eval.empty:
@@ -2683,8 +2728,12 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                             timeout_bars=dyn_to_bars,
                         )
 
-                pos_action = sig_eval.get("action", "HOLD")
-                exit_reason = sig_eval.get("reason", "HOLD")
+                if ny_trail_triggered:
+                    pos_action = "CLOSE_ALL"
+                    exit_reason = ny_trail_reason
+                else:
+                    pos_action = sig_eval.get("action", "HOLD")
+                    exit_reason = sig_eval.get("reason", "HOLD")
                 whale_info = get_whale_sentiment_info(sym)
                 whale_sig = whale_info.get("signal", "NEUTRAL")
 
@@ -2778,6 +2827,28 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
         else:
             # ===== BULL (買い相場: ロング) または BEAR (売り相場: ショート) =====
             is_sell_regime = (overall_regime == "SELL")
+
+            # JST 時間帯ロール制判定
+            now_jst_b3 = datetime.now(timezone.utc) + timedelta(hours=9)
+            hour_jst_b3 = now_jst_b3.hour
+            is_tokyo_b3 = (9 <= hour_jst_b3 < 16)
+            is_london_b3 = (16 <= hour_jst_b3 < 22)
+            is_ny_b3 = not (is_tokyo_b3 or is_london_b3)
+
+            if is_ny_b3:
+                if cycle_count % 20 == 0:
+                    discord.print_log(f"🌙 [米国時間新規停止] 米国セッション(22:00〜翌09:00 JST)のため新規エントリーを完全停止中 (トレール決済・既存ポジション監視のみ)", level="info")
+                if pending_entry_orders:
+                    for p_sym in list(pending_entry_orders.keys()):
+                        p_api = symbol_apis.get(p_sym)
+                        if p_api:
+                            try:
+                                await p_api.active_order_cancel()
+                                discord.print_log(f"🛡️ [米国時間退避] 米国セッション突入に伴い {p_sym} の未約定指値を安全にキャンセルしました。")
+                            except Exception:
+                                pass
+                    pending_entry_orders.clear()
+                continue
             total_active_count = len(active_positions) + len(pending_entry_orders)
 
             for sym in selected_symbols:
@@ -2811,6 +2882,15 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                     sym_params_e = symbol_params_map.get(sym, best_params)
                     cand_interval_e = int(sym_params_e.get("interval", 5) or 5)
                     cand_strat_e = str(sym_params_e.get("strategy", "rsima")).lower()
+
+                    # 時間帯ロール適合性チェック (東京はレンジ逆張りのみ、欧州はブレイクアウトのみ)
+                    is_brk_strat = (cand_strat_e in ("vah_break", "val_break"))
+                    if is_tokyo_b3 and is_brk_strat:
+                        # 東京時間はレンジ逆張りのみ許可 (ブレイクアウトはダマシ回避のため遮断)
+                        continue
+                    if is_london_b3 and not is_brk_strat:
+                        # 欧州時間はブレイクアウトのみ許可 (逆張りはトレンド被弾回避のため遮断)
+                        continue
 
                     df_entry_eval = resample_candles(df_5m, cand_interval_e, drop_unclosed=True) if cand_interval_e > 5 else df_5m.copy()
                     try:
