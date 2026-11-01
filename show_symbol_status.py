@@ -169,21 +169,41 @@ def build_symbols_status_summary(
             category = "SELECTED"
             counts["SELECTED"] += 1
             is_short_strat = ("SHORT" in strat or strat.startswith("VAH_POC") or strat == "VAL_BREAK" or is_sell_mode)
-            dyn_sl = abs(float(opt_info.get("dynamic_mae_stop", opt_info.get("sl_pct", 0.025))))
-            dyn_to = int(opt_info.get("dynamic_timeout_bars", max(3, 240 // max(1, int(interval_val or 5)))))
-            if strat in ("VAH_BREAK", "VAL_BREAK") or strat.startswith("VAL_POC") or strat.startswith("VAH_POC") or strat == "VP_VAL_GC":
-                mp_val = opt_info.get("mp", 200)
-                bins_val = opt_info.get("num_bins", 50)
-                va_pct = int(float(opt_info.get("value_area_pct", 0.70)) * 100)
-                tr_pct = int(float(opt_info.get("target_ratio", 0.70)) * 100)
-                ma_cond = f"{opt_info.get('ma_type', 'EMA' if 'EMA' in strat else 'NONE')}_{opt_info.get('ma_condition', 'close_below' if is_short_strat else 'close_above')}"
-                sl_label = f"直近高値確定足SL(最大{dyn_sl:.2%})" if is_short_strat else f"動的SL={dyn_sl:.2%}"
-                detail_reason = f"戦略={strat} ({interval_val}m / MP={mp_val}, Bins={bins_val}, VA={va_pct}%, TR={tr_pct}%, {ma_cond}, {sl_label}, TO={dyn_to}本)"
+            rng_p = opt_info.get("range_params")
+            brk_p = opt_info.get("breakout_params")
+            if isinstance(rng_p, dict) and isinstance(brk_p, dict) and rng_p and brk_p:
+                is_rq = bool(opt_info.get("is_range_qualified", rng_p.get("is_qualified", False)))
+                is_bq = bool(opt_info.get("is_breakout_qualified", brk_p.get("is_qualified", False)))
+                r_st = str(rng_p.get("strategy", "-")).upper()
+                r_iv = int(rng_p.get("interval", 5) or 5)
+                r_pnl = float(rng_p.get("pnl", 0.0))
+                r_cnt = int(rng_p.get("trade_count", 0))
+                r_mark = "🟢" if is_rq else "⚪"
+                b_st = str(brk_p.get("strategy", "-")).upper()
+                b_iv = int(brk_p.get("interval", 5) or 5)
+                b_pnl = float(brk_p.get("pnl", 0.0))
+                b_cnt = int(brk_p.get("trade_count", 0))
+                b_mark = "🟢" if is_bq else "⚪"
+                detail_reason = (
+                    f"🗼東京:{r_mark}{r_st}({r_iv}m/${r_pnl:+.1f}/{r_cnt}回) | "
+                    f"🏰欧州:{b_mark}{b_st}({b_iv}m/${b_pnl:+.1f}/{b_cnt}回)"
+                )
             else:
-                ep_val = int(float(opt_info.get("s_ep" if is_short_strat else "l_ep", 60 if is_short_strat else 40)))
-                cp_val = int(float(opt_info.get("s_cp" if is_short_strat else "l_cp", 40 if is_short_strat else 60)))
-                sl_label = f"直近高値確定足SL(最大{dyn_sl:.2%})" if is_short_strat else f"動的SL={dyn_sl:.2%}"
-                detail_reason = f"戦略={strat or 'RSIMA'} ({interval_val}m / R9, M7, EP={ep_val}, CP={cp_val}, {sl_label}, TO={dyn_to}本)"
+                dyn_sl = abs(float(opt_info.get("dynamic_mae_stop", opt_info.get("sl_pct", 0.025))))
+                dyn_to = int(opt_info.get("dynamic_timeout_bars", max(3, 240 // max(1, int(interval_val or 5)))))
+                if strat in ("VAH_BREAK", "VAL_BREAK") or strat.startswith("VAL_POC") or strat.startswith("VAH_POC") or strat == "VP_VAL_GC":
+                    mp_val = opt_info.get("mp", 200)
+                    bins_val = opt_info.get("num_bins", 50)
+                    va_pct = int(float(opt_info.get("value_area_pct", 0.70)) * 100)
+                    tr_pct = int(float(opt_info.get("target_ratio", 0.70)) * 100)
+                    ma_cond = f"{opt_info.get('ma_type', 'EMA' if 'EMA' in strat else 'NONE')}_{opt_info.get('ma_condition', 'close_below' if is_short_strat else 'close_above')}"
+                    sl_label = f"直近高値確定足SL(最大{dyn_sl:.2%})" if is_short_strat else f"直近安値確定足SL(最大{dyn_sl:.2%})"
+                    detail_reason = f"戦略={strat} ({interval_val}m / MP={mp_val}, Bins={bins_val}, VA={va_pct}%, TR={tr_pct}%, {ma_cond}, {sl_label}, TO={dyn_to}本)"
+                else:
+                    ep_val = int(float(opt_info.get("s_ep" if is_short_strat else "l_ep", 60 if is_short_strat else 40)))
+                    cp_val = int(float(opt_info.get("s_cp" if is_short_strat else "l_cp", 40 if is_short_strat else 60)))
+                    sl_label = f"直近高値確定足SL(最大{dyn_sl:.2%})" if is_short_strat else f"直近安値確定足SL(最大{dyn_sl:.2%})"
+                    detail_reason = f"戦略={strat or 'RSIMA'} ({interval_val}m / R9, M7, EP={ep_val}, CP={cp_val}, {sl_label}, TO={dyn_to}本)"
             if is_peak_dropped:
                 detail_reason += " [※3期間比較:前半高値警戒]"
         elif not is_sell_mode and whale_sig == "SHORT_ONLY":
@@ -228,7 +248,19 @@ def build_symbols_status_summary(
             badge = "🔴 【個別最適化不合格】"
             category = "OPT_REJECTED"
             counts["OPT_REJECTED"] += 1
-            if pnl is not None:
+            rng_p = opt_info.get("range_params")
+            brk_p = opt_info.get("breakout_params")
+            if isinstance(rng_p, dict) and isinstance(brk_p, dict) and rng_p and brk_p:
+                r_st = str(rng_p.get("strategy", "-")).upper()
+                r_pnl = float(rng_p.get("pnl", 0.0))
+                r_cnt = int(rng_p.get("trade_count", 0))
+                b_st = str(brk_p.get("strategy", "-")).upper()
+                b_pnl = float(brk_p.get("pnl", 0.0))
+                b_cnt = int(brk_p.get("trade_count", 0))
+                detail_reason = (
+                    f"二重頑健性未達 [🗼東京:{r_st}(${r_pnl:+.1f}/{r_cnt}回) | 🏰欧州:{b_st}(${b_pnl:+.1f}/{b_cnt}回)]"
+                )
+            elif pnl is not None:
                 detail_reason = f"個別最適化不合格 (PnL: ${pnl:+.2f}, 取引: {trade_count}回, 二重頑健性未達: 前半黒字かつ後半加速が必要)"
             else:
                 detail_reason = "直近データ不足または二重頑健性基準(10回以上＆前半黒字＆後半加速)未達"

@@ -1087,6 +1087,14 @@ async def validate_profitable_candidates(trade_side: str, mode: str, base_symbol
                 cnt_7d = int(best_params_dict.get("trades_recent_7d", 0))
                 pnl_1st = float(best_params_dict.get("pnl_first_half", 0.0))
                 pnl_2nd = float(best_params_dict.get("pnl_second_half", 0.0))
+
+                rng_params = best_params_dict.get("range_params", {})
+                brk_params = best_params_dict.get("breakout_params", {})
+                is_rng_qual = bool(best_params_dict.get("is_range_qualified", rng_params.get("is_qualified", False)))
+                is_brk_qual = bool(best_params_dict.get("is_breakout_qualified", brk_params.get("is_qualified", False)))
+                rng_q_lvl = str(best_params_dict.get("range_qual_level", rng_params.get("qual_level", "UNQUALIFIED")))
+                brk_q_lvl = str(best_params_dict.get("breakout_qual_level", brk_params.get("qual_level", "UNQUALIFIED")))
+
                 cand_params = {
                     **best_params_dict,
                     "strategy": cand_strat,
@@ -1104,13 +1112,19 @@ async def validate_profitable_candidates(trade_side: str, mode: str, base_symbol
                     "pnl_second_half": pnl_2nd,
                     "pnl_recent_7d": pnl_7d,
                     "trades_recent_7d": cnt_7d,
-                    "is_qualified": bool(best_params_dict.get("is_qualified", False)),
+                    "range_params": rng_params,
+                    "breakout_params": brk_params,
+                    "is_range_qualified": is_rng_qual,
+                    "is_breakout_qualified": is_brk_qual,
+                    "range_qual_level": rng_q_lvl,
+                    "breakout_qual_level": brk_q_lvl,
+                    "is_qualified": bool(is_rng_qual or is_brk_qual or best_params_dict.get("is_qualified", False)),
                     "chart_df": best_params_dict.get("chart_df"),
                     "params": best_params_dict,
                 }
                 symbol_params_map[cand] = cand_params
 
-                # 4大完全必須条件: 前半黒字 & 後半加速(後半>前半) & 直近7日取引1回以上 & 直近7日黒字
+                # 4大完全必須条件 (東京レンジ または 欧州ブレイク のいずれかが合格していれば監視対象に選抜)
                 is_tier1 = bool(
                     trade_cnt >= 10
                     and pnl_1st > 0.0
@@ -1123,27 +1137,46 @@ async def validate_profitable_candidates(trade_side: str, mode: str, base_symbol
                     and pnl_1st > 0.0
                     and pnl_2nd > pnl_1st
                 )
-                is_qual = is_tier1 or is_tier2
+                is_qual = bool(is_rng_qual or is_brk_qual or is_tier1 or is_tier2)
+
+                # デュアル傾向表示文字列の構築
+                rng_st_str = str(rng_params.get("strategy", "-")).upper()
+                rng_iv_str = f"{rng_params.get('interval', 5)}m"
+                rng_pnl_v = float(rng_params.get("pnl", 0.0))
+                rng_tr_v = int(rng_params.get("trade_count", 0))
+                rng_wr_v = float(rng_params.get("win_rate", 0.0))
+                rng_badge = f"🟢合格({rng_q_lvl})" if is_rng_qual else "🔴未達"
+
+                brk_st_str = str(brk_params.get("strategy", "-")).upper()
+                brk_iv_str = f"{brk_params.get('interval', 5)}m"
+                brk_pnl_v = float(brk_params.get("pnl", 0.0))
+                brk_tr_v = int(brk_params.get("trade_count", 0))
+                brk_wr_v = float(brk_params.get("win_rate", 0.0))
+                brk_badge = f"🟢合格({brk_q_lvl})" if is_brk_qual else "🔴未達"
+
+                dual_tendency_str = (
+                    f"🗼東京レンジ[{rng_badge}: {rng_st_str}({rng_iv_str}) ${rng_pnl_v:+.2f}/{rng_tr_v}回/{rng_wr_v:.0f}%] | "
+                    f"🏰欧州ブレイク[{brk_badge}: {brk_st_str}({brk_iv_str}) ${brk_pnl_v:+.2f}/{brk_tr_v}回/{brk_wr_v:.0f}%]"
+                )
+
                 if is_qual:
-                    dyn_sl_disp = cand_params.get("dynamic_mae_stop", -0.025)
-                    if any(k in cand_strat for k in ("val_poc", "vah_poc", "vah_break", "val_break")):
-                        detail_str = f"MP={cand_mp}, Bins={cand_params.get('num_bins', 50)}, VA={int(cand_params.get('value_area_pct', 0.7)*100)}%, TR={int(cand_params.get('target_ratio', 0.7)*100)}%, {cand_params.get('ma_type', 'NONE')}_{cand_params.get('ma_condition', 'none')}, 動的SL={dyn_sl_disp:.2%}"
-                    elif "short" in cand_strat:
-                        detail_str = f"EP={int(cand_params.get('s_ep', 60))}, CP={int(cand_params.get('s_cp', 40))}, 動的SL={dyn_sl_disp:.2%}"
+                    if is_rng_qual and is_brk_qual:
+                        qual_tag = "両刀合格(東京レンジ+欧州ブレイク)"
+                    elif is_rng_qual:
+                        qual_tag = f"東京レンジ専任({rng_q_lvl})"
+                    elif is_brk_qual:
+                        qual_tag = f"欧州ブレイク専任({brk_q_lvl})"
                     else:
-                        detail_str = f"EP={int(cand_params.get('l_ep', 40))}, CP={int(cand_params.get('l_cp', 70))}, 動的SL={dyn_sl_disp:.2%}"
-                    s_pnl = cand_params.get('single_pnl', cand_pnl)
-                    s_cnt = cand_params.get('single_trades', trade_cnt)
-                    s_win = cand_params.get('single_win_rate', win_rt)
-                    qual_tag = "Tier1(直近7d黒字&後半加速)" if is_tier1 else "Tier2(後半加速)"
+                        qual_tag = "Tier1(直近7d黒字&後半加速)" if is_tier1 else "Tier2(後半加速)"
                     discord.print_log(
-                        f"   [合格 🟢 - {qual_tag}] {cand}: 戦略={cand_strat.upper()} ({cand_inv}m / {detail_str}) -> "
-                        f"純利益: +${cand_pnl:.2f} USDT [前半: +${pnl_1st:.2f} / 後半: +${pnl_2nd:.2f} / 直近7d: +${pnl_7d:.2f}({cnt_7d}回), 取引: {trade_cnt}回, 勝率: {win_rt:.1f}%, DD: {max_dd:.2f} USDT ({max_dd:.1f}%)] "
-                        f"[シングル1枠: +${s_pnl:.2f} / {s_cnt}回 / {s_win:.1f}%]"
+                        f"   [合格 🟢 - {qual_tag}] {cand}: {dual_tendency_str} -> "
+                        f"代表PnL: ${cand_pnl:+.2f} USDT [前半: ${pnl_1st:+.2f} / 後半: ${pnl_2nd:+.2f} / 直近7d: ${pnl_7d:+.2f}({cnt_7d}回), 取引: {trade_cnt}回, 勝率: {win_rt:.1f}%, DD: {max_dd:.1f}%]"
                     )
                     profitable_cands.append(cand)
                 else:
-                    discord.print_log(f"   [不合格 🔴] {cand}: PnL = ${cand_pnl:+.2f} USDT [前半: ${pnl_1st:+.2f} / 後半: ${pnl_2nd:+.2f} / 直近7d: ${pnl_7d:+.2f}({cnt_7d}回)] (取引: {trade_cnt}回 / 二重頑健性未達: 前半黒字かつ後半加速が必須)")
+                    discord.print_log(
+                        f"   [不合格 🔴] {cand}: {dual_tendency_str} (二重頑健性未達: 前半黒字かつ後半加速が必須)"
+                    )
 
             except Exception as opt_err:
                 discord.print_log(f"   [最適化エラー] {cand}: {opt_err}")
@@ -1685,49 +1718,44 @@ async def run_screening_and_optimization(mode: str, send_charts: bool = False, s
         discord.print_log(f"[Warning] 全銘柄ステータスダッシュボード出力エラー: {e}")
 
 
-    # 選定銘柄の個別最適化パラメータをDiscordログ表示
+    # 選定銘柄の個別最適化パラメータをDiscordログ表示 (東京レンジ & 欧州ブレイク デュアル保持)
     if selected_symbols:
         side_strat_label = "ショートPure3大戦略 (VAH_POC / VAL_BREAK / RSIMA_SHORT)" if trade_side == "short" else "ロングPure3大戦略 (VAL_POC / VAH_BREAK / RSIMA)"
-        discord.print_log(f"\n★ 【合格銘柄 個別最適化パラメータ一覧 ({side_strat_label} 108通り検証)】")
+        discord.print_log(f"\n★ 【合格銘柄 デュアル最適化パラメータ一覧 ({side_strat_label} 126通り検証 / 東京レンジ＆欧州ブレイク2種保持)】")
         for sym in selected_symbols:
             p = symbol_params_map.get(sym, default_best_params)
-            pnl_val = p.get('pnl', 0.0)
-            wr_val = p.get('win_rate', 0.0)
-            tc_val = p.get('trade_count', 0)
-            dd_val = p.get('max_dd', 0.0)
-            strat = p.get('strategy', 'rsima').upper()
-            inv_val = int(p.get('interval', 5))
-            is_short_strat = ("SHORT" in strat or strat.startswith("VAH_POC") or strat == "VAL_BREAK" or trade_side == "short")
-            is_single_fixed = True
-            max_trades_label = "単発1本固定/ナンピンなし"
-            
-            if strat in ("VAH_BREAK", "VAL_BREAK"):
-                mp_v = p.get('mp', 200)
-                bins_v = p.get('num_bins', 50)
-                va_v = int(float(p.get('value_area_pct', 0.70)) * 100)
-                tr_v = int(float(p.get('target_ratio', 0.70)) * 100)
-                param_str = f"{inv_val}m / MP={mp_v}, Bins={bins_v}, VA={va_v}%, TR={tr_v}% ➔ 単発固定 ➔ VA拡張{tr_v}%利確"
-            elif strat.startswith("VAH_POC") or strat in ("VAL_POC", "VP_VAL_GC"):
-                mp_v = p.get('mp', 200)
-                bins_v = p.get('num_bins', 50)
-                va_v = int(float(p.get('value_area_pct', 0.70)) * 100)
-                ma_v = f"{p.get('ma_type', 'NONE')}_{p.get('ma_condition', 'none')}"
-                if is_short_strat:
-                    param_str = f"{inv_val}m / MP={mp_v}, Bins={bins_v}, VA={va_v}%, {ma_v} ➔ 単発固定 ➔ VA50%利確"
+            rng_p = p.get("range_params", p)
+            brk_p = p.get("breakout_params", p)
+            is_rng_q = bool(p.get("is_range_qualified", rng_p.get("is_qualified", False)))
+            is_brk_q = bool(p.get("is_breakout_qualified", brk_p.get("is_qualified", False)))
+
+            def _fmt_sub_param(sub_d: dict, is_q: bool, is_brk_mode: bool) -> str:
+                st_u = str(sub_d.get("strategy", "rsima")).upper()
+                iv_u = int(sub_d.get("interval", 5) or 5)
+                pnl_u = float(sub_d.get("pnl", 0.0))
+                tc_u = int(sub_d.get("trade_count", 0))
+                wr_u = float(sub_d.get("win_rate", 0.0))
+                q_mark = "🟢稼働" if is_q else "⚪待機(未達)"
+                if is_brk_mode or st_u in ("VAH_BREAK", "VAL_BREAK"):
+                    mp_u = int(sub_d.get("mp", 200))
+                    tr_u = int(float(sub_d.get("target_ratio", 0.70)) * 100)
+                    spec_s = f"{st_u}({iv_u}m/MP={mp_u}/TR={tr_u}%)"
+                elif "POC" in st_u:
+                    mp_u = int(sub_d.get("mp", 200))
+                    tr_u = int(float(sub_d.get("target_ratio", 0.70)) * 100)
+                    spec_s = f"{st_u}({iv_u}m/MP={mp_u}/TR={tr_u}%)"
                 else:
-                    param_str = f"{inv_val}m / MP={mp_v}, Bins={bins_v}, VA={va_v}%, {ma_v} ➔ VA50%間隔ナンピン(最大2回/計3枠) ➔ VA50%利確"
-            else:
-                ep_v = int(float(p.get('s_ep' if is_short_strat else 'l_ep', 60 if is_short_strat else 40)))
-                cp_v = int(float(p.get('s_cp' if is_short_strat else 'l_cp', 40 if is_short_strat else 60)))
-                sl_v = float(p.get('sl_pct', 0.025)) * 100
-                if is_short_strat:
-                    param_str = f"{inv_val}m / RSI=9, EMA=7, EP={ep_v}, CP={cp_v}, 動的SL={sl_v:.1f}% ➔ 単発固定 ➔ RSI冷却利確"
-                else:
-                    param_str = f"{inv_val}m / RSI=9, EMA=7, EP={ep_v}, CP={cp_v}, SL={sl_v:.1f}% ➔ VA50%間隔ナンピン(最大2回/計3枠)"
+                    is_sh = (trade_side == "short" or "SHORT" in st_u)
+                    ep_u = int(float(sub_d.get("s_ep" if is_sh else "l_ep", 60 if is_sh else 40)))
+                    cp_u = int(float(sub_d.get("s_cp" if is_sh else "l_cp", 40 if is_sh else 60)))
+                    spec_s = f"{st_u}({iv_u}m/EP={ep_u}/CP={cp_u})"
+                return f"{q_mark} {spec_s} [${pnl_u:+.2f}/{tc_u}回/勝率{wr_u:.0f}%]"
+
+            rng_summary = _fmt_sub_param(rng_p, is_rng_q, False)
+            brk_summary = _fmt_sub_param(brk_p, is_brk_q, True)
 
             discord.print_log(
-                f"   📌 [{sym}] 戦略={strat} ({max_trades_label}) | {param_str} | "
-                f"純利益: {pnl_val:+.4f} USDT (取引: {tc_val}回, 勝率: {wr_val:.1f}%, DD: {dd_val:.2f} USDT ({dd_val:.1f}%))"
+                f"   📌 [{sym}] (単発1本固定) | 🗼東京(09-16JST): {rng_summary} ／ 🏰欧州(16-22JST): {brk_summary}"
             )
     else:
         discord.print_log("\n⚠️ 【トレード適格銘柄なし】本日MTF条件を満たす銘柄がないため、新規エントリーは全停止しノーポジ待機します。")
@@ -2903,7 +2931,24 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                     if time.time() - last_trade_time.get(sym, 0) < 1200:
                         continue
 
-                    sym_params_e = symbol_params_map.get(sym, best_params)
+                    raw_sym_params = symbol_params_map.get(sym, best_params)
+                    # 時間帯連動デュアルパラメータ自動切替:
+                    # 東京時間 (09:00〜16:00 JST) -> レンジ逆張り最適パラメータ (range_params)
+                    # 欧州時間 (16:00〜22:00 JST) -> ブレイクアウト最適パラメータ (breakout_params)
+                    if is_tokyo_b3:
+                        sym_params_e = raw_sym_params.get("range_params") or raw_sym_params
+                        if "is_range_qualified" in raw_sym_params and not raw_sym_params.get("is_range_qualified", False):
+                            continue
+                    elif is_london_b3:
+                        sym_params_e = raw_sym_params.get("breakout_params") or raw_sym_params
+                        if "is_breakout_qualified" in raw_sym_params and not raw_sym_params.get("is_breakout_qualified", False):
+                            continue
+                    else:
+                        continue
+
+                    if not sym_params_e.get("is_qualified", True):
+                        continue
+
                     cand_interval_e = int(sym_params_e.get("interval", 5) or 5)
                     cand_strat_e = str(sym_params_e.get("strategy", "rsima")).lower()
 

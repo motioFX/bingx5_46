@@ -2336,6 +2336,8 @@ def simulate_vah_break_fast(
     if record_chart:
         res_dict['exec_buy'] = exec_buy
         res_dict['exec_sell'] = exec_sell
+        res_dict['exec_buy_price'] = exec_buy
+        res_dict['exec_sell_price'] = exec_sell
         res_dict['pnl_curve'] = pnl_curve
     return res_dict
 
@@ -2519,6 +2521,8 @@ def simulate_val_break_fast(
     if record_chart:
         res_dict['exec_buy'] = exec_buy
         res_dict['exec_sell'] = exec_sell
+        res_dict['exec_buy_price'] = exec_buy
+        res_dict['exec_sell_price'] = exec_sell
         res_dict['pnl_curve'] = pnl_curve
     return res_dict
 
@@ -3475,6 +3479,110 @@ def calculate_dynamic_mae_stop(
         return (default_stop, default_profile) if return_details else default_stop
 
 
+
+def _select_best_from_candidates(cands: List[Dict[str, Any]], min_trades: int = 10):
+    t1 = []
+    t2 = []
+    for c in cands:
+        if not c:
+            continue
+        c_cnt = int(c.get('trade_count', 0))
+        c_pnl = float(c.get('final_pnl', c.get('pnl', 0.0)))
+        c_p1 = float(c.get('pnl_first_half', 0.0))
+        c_p2 = float(c.get('pnl_second_half', 0.0))
+        c_p7 = float(c.get('pnl_recent_7d', 0.0))
+        c_c7 = int(c.get('trades_recent_7d', 0))
+        if c_cnt >= min_trades and c_p1 > 0.0 and c_p2 > c_p1 and c_p7 > 0.0 and c_c7 >= 1:
+            t1.append((c_p2 * 1.0 + c_p7 * 1.0 + c_pnl * 0.2, c))
+        elif c_cnt >= min_trades and c_p1 > 0.0 and c_p2 > c_p1:
+            t2.append((c_p2, c))
+    if t1:
+        t1.sort(key=lambda x: x[0], reverse=True)
+        return t1[0][1], True, "Tier1(直近7d黒字&後半加速)"
+    if t2:
+        t2.sort(key=lambda x: x[0], reverse=True)
+        return t2[0][1], True, "Tier2(後半加速)"
+    valid_c = [c for c in cands if c]
+    valid_c.sort(key=lambda c: float(c.get('final_pnl', c.get('pnl', -float('inf')))), reverse=True)
+    return valid_c[0], False, "Tier3(未達)"
+
+
+def _build_light_session_params(winner_cfg: Dict[str, Any], is_qual: bool, qual_level: str, df_5m: pd.DataFrame, side: str) -> Dict[str, Any]:
+    strat = str(winner_cfg.get('strategy', 'val_poc' if side == 'long' else 'vah_poc'))
+    inv = int(winner_cfg.get('interval', 5))
+    pnl_v = float(winner_cfg.get('final_pnl', winner_cfg.get('pnl', 0.0)))
+    cnt_v = int(winner_cfg.get('trade_count', 0))
+    win_v = float(winner_cfg.get('win_rate', 0.0))
+    dd_v = float(winner_cfg.get('DD_max', 0.0))
+    if 'rsi' in strat:
+        p_dict: Dict[str, Any] = {
+            'strategy': strat,
+            'trade_side': side,
+            'use_ema_filter': False,
+            'interval': inv,
+            'mp': 100,
+            'l_ep': float(winner_cfg.get('l_ep', 40.0)),
+            'l_cp': float(winner_cfg.get('l_cp', 60.0)),
+            's_ep': float(winner_cfg.get('s_ep', 60.0)),
+            's_cp': float(winner_cfg.get('s_cp', 40.0)),
+            'sl_pct': float(winner_cfg.get('sl_pct', 0.025)),
+            'margin': float(winner_cfg.get('sl_pct', 0.025)) * 100.0,
+            'pnl': pnl_v,
+            'trade_count': cnt_v,
+            'win_rate': win_v,
+            'DD_max': dd_v,
+            'max_dd': dd_v,
+            'single_pnl': pnl_v,
+            'single_trades': cnt_v,
+            'single_win_rate': win_v,
+            'pnl_first_half': float(winner_cfg.get('pnl_first_half', 0.0)),
+            'pnl_second_half': float(winner_cfg.get('pnl_second_half', 0.0)),
+            'pnl_recent_7d': float(winner_cfg.get('pnl_recent_7d', 0.0)),
+            'trades_recent_7d': int(winner_cfg.get('trades_recent_7d', 0)),
+            'is_qualified': is_qual,
+            'qual_level': qual_level,
+        }
+    else:
+        p_dict = {
+            'strategy': strat,
+            'trade_side': side,
+            'use_ema_filter': False,
+            'interval': inv,
+            'mp': int(winner_cfg.get('mp_period', 200)),
+            'num_bins': int(winner_cfg.get('num_bins', 50)),
+            'value_area_pct': float(winner_cfg.get('value_area_pct', 0.70)),
+            'target_ratio': float(winner_cfg.get('target_ratio', 0.70)),
+            'ma_type': 'NONE',
+            'ma_condition': 'none',
+            'margin': 9.0,
+            'pnl': pnl_v,
+            'trade_count': cnt_v,
+            'win_rate': win_v,
+            'DD_max': dd_v,
+            'max_dd': dd_v,
+            'single_pnl': pnl_v,
+            'single_trades': cnt_v,
+            'single_win_rate': win_v,
+            'pnl_first_half': float(winner_cfg.get('pnl_first_half', 0.0)),
+            'pnl_second_half': float(winner_cfg.get('pnl_second_half', 0.0)),
+            'pnl_recent_7d': float(winner_cfg.get('pnl_recent_7d', 0.0)),
+            'trades_recent_7d': int(winner_cfg.get('trades_recent_7d', 0)),
+            'is_qualified': is_qual,
+            'qual_level': qual_level,
+        }
+    dyn_stop, risk_prof = calculate_dynamic_mae_stop(
+        df_5m=df_5m, strategy=strat, params=p_dict,
+        default_stop=-0.025, min_stop=-0.015, max_stop=-0.032, return_details=True
+    )
+    p_dict['dynamic_mae_stop'] = dyn_stop
+    p_dict['sl_pct'] = abs(dyn_stop)
+    p_dict['dynamic_timeout_bars'] = risk_prof['dynamic_timeout_bars']
+    p_dict['dynamic_timeout_minutes'] = risk_prof['dynamic_timeout_minutes']
+    p_dict['avg_hold_minutes'] = risk_prof['avg_hold_minutes']
+    p_dict['p90_hold_minutes'] = risk_prof['p90_hold_minutes']
+    p_dict['max_hold_minutes'] = risk_prof['max_hold_minutes']
+    return p_dict
+
 def _run_interval_comparison_short(df_5m: pd.DataFrame, lot: float = 1.0, data_equity: float = 100.0, symbol: str = ""):
     """
     【売り相場 BEAR時専用】ショート4大基本戦略体系 (単発1本固定・EMA200分離モデル / 計144通り) 低負荷ジェントル最適化
@@ -3970,7 +4078,32 @@ def _run_interval_comparison_short(df_5m: pd.DataFrame, lot: float = 1.0, data_e
     to_min = risk_prof['dynamic_timeout_minutes']
     to_b = risk_prof['dynamic_timeout_bars']
     p90_m = risk_prof['p90_hold_minutes']
-    discord.print_log(f"🛡️ [{symbol}] ショート動的リスク算出: 動的SL={dyn_stop:.2%} (バンド: -1.50%〜-3.20%) | 動的タイムアウト={to_min}分 ({to_b}本, 勝ち90%ile={p90_m}分)")
+
+    # --- 東京レンジ (VAH_POC vs RSIMA_SHORT) ＆ 欧州ブレイク (VAL_BREAK) デュアル保持 ---
+    rng_win_s, is_rng_qual_s, rng_ql_s = _select_best_from_candidates([best_vp_none_cfg, best_rsi_none_cfg], MIN_TRADES)
+    brk_win_s, is_brk_qual_s, brk_ql_s = _select_best_from_candidates([best_vb_none_cfg], MIN_TRADES)
+    range_params_s = _build_light_session_params(rng_win_s, is_rng_qual_s, rng_ql_s, df_5m, "short")
+    breakout_params_s = _build_light_session_params(brk_win_s, is_brk_qual_s, brk_ql_s, df_5m, "short")
+
+    best_params['range_params'] = range_params_s
+    best_params['breakout_params'] = breakout_params_s
+    best_params['is_range_qualified'] = is_rng_qual_s
+    best_params['is_breakout_qualified'] = is_brk_qual_s
+    best_params['range_qual_level'] = rng_ql_s
+    best_params['breakout_qual_level'] = brk_ql_s
+    best_params['is_qualified'] = bool(is_rng_qual_s or is_brk_qual_s)
+
+    r_badge = f"🟢合格({rng_ql_s})" if is_rng_qual_s else "🔴未達"
+    b_badge = f"🟢合格({brk_ql_s})" if is_brk_qual_s else "🔴未達"
+    discord.print_log(
+        f"📌 [{symbol}] セッション別デュアル最適パラメータ保持 (SHORT):\n"
+        f"   🗼 [東京レンジ (09-16h)] {r_badge} : {range_params_s['strategy'].upper()} ({range_params_s['interval']}m) | "
+        f"PnL: {range_params_s['pnl']:+.2f} USDT [前半:{range_params_s['pnl_first_half']:+.2f} / 後半:{range_params_s['pnl_second_half']:+.2f} / 7d:{range_params_s['pnl_recent_7d']:+.2f}({range_params_s['trades_recent_7d']}回)] "
+        f"({range_params_s['trade_count']}回 / 勝率{range_params_s['win_rate']:.1f}% / SL:{range_params_s['dynamic_mae_stop']:.2%} / TO:{range_params_s['dynamic_timeout_minutes']}m)\n"
+        f"   🏰 [欧州ブレイク (16-22h)] {b_badge} : {breakout_params_s['strategy'].upper()} ({breakout_params_s['interval']}m/MP{breakout_params_s.get('mp',200)}/TR{int(breakout_params_s.get('target_ratio',0.7)*100)}%) | "
+        f"PnL: {breakout_params_s['pnl']:+.2f} USDT [前半:{breakout_params_s['pnl_first_half']:+.2f} / 後半:{breakout_params_s['pnl_second_half']:+.2f} / 7d:{breakout_params_s['pnl_recent_7d']:+.2f}({breakout_params_s['trades_recent_7d']}回)] "
+        f"({breakout_params_s['trade_count']}回 / 勝率{breakout_params_s['win_rate']:.1f}% / SL:{breakout_params_s['dynamic_mae_stop']:.2%} / TO:{breakout_params_s['dynamic_timeout_minutes']}m)"
+    )
 
     results["_best_params_"] = best_params
     return results, best_strategy, best_interval, best_mp, best_margin
@@ -4505,7 +4638,32 @@ def run_interval_comparison(df_5m: pd.DataFrame, lot: float = 1.0, data_equity: 
     to_min = risk_prof['dynamic_timeout_minutes']
     to_b = risk_prof['dynamic_timeout_bars']
     p90_m = risk_prof['p90_hold_minutes']
-    discord.print_log(f"🛡️ [{symbol}] 動的リスク算出: 動的SL={dyn_stop:.2%} (バンド: -1.50%〜-3.20%) | 動的タイムアウト={to_min}分 ({to_b}本, 勝ち90%ile={p90_m}分)")
+
+    # --- 東京レンジ (VAL_POC vs RSIMA) ＆ 欧州ブレイク (VAH_BREAK) デュアル保持 ---
+    rng_win_l, is_rng_qual_l, rng_ql_l = _select_best_from_candidates([best_vp_none_cfg, best_rsi_none_cfg], MIN_TRADES)
+    brk_win_l, is_brk_qual_l, brk_ql_l = _select_best_from_candidates([best_vb_none_cfg], MIN_TRADES)
+    range_params_l = _build_light_session_params(rng_win_l, is_rng_qual_l, rng_ql_l, df_5m, "long")
+    breakout_params_l = _build_light_session_params(brk_win_l, is_brk_qual_l, brk_ql_l, df_5m, "long")
+
+    best_params['range_params'] = range_params_l
+    best_params['breakout_params'] = breakout_params_l
+    best_params['is_range_qualified'] = is_rng_qual_l
+    best_params['is_breakout_qualified'] = is_brk_qual_l
+    best_params['range_qual_level'] = rng_ql_l
+    best_params['breakout_qual_level'] = brk_ql_l
+    best_params['is_qualified'] = bool(is_rng_qual_l or is_brk_qual_l)
+
+    r_badge = f"🟢合格({rng_ql_l})" if is_rng_qual_l else "🔴未達"
+    b_badge = f"🟢合格({brk_ql_l})" if is_brk_qual_l else "🔴未達"
+    discord.print_log(
+        f"📌 [{symbol}] セッション別デュアル最適パラメータ保持 (LONG):\n"
+        f"   🗼 [東京レンジ (09-16h)] {r_badge} : {range_params_l['strategy'].upper()} ({range_params_l['interval']}m) | "
+        f"PnL: {range_params_l['pnl']:+.2f} USDT [前半:{range_params_l['pnl_first_half']:+.2f} / 後半:{range_params_l['pnl_second_half']:+.2f} / 7d:{range_params_l['pnl_recent_7d']:+.2f}({range_params_l['trades_recent_7d']}回)] "
+        f"({range_params_l['trade_count']}回 / 勝率{range_params_l['win_rate']:.1f}% / SL:{range_params_l['dynamic_mae_stop']:.2%} / TO:{range_params_l['dynamic_timeout_minutes']}m)\n"
+        f"   🏰 [欧州ブレイク (16-22h)] {b_badge} : {breakout_params_l['strategy'].upper()} ({breakout_params_l['interval']}m/MP{breakout_params_l.get('mp',200)}/TR{int(breakout_params_l.get('target_ratio',0.7)*100)}%) | "
+        f"PnL: {breakout_params_l['pnl']:+.2f} USDT [前半:{breakout_params_l['pnl_first_half']:+.2f} / 後半:{breakout_params_l['pnl_second_half']:+.2f} / 7d:{breakout_params_l['pnl_recent_7d']:+.2f}({breakout_params_l['trades_recent_7d']}回)] "
+        f"({breakout_params_l['trade_count']}回 / 勝率{breakout_params_l['win_rate']:.1f}% / SL:{breakout_params_l['dynamic_mae_stop']:.2%} / TO:{breakout_params_l['dynamic_timeout_minutes']}m)"
+    )
 
     results["_best_params_"] = best_params
     return results, best_strategy, best_interval, best_mp, best_margin
