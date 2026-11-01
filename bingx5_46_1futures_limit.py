@@ -1639,7 +1639,7 @@ async def run_screening_and_optimization(mode: str, send_charts: bool = False, s
 
     if overall_reg_mode == "BUY":
         trade_side = "long"
-        strat_mode_desc = "LONG ONLY (買い相場特化・最大3枠ナンピン)"
+        strat_mode_desc = "LONG ONLY (買い相場特化・単発1本固定)"
     elif overall_reg_mode == "SELL":
         trade_side = "short"
         strat_mode_desc = "SHORT ONLY (売り相場特化・単発1本固定/ナンピンなし)"
@@ -2000,8 +2000,8 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
         f"  監視足種     : 5分足 (5m) & pybotters WebSocket リアルタイム配信\n"
         f"  銘柄選定周期 : 毎日 {hours_str} JST (8時間ごと)\n"
         f"  ポジション枠 : 最大 {MAX_ACTIVE_POSITIONS} 銘柄同時保有\n"
-        f"  買い (BULL)  : 最大3枠ナンピン (1.0x等倍) / 動的MAE損切り\n"
-        f"  売り (BEAR)  : 単発1本固定 (ナンピンなし) / 動的MAE損切り\n"
+        f"  買い (BULL)  : 単発1本固定 (ナンピンなし) / 直近10本安値確定足SL & POC防衛SL\n"
+        f"  売り (BEAR)  : 単発1本固定 (ナンピンなし) / 直近10本高値確定足SL & POC防衛SL\n"
         "==================================================\n"
         "```"
     )
@@ -3165,7 +3165,7 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
 
                     else:
                         # --------------------------------------------------
-                        # 【BULL相場】ロング新規エントリー判定 (最大3枠ナンピン ※VAH_BREAKは単発固定)
+                        # 【BULL相場】ロング新規エントリー判定 (単発1本固定)
                         # --------------------------------------------------
                         if cand_strat_e == "vah_break":
                             sig_entry = check_vah_break_signals(
