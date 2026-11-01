@@ -844,16 +844,14 @@ async def fetch_bingx_candles(symbol: str, granularity: str = "5m", limit: int =
 
         if not df.empty:
             gran_upper = granularity.upper()
-            if gran_upper in ("15M", "30M", "1H", "60M", "1D"):
-                rule_map = {"15M": "15min", "30M": "30min", "1H": "1h", "60M": "1h", "1D": "1d"}
-                rule = rule_map.get(gran_upper, "15min")
-                df = resample_from_5m(df, rule=rule)
+            # PROJECT_RULES準拠: 採用足種は 5m および 15m のみ (30m/1h/日足生成は完全廃止)
+            if gran_upper == "15M":
+                df = resample_from_5m(df, interval_minutes=15)
 
             df = df.tail(limit).copy().reset_index(drop=True)
 
             now_utc = datetime.now(timezone.utc)
-            granularity_sec_map = {"1M": 60, "3M": 180, "5M": 300, "15M": 900, "30M": 1800, "1H": 3600, "60M": 3600, "1D": 86400}
-            gran_sec = granularity_sec_map.get(gran_upper, 300)
+            gran_sec = 900 if gran_upper == "15M" else 300
             if not df.empty:
                 last_ts = pd.to_datetime(df['timestamp'].iloc[-1], utc=True)
                 candle_close_time = last_ts + timedelta(seconds=gran_sec)
@@ -1065,19 +1063,10 @@ async def validate_profitable_candidates(trade_side: str, mode: str, base_symbol
         cand_whale_info = get_whale_sentiment_info(cand)
         cand_whale_sig = cand_whale_info.get("signal", "NEUTRAL")
 
-        # 1. SSoT 5分足時系列ストアから取得
+        # 1. SSoT 5分足時系列ストアから取得 (1H足/日足生成は廃止し5分足ストアから直接個別最適化)
         cand_df_5m = load_5m_candles(cand)
         if cand_df_5m.empty or len(cand_df_5m) < 500:
             cand_df_5m = await asyncio.to_thread(sync_symbol_5m_candles, cand, 35)
-
-        # 2. 1H足トレンド判定用データを 5分足から数学的完全整合リサンプリング
-        if not cand_df_5m.empty and len(cand_df_5m) >= 60:
-            cand_df = resample_from_5m(cand_df_5m, 60)
-        else:
-            cand_df = await load_local_or_api_candles(cand, limit=768)
-
-        if cand_df is not None and not cand_df.empty:
-            raw_dfs[cand] = cand_df
 
         discord.print_log(f"個別最適化中: {cand} (Rank #{cand_idx+1}) [方向: {actual_side.upper()}] ...")
 
@@ -1204,9 +1193,12 @@ async def validate_profitable_candidates(trade_side: str, mode: str, base_symbol
 
             if isinstance(chart_df, pd.DataFrame) and not chart_df.empty:
                 chart_df.to_csv(bg_csv, index=False)
-            elif best_sym in raw_dfs:
-                cand_df = raw_dfs[best_sym]
-                cand_df.tail(min(len(cand_df), 720)).reset_index(drop=True).to_csv(bg_csv, index=False)
+            else:
+                cand_df = load_5m_candles(best_sym)
+                if not cand_df.empty:
+                    if best_inv > 5:
+                        cand_df = resample_from_5m(cand_df, interval_minutes=best_inv)
+                    cand_df.tail(min(len(cand_df), 720)).reset_index(drop=True).to_csv(bg_csv, index=False)
 
             strat_tag = str(best_strat).upper()
             chart_label = f"Best1Month_{strat_tag}_{best_inv}m"

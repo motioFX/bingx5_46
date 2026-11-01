@@ -49,13 +49,10 @@ def calculate_monthly_levels_for_symbol(
     clean_sym = normalize_sym(symbol)
     ticker = clean_sym.replace("-USDT", "")
 
+    # PROJECT_RULES準拠: SSoT 5分足ストアのみを参照 (daily/merged CSVは完全廃止)
     candidate_files = [
         data_dir / f"candles_5m/candles_5m_{clean_sym}.csv",
         data_dir / f"candles_5m/candles_5m_{ticker}.csv",
-        data_dir / f"daily_{clean_sym}.csv",
-        data_dir / f"daily_{ticker}.csv",
-        data_dir / f"merged_{clean_sym}.csv",
-        data_dir / f"merged_{ticker}.csv",
     ]
 
     df_pm = None

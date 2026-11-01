@@ -297,7 +297,7 @@ async def main() -> None:
     log(f"[SSoT Sync] 全 {len(ALL_SYMBOLS)} 銘柄の 5分足時系列ストアを同期中...")
     sync_all_target_symbols_5m(ALL_SYMBOLS, target_days=65)
 
-    # 2. 5分足ストアから 1H足 および 日足(1D) を動的生成して Data/ に保存
+    # 2. 地合い判定用データ準備 (PROJECT_RULES準拠: 30m/1h/日足CSVディスク保存完全廃止・メモリ内オンザフライ処理)
     all_dfs = []
     symbol_1h_dict = {}
 
@@ -305,23 +305,15 @@ async def main() -> None:
         df_5m = load_5m_candles(sym)
         if df_5m.empty:
             continue
+        # 地合い判定・ノーマライズ比較に必要な720時間分の系列のみメモリ上で動的生成 (ディスクへのmerged/daily CSV保存は廃止)
         df_1h = resample_from_5m(df_5m, 60)
-        df_1d = resample_from_5m(df_5m, 1440)
         df_1h["symbol"] = sym
-        df_1d["symbol"] = sym
 
-        # 個別CSV保存
         clean_sym = normalize_symbol_name(sym)
-        ticker = get_clean_symbol(clean_sym)
-        df_1h.to_csv(out_dir / f"merged_{clean_sym}.csv", index=False)
-        df_1h.to_csv(out_dir / f"merged_{ticker}.csv", index=False)
-        df_1d.to_csv(out_dir / f"daily_{clean_sym}.csv", index=False)
-        df_1d.to_csv(out_dir / f"daily_{ticker}.csv", index=False)
-
         all_dfs.append(df_1h)
         symbol_1h_dict[clean_sym] = df_1h
 
-    log(f"[Resample Done] 生成完了: {len(all_dfs)} 銘柄の 1H足 & 日足データ")
+    log(f"[SSoT Evaluation] 全 {len(all_dfs)} 銘柄の地合いデータをメモリ上で準備完了 (不要なCSV生成・ディスク保存完全廃止)")
 
     # 3. 3段階全体地合い判定 (30d / 10d / 5d 22票制) を先行判定
     regime_eval_res = evaluate_market_regime_3window(symbol_1h_dict)
