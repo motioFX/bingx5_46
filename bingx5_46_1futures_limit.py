@@ -2398,12 +2398,18 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
 
                     # ショートの場合、直近高値と確定足SLを算出
                     rec_h_val = 0.0
+                    rec_l_val = 0.0
                     sl_px_val = 0.0
-                    if is_short_pos and df_sym is not None and not df_sym.empty:
+                    if df_sym is not None and not df_sym.empty:
                         df_p_eval = resample_candles(df_sym, opt_inv_p, drop_unclosed=True) if opt_inv_p > 5 else df_sym.copy()
-                        h_eval = df_p_eval["high"].astype(float) if "high" in df_p_eval.columns else df_p_eval["close"].astype(float)
-                        rec_h_val = float(h_eval.iloc[-10:].max()) if len(h_eval) >= 10 else float(h_eval.max())
-                        sl_px_val = min(max(rec_h_val, entry_px * 1.0020), entry_px * (1.0 + abs(dyn_sl_p)))
+                        if is_short_pos:
+                            h_eval = df_p_eval["high"].astype(float) if "high" in df_p_eval.columns else df_p_eval["close"].astype(float)
+                            rec_h_val = float(h_eval.iloc[-10:].max()) if len(h_eval) >= 10 else float(h_eval.max())
+                            sl_px_val = min(max(rec_h_val, entry_px * 1.0020), entry_px * (1.0 + abs(dyn_sl_p)))
+                        else:
+                            l_eval = df_p_eval["low"].astype(float) if "low" in df_p_eval.columns else df_p_eval["close"].astype(float)
+                            rec_l_val = float(l_eval.iloc[-10:].min()) if len(l_eval) >= 10 else float(l_eval.min())
+                            sl_px_val = max(min(rec_l_val, entry_px * 0.9980), entry_px * (1.0 - abs(dyn_sl_p)))
 
                     scale_state_new = {
                         "nanpin_count": 0,
@@ -2422,6 +2428,7 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                         "l_ep": float(p_order.get("l_ep", sym_params_p.get("l_ep", 40.0))),
                         "l_cp": float(p_order.get("l_cp", sym_params_p.get("l_cp", 60.0))),
                         "recent_high": rec_h_val,
+                        "recent_low": rec_l_val,
                         "sl_price": sl_px_val,
                     }
                     scale_in_states[sym] = scale_state_new
@@ -2583,13 +2590,21 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                                     pnl_pct_trail = (cur_px - entry_px) / entry_px
                                     ny_trail_reason = f"NY_SESSION_TRAILING_STOP: 米国時間トレール利確 (最高値=${highest_px:.4f}から0.4%押し到達=${trail_stop_px:.4f}, PnL={pnl_pct_trail:+.2%})"
 
-                # ショートポジションの直近高値(Swing High)復元・自動補完
+                # ショート・ロングポジションの直近10本高安(Swing High / Low)復元・自動補完
                 recent_high_val = float(scale_state_cur.get("recent_high", 0.0) or 0.0)
+                recent_low_val = float(scale_state_cur.get("recent_low", 0.0) or 0.0)
                 if is_short_pos and recent_high_val <= 0.0 and df_eval is not None and not df_eval.empty:
                     h_eval = df_eval["high"].astype(float) if "high" in df_eval.columns else df_eval["close"].astype(float)
                     recent_high_val = float(h_eval.iloc[-10:].max()) if len(h_eval) >= 10 else float(h_eval.max())
                     scale_state_cur["recent_high"] = recent_high_val
                     scale_state_cur["sl_price"] = min(max(recent_high_val, entry_px * 1.0020), entry_px * (1.0 + abs(dyn_sl_pct)))
+                    scale_in_states[sym] = scale_state_cur
+                    save_scale_in_states(scale_in_states)
+                elif not is_short_pos and recent_low_val <= 0.0 and df_eval is not None and not df_eval.empty:
+                    l_eval = df_eval["low"].astype(float) if "low" in df_eval.columns else df_eval["close"].astype(float)
+                    recent_low_val = float(l_eval.iloc[-10:].min()) if len(l_eval) >= 10 else float(l_eval.min())
+                    scale_state_cur["recent_low"] = recent_low_val
+                    scale_state_cur["sl_price"] = max(min(recent_low_val, entry_px * 0.9980), entry_px * (1.0 - abs(dyn_sl_pct)))
                     scale_in_states[sym] = scale_state_cur
                     save_scale_in_states(scale_in_states)
 
@@ -2707,6 +2722,7 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                             bars_held=bars_held_cur,
                             use_ema_filter=use_ema_v,
                             timeout_bars=dyn_to_bars,
+                            recent_low=recent_low_val,
                         )
                     else:
                         use_ema_r = ("ema" in cand_strat)
@@ -2730,6 +2746,7 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                             bars_held=bars_held_cur,
                             use_ema_filter=use_ema_r,
                             timeout_bars=dyn_to_bars,
+                            recent_low=recent_low_val,
                         )
 
                 if ny_trail_triggered:
@@ -3227,8 +3244,11 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                                                 last_trade_time[sym] = time.time()
                                                 last_nanpin_time[sym] = time.time()
                                                 tracked_active_positions.add(sym)
+                                                l_eval = df_entry_eval["low"].astype(float) if "low" in df_entry_eval.columns else df_entry_eval["close"].astype(float)
+                                                rec_l_val = float(l_eval.iloc[-10:].min()) if len(l_eval) >= 10 else float(l_eval.min())
                                                 dyn_sl_pct_e = float(sym_params_e.get("dynamic_mae_stop", -0.025))
                                                 dyn_to_bars_e = int(sym_params_e.get("dynamic_timeout_bars", max(3, 240 // max(1, cand_interval_e))))
+                                                sl_px_val = max(min(rec_l_val, actual_fill_px * 0.9980), actual_fill_px * (1.0 - abs(dyn_sl_pct_e)))
                                                 scale_in_states[sym] = {
                                                     "nanpin_count": 0,
                                                     "last_entry_price": actual_fill_px,
@@ -3243,6 +3263,8 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                                                     "target_ratio": float(sym_params_e.get("target_ratio", 0.70)),
                                                     "l_ep": float(sym_params_e.get("l_ep", 40.0)),
                                                     "l_cp": float(sym_params_e.get("l_cp", 60.0)),
+                                                    "recent_low": rec_l_val,
+                                                    "sl_price": sl_px_val,
                                                 }
                                                 save_scale_in_states(scale_in_states)
                                                 inv_label_e = f"{cand_interval_e}m" if cand_interval_e < 60 else f"{cand_interval_e // 60}h"
@@ -3309,8 +3331,11 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                                 trade_counts[sym] = 1
                                 last_nanpin_time[sym] = time.time()
                                 tracked_active_positions.add(sym)
+                                l_eval = df_entry_eval["low"].astype(float) if "low" in df_entry_eval.columns else df_entry_eval["close"].astype(float)
+                                rec_l_val = float(l_eval.iloc[-10:].min()) if len(l_eval) >= 10 else float(l_eval.min())
                                 dyn_sl_pct_e = float(sym_params_e.get("dynamic_mae_stop", -0.025))
                                 dyn_to_bars_e = int(sym_params_e.get("dynamic_timeout_bars", max(3, 240 // max(1, cand_interval_e))))
+                                sl_px_val = max(min(rec_l_val, actual_fill_px * 0.9980), actual_fill_px * (1.0 - abs(dyn_sl_pct_e)))
                                 scale_state_new = {
                                     "nanpin_count": 0,
                                     "last_entry_price": actual_fill_px,
@@ -3325,6 +3350,8 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                                     "target_ratio": float(sym_params_e.get("target_ratio", 0.70)),
                                     "l_ep": float(sym_params_e.get("l_ep", 40.0)),
                                     "l_cp": float(sym_params_e.get("l_cp", 60.0)),
+                                    "recent_low": rec_l_val,
+                                    "sl_price": sl_px_val,
                                 }
                                 scale_in_states[sym] = scale_state_new
                                 save_scale_in_states(scale_in_states)
