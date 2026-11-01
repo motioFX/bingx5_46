@@ -2252,10 +2252,7 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                         h_pos_tag = f"保有S({h_sign}${abs(h_pnl):.2f}/1枠)"
                     elif h_has_long:
                         h_sign = "+" if h_pnl >= 0 else "-"
-                        h_t_cnt = trade_counts.get(h_sym, 1)
-                        if h_t_cnt <= 0:
-                            h_t_cnt = 1
-                        h_pos_tag = f"保有L({h_sign}${abs(h_pnl):.2f}/{h_t_cnt}枠)"
+                        h_pos_tag = f"保有L({h_sign}${abs(h_pnl):.2f}/1枠)"
                     elif h_sym in pending_entry_orders:
                         p_px = pending_entry_orders[h_sym].get("price", 0.0)
                         h_pos_tag = f"指値(${p_px:.4f})" if p_px < 10 else f"指値(${p_px:.2f})"
