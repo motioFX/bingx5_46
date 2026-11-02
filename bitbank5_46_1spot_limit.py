@@ -1,9 +1,12 @@
 # === Time Synchronization & Import Path Setup ===
 from __future__ import annotations
 import sys
+import os
 from pathlib import Path
 import time
 import requests
+
+BASE_DIR = Path(__file__).resolve().parent
 
 if hasattr(sys.stdout, "reconfigure"):
     try:
@@ -49,14 +52,14 @@ class TeeLogger:
             except Exception:
                 pass
 
-log_dir = Path(__file__).resolve().parent / "Data"
+log_dir = BASE_DIR / "Data"
 log_dir.mkdir(parents=True, exist_ok=True)
 log_file_path = log_dir / "bot_output.log"
 sys.stdout = TeeLogger(log_file_path, sys.stdout)
 sys.stderr = TeeLogger(log_file_path, sys.stderr)
 
 # Prioritize the directory containing this script for imports
-script_dir = str(Path(__file__).resolve().parent)
+script_dir = str(BASE_DIR)
 if script_dir not in sys.path:
     sys.path.insert(0, script_dir)
 
