@@ -2880,30 +2880,51 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
             # ===== BULL (買い相場: ロング) または BEAR (売り相場: ショート) =====
             is_sell_regime = (overall_regime == "SELL")
 
-            # JST 時間帯ロール制判定
+            # JST 時間帯判定 (Phase B3: 時間帯ウィンドウ動的適応 ＆ 3態勢地合いディフェンス)
             now_jst_b3 = datetime.now(timezone.utc) + timedelta(hours=9)
             hour_jst_b3 = now_jst_b3.hour
-            is_tokyo_b3 = (9 <= hour_jst_b3 < 16)
-            is_london_b3 = (16 <= hour_jst_b3 < 22)
-            is_ny_b3 = not (is_tokyo_b3 or is_london_b3)
 
-            if is_ny_b3:
+            # 1. 欧州時間 (16:00〜22:00 JST) 安全フィルター: 上ヒゲ・下ヒゲ乱高下ダマシ回避のため新規エントリー完全停止
+            is_london_danger = (16 <= hour_jst_b3 < 22)
+            if is_london_danger:
                 if cycle_count % 20 == 0:
-                    discord.print_log(f"🌙 [米国時間新規停止] 米国セッション(22:00〜翌09:00 JST)のため新規エントリーを完全停止中 (トレール決済・既存ポジション監視のみ)", level="info")
+                    discord.print_log("🛡️ [欧州セッション待機] 16:00〜22:00 JST はダマシ乱高下回避のため新規エントリー完全停止中 (ノーポジ待機)", level="info")
                 if pending_entry_orders:
                     for p_sym in list(pending_entry_orders.keys()):
                         p_api = symbol_apis.get(p_sym)
                         if p_api:
                             try:
                                 await p_api.active_order_cancel()
-                                discord.print_log(f"🛡️ [米国時間退避] 米国セッション突入に伴い {p_sym} の未約定指値を安全にキャンセルしました。")
+                                discord.print_log(f"🛡️ [欧州時間退避] 欧州セッション突入に伴い {p_sym} の未約定指値を安全にキャンセルしました。")
                             except Exception:
                                 pass
                     pending_entry_orders.clear()
                 continue
+
+            # 2. 米国オープン寄り付き〜初動 (22:00〜01:00 JST) のロング飛び乗りブレイク完全停止 (上ヒゲダマシ回避)
+            if not is_sell_regime and (22 <= hour_jst_b3 or hour_jst_b3 < 1):
+                if cycle_count % 20 == 0:
+                    discord.print_log("🛡️ [米国寄り付き買い停止] 22:00〜01:00 JST はロングブレイク上ヒゲダマシ回避のため買いエントリー停止中", level="info")
+                continue
+
             total_active_count = len(active_positions) + len(pending_entry_orders)
 
-            for sym in selected_symbols:
+            # BUY地合い時の出来高急増 Top 2 厳選 (出来高急増銘柄に絞り込み)
+            candidate_syms = list(selected_symbols)
+            if not is_sell_regime and len(candidate_syms) > 2:
+                # 各銘柄の直近24本平均に対する直近出来高倍率でソート
+                vol_spike_scores = {}
+                for s in candidate_syms:
+                    df_s = cached_5m_dfs.get(s)
+                    if df_s is not None and len(df_s) >= 25 and 'volume' in df_s.columns:
+                        v_cur = float(df_s['volume'].iloc[-1])
+                        v_avg = float(df_s['volume'].iloc[-25:-1].mean()) or 1.0
+                        vol_spike_scores[s] = v_cur / v_avg
+                    else:
+                        vol_spike_scores[s] = 1.0
+                candidate_syms = sorted(candidate_syms, key=lambda s: vol_spike_scores.get(s, 1.0), reverse=True)[:2]
+
+            for sym in candidate_syms:
                 if sym in active_positions:
                     continue
 
@@ -2932,34 +2953,26 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                         continue
 
                     raw_sym_params = symbol_params_map.get(sym, best_params)
-                    # 時間帯連動デュアルパラメータ自動切替:
-                    # 東京時間 (09:00〜16:00 JST) -> レンジ逆張り最適パラメータ (range_params)
-                    # 欧州時間 (16:00〜22:00 JST) -> ブレイクアウト最適パラメータ (breakout_params)
-                    if is_tokyo_b3:
+                    # 時間帯連動デュアルパラメータ選出:
+                    # 東京時間 (09:00〜16:00 JST): レンジ逆張り最適 (range_params)
+                    # 米国深夜・早朝 (23:00〜08:00 JST): ブレイクアウト最適 (breakout_params)
+                    if 9 <= hour_jst_b3 < 16:
                         sym_params_e = raw_sym_params.get("range_params") or raw_sym_params
-                        if "is_range_qualified" in raw_sym_params and not raw_sym_params.get("is_range_qualified", False):
-                            continue
-                    elif is_london_b3:
-                        sym_params_e = raw_sym_params.get("breakout_params") or raw_sym_params
-                        if "is_breakout_qualified" in raw_sym_params and not raw_sym_params.get("is_breakout_qualified", False):
-                            continue
                     else:
-                        continue
+                        sym_params_e = raw_sym_params.get("breakout_params") or raw_sym_params
 
-                    if not sym_params_e.get("is_qualified", True):
+                    if not sym_params_e.get("is_qualified", False):
+                        if not raw_sym_params.get("is_qualified", False):
+                            continue
+                        sym_params_e = raw_sym_params
+
+                    # 動的 time_window 照合 (個別最適化選出ウィンドウ)
+                    p_tw = sym_params_e.get("time_window", "WINDOW_FULL")
+                    if not logic.is_in_time_window(hour_jst_b3, p_tw):
                         continue
 
                     cand_interval_e = int(sym_params_e.get("interval", 5) or 5)
-                    cand_strat_e = str(sym_params_e.get("strategy", "rsima")).lower()
-
-                    # 時間帯ロール適合性チェック (東京はレンジ逆張りのみ、欧州はブレイクアウトのみ)
-                    is_brk_strat = (cand_strat_e in ("vah_break", "val_break"))
-                    if is_tokyo_b3 and is_brk_strat:
-                        # 東京時間はレンジ逆張りのみ許可 (ブレイクアウトはダマシ回避のため遮断)
-                        continue
-                    if is_london_b3 and not is_brk_strat:
-                        # 欧州時間はブレイクアウトのみ許可 (逆張りはトレンド被弾回避のため遮断)
-                        continue
+                    cand_strat_e = str(sym_params_e.get("strategy", "val_poc" if not is_sell_regime else "vah_poc")).lower()
 
                     df_entry_eval = resample_candles(df_5m, cand_interval_e, drop_unclosed=True) if cand_interval_e > 5 else df_5m.copy()
                     try:
@@ -3212,7 +3225,7 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                         # --------------------------------------------------
                         # 【BULL相場】ロング新規エントリー判定 (単発1本固定)
                         # --------------------------------------------------
-                        if cand_strat_e == "vah_break":
+                        if cand_strat_e in ("vah_break", "vah_retest_v2"):
                             sig_entry = check_vah_break_signals(
                                 df_5m=df_entry_eval,
                                 current_pos_qty=0.0,
