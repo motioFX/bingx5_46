@@ -1200,12 +1200,12 @@ async def sync_historical_and_charts(
         if not skip_upload:
             record_full_sync_slot(datetime.now(JST), status="in_progress")
 
-        discord.print_log(f"\n📦 【海外取引所（Hyperliquid & BingX）全銘柄データ収集＆4年分アーカイブ配信】 開始 (直近{incremental_hours}H差分つけ足し最新化 / 日足・1h・15m・5m足)...")
+        discord.print_log(f"\n📦 【海外取引所（Hyperliquid & BingX）全銘柄5分足データ収集＆時間分割アーカイブ配信】 開始 (直近{incremental_hours}H差分つけ足し最新化 / 5分足のみ)...")
         
         # 海外取引所統合データ収集パイプライン
         try:
             from master_data_collector import run_all_exchanges_pipeline
-            target_intervals = list(intervals) if intervals else ["1d", "1h", "15m", "5m"]
+            target_intervals = list(intervals) if intervals else ["5m"]
             await run_all_exchanges_pipeline(
                 days_1d=1460,
                 days_1h=1460,
@@ -1220,7 +1220,7 @@ async def sync_historical_and_charts(
                 skip_charts=True,
                 incremental_hours=incremental_hours
             )
-            discord.print_log("✅ 【海外取引所 データ同期完了】 Hyperliquid & BingX 全銘柄マルチ時間足のアーカイブ同期＆配信が完了しました。")
+            discord.print_log("✅ 【海外取引所 データ同期完了】 Hyperliquid & BingX 全銘柄5分足のアーカイブ同期＆配信が完了しました。")
             if not skip_upload:
                 record_full_sync_slot(datetime.now(JST), status="completed")
         except Exception as e:
@@ -1252,7 +1252,7 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
         f"  動作モード   : {op_mode_str}\n"
         f"  目標投資額   : {BITBANK_TARGET_POSITION_VALUE_JPY:,.0f} JPY (1,000万円 / 現物 1.0倍)\n"
         f"  戦略方向     : 現物ポジション自動監査 ＆ 海外全銘柄データ収集\n"
-        f"  ローソク足   : 日足 (1D) / 1時間足 (1H) / 15分足 (15M) / 5分足 (5M)\n"
+        f"  ローソク足   : 5分足 (5M) (BingX 3カテゴリー ＆ Hyperliquid全銘柄)\n"
         f"  定期同期時刻 : 毎日 {hours_str} JST (8時間ごと)\n"
         f"=================================================="
     )

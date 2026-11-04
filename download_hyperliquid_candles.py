@@ -238,10 +238,10 @@ async def run_pipeline(
     candles_dir.mkdir(parents=True, exist_ok=True)
 
     now_jst = datetime.now(JST).strftime("%Y%m%d_%H%M%S")
-    target_intervals = list(intervals) if intervals else ["1d", "1h", "15m", "5m"]
+    target_intervals = list(intervals) if intervals else ["5m"]
 
     log("=" * 70)
-    log("🚀 [Hyperliquid] 全銘柄マルチ時間足データ収集＆時間分割Discord配信パイプライン開始")
+    log("🚀 [Hyperliquid] 全銘柄 5分足データ収集＆時間分割Discord配信パイプライン開始")
     log(f"   対象足種: {target_intervals} | 実行日時タグ: {now_jst}")
     log("=" * 70)
 
@@ -257,7 +257,7 @@ async def run_pipeline(
 
     for interval in target_intervals:
         log(f"\n📂 ========== Hyperliquid 【{interval.upper()}足】 収集開始 ==========")
-        target_days = days_map.get(interval, 30)
+        target_days = days_map.get(interval, 90)
 
         symbol_dfs: Dict[str, pd.DataFrame] = {}
 
@@ -288,6 +288,10 @@ async def run_pipeline(
             fixed_csv = data_dir / "hyperliquid_all_symbols_merged.csv"
             master_df.to_csv(fixed_csv, index=False, encoding="utf-8")
             log(f"📄 [Hyperliquid] 1H 統合マスターCSVを更新しました: {fixed_csv.name} ({len(master_df):,} 行)")
+        elif interval == "5m":
+            fixed_csv = data_dir / "hyperliquid_5m_merged.csv"
+            master_df.to_csv(fixed_csv, index=False, encoding="utf-8")
+            log(f"📄 [Hyperliquid] 5M 統合マスターCSVを更新しました: {fixed_csv.name} ({len(master_df):,} 行)")
 
         # 3. ZIP アーカイブ生成 (直近8時間差分を足し合わせた全期間データを時間分割ZIP)
         parts = split_and_create_time_zips(
@@ -323,13 +327,13 @@ async def run_pipeline(
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Hyperliquid 全銘柄マルチ時間足データ収集パイプライン")
+    parser = argparse.ArgumentParser(description="Hyperliquid 全銘柄5分足データ収集パイプライン")
     parser.add_argument("--days-1d", type=int, default=1460, help="日足取得期間（日）")
     parser.add_argument("--days-1h", type=int, default=1460, help="1時間足取得期間（日）")
     parser.add_argument("--days-15m", type=int, default=180, help="15分足取得期間（日）")
     parser.add_argument("--days-5m", type=int, default=90, help="5分足取得期間（日）")
     parser.add_argument("--days-1m", type=int, default=30, help="1分足取得期間（日）")
-    parser.add_argument("--intervals", nargs="+", default=["1d", "1h", "15m", "5m"], help="実行する足種 (デフォルト: 1d 1h 15m 5m)")
+    parser.add_argument("--intervals", nargs="+", default=["5m"], help="実行する足種 (デフォルト: 5m)")
     parser.add_argument("--force", action="store_true", help="既存キャッシュを無視して全件再取得")
     parser.add_argument("--force-upload", action="store_true", help="ハッシュを無視して強制アップロード")
     parser.add_argument("--skip-upload", action="store_true", help="Discordアップロードをスキップ")

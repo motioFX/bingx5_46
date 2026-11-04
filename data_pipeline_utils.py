@@ -81,7 +81,7 @@ def build_full_symbol_time_grid(
     sorted_ts = sorted(list(all_ts_set))
     log_util(f"   ⏱️ タイムスタンプ統合: 全 {len(sorted_ts):,} ステップ (全 {len(all_symbols)} 銘柄対象)")
 
-    # 2. メモリ効率を考慮し、全銘柄をアライメント
+    # 2. メモリ効率を考慮し、全銘柄をアライメント (float32化でRAM半減)
     aligned_dfs: List[pd.DataFrame] = []
     base_ts_df = pd.DataFrame({"timestamp": sorted_ts})
 
@@ -94,6 +94,11 @@ def build_full_symbol_time_grid(
             for col in ["open", "high", "low", "close", "volume"]:
                 merged[col] = np.nan
 
+        # メモリ削減: float64 (8バイト) -> float32 (4バイト)
+        for col in ["open", "high", "low", "close", "volume"]:
+            if col in merged.columns:
+                merged[col] = merged[col].astype("float32")
+
         merged["symbol"] = sym
         # 必要なカラム順を保証
         merged = merged[["timestamp", "symbol", "open", "high", "low", "close", "volume"]]
@@ -105,6 +110,7 @@ def build_full_symbol_time_grid(
 
     del aligned_dfs
     del base_ts_df
+    del cleaned_dfs
     gc.collect()
 
     log_util(f"   ✅ 全銘柄網羅テーブル生成完了: {len(master_df):,} 行 (欠損NaN補完済み)")

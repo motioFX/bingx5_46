@@ -68,12 +68,13 @@ async def run_all_exchanges_pipeline(
     start_time = time.time()
     now_jst = datetime.now(JST).strftime("%Y-%m-%d %H:%M:%S JST")
 
-    target_intervals = list(intervals) if intervals else ["1d", "1h", "15m", "5m"]
+    target_intervals = list(intervals) if intervals else ["5m"]
     target_exchanges = [e.lower() for e in exchanges] if exchanges else ["hyperliquid", "bingx"]
+    target_bingx_cats = list(bingx_categories) if bingx_categories else ["crypto", "forex_commodities", "stocks"]
 
     mode_label = f"8時間差分つけ足し更新 (直近{incremental_hours}H)" if incremental_hours > 0 and not force else "全期間フル同期"
     log("=" * 80)
-    log(f"🌍 【取引所 全銘柄マルチ時間足 統合データ収集パイプライン開始】 ({mode_label})")
+    log(f"🌍 【取引所 全銘柄 5分足データ収集パイプライン開始】 ({mode_label})")
     log(f"   開始時刻: {now_jst}")
     log(f"   対象取引所: {target_exchanges}")
     log(f"   対象足種: {target_intervals}")
@@ -149,7 +150,7 @@ async def run_all_exchanges_pipeline(
     else:
         log("⏭️ [Hyperliquid] 対象外のためスキップします。")
 
-    # 4. BingX パイプライン (FX除外 全1100+銘柄)
+    # 4. BingX パイプライン (3カテゴリー: クリプト, FX＆コモディティ, 株式)
     if "bingx" in target_exchanges:
         log("\n" + "#" * 35 + " BingX " + "#" * 35)
         try:
@@ -160,7 +161,7 @@ async def run_all_exchanges_pipeline(
                 days_5m=days_5m,
                 days_1m=days_1m,
                 intervals=target_intervals,
-                categories=bingx_categories,
+                categories=target_bingx_cats,
                 force=force,
                 force_upload=force_upload,
                 skip_upload=skip_upload,
@@ -173,8 +174,8 @@ async def run_all_exchanges_pipeline(
     else:
         log("⏭️ [BingX] 対象外のためスキップします。")
 
-    # 5. BingX クリプト主要21銘柄 5分足データセット (2ヶ月分蓄積 ＆ 一括ZIP配信)
-    if "bingx" in target_exchanges or "crypto21" in target_exchanges:
+    # 5. BingX クリプト主要21銘柄 5分足データセット (明示的指定時のみ実行)
+    if "crypto21" in target_exchanges:
         log("\n" + "#" * 25 + " BingX Crypto Top 21 (5m) " + "#" * 25)
         try:
             await crypto21_pipeline.run_crypto21_5m_pipeline(
@@ -197,15 +198,15 @@ async def run_all_exchanges_pipeline(
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="取引所 全銘柄マルチ時間足統合データ収集パイプライン")
+    parser = argparse.ArgumentParser(description="取引所 全銘柄5分足データ収集パイプライン")
     parser.add_argument("--days-1d", type=int, default=1460, help="日足取得期間（日）")
     parser.add_argument("--days-1h", type=int, default=1460, help="1時間足取得期間（日）")
     parser.add_argument("--days-15m", type=int, default=180, help="15分足取得期間（日）")
     parser.add_argument("--days-5m", type=int, default=60, help="5分足取得期間（日、デフォルト60日＝2ヶ月分）")
     parser.add_argument("--days-1m", type=int, default=30, help="1分足取得期間（日）")
-    parser.add_argument("--intervals", nargs="+", default=["1d", "1h", "15m", "5m"], help="実行する足種 (デフォルト: 1d 1h 15m 5m)")
+    parser.add_argument("--intervals", nargs="+", default=["5m"], help="実行する足種 (デフォルト: 5m)")
     parser.add_argument("--exchanges", nargs="+", default=["hyperliquid", "bingx"], help="実行する取引所 (デフォルト: hyperliquid bingx)")
-    parser.add_argument("--bingx-categories", nargs="+", default=None, help="BingX対象カテゴリー (crypto_top21, crypto, indices_commodities, forex, stocks)")
+    parser.add_argument("--bingx-categories", nargs="+", default=["crypto", "forex_commodities", "stocks"], help="BingX対象カテゴリー (crypto, forex_commodities, stocks)")
     parser.add_argument("--force", action="store_true", help="既存キャッシュを無視して全件再取得")
     parser.add_argument("--force-upload", action="store_true", help="ハッシュを無視して強制アップロード")
     parser.add_argument("--skip-upload", action="store_true", help="Discordアップロードをスキップ")

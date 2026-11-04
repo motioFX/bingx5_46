@@ -77,21 +77,13 @@ def log(message: str) -> None:
 
 
 CATEGORY_METADATA = {
-    "crypto_top21": {
-        "label": "🪙 クリプト主要21銘柄",
-        "file_tag": "crypto_top21",
-    },
     "crypto": {
         "label": "🪙 クリプト",
         "file_tag": "crypto",
     },
-    "indices_commodities": {
-        "label": "🥇 指数＆コモディティ",
-        "file_tag": "indices_commodities",
-    },
-    "forex": {
-        "label": "💱 FX",
-        "file_tag": "forex",
+    "forex_commodities": {
+        "label": "💱🥇 FX＆コモディティ",
+        "file_tag": "forex_commodities",
     },
     "stocks": {
         "label": "📈 株式",
@@ -99,7 +91,7 @@ CATEGORY_METADATA = {
     },
 }
 
-# ユーザー指定 クリプト主要21銘柄リスト
+# ユーザー指定 クリプト主要21銘柄リスト（フォールバック用）
 CRYPTO_21_SYMBOLS: List[str] = [
     "HYPE-USDT",
     "SOL-USDT",
@@ -135,26 +127,22 @@ BINGX_API_MAX_DAYS: Dict[str, int] = {
 
 
 def get_symbol_category(symbol: str) -> str:
-    """銘柄コードからカテゴリーを判定 (crypto, indices_commodities, forex, stocks)"""
+    """銘柄コードから3カテゴリーを判定 (crypto, forex_commodities, stocks)"""
     sym = symbol.strip().upper()
-    if sym.startswith("NCFX") or "FOREX" in sym:
-        return "forex"
+    if sym.startswith("NCFX") or "FOREX" in sym or sym.startswith("NCCO") or sym.startswith("NCSI") or sym.startswith("NCID") or sym.startswith("NCIN"):
+        return "forex_commodities"
     elif sym.startswith("NCSK"):
         return "stocks"
-    elif sym.startswith("NCCO") or sym.startswith("NCSI") or sym.startswith("NCID") or sym.startswith("NCIN"):
-        return "indices_commodities"
     else:
         return "crypto"
 
 
 def fetch_bingx_symbols_by_category() -> Dict[str, List[str]]:
-    """BingX の全1,200+銘柄を各カテゴリー別に分類して取得（クリプト主要21銘柄を含む）"""
+    """BingX の全1,200+銘柄を3カテゴリー（クリプト、FX＆コモディティ、株式）に分類して取得"""
     url = f"{BINGX_API_URL}/openApi/swap/v2/quote/contracts"
     categorized: Dict[str, List[str]] = {
-        "crypto_top21": list(CRYPTO_21_SYMBOLS),
         "crypto": [],
-        "indices_commodities": [],
-        "forex": [],
+        "forex_commodities": [],
         "stocks": [],
     }
     try:
@@ -174,13 +162,11 @@ def fetch_bingx_symbols_by_category() -> Dict[str, List[str]]:
         log(f"[BingX API Error] 銘柄一覧取得失敗: {e}")
 
     return {
-        "crypto_top21": list(CRYPTO_21_SYMBOLS),
         "crypto": [
             "BTC-USDT", "ETH-USDT", "SOL-USDT", "NEAR-USDT", "ARB-USDT",
             "DOGE-USDT", "BNB-USDT", "XRP-USDT", "SUI-USDT", "AVAX-USDT", "LINK-USDT"
         ],
-        "indices_commodities": ["NCCOGOLD2USD-USDT", "NCSINASDAQ1002USD-USDT", "NCSISP5002USD-USDT"],
-        "forex": ["NCFXUSD2JPY-USDT", "NCFXEUR2USD-USDT"],
+        "forex_commodities": ["NCFXUSD2JPY-USDT", "NCFXEUR2USD-USDT", "NCCOGOLD2USD-USDT", "NCSINASDAQ1002USD-USDT", "NCSISP5002USD-USDT"],
         "stocks": ["NCSKTSLA2USD-USDT", "NCSKNVDA2USD-USDT", "NCSKMSFT2USD-USDT"],
     }
 
@@ -361,13 +347,13 @@ async def run_pipeline(
     candles_dir.mkdir(parents=True, exist_ok=True)
 
     now_jst = datetime.now(JST).strftime("%Y%m%d_%H%M%S")
-    target_intervals = list(intervals) if intervals else ["1d", "1h", "15m", "5m"]
+    target_intervals = list(intervals) if intervals else ["5m"]
 
-    default_cat_order = ["crypto_top21", "crypto", "indices_commodities", "forex", "stocks"]
+    default_cat_order = ["crypto", "forex_commodities", "stocks"]
     target_categories = [c.lower() for c in categories] if categories else default_cat_order
 
     log("=" * 75)
-    log("🚀 [BingX] カテゴリー別マルチ時間足データ収集＆時間分割配信パイプライン開始")
+    log("🚀 [BingX] 3カテゴリー別 5分足データ収集＆時間分割配信パイプライン開始")
     log(f"   対象カテゴリー: {target_categories}")
     log(f"   対象足種: {target_intervals} | 実行日時タグ: {now_jst}")
     log("=" * 75)
@@ -394,7 +380,7 @@ async def run_pipeline(
 
         for interval in target_intervals:
             log(f"\n📂 ========== BingX [{cat_label}] 【{interval.upper()}足】 収集開始 ==========")
-            target_days = days_map.get(interval, 30)
+            target_days = days_map.get(interval, 60)
 
             symbol_dfs: Dict[str, pd.DataFrame] = {}
 
@@ -425,10 +411,10 @@ async def run_pipeline(
                 cat_csv = data_dir / f"bingx_{cat_tag}_all_symbols_merged.csv"
                 master_df.to_csv(cat_csv, index=False, encoding="utf-8")
                 log(f"📄 [BingX] [{cat_label}] 1H 統合マスターCSVを更新しました: {cat_csv.name} ({len(master_df):,} 行)")
-            elif interval == "5m" and cat == "crypto_top21":
-                top21_csv = data_dir / "bingx_crypto21_5m_merged.csv"
-                master_df.to_csv(top21_csv, index=False, encoding="utf-8")
-                log(f"📄 [BingX] [{cat_label}] 5M 2ヶ月分統合マスターCSVを更新しました: {top21_csv.name} ({len(master_df):,} 行)")
+            elif interval == "5m":
+                cat_csv = data_dir / f"bingx_{cat_tag}_5m_merged.csv"
+                master_df.to_csv(cat_csv, index=False, encoding="utf-8")
+                log(f"📄 [BingX] [{cat_label}] 5M 統合マスターCSVを更新しました: {cat_csv.name} ({len(master_df):,} 行)")
 
             # 3. カテゴリー別 ZIP アーカイブ生成 (直近8時間差分を足し合わせた全期間データを時間分割ZIP)
             exchange_slug = f"bingx_{cat_tag}"
@@ -438,7 +424,7 @@ async def run_pipeline(
                 interval=interval,
                 out_dir=data_dir,
                 timestamp_tag=now_jst,
-                max_part_rows=600_000,
+                max_part_rows=400_000,
                 min_parts=1
             )
 
@@ -471,14 +457,14 @@ async def run_pipeline(
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="BingX 各カテゴリー別 全銘柄マルチ時間足データ収集パイプライン")
+    parser = argparse.ArgumentParser(description="BingX 3カテゴリー別 全銘柄5分足データ収集パイプライン")
     parser.add_argument("--days-1d", type=int, default=1460, help="日足取得期間（日）")
     parser.add_argument("--days-1h", type=int, default=1460, help="1時間足取得期間（日）")
     parser.add_argument("--days-15m", type=int, default=180, help="15分足取得期間（日）")
     parser.add_argument("--days-5m", type=int, default=60, help="5分足取得期間（日、デフォルト60日＝2ヶ月分）")
     parser.add_argument("--days-1m", type=int, default=30, help="1分足取得期間（日）")
-    parser.add_argument("--intervals", nargs="+", default=["1d", "1h", "15m", "5m"], help="実行する足種 (デフォルト: 1d 1h 15m 5m)")
-    parser.add_argument("--categories", nargs="+", default=["crypto_top21", "crypto", "indices_commodities", "forex", "stocks"], help="対象カテゴリー (crypto_top21, crypto, indices_commodities, forex, stocks)")
+    parser.add_argument("--intervals", nargs="+", default=["5m"], help="実行する足種 (デフォルト: 5m)")
+    parser.add_argument("--categories", nargs="+", default=["crypto", "forex_commodities", "stocks"], help="対象カテゴリー (crypto, forex_commodities, stocks)")
     parser.add_argument("--force", action="store_true", help="既存キャッシュを無視して全件再取得")
     parser.add_argument("--force-upload", action="store_true", help="ハッシュを無視して強制アップロード")
     parser.add_argument("--skip-upload", action="store_true", help="Discordアップロードをスキップ")
