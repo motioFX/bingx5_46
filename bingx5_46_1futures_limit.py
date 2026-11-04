@@ -140,7 +140,7 @@ FIXED_SYMBOLS: List[str] = [
 # [ 6 ] 定期銘柄選定・リセット時刻（JST時間: 0〜23時）
 #       デフォルト: [1, 9, 17] (01:00, 09:00, 17:00 JST / 8時間ごと・主要セッション＆FR節目)。
 #       CLI引数 (--analysis-hours / --reset-hours / --reset-hour) での上書き指定も可能。
-ANALYSIS_HOURS: List[int] = [1, 9, 17]
+ANALYSIS_HOURS: List[int] = list(range(24))
 DAILY_ANALYSIS_MINUTE = 0
 
 # コマンドライン引数からのナンピン数オーバーライド
@@ -2006,7 +2006,11 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
     account_mode_str = "[LIVE Account] (本番口座)" if mode == "live" else "[DEMO Account] (BingX VST デモ口座)"
     air_mode_str = "[AIR MODE ON] (シミュレーション・仮想ペーパートレード)" if bingx5_46_2api.is_air else "[REAL VST ORDER ON] (実際にBingX VST取引所へ発注・約定・管理)"
 
-    hours_str = ", ".join([f"{h:02d}:00" for h in sorted(ANALYSIS_HOURS)])
+    if len(ANALYSIS_HOURS) == 24:
+        cycle_str = "毎時 00:05 JST (1時間サイクル / 地合い判定毎時追従)"
+    else:
+        hours_str = ", ".join([f"{h:02d}:00" for h in sorted(ANALYSIS_HOURS)])
+        cycle_str = f"毎日 {hours_str} JST ({24 // max(1, len(ANALYSIS_HOURS))}時間ごと)"
     start_msg = (
         "```text\n"
         " ____  _               __  __\n"
@@ -2026,7 +2030,7 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
         f"  発注モード   : {air_mode_str}\n"
         f"  戦略態勢     : 3態勢地合い連動 (BULL:買い / NEUTRAL:待機 / BEAR:売り)\n"
         f"  監視足種     : 5分足 (5m) & pybotters WebSocket リアルタイム配信\n"
-        f"  銘柄選定周期 : 毎日 {hours_str} JST (8時間ごと)\n"
+        f"  銘柄選定周期 : {cycle_str}\n"
         f"  ポジション枠 : 最大 {MAX_ACTIVE_POSITIONS} 銘柄同時保有\n"
         f"  買い (BULL)  : 単発1本固定 (ナンピンなし) / 直近10本安値確定足SL & POC防衛SL\n"
         f"  売り (BEAR)  : 単発1本固定 (ナンピンなし) / 直近10本高値確定足SL & POC防衛SL\n"
@@ -2125,33 +2129,38 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
             and current_slot != last_screening_slot
         )
         if is_periodic_reset_time:
-            periodic_banner = (
-                "```text\n"
-                " ____  _               __  __\n"
-                "| __ )(_)_ __   __ _  \\ \\/ /\n"
-                "|  _ \\| | '_ \\ / _` |  \\  / \n"
-                "| |_) | | | | | (_| |  /  \\ \n"
-                "|____/|_|_| |_|\\__, | /_/\\_\\\n"
-                "               |___/        \n"
-                "================================\n"
-                " PERIODIC SCREENING & OPTIMIZE  \n"
-                "================================\n"
-                "```\n"
-                "🔄 **【BingX 定期銘柄スクリーニング＆パラメータ最適化】**\n"
-                "```text\n"
-                "==================================================\n"
-                f"  実行時刻     : {now_jst.strftime('%Y-%m-%d %H:%M')} JST\n"
-                f"  取引口座設定 : {account_mode_str}\n"
-                f"  戦略態勢     : 3態勢地合い連動 (BULL:買い / NEUTRAL:待機 / BEAR:売り)\n"
-                f"  ローソク足   : 5分足 (5m) & pybotters WebSocket リアルタイム配信\n"
-                "==================================================\n"
-                "```"
-            )
-            discord.print_log(periodic_banner, force_send=True)
-            discord.print_log(f"[Phase C] 定期銘柄選定時刻 ({now_jst.hour:02d}:00 JST) 到達。スクリーニング＆最適化を実行します。")
+            # 8時間節目（01:00, 09:00, 17:00 JST）のみアスキーアートバナーおよびフルチャート画像を送信
+            is_major_slot = (now_jst.hour in [1, 9, 17])
+            if is_major_slot:
+                periodic_banner = (
+                    "```text\n"
+                    " ____  _               __  __\n"
+                    "| __ )(_)_ __   __ _  \\ \\/ /\n"
+                    "|  _ \\| | '_ \\ / _` |  \\  / \n"
+                    "| |_) | | | | | (_| |  /  \\ \n"
+                    "|____/|_|_| |_|\\__, | /_/\\_\\\n"
+                    "               |___/        \n"
+                    "================================\n"
+                    " PERIODIC SCREENING & OPTIMIZE  \n"
+                    "================================\n"
+                    "```\n"
+                    "🔄 **【BingX 定期銘柄スクリーニング＆パラメータ最適化】**\n"
+                    "```text\n"
+                    "==================================================\n"
+                    f"  実行時刻     : {now_jst.strftime('%Y-%m-%d %H:%M')} JST\n"
+                    f"  取引口座設定 : {account_mode_str}\n"
+                    f"  戦略態勢     : 3態勢地合い連動 (BULL:買い / NEUTRAL:待機 / BEAR:売り)\n"
+                    f"  ローソク足   : 5分足 (5m) & pybotters WebSocket リアルタイム配信\n"
+                    "==================================================\n"
+                    "```"
+                )
+                discord.print_log(periodic_banner, force_send=True)
+            discord.print_log(f"[Phase C] 定期銘柄選定時刻 ({now_jst.hour:02d}:00 JST) 到達。スクリーニング＆地合い判定を実行します (節目={is_major_slot})。")
 
-            # 1. 定期フルスクリーニング＆最適化（チャート送信付き）
-            trade_side, new_symbol_params_map, best_params, selected_symbols = await run_screening_and_optimization(mode, send_charts=True)
+            # 1. 定期スクリーニング＆最適化（チャート画像は節目 01/09/17 JST のみ送信、中間時間はスキップ）
+            trade_side, new_symbol_params_map, best_params, selected_symbols = await run_screening_and_optimization(
+                mode, send_charts=is_major_slot
+            )
 
             # 2. 旧インスタンスの引き継ぎと新選定銘柄の symbol_apis 構築
             old_apis = symbol_apis
@@ -2201,7 +2210,9 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
             discord.print_log(f"[Periodic Reset Complete] 新しい選定銘柄 ({trade_side.upper()}): {', '.join(selected_symbols)} | 現在の全監視対象: {', '.join(symbol_apis.keys())}")
 
             # 8時間ごとの実運用トレード実績レポート
-            await send_periodic_performance_report(symbol_apis, mode, label="8時間定期レポート")
+            # 8時間節目（01:00, 09:00, 17:00 JST）のみ実運用トレード実績レポート画像を送信
+            if is_major_slot:
+                await send_periodic_performance_report(symbol_apis, mode, label="定期パフォーマンスレポート")
 
         # -------------------------------------------------------------
         # [フェーズ B1] 毎時タスク (正時00:05 JST: クジラ更新 & OI蓄積 & 毎時サマリー送信)
