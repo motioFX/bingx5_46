@@ -539,6 +539,7 @@ def get_regime_gate_info(symbol: str) -> Dict[str, Any]:
         "regime_reason": "DEFAULT",
         "action": "NORMAL",
         "overall_regime": "NEUTRAL",
+        "regime_strength": {},
         "is_buy_regime": False,
         "is_sell_regime": False,
         "is_peak_dropped": False,
@@ -573,6 +574,7 @@ def get_regime_gate_info(symbol: str) -> Dict[str, Any]:
             "regime_reason": effective_reason,
             "action": effective_action,
             "overall_regime": overall_reg,
+            "regime_strength": data.get("regime_strength", {}),
             "is_buy_regime": is_buy,
             "is_sell_regime": is_sell,
             "is_peak_dropped": is_peak_dropped,
@@ -2330,6 +2332,7 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
         # -------------------------------------------------------------
         regime_info = get_regime_gate_info("BTC-USDT")
         overall_regime = regime_info.get("overall_regime", "NEUTRAL")
+        regime_strength = regime_info.get("regime_strength", {})
         is_emergency_be = (overall_regime != "BUY")
         is_regime_safe = (regime_info.get("regime_gate") == "ALLOW")
 
@@ -2878,11 +2881,20 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
         if overall_regime == "NEUTRAL":
             # ===== NEUTRAL (中立相場): 新規エントリー完全停止 ＆ 待機指値即時キャンセル =====
             # 1時間に1回のみDiscord通知 (毎時初回)、それ以外のループはローカルdebugログのみ
+            strength_desc = ""
+            if regime_strength:
+                t_jp = regime_strength.get("tier_jp", "中立")
+                n_sc = regime_strength.get("net_score", 0.0)
+                sign_sc = f"+{n_sc:.2f}" if n_sc > 0 else f"{n_sc:.2f}"
+                strength_desc = f"【{t_jp} (スコア: {sign_sc})】"
+
+            notice_msg = f"⚪ [地合い中立待機] 総合地合い中立{strength_desc}のため新規エントリーを完全停止中 (ノーポジ待機・既存ポジション建値早期撤退のみ)"
+
             if now_jst.hour != last_neutral_notice_hour:
                 last_neutral_notice_hour = now_jst.hour
-                discord.print_log(f"⚪ [地合い中立待機] 総合地合い中立(NEUTRAL)のため新規エントリーを完全停止中 (ノーポジ待機・既存ポジション建値早期撤退のみ)", level="info")
+                discord.print_log(notice_msg, level="info")
             elif cycle_count % 20 == 0:
-                discord.print_log(f"⚪ [地合い中立待機] 総合地合い中立(NEUTRAL)のため新規エントリーを完全停止中 (ノーポジ待機・既存ポジション建値早期撤退のみ)", level="debug")
+                discord.print_log(notice_msg, level="debug")
             if pending_entry_orders:
                 for p_sym in list(pending_entry_orders.keys()):
                     p_api = symbol_apis.get(p_sym)

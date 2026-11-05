@@ -417,6 +417,18 @@ async def main() -> None:
         reason_suffix = f" ({reg_reason})" if reg_reason else " (3期間合致判定)"
         regime_summary_lines.append(f"\n👉 **総合地合い判定**: {overall_icon} **{overall_label}**{reason_suffix}")
 
+        r_str = regime_eval_res.get("regime_strength", {})
+        if r_str:
+            t_jp = r_str.get("tier_jp", "")
+            t_en = r_str.get("tier", "")
+            n_sc = r_str.get("net_score", 0.0)
+            m_b = r_str.get("mean_buy_votes", 0.0)
+            m_sl = r_str.get("mean_sell_votes", 0.0)
+            sign_sc = f"+{n_sc:.2f}" if n_sc > 0 else f"{n_sc:.2f}"
+            regime_summary_lines.append(
+                f"⚡ **地合い強度**: 【{t_jp} ({t_en})】 スコア: `{sign_sc}` (買い平均: `{m_b:.1f}`票 vs 売り平均: `{m_sl:.1f}`票)"
+            )
+
         if overall_reg == "BUY":
             regime_summary_lines.append(f"🎯 **買いトレード推奨銘柄 ({len(recommended_syms)}銘柄)**: `{', '.join(recommended_syms) if recommended_syms else 'なし'}`")
             regime_summary_lines.append("⚡ **アクション**: 買い推奨銘柄の個別最適化（ロング144通り: 単発厳選 ➔ 最大3枠ナンピン）を実行し、ロングトレードを開始します。")
@@ -436,6 +448,7 @@ async def main() -> None:
     state_data = {
         "market_state": final_state,
         "overall_regime": overall_reg,
+        "regime_strength": regime_eval_res.get("regime_strength", {}),
         "regime_reason": regime_eval_res.get("regime_reason", ""),
         "is_30d_peak_breakdown": regime_eval_res.get("is_30d_peak_breakdown", False),
         "is_30d_bottom_reversal": regime_eval_res.get("is_30d_bottom_reversal", False),

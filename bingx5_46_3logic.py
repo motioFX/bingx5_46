@@ -7229,8 +7229,60 @@ def evaluate_market_regime_3window(
         regime_reason = f"地合い不一致または中立 (30d={states[0]}, 10d={states[1]}, 5d={states[2]})"
         recommended_symbols = []
 
+    # ===== 地合い強度 (Strength Tier & net_score) 算出 (全態勢・中立含む) =====
+    b_30d = period_results.get("30d", {}).get("buy_votes", 0)
+    sl_30d = period_results.get("30d", {}).get("sell_votes", 0)
+    b_10d = period_results.get("10d", {}).get("buy_votes", 0)
+    sl_10d = period_results.get("10d", {}).get("sell_votes", 0)
+    b_5d = period_results.get("5d", {}).get("buy_votes", 0)
+    sl_5d = period_results.get("5d", {}).get("sell_votes", 0)
+
+    mean_b = (b_30d + b_10d + b_5d) / 3.0
+    mean_sl = (sl_30d + sl_10d + sl_5d) / 3.0
+    net_score = (mean_b - mean_sl) / 22.0  # -1.0 〜 +1.0
+
+    if overall_regime == "BUY":
+        if mean_b >= 16.0:
+            strength_tier = "STRONG_BUY"
+            strength_tier_jp = "強気買い"
+        elif mean_b >= 13.0:
+            strength_tier = "MODERATE_BUY"
+            strength_tier_jp = "中気買い"
+        else:
+            strength_tier = "WEAK_BUY"
+            strength_tier_jp = "弱気買い"
+    elif overall_regime == "SELL":
+        if mean_sl >= 16.0:
+            strength_tier = "STRONG_SELL"
+            strength_tier_jp = "強気売り"
+        elif mean_sl >= 13.0:
+            strength_tier = "MODERATE_SELL"
+            strength_tier_jp = "中気売り"
+        else:
+            strength_tier = "WEAK_SELL"
+            strength_tier_jp = "弱気売り"
+    else:  # NEUTRAL
+        if net_score >= 0.15:
+            strength_tier = "LEAN_BUY"
+            strength_tier_jp = "買い寄り中立"
+        elif net_score <= -0.15:
+            strength_tier = "LEAN_SELL"
+            strength_tier_jp = "売り寄り中立"
+        else:
+            strength_tier = "BALANCED"
+            strength_tier_jp = "拮抗中立"
+
+    regime_strength = {
+        "tier": strength_tier,
+        "tier_jp": strength_tier_jp,
+        "net_score": round(net_score, 3),
+        "mean_buy_votes": round(mean_b, 1),
+        "mean_sell_votes": round(mean_sl, 1),
+    }
+
     return {
         "overall_regime": overall_regime,
+        "regime_strength": regime_strength,
         "is_buy_regime": (overall_regime == "BUY"),
         "is_sell_regime": (overall_regime == "SELL"),
         "regime_reason": regime_reason,
