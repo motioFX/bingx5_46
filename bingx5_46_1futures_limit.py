@@ -2112,6 +2112,8 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
     last_hourly_slot = None
     cached_positions_map: Dict[str, dict] = {}
     missing_position_counts: Dict[str, int] = {}
+    last_neutral_notice_hour: Optional[int] = None
+    last_ny_notice_hour: Optional[int] = None
 
     # ========== フェーズB: MTFリアルタイム監視ループ (30秒サイクル省エネ運用) ==========
     while True:
@@ -2875,8 +2877,12 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
         # -------------------------------------------------------------
         if overall_regime == "NEUTRAL":
             # ===== NEUTRAL (中立相場): 新規エントリー完全停止 ＆ 待機指値即時キャンセル =====
-            if cycle_count % 20 == 0:
+            # 1時間に1回のみDiscord通知 (毎時初回)、それ以外のループはローカルdebugログのみ
+            if now_jst.hour != last_neutral_notice_hour:
+                last_neutral_notice_hour = now_jst.hour
                 discord.print_log(f"⚪ [地合い中立待機] 総合地合い中立(NEUTRAL)のため新規エントリーを完全停止中 (ノーポジ待機・既存ポジション建値早期撤退のみ)", level="info")
+            elif cycle_count % 20 == 0:
+                discord.print_log(f"⚪ [地合い中立待機] 総合地合い中立(NEUTRAL)のため新規エントリーを完全停止中 (ノーポジ待機・既存ポジション建値早期撤退のみ)", level="debug")
             if pending_entry_orders:
                 for p_sym in list(pending_entry_orders.keys()):
                     p_api = symbol_apis.get(p_sym)
@@ -2899,8 +2905,12 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
             is_ny_b3 = not (is_tokyo_b3 or is_london_b3)
 
             if is_ny_b3:
-                if cycle_count % 20 == 0:
+                # 1時間に1回のみDiscord通知 (毎時初回)、それ以外のループはローカルdebugログのみ
+                if now_jst_b3.hour != last_ny_notice_hour:
+                    last_ny_notice_hour = now_jst_b3.hour
                     discord.print_log(f"🌙 [米国時間新規停止] 米国セッション(22:00〜翌09:00 JST)のため新規エントリーを完全停止中 (トレール決済・既存ポジション監視のみ)", level="info")
+                elif cycle_count % 20 == 0:
+                    discord.print_log(f"🌙 [米国時間新規停止] 米国セッション(22:00〜翌09:00 JST)のため新規エントリーを完全停止中 (トレール決済・既存ポジション監視のみ)", level="debug")
                 if pending_entry_orders:
                     for p_sym in list(pending_entry_orders.keys()):
                         p_api = symbol_apis.get(p_sym)
