@@ -45,6 +45,23 @@ def _pad_display(text: str, width: int, align: str = 'left') -> str:
         return text_str + ' ' * pad
 
 
+def _sanitize_for_json(obj: Any) -> Any:
+    """pandas DataFrame, Series, numpy型などを再帰的にJSONシリアライズ可能なPython基本型に変換・除外する"""
+    if isinstance(obj, dict):
+        return {
+            str(k): _sanitize_for_json(v)
+            for k, v in obj.items()
+            if k != "chart_df" and not (hasattr(v, "__class__") and v.__class__.__name__ in ("DataFrame", "Series"))
+        }
+    elif isinstance(obj, (list, tuple, set)):
+        return [_sanitize_for_json(x) for x in obj]
+    elif hasattr(obj, "__class__") and obj.__class__.__name__ in ("DataFrame", "Series"):
+        return None
+    elif hasattr(obj, "item"):
+        return obj.item()
+    return obj
+
+
 # Automatic Dual Logging: Output to Terminal, Data/bot_output.log, and Data/logs/bot_YYYY-MM-DD.log
 class TeeLogger:
     def __init__(self, filepath: Path, original_stdout, max_size_mb: int = 15):
@@ -1252,8 +1269,15 @@ async def validate_profitable_candidates(trade_side: str, mode: str, base_symbol
             print(f"Best cand chart error {best_sym}: {ch_err}")
 
     # チャート出力完了後はメモリ解放
-    for sym_k in symbol_params_map:
-        symbol_params_map[sym_k].pop("chart_df", None)
+    for sym_k in list(symbol_params_map.keys()):
+        cand_dict = symbol_params_map[sym_k]
+        cand_dict.pop("chart_df", None)
+        if isinstance(cand_dict.get("params"), dict):
+            cand_dict["params"].pop("chart_df", None)
+        if isinstance(cand_dict.get("range_params"), dict):
+            cand_dict["range_params"].pop("chart_df", None)
+        if isinstance(cand_dict.get("breakout_params"), dict):
+            cand_dict["breakout_params"].pop("chart_df", None)
 
     if best_sym:
         default_best_params = symbol_params_map.get(best_sym, default_best_params)
@@ -1696,17 +1720,20 @@ async def run_screening_and_optimization(mode: str, send_charts: bool = False, s
     selected_symbols = list(profitable_cands)[:MAX_SELECTED_SYMBOLS]
     print(f"\n[Selection Result] 選定{len(selected_symbols)}銘柄 (サイクル適格 ＆ 個別最適化合格): {', '.join(selected_symbols) if selected_symbols else 'なし (全銘柄見送り・完全ノーポジ維持)'}")
 
-    # 直近の選定結果を JSON に永続化 (show_symbol_status 用)
+    # 直近の選定結果を JSON に永続化 (show_symbol_status 用 / アトミック書き込み)
     last_res_file = Path(__file__).resolve().parent / "Data" / "last_selection_result.json"
     try:
-        with open(last_res_file, "w", encoding="utf-8") as f:
+        clean_map = _sanitize_for_json(symbol_params_map)
+        tmp_file = last_res_file.with_suffix(".tmp")
+        with open(tmp_file, "w", encoding="utf-8") as f:
             json.dump({
                 "selected_symbols": selected_symbols,
-                "symbol_params_map": symbol_params_map,
+                "symbol_params_map": clean_map,
                 "evaluated_at": datetime.now(timezone.utc).isoformat()
             }, f, indent=2, ensure_ascii=False)
+        tmp_file.replace(last_res_file)
     except Exception as e:
-        pass
+        discord.print_log(f"[Warning] last_selection_result.json 保存エラー: {e}")
 
     # 全20銘柄の選定・除外ステータス完全一覧ダッシュボードを出力 ＆ Discord送信 (PROJECT_RULES.md 準拠)
     try:
