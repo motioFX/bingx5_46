@@ -3015,7 +3015,7 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                     cand_strat_e = str(sym_params_e.get("strategy", "rsima")).lower()
 
                     # 許可戦略チェック (allowed_strategies が指定されている場合)
-                    gate_allowed = gate_info.get("allowed_strategies", [])
+                    gate_allowed = regime_info.get("allowed_strategies", []) if "regime_info" in locals() else []
                     if gate_allowed and cand_strat_e not in gate_allowed:
                         continue
 
