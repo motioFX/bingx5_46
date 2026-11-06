@@ -7182,46 +7182,42 @@ def evaluate_market_regime_3window(
         or len(bottom_reversal_by_window.get("30d", set())) >= 8
     )
 
-    # 総合地合い判定 (実証最適・初動エッジ特化4大規約 / 2023-2026年 40万本実証準拠)
+    # 総合地合い判定 (5分足アクティブ稼働・実APIデモ検証モード: 過半数連動)
     states = [period_results[w]["state"] for w in ["30d", "10d", "5d"]]
     recommended_symbols = []
     regime_reason = ""
     regime_pattern = f"({states[0][:1]},{states[1][:1]},{states[2][:1]})"
     allowed_strategies = []
 
-    # パターン1: (N, N, B) 保ち合い上放れ初動 ➔ 総合「BUY」【ブレイクアウト(VAH_BREAK)単独発注】
-    if states == ["NEUTRAL", "NEUTRAL", "BUY"]:
+    buy_count = states.count("BUY")
+    sell_count = states.count("SELL")
+
+    # 1. 買い優勢 (BUYが2つ以上、または 5dがBUYかつ30d底打ち反転)
+    if buy_count >= 2 or (states[2] == "BUY" and is_30d_bottom_reversal):
         overall_regime = "BUY"
-        regime_reason = "保ち合い上放れ初動 (N,N,B) ➔ VAHブレイクアウト順張り単独 (検証中の候補 / 本番ロジック検証 PF0.83)"
-        allowed_strategies = ["vah_break"]
-        recommended_symbols = sorted([s for s in eligible_buy_by_window.get("5d", set()) if s.upper().replace("-USDT", "").replace("USDT", "") != "BTC"])
+        regime_reason = f"買い優勢地合い {regime_pattern} ➔ 全買い戦略アクティブ稼働"
+        allowed_strategies = ["val_poc", "vah_break", "rsima"]
+        # 候補銘柄: 5dまたは10dで買い条件を満たした銘柄群
+        cands = eligible_buy_by_window.get("5d", set()).union(eligible_buy_by_window.get("10d", set()))
+        if not cands:
+            cands = eligible_buy_by_window.get("30d", set())
+        recommended_symbols = sorted([s for s in cands if s.upper().replace("-USDT", "").replace("USDT", "") != "BTC"])
 
-    # パターン2: (N, N, S) 保ち合い下放れ初動 ➔ 総合「SELL」【ブレイクダウン ＆ レンジ戻り売り併用】
-    elif states == ["NEUTRAL", "NEUTRAL", "SELL"]:
+    # 2. 売り優勢 (SELLが2つ以上、または 5dがSELLかつ30d天井崩壊)
+    elif sell_count >= 2 or (states[2] == "SELL" and is_30d_peak_breakdown):
         overall_regime = "SELL"
-        regime_reason = "保ち合い下放れ初動 (N,N,S) ➔ VALブレイク ＆ レンジ戻り売り特化 (勝率59-62%/PF1.18-1.19)"
+        regime_reason = f"売り優勢地合い {regime_pattern} ➔ 全売り戦略アクティブ稼働"
         allowed_strategies = ["val_break", "vah_poc", "rsima_short"]
-        recommended_symbols = sorted([s for s in eligible_sell_by_window.get("5d", set()) if s.upper().replace("-USDT", "").replace("USDT", "") != "BTC"])
+        # 候補銘柄: 5dまたは10dで売り条件を満たした銘柄群
+        cands = eligible_sell_by_window.get("5d", set()).union(eligible_sell_by_window.get("10d", set()))
+        if not cands:
+            cands = eligible_sell_by_window.get("30d", set())
+        recommended_symbols = sorted([s for s in cands if s.upper().replace("-USDT", "").replace("USDT", "") != "BTC"])
 
-    # パターン3: (N, S, S) 中短期下落加速期 ➔ 総合「SELL」【ブレイクダウン ＆ レンジ戻り売り併用】
-    elif states == ["NEUTRAL", "SELL", "SELL"]:
-        overall_regime = "SELL"
-        regime_reason = "中短期下落加速期 (N,S,S) ➔ VALブレイク ＆ レンジ戻り売り特化 (勝率56.7%/PF1.09)"
-        allowed_strategies = ["val_break", "vah_poc", "rsima_short"]
-        common_10_5 = eligible_sell_by_window["10d"].intersection(eligible_sell_by_window["5d"])
-        recommended_symbols = sorted([s for s in common_10_5 if s.upper().replace("-USDT", "").replace("USDT", "") != "BTC"])
-
-    # それ以外（(S, S, S) 長期売り・(N, B, B) 上昇加速・(B, B, B) 成熟買い・逆行局面すべて）➔ 総合「NEUTRAL (完全見送り)」
+    # 3. 中立 (拮抗または保ち合い)
     else:
         overall_regime = "NEUTRAL"
-        if states == ["SELL", "SELL", "SELL"]:
-            regime_reason = "長期売り継続期 (S,S,S) ➔ 本番ロジック検証で全戦略マイナス・完全見送り(ノーポジ維持)"
-        elif states == ["NEUTRAL", "BUY", "BUY"]:
-            regime_reason = "中短期上昇加速 (N,B,B) ➔ 本番ロジック検証で全戦略マイナス・完全見送り(ノーポジ維持)"
-        elif states == ["BUY", "BUY", "BUY"]:
-            regime_reason = "長期成熟買い相場 (B,B,B) ➔ 本番ロジック検証で全戦略マイナス・完全見送り(ノーポジ維持)"
-        else:
-            regime_reason = f"地合い不一致または中立 (30d={states[0]}, 10d={states[1]}, 5d={states[2]})"
+        regime_reason = f"拮抗・保ち合い中立 {regime_pattern} ➔ ノーポジ待機"
         recommended_symbols = []
         allowed_strategies = []
 

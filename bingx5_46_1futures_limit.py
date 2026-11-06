@@ -2955,23 +2955,12 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
             is_ny_b3 = not (is_tokyo_b3 or is_london_b3)
 
             if is_ny_b3:
-                # 1時間に1回のみDiscord通知 (毎時初回)、それ以外のループはローカルdebugログのみ
+                # 5分足24時間アクティブ検証モード: 米国セッションもエントリー監視継続
                 if now_jst_b3.hour != last_ny_notice_hour:
                     last_ny_notice_hour = now_jst_b3.hour
-                    discord.print_log(f"🌙 [米国時間新規停止] 米国セッション(22:00〜翌09:00 JST)のため新規エントリーを完全停止中 (トレール決済・既存ポジション監視のみ)", level="info")
-                elif cycle_count % 20 == 0:
-                    discord.print_log(f"🌙 [米国時間新規停止] 米国セッション(22:00〜翌09:00 JST)のため新規エントリーを完全停止中 (トレール決済・既存ポジション監視のみ)", level="debug")
-                if pending_entry_orders:
-                    for p_sym in list(pending_entry_orders.keys()):
-                        p_api = symbol_apis.get(p_sym)
-                        if p_api:
-                            try:
-                                await p_api.active_order_cancel()
-                                discord.print_log(f"🛡️ [米国時間退避] 米国セッション突入に伴い {p_sym} の未約定指値を安全にキャンセルしました。")
-                            except Exception:
-                                pass
-                    pending_entry_orders.clear()
-                continue
+                    discord.print_log(f"🌙 [米国時間アクティブ監視] 米国セッション(22:00〜翌09:00 JST) 24時間フル稼働中 (トレール防衛＆5分足チャンス監視)", level="info")
+                elif cycle_count % 30 == 0:
+                    discord.print_log(f"🌙 [米国時間アクティブ監視] 米国セッション(22:00〜翌09:00 JST) 24時間フル稼働中 (トレール防衛＆5分足チャンス監視)", level="debug")
             total_active_count = len(active_positions) + len(pending_entry_orders)
 
             for sym in selected_symbols:
@@ -3006,36 +2995,35 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                     # 時間帯連動デュアルパラメータ自動切替:
                     # 東京時間 (09:00〜16:00 JST) -> レンジ逆張り最適パラメータ (range_params)
                     # 欧州時間 (16:00〜22:00 JST) -> ブレイクアウト最適パラメータ (breakout_params)
+                    # 時間帯連動デュアルパラメータ切替 (24時間アクティブ検証モード):
+                    # 東京時間 (09:00〜16:00 JST) -> レンジ逆張り最適パラメータ (range_params)
+                    # 欧州時間 (16:00〜22:00 JST) -> ブレイクアウト最適パラメータ (breakout_params)
+                    # 米国時間 (22:00〜翌09:00 JST) -> 合格戦略または総合最適パラメータ (raw_sym_params)
                     if is_tokyo_b3:
                         sym_params_e = raw_sym_params.get("range_params") or raw_sym_params
-                        if "is_range_qualified" in raw_sym_params and not raw_sym_params.get("is_range_qualified", False):
-                            continue
                     elif is_london_b3:
                         sym_params_e = raw_sym_params.get("breakout_params") or raw_sym_params
-                        if "is_breakout_qualified" in raw_sym_params and not raw_sym_params.get("is_breakout_qualified", False):
-                            continue
                     else:
-                        continue
-
-                    if not sym_params_e.get("is_qualified", True):
-                        continue
+                        if raw_sym_params.get("is_breakout_qualified"):
+                            sym_params_e = raw_sym_params.get("breakout_params") or raw_sym_params
+                        elif raw_sym_params.get("is_range_qualified"):
+                            sym_params_e = raw_sym_params.get("range_params") or raw_sym_params
+                        else:
+                            sym_params_e = raw_sym_params
 
                     cand_interval_e = int(sym_params_e.get("interval", 5) or 5)
                     cand_strat_e = str(sym_params_e.get("strategy", "rsima")).lower()
 
-                    # 実証最適初動エッジ特化チェック: allowed_strategies が指定されている場合、合致しない戦略は遮断
+                    # 許可戦略チェック (allowed_strategies が指定されている場合)
                     gate_allowed = gate_info.get("allowed_strategies", [])
                     if gate_allowed and cand_strat_e not in gate_allowed:
                         continue
 
-                    # 時間帯ロール適合性チェック (東京はレンジ逆張りのみ、欧州はブレイクアウトのみ)
-                    # 本番ロジック整合バックテストで N,N,B x VAH_BREAK は欧州のみ PF>1 (東京 PF0.68) のため、全地合いで同一規則を適用
+                    # 時間帯ロール適合性チェック (東京はレンジ逆張りのみ、欧州はブレイクアウトのみ、米国は両方許可)
                     is_brk_strat = (cand_strat_e in ("vah_break", "val_break"))
                     if is_tokyo_b3 and is_brk_strat:
-                        # 東京時間はレンジ逆張りのみ許可 (ブレイクアウトはダマシ回避のため遮断)
                         continue
                     if is_london_b3 and not is_brk_strat:
-                        # 欧州時間はブレイクアウトのみ許可 (逆張りはトレンド被弾回避のため遮断)
                         continue
 
                     df_entry_eval = resample_candles(df_5m, cand_interval_e, drop_unclosed=True) if cand_interval_e > 5 else df_5m.copy()
