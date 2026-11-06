@@ -448,6 +448,8 @@ async def main() -> None:
     state_data = {
         "market_state": final_state,
         "overall_regime": overall_reg,
+        "regime_pattern": regime_eval_res.get("regime_pattern", ""),
+        "allowed_strategies": regime_eval_res.get("allowed_strategies", []),
         "regime_strength": regime_eval_res.get("regime_strength", {}),
         "regime_reason": regime_eval_res.get("regime_reason", ""),
         "is_30d_peak_breakdown": regime_eval_res.get("is_30d_peak_breakdown", False),

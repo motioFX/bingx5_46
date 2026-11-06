@@ -7171,63 +7171,54 @@ def evaluate_market_regime_3window(
         or len(bottom_reversal_by_window.get("30d", set())) >= 8
     )
 
-    # 総合地合い判定 (3期間すべてが一致しているか、または30d天井崩壊/底打ち反転緩和)
+    # 総合地合い判定 (実証最適・初動エッジ特化4大規約 / 2023-2026年 40万本実証準拠)
     states = [period_results[w]["state"] for w in ["30d", "10d", "5d"]]
     recommended_symbols = []
     regime_reason = ""
+    regime_pattern = f"({states[0][:1]},{states[1][:1]},{states[2][:1]})"
+    allowed_strategies = []
 
-    if states == ["BUY", "BUY", "BUY"]:
+    # パターン1: (N, N, B) 保ち合い上放れ初動 ➔ 総合「BUY」【ブレイクアウト(VAH_BREAK)単独発注】
+    if states == ["NEUTRAL", "NEUTRAL", "BUY"]:
         overall_regime = "BUY"
-        regime_reason = "3期間すべて買い (BUY一致)"
-        common_buy = set.intersection(*(eligible_buy_by_window[w] for w in ["30d", "10d", "5d"]))
-        recommended_symbols = sorted([s for s in common_buy if s.upper().replace("-USDT", "").replace("USDT", "") != "BTC"])
-    elif states == ["SELL", "SELL", "SELL"]:
-        overall_regime = "SELL"
-        regime_reason = "3期間すべて売り (SELL一致)"
-        common_sell = set.intersection(*(eligible_sell_by_window[w] for w in ["30d", "10d", "5d"]))
-        recommended_symbols = sorted([s for s in common_sell if s.upper().replace("-USDT", "").replace("USDT", "") != "BTC"])
-    elif states[1] == "BUY" and states[2] == "BUY" and is_30d_bottom_reversal:
-        overall_regime = "BUY"
-        rev_detail = []
-        if btc_bottom_rev_by_window.get("30d", False):
-            rev_detail.append("BTC底打ち反転")
-        if market_bottom_rev_by_window.get("30d", False):
-            rev_detail.append("市場平均底打ち反転")
-        rev_count = len(bottom_reversal_by_window.get("30d", set()))
-        if rev_count > 0:
-            rev_detail.append(f"底打ち反転{rev_count}銘柄")
-        detail_str = "/".join(rev_detail) if rev_detail else "底打ち反転検知"
-        regime_reason = f"30d底打ち反転上昇({detail_str}) ＆ 10d/5d買い一致 (30d={states[0]}から買い判定緩和)"
+        regime_reason = "保ち合い上放れ初動 (N,N,B) ➔ VAHブレイクアウト順張り単独特化 (勝率58.4%/PF1.13)"
+        allowed_strategies = ["vah_break"]
+        recommended_symbols = sorted([s for s in eligible_buy_by_window.get("5d", set()) if s.upper().replace("-USDT", "").replace("USDT", "") != "BTC"])
 
-        common_10_5 = eligible_buy_by_window["10d"].intersection(eligible_buy_by_window["5d"])
-        eligible_30d_long = eligible_buy_by_window["30d"].union(bottom_reversal_by_window.get("30d", set()))
-        common_buy = common_10_5.intersection(eligible_30d_long)
-        if not common_buy:
-            common_buy = common_10_5
-        recommended_symbols = sorted([s for s in common_buy if s.upper().replace("-USDT", "").replace("USDT", "") != "BTC"])
-    elif states[1] == "SELL" and states[2] == "SELL" and is_30d_peak_breakdown:
+    # パターン2: (N, N, S) 保ち合い下放れ初動 ➔ 総合「SELL」【ブレイクダウン ＆ レンジ戻り売り併用】
+    elif states == ["NEUTRAL", "NEUTRAL", "SELL"]:
         overall_regime = "SELL"
-        bd_detail = []
-        if btc_peak_breakdown_by_window.get("30d", False):
-            bd_detail.append("BTC天井崩壊")
-        if market_peak_bd_by_window.get("30d", False):
-            bd_detail.append("市場平均天井崩壊")
-        bd_count = len(peak_breakdown_by_window.get("30d", set()))
-        if bd_count > 0:
-            bd_detail.append(f"天井崩壊{bd_count}銘柄")
-        detail_str = "/".join(bd_detail) if bd_detail else "天井崩壊検知"
-        regime_reason = f"30d天井崩壊下落({detail_str}) ＆ 10d/5d売り一致 (30d={states[0]}から売り判定緩和)"
+        regime_reason = "保ち合い下放れ初動 (N,N,S) ➔ VALブレイク ＆ レンジ戻り売り特化 (勝率59-62%/PF1.18-1.19)"
+        allowed_strategies = ["val_break", "vah_poc", "rsima_short"]
+        recommended_symbols = sorted([s for s in eligible_sell_by_window.get("5d", set()) if s.upper().replace("-USDT", "").replace("USDT", "") != "BTC"])
 
+    # パターン3: (N, S, S) 中短期下落加速期 ➔ 総合「SELL」【ブレイクダウン ＆ レンジ戻り売り併用】
+    elif states == ["NEUTRAL", "SELL", "SELL"]:
+        overall_regime = "SELL"
+        regime_reason = "中短期下落加速期 (N,S,S) ➔ VALブレイク ＆ レンジ戻り売り特化 (勝率56.7%/PF1.09)"
+        allowed_strategies = ["val_break", "vah_poc", "rsima_short"]
         common_10_5 = eligible_sell_by_window["10d"].intersection(eligible_sell_by_window["5d"])
-        eligible_30d_short = eligible_sell_by_window["30d"].union(peak_breakdown_by_window.get("30d", set()))
-        common_sell = common_10_5.intersection(eligible_30d_short)
-        if not common_sell:
-            common_sell = common_10_5
+        recommended_symbols = sorted([s for s in common_10_5 if s.upper().replace("-USDT", "").replace("USDT", "") != "BTC"])
+
+    # パターン4: (S, S, S) 長期売り継続期 または 30d天井崩壊下落 ➔ 総合「SELL」
+    elif states == ["SELL", "SELL", "SELL"] or (states[1] == "SELL" and states[2] == "SELL" and is_30d_peak_breakdown):
+        overall_regime = "SELL"
+        regime_reason = "長期売り継続期 (S,S,S) ➔ 厳格二重頑健性クリア銘柄特化"
+        allowed_strategies = ["val_break", "vah_poc", "rsima_short"]
+        common_sell = set.intersection(*(eligible_sell_by_window[w] for w in ["30d", "10d", "5d"])) if states == ["SELL", "SELL", "SELL"] else eligible_sell_by_window["10d"].intersection(eligible_sell_by_window["5d"])
         recommended_symbols = sorted([s for s in common_sell if s.upper().replace("-USDT", "").replace("USDT", "") != "BTC"])
+
+    # それ以外（(N, B, B) 上昇加速・(B, B, B) 成熟買い・逆行局面等）➔ 総合「NEUTRAL (完全見送り)」
     else:
         overall_regime = "NEUTRAL"
-        regime_reason = f"地合い不一致または中立 (30d={states[0]}, 10d={states[1]}, 5d={states[2]})"
+        if states == ["NEUTRAL", "BUY", "BUY"]:
+            regime_reason = "中短期上昇加速 (N,B,B) ➔ 4年実証大敗・完全見送り(ノーポジ維持)"
+        elif states == ["BUY", "BUY", "BUY"]:
+            regime_reason = "長期成熟買い相場 (B,B,B) ➔ 4年実証大敗・完全見送り(ノーポジ維持)"
+        else:
+            regime_reason = f"地合い不一致または中立 (30d={states[0]}, 10d={states[1]}, 5d={states[2]})"
         recommended_symbols = []
+        allowed_strategies = []
 
     # ===== 地合い強度 (Strength Tier & net_score) 算出 (全態勢・中立含む) =====
     b_30d = period_results.get("30d", {}).get("buy_votes", 0)
@@ -7282,6 +7273,8 @@ def evaluate_market_regime_3window(
 
     return {
         "overall_regime": overall_regime,
+        "regime_pattern": regime_pattern,
+        "allowed_strategies": allowed_strategies,
         "regime_strength": regime_strength,
         "is_buy_regime": (overall_regime == "BUY"),
         "is_sell_regime": (overall_regime == "SELL"),

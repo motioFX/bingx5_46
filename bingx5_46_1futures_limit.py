@@ -591,6 +591,8 @@ def get_regime_gate_info(symbol: str) -> Dict[str, Any]:
             "regime_reason": effective_reason,
             "action": effective_action,
             "overall_regime": overall_reg,
+            "regime_pattern": data.get("regime_pattern", ""),
+            "allowed_strategies": data.get("allowed_strategies", []),
             "regime_strength": data.get("regime_strength", {}),
             "is_buy_regime": is_buy,
             "is_sell_regime": is_sell,
@@ -1012,7 +1014,10 @@ async def validate_profitable_candidates(trade_side: str, mode: str, base_symbol
         "params": {"rsi_len": 9, "lma_len": 7, "lEp": 40.0, "lCp": 60.0, "max_trades": MAX_TRADES_COUNT}
     }
 
-    # 3態勢地合い連動モデルに基づく候補選定 & トレード態勢決定
+    # 3態勢地合い連動モデルに基づく候補選定 & トレード態勢決定 (実証最適・初動エッジ特化4大規約)
+    reg_pat = market_state_info.get("regime_pattern", "")
+    allowed_strats = market_state_info.get("allowed_strategies", [])
+
     if overall_reg == "BUY":
         actual_side = "long"
         all_candidates = [
@@ -1156,7 +1161,13 @@ async def validate_profitable_candidates(trade_side: str, mode: str, base_symbol
                     and pnl_1st > 0.0
                     and pnl_2nd > pnl_1st
                 )
-                is_qual = bool(is_rng_qual or is_brk_qual or is_tier1 or is_tier2)
+                # 初動エッジ特化: N,N,B (上放れ初動) はブレイクアウト順張りのみ許可 (レンジ逆張り除外)
+                if allowed_strats == ["vah_break"]:
+                    is_qual = bool(is_brk_qual)
+                    cand_params["strategy"] = "vah_break"
+                    cand_params["params"] = brk_params
+                else:
+                    is_qual = bool(is_rng_qual or is_brk_qual or is_tier1 or is_tier2)
 
                 # デュアル傾向表示文字列の構築
                 rng_st_str = str(rng_params.get("strategy", "-")).upper()
@@ -3012,14 +3023,21 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                     cand_interval_e = int(sym_params_e.get("interval", 5) or 5)
                     cand_strat_e = str(sym_params_e.get("strategy", "rsima")).lower()
 
-                    # 時間帯ロール適合性チェック (東京はレンジ逆張りのみ、欧州はブレイクアウトのみ)
+                    # 実証最適初動エッジ特化チェック: allowed_strategies が指定されている場合、合致しない戦略は遮断
+                    gate_allowed = gate_info.get("allowed_strategies", [])
+                    if gate_allowed and cand_strat_e not in gate_allowed:
+                        continue
+
+                    # 時間帯ロール適合性チェック (通常時: 東京はレンジ逆張りのみ、欧州はブレイクアウトのみ)
+                    # ただし、allowed_strategies がブレイクアウト特化 (例: N,N,B) の場合は全時間帯でブレイクを許可
                     is_brk_strat = (cand_strat_e in ("vah_break", "val_break"))
-                    if is_tokyo_b3 and is_brk_strat:
-                        # 東京時間はレンジ逆張りのみ許可 (ブレイクアウトはダマシ回避のため遮断)
-                        continue
-                    if is_london_b3 and not is_brk_strat:
-                        # 欧州時間はブレイクアウトのみ許可 (逆張りはトレンド被弾回避のため遮断)
-                        continue
+                    if not (gate_allowed and "vah_break" in gate_allowed and len(gate_allowed) == 1):
+                        if is_tokyo_b3 and is_brk_strat:
+                            # 東京時間はレンジ逆張りのみ許可 (ブレイクアウトはダマシ回避のため遮断)
+                            continue
+                        if is_london_b3 and not is_brk_strat:
+                            # 欧州時間はブレイクアウトのみ許可 (逆張りはトレンド被弾回避のため遮断)
+                            continue
 
                     df_entry_eval = resample_candles(df_5m, cand_interval_e, drop_unclosed=True) if cand_interval_e > 5 else df_5m.copy()
                     try:
