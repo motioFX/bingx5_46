@@ -7200,18 +7200,12 @@ def evaluate_market_regime_3window(
         common_10_5 = eligible_sell_by_window["10d"].intersection(eligible_sell_by_window["5d"])
         recommended_symbols = sorted([s for s in common_10_5 if s.upper().replace("-USDT", "").replace("USDT", "") != "BTC"])
 
-    # パターン4: (S, S, S) 長期売り継続期 または 30d天井崩壊下落 ➔ 総合「SELL」
-    elif states == ["SELL", "SELL", "SELL"] or (states[1] == "SELL" and states[2] == "SELL" and is_30d_peak_breakdown):
-        overall_regime = "SELL"
-        regime_reason = "長期売り継続期 (S,S,S) ➔ 厳格二重頑健性クリア銘柄特化"
-        allowed_strategies = ["val_break", "vah_poc", "rsima_short"]
-        common_sell = set.intersection(*(eligible_sell_by_window[w] for w in ["30d", "10d", "5d"])) if states == ["SELL", "SELL", "SELL"] else eligible_sell_by_window["10d"].intersection(eligible_sell_by_window["5d"])
-        recommended_symbols = sorted([s for s in common_sell if s.upper().replace("-USDT", "").replace("USDT", "") != "BTC"])
-
-    # それ以外（(N, B, B) 上昇加速・(B, B, B) 成熟買い・逆行局面等）➔ 総合「NEUTRAL (完全見送り)」
+    # それ以外（(S, S, S) 長期売り・(N, B, B) 上昇加速・(B, B, B) 成熟買い・逆行局面すべて）➔ 総合「NEUTRAL (完全見送り)」
     else:
         overall_regime = "NEUTRAL"
-        if states == ["NEUTRAL", "BUY", "BUY"]:
+        if states == ["SELL", "SELL", "SELL"]:
+            regime_reason = "長期売り継続期 (S,S,S) ➔ 4年実証勝率41.6%大敗・完全見送り(ノーポジ維持)"
+        elif states == ["NEUTRAL", "BUY", "BUY"]:
             regime_reason = "中短期上昇加速 (N,B,B) ➔ 4年実証大敗・完全見送り(ノーポジ維持)"
         elif states == ["BUY", "BUY", "BUY"]:
             regime_reason = "長期成熟買い相場 (B,B,B) ➔ 4年実証大敗・完全見送り(ノーポジ維持)"
