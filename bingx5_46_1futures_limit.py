@@ -3028,16 +3028,15 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                     if gate_allowed and cand_strat_e not in gate_allowed:
                         continue
 
-                    # 時間帯ロール適合性チェック (通常時: 東京はレンジ逆張りのみ、欧州はブレイクアウトのみ)
-                    # ただし、allowed_strategies がブレイクアウト特化 (例: N,N,B) の場合は全時間帯でブレイクを許可
+                    # 時間帯ロール適合性チェック (東京はレンジ逆張りのみ、欧州はブレイクアウトのみ)
+                    # 本番ロジック整合バックテストで N,N,B x VAH_BREAK は欧州のみ PF>1 (東京 PF0.68) のため、全地合いで同一規則を適用
                     is_brk_strat = (cand_strat_e in ("vah_break", "val_break"))
-                    if not (gate_allowed and "vah_break" in gate_allowed and len(gate_allowed) == 1):
-                        if is_tokyo_b3 and is_brk_strat:
-                            # 東京時間はレンジ逆張りのみ許可 (ブレイクアウトはダマシ回避のため遮断)
-                            continue
-                        if is_london_b3 and not is_brk_strat:
-                            # 欧州時間はブレイクアウトのみ許可 (逆張りはトレンド被弾回避のため遮断)
-                            continue
+                    if is_tokyo_b3 and is_brk_strat:
+                        # 東京時間はレンジ逆張りのみ許可 (ブレイクアウトはダマシ回避のため遮断)
+                        continue
+                    if is_london_b3 and not is_brk_strat:
+                        # 欧州時間はブレイクアウトのみ許可 (逆張りはトレンド被弾回避のため遮断)
+                        continue
 
                     df_entry_eval = resample_candles(df_5m, cand_interval_e, drop_unclosed=True) if cand_interval_e > 5 else df_5m.copy()
                     try:

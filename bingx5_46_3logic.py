@@ -2490,6 +2490,17 @@ def simulate_val_break_fast(
                         pos_count = 0
                         entry_bar_idx = -1
 
+        # 2. ショート新規ブレイクダウンエントリー判定 (単発1本固定 / VAH_BREAK の完全対称)
+        if pending_limit < 0:
+            if pos_count == 0 and i >= cooldown_until:
+                if not np.isnan(val) and not np.isnan(vals[i-1]) and not np.isnan(vah):
+                    va_diff_e = max(0.0, vah - val)
+                    val_breakdown = (closes[i-1] >= vals[i-1]) and (c < val)
+                    not_overextended = (c >= val - va_diff_e * 0.35) if va_diff_e > 0 else True
+                    va_width = va_diff_e / val if val > 0 else 0.0
+                    if val_breakdown and not_overextended and (va_width >= 0.015) and (ma_filter is None or ma_filter[i]):
+                        pending_limit = c * 1.0002
+
         if pos_qty > 0:
             unrealized = pos_cost - (pos_qty * c)
             cur_eq = initial_equity + cum_pnl + unrealized
@@ -7181,7 +7192,7 @@ def evaluate_market_regime_3window(
     # パターン1: (N, N, B) 保ち合い上放れ初動 ➔ 総合「BUY」【ブレイクアウト(VAH_BREAK)単独発注】
     if states == ["NEUTRAL", "NEUTRAL", "BUY"]:
         overall_regime = "BUY"
-        regime_reason = "保ち合い上放れ初動 (N,N,B) ➔ VAHブレイクアウト順張り単独特化 (勝率58.4%/PF1.13)"
+        regime_reason = "保ち合い上放れ初動 (N,N,B) ➔ VAHブレイクアウト順張り単独 (検証中の候補 / 本番ロジック検証 PF0.83)"
         allowed_strategies = ["vah_break"]
         recommended_symbols = sorted([s for s in eligible_buy_by_window.get("5d", set()) if s.upper().replace("-USDT", "").replace("USDT", "") != "BTC"])
 
@@ -7204,11 +7215,11 @@ def evaluate_market_regime_3window(
     else:
         overall_regime = "NEUTRAL"
         if states == ["SELL", "SELL", "SELL"]:
-            regime_reason = "長期売り継続期 (S,S,S) ➔ 4年実証勝率41.6%大敗・完全見送り(ノーポジ維持)"
+            regime_reason = "長期売り継続期 (S,S,S) ➔ 本番ロジック検証で全戦略マイナス・完全見送り(ノーポジ維持)"
         elif states == ["NEUTRAL", "BUY", "BUY"]:
-            regime_reason = "中短期上昇加速 (N,B,B) ➔ 4年実証大敗・完全見送り(ノーポジ維持)"
+            regime_reason = "中短期上昇加速 (N,B,B) ➔ 本番ロジック検証で全戦略マイナス・完全見送り(ノーポジ維持)"
         elif states == ["BUY", "BUY", "BUY"]:
-            regime_reason = "長期成熟買い相場 (B,B,B) ➔ 4年実証大敗・完全見送り(ノーポジ維持)"
+            regime_reason = "長期成熟買い相場 (B,B,B) ➔ 本番ロジック検証で全戦略マイナス・完全見送り(ノーポジ維持)"
         else:
             regime_reason = f"地合い不一致または中立 (30d={states[0]}, 10d={states[1]}, 5d={states[2]})"
         recommended_symbols = []
