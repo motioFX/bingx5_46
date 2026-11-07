@@ -350,6 +350,9 @@ discord = send_discord()
 # ==============================================================================
 DAILY_TRADE_STATE_FILE = Path("Data/daily_trade_state.json")
 DAILY_MAX_TRADES = 1  # 1日最大1トレード固定 (直近52日間バックテスト PF 1.79 実証最適値)
+# 🚀 中堅アルト ＆ 出来高急増 (Volume Surge 1.5倍) ゲート規約 (PROJECT_RULES 準拠)
+EXCLUDED_MEGA_CAPS = ["SOL-USDT", "DOGE-USDT", "XRP-USDT"]
+MIN_VOLUME_SURGE_RATIO = 1.5  # 直近20本平均比 1.5倍以上必須 (日次勝率 57.1% / PF 2.13 実証最適値)
 
 def get_current_trading_day() -> str:
     """
@@ -2152,6 +2155,7 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
         f"  買い (BULL)  : 単発1本固定 (ナンピンなし) / 直近10本安値確定足SL & POC防衛SL\n"
         f"  売り (BEAR)  : 単発1本固定 (ナンピンなし) / 直近10本高値確定足SL & POC防衛SL\n"
         f"  日次リスク管理: 1日1トレード固定規約 (One Trade Per Day - JST 09:00 リセット)\n"
+        f"  銘柄＆出来高 : 中堅アルト特化 (超大型SOL/DOGE/XRP除外) ＆ 出来高急増1.5倍ゲート\n"
         "==================================================\n"
         "```"
     )
@@ -3076,6 +3080,10 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                 if sym in active_positions:
                     continue
 
+                # 🚀 【PROJECT_RULES 準拠】 超大型銘柄除外 (HFT狩り場・値動き重小回避 ➔ 中堅アルト特化)
+                if sym in EXCLUDED_MEGA_CAPS:
+                    continue
+
                 try:
                     # 確定足タイミングまたは未キャッシュ時はストアから取得
                     if is_candle_closed or sym not in cached_5m_dfs or cached_5m_dfs[sym].empty:
@@ -3085,6 +3093,14 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
 
                     df_5m = cached_5m_dfs.get(sym)
                     if df_5m is None or df_5m.empty or len(df_5m) < 20:
+                        continue
+
+                    # 🚀 【PROJECT_RULES 準拠】 出来高急増ゲート (Volume Surge 1.5倍)
+                    # 直近20本平均比 1.5倍以上の出来高流入が確認できない薄商いノイズを物理遮断
+                    cur_vol = float(df_5m["volume"].iloc[-1]) if "volume" in df_5m.columns else 0.0
+                    vol_avg_20 = float(df_5m["volume"].iloc[-21:-1].mean()) if len(df_5m) >= 21 else float(df_5m["volume"].mean())
+                    vol_ratio = cur_vol / max(0.0001, vol_avg_20)
+                    if vol_ratio < MIN_VOLUME_SURGE_RATIO:
                         continue
 
                     cur_px = ws_mgr.get_latest_price(sym)
