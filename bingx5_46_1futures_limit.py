@@ -350,6 +350,7 @@ discord = send_discord()
 # ==============================================================================
 DAILY_TRADE_STATE_FILE = Path("Data/daily_trade_state.json")
 DAILY_MAX_TRADES = 1  # 1日最大1トレード固定 (直近52日間バックテスト PF 1.79 実証最適値)
+DAILY_MAX_LOSS_USDT = 1.50  # 1日最大許容損失額 (W7準拠: 目標投資額 $15.0 の 10% 到達で即座に当日新規停止)
 # 🚀 中堅アルト ＆ 出来高急増 (Volume Surge 1.5倍) ゲート規約 (PROJECT_RULES 準拠)
 EXCLUDED_MEGA_CAPS = ["SOL-USDT", "DOGE-USDT", "XRP-USDT"]
 MIN_VOLUME_SURGE_RATIO = 1.5  # 直近20本平均比 1.5倍以上必須 (日次勝率 57.1% / PF 2.13 実証最適値)
@@ -368,6 +369,8 @@ def load_daily_trade_state() -> Dict[str, Any]:
     default_state = {
         "trade_date": cur_day,
         "trades_count": 0,
+        "daily_pnl_usdt": 0.0,
+        "circuit_broken": False,
         "last_exit_time": None,
         "last_pnl": 0.0,
         "last_symbol": None,
@@ -390,17 +393,22 @@ def load_daily_trade_state() -> Dict[str, Any]:
             state = default_state
             with open(DAILY_TRADE_STATE_FILE, "w", encoding="utf-8") as f:
                 json.dump(state, f, indent=2, ensure_ascii=False)
-            discord.print_log(f"🌅 [新営業日開始] 09:00 JST到達により日次トレード制限をリセットしました (本日上限: {DAILY_MAX_TRADES}回)")
+            discord.print_log(f"🌅 [新営業日開始] 09:00 JST到達により日次トレード制限および損失サーキットブレーカーをリセットしました (本日上限: {DAILY_MAX_TRADES}回 / 最大許容損失: -${DAILY_MAX_LOSS_USDT:.2f})")
         return state
     except Exception as e:
         discord.print_log(f"⚠️ 日次トレード状態読み込みエラー: {e} -> デフォルト初期化", level="warning")
         return default_state
 
 def record_daily_trade_completion(symbol: str, side: str, pnl: float, reason: str):
-    """ポジション決済完了時に呼び出し、当日のトレード回数を加算して永続化する"""
+    """ポジション決済完了時に呼び出し、当日のトレード回数および累積PnLを加算して永続化する"""
     try:
         state = load_daily_trade_state()
         state["trades_count"] = int(state.get("trades_count", 0)) + 1
+        current_daily_pnl = float(state.get("daily_pnl_usdt", 0.0)) + float(pnl)
+        state["daily_pnl_usdt"] = round(current_daily_pnl, 4)
+        if current_daily_pnl <= -DAILY_MAX_LOSS_USDT:
+            state["circuit_broken"] = True
+
         now_jst_str = (datetime.now(timezone.utc) + timedelta(hours=9)).strftime("%Y-%m-%d %H:%M:%S JST")
         state["last_exit_time"] = now_jst_str
         state["last_symbol"] = symbol
@@ -409,9 +417,11 @@ def record_daily_trade_completion(symbol: str, side: str, pnl: float, reason: st
         state["last_reason"] = reason
         with open(DAILY_TRADE_STATE_FILE, "w", encoding="utf-8") as f:
             json.dump(state, f, indent=2, ensure_ascii=False)
+
+        cb_warning = f" 🚨【損失サーキットブレーカー発動】累計損失 -${abs(current_daily_pnl):.2f} 到達のため本日エントリー完全遮断！" if state.get("circuit_broken") else ""
         discord.print_log(
             f"🛡️ [1日1トレード規約] 本日のトレード完了を記録しました: "
-            f"({state['trades_count']}/{DAILY_MAX_TRADES}回完了) {symbol} {side} PnL: {pnl:+.2f} USDT ({reason}) "
+            f"({state['trades_count']}/{DAILY_MAX_TRADES}回完了, 本日累計PnL: ${current_daily_pnl:+.2f}) {symbol} {side} PnL: {pnl:+.2f} USDT ({reason}){cb_warning} "
             f"➔ 翌朝09:00 JSTまで新規エントリーを物理遮断します。"
         )
     except Exception as e:
@@ -421,9 +431,12 @@ def can_open_new_trade_today() -> Tuple[bool, str, int]:
     """当日の新規エントリーが可能か判定する (可能フラグ, 理由文字列, 当日完了回数)"""
     state = load_daily_trade_state()
     cnt = int(state.get("trades_count", 0))
+    daily_pnl = float(state.get("daily_pnl_usdt", 0.0))
+    if state.get("circuit_broken", False) or daily_pnl <= -DAILY_MAX_LOSS_USDT:
+        return False, f"🚨 日次損失サーキットブレーカー発動中 (本日累計 PnL: ${daily_pnl:+.2f} <= -${DAILY_MAX_LOSS_USDT:.2f} USDT) - 翌朝09:00 JSTまで新規エントリー完全遮断", cnt
     if cnt >= DAILY_MAX_TRADES:
         return False, f"本日トレード上限到達 ({cnt}/{DAILY_MAX_TRADES}回完了) - 翌朝09:00 JSTまで新規エントリー休止", cnt
-    return True, f"本日トレード可能 ({cnt}/{DAILY_MAX_TRADES}回)", cnt
+    return True, f"本日トレード可能 ({cnt}/{DAILY_MAX_TRADES}回, 累計PnL: ${daily_pnl:+.2f})", cnt
 
 def format_state_message(symbol: str, position: Dict[str, Any], open_orders_count: int, pending_flatten: bool, trade_side: str = "long") -> str:
     buy_qty = position.get("buy", 0.0)
@@ -1100,11 +1113,11 @@ async def validate_profitable_candidates(trade_side: str, mode: str, base_symbol
 
     if overall_reg == "BUY":
         actual_side = "long"
-        all_candidates = [
+        raw_cands = [
             s for s in recommended_symbols
             if get_clean_symbol(s) != "BTC" and get_clean_symbol(s) not in excluded_clean
         ]
-        if not all_candidates:
+        if not raw_cands:
             period_res = market_state_info.get("period_results", {})
             any_buy_passed = set()
             for w_info in period_res.values():
@@ -1112,21 +1125,34 @@ async def validate_profitable_candidates(trade_side: str, mode: str, base_symbol
                     cl_s = get_clean_symbol(s)
                     if cl_s != "BTC" and cl_s not in excluded_clean:
                         any_buy_passed.add(cl_s)
-            all_candidates = [s for s in FIXED_SYMBOLS if get_clean_symbol(s) in any_buy_passed]
-        if not all_candidates:
-            all_candidates = [s for s in FIXED_SYMBOLS if get_clean_symbol(s) not in excluded_clean]
+            raw_cands = [s for s in FIXED_SYMBOLS if get_clean_symbol(s) in any_buy_passed]
+        if not raw_cands:
+            raw_cands = [s for s in FIXED_SYMBOLS if get_clean_symbol(s) not in excluded_clean]
+
+        # 🚀 【PROJECT_RULES 準拠】 超大型銘柄事前除外 (SOL, DOGE, XRP: HFT過密競争・値動き重小回避 ➔ 中堅アルト特化)
+        # 🟢 クジラ逆風銘柄事前除外 (BUY相場でのSHORT_ONLY除外)
+        excluded_megas = set(EXCLUDED_MEGA_CAPS + [get_clean_symbol(x) for x in EXCLUDED_MEGA_CAPS])
+        all_candidates = []
+        for cand in raw_cands:
+            cand_clean = get_clean_symbol(cand)
+            if cand in excluded_megas or cand_clean in excluded_megas:
+                continue
+            w_info = get_whale_sentiment_info(cand)
+            if w_info.get("signal") == "SHORT_ONLY":
+                continue
+            all_candidates.append(cand)
 
         discord.print_log(
-            f"【全体地合い判定: BUY 🟢】3期間買い推奨銘柄（計 {len(all_candidates)} 銘柄: {', '.join(all_candidates) if all_candidates else 'なし'}）"
+            f"【全体地合い判定: BUY 🟢】買い推奨中堅アルト銘柄（計 {len(all_candidates)} 銘柄: {', '.join(all_candidates) if all_candidates else 'なし'} / 超大型・クジラ逆風除外済）"
             f"のロングPure3大戦略個別最適化（108通り: 単発厳選 ➔ 3枠ナンピン検証 ※ブレイクは単発固定）を開始します..."
         )
     elif overall_reg == "SELL":
         actual_side = "short"
-        all_candidates = [
+        raw_cands = [
             s for s in recommended_symbols
             if get_clean_symbol(s) != "BTC" and get_clean_symbol(s) not in excluded_clean
         ]
-        if not all_candidates:
+        if not raw_cands:
             # 3期間完全合致が0件の場合、売り票を獲得した銘柄から補完選定
             period_res = market_state_info.get("period_results", {})
             any_sell_passed = set()
@@ -1135,13 +1161,26 @@ async def validate_profitable_candidates(trade_side: str, mode: str, base_symbol
                     cl_s = get_clean_symbol(s)
                     if cl_s != "BTC" and cl_s not in excluded_clean:
                         any_sell_passed.add(cl_s)
-            all_candidates = [s for s in FIXED_SYMBOLS if get_clean_symbol(s) in any_sell_passed]
-        if not all_candidates:
+            raw_cands = [s for s in FIXED_SYMBOLS if get_clean_symbol(s) in any_sell_passed]
+        if not raw_cands:
             # 売り票合致も0件の場合、固定20銘柄から売り除外(底打ち反発)を除いた銘柄をバックテスト対象とする
-            all_candidates = [s for s in FIXED_SYMBOLS if get_clean_symbol(s) not in excluded_clean]
+            raw_cands = [s for s in FIXED_SYMBOLS if get_clean_symbol(s) not in excluded_clean]
+
+        # 🚀 【PROJECT_RULES 準拠】 超大型銘柄事前除外 (SOL, DOGE, XRP: HFT過密競争・値動き重小回避 ➔ 中堅アルト特化)
+        # 🐻 クジラ逆風銘柄事前除外 (SELL相場でのLONG_ONLY除外)
+        excluded_megas = set(EXCLUDED_MEGA_CAPS + [get_clean_symbol(x) for x in EXCLUDED_MEGA_CAPS])
+        all_candidates = []
+        for cand in raw_cands:
+            cand_clean = get_clean_symbol(cand)
+            if cand in excluded_megas or cand_clean in excluded_megas:
+                continue
+            w_info = get_whale_sentiment_info(cand)
+            if w_info.get("signal") == "LONG_ONLY":
+                continue
+            all_candidates.append(cand)
 
         discord.print_log(
-            f"【全体地合い判定: SELL 🔴】3期間売り推奨銘柄（計 {len(all_candidates)} 銘柄: {', '.join(all_candidates) if all_candidates else 'なし'}）"
+            f"【全体地合い判定: SELL 🔴】売り推奨中堅アルト銘柄（計 {len(all_candidates)} 銘柄: {', '.join(all_candidates) if all_candidates else 'なし'} / 超大型・クジラ逆風除外済）"
             f"のショートPure3大戦略個別最適化（108通り: 単発1本固定・ナンピン完全なし）を開始します..."
         )
     else:
@@ -1229,12 +1268,13 @@ async def validate_profitable_candidates(trade_side: str, mode: str, base_symbol
                 symbol_params_map[cand] = cand_params
 
                 # 4大完全必須条件 (東京レンジ または 欧州ブレイク のいずれかが合格していれば監視対象に選抜)
+                # 🚀 【W3 強化】直近7日取引回数を最低2回以上 (cnt_7d >= 2) へ強化し、1回限りの偶発的トレードによる「見せかけTier 1」を排除
                 is_tier1 = bool(
                     trade_cnt >= 10
                     and pnl_1st > 0.0
                     and pnl_2nd > pnl_1st
                     and pnl_7d > 0.0
-                    and cnt_7d >= 1
+                    and cnt_7d >= 2
                 )
                 is_tier2 = bool(
                     trade_cnt >= 10
@@ -1807,8 +1847,10 @@ async def run_screening_and_optimization(mode: str, send_charts: bool = False, s
         trade_side=trade_side, mode=mode, base_symbol=base_sym
     )
 
-    # MTF適格 かつ バックテスト合格銘柄のみを選定（不適格銘柄の強制追加は完全撤廃）
-    selected_symbols = list(profitable_cands)[:MAX_SELECTED_SYMBOLS]
+    # MTF適格 かつ バックテスト合格銘柄のみを選定（超大型銘柄 EXCLUDED_MEGA_CAPS 二重除外ガード）
+    excluded_megas = set(EXCLUDED_MEGA_CAPS + [get_clean_symbol(x) for x in EXCLUDED_MEGA_CAPS])
+    filtered_cands = [s for s in profitable_cands if s not in excluded_megas and get_clean_symbol(s) not in excluded_megas]
+    selected_symbols = list(filtered_cands)[:MAX_SELECTED_SYMBOLS]
     print(f"\n[Selection Result] 選定{len(selected_symbols)}銘柄 (サイクル適格 ＆ 個別最適化合格): {', '.join(selected_symbols) if selected_symbols else 'なし (全銘柄見送り・完全ノーポジ維持)'}")
 
     # 直近の選定結果を JSON に永続化 (show_symbol_status 用 / アトミック書き込み)
@@ -3048,12 +3090,20 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
             is_ny_b3 = not (is_tokyo_b3 or is_london_b3)
 
             if is_ny_b3:
-                # 5分足24時間アクティブ検証モード: 米国セッションもエントリー監視継続
-                if now_jst_b3.hour != last_ny_notice_hour:
-                    last_ny_notice_hour = now_jst_b3.hour
-                    discord.print_log(f"🌙 [米国時間アクティブ監視] 米国セッション(22:00〜翌09:00 JST) 24時間フル稼働中 (トレール防衛＆5分足チャンス監視)", level="info")
-                elif cycle_count % 30 == 0:
-                    discord.print_log(f"🌙 [米国時間アクティブ監視] 米国セッション(22:00〜翌09:00 JST) 24時間フル稼働中 (トレール防衛＆5分足チャンス監視)", level="debug")
+                if BINGX_IS_LIVE:
+                    # 本番リアル運用規約 (PROJECT_RULES.md W1準拠):
+                    # 米国セッション(22:00〜翌09:00 JST)は乱高下・ヒゲ狩り回避のため新規エントリー完全停止 (ノーポジ待機 ＆ 既存ポジション境界トレールのみ)
+                    if now_jst_b3.hour != last_ny_notice_hour:
+                        last_ny_notice_hour = now_jst_b3.hour
+                        discord.print_log("🌙 [本番リアル運用] 米国セッション(22:00〜翌09:00 JST) 新規エントリー完全停止中 (ノーポジ待機 ＆ 既存トレール防衛のみ)", level="info")
+                    continue
+                else:
+                    # デモアクティブ検証モード: 米国セッションもエントリー監視継続
+                    if now_jst_b3.hour != last_ny_notice_hour:
+                        last_ny_notice_hour = now_jst_b3.hour
+                        discord.print_log(f"🌙 [デモアクティブ検証] 米国セッション(22:00〜翌09:00 JST) 24時間フル稼働中 (トレール防衛＆5分足チャンス監視)", level="info")
+                    elif cycle_count % 30 == 0:
+                        discord.print_log(f"🌙 [デモアクティブ検証] 米国セッション(22:00〜翌09:00 JST) 24時間フル稼働中 (トレール防衛＆5分足チャンス監視)", level="debug")
             total_active_count = len(active_positions) + len(pending_entry_orders)
 
             # 🛡️ 1日1トレード固定ガードチェック (One Trade Per Day Guard)
