@@ -348,7 +348,7 @@ discord = send_discord()
 # ==============================================================================
 # 🛡️ 1日1トレード固定規約 (One Trade Per Day Guard - PROJECT_RULES 準拠)
 # ==============================================================================
-DAILY_TRADE_STATE_FILE = Path("Data/daily_trade_state.json")
+DAILY_TRADE_STATE_FILE = Path(__file__).resolve().parent / "Data" / "daily_trade_state.json"
 DAILY_MAX_TRADES = 1  # 1日最大1トレード固定 (直近52日間バックテスト PF 1.79 実証最適値)
 DAILY_MAX_LOSS_USDT = 1.50  # 1日最大許容損失額 (W7準拠: 目標投資額 $15.0 の 10% 到達で即座に当日新規停止)
 # 🚀 中堅アルト ＆ 出来高急増 (Volume Surge 1.5倍) ゲート規約 (PROJECT_RULES 準拠)
