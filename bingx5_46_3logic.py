@@ -7028,9 +7028,9 @@ def evaluate_market_regime_3window(
     それ以外は総合地合い「NEUTRAL」（トレードなし）。
     """
     windows = [
-        ("30d", 30 * 24),  # 720h
-        ("10d", 10 * 24),  # 240h
-        ("5d", 5 * 24),    # 120h
+        ("14d", 14 * 24),  # 336h
+        ("7d", 7 * 24),    # 168h
+        ("2d", 2 * 24),    # 48h
     ]
 
     period_results = {}
@@ -7168,22 +7168,24 @@ def evaluate_market_regime_3window(
         btc_bottom_rev_by_window[w_name] = btc_bottom_reversal
         market_bottom_rev_by_window[w_name] = market_bottom_rev
 
-    # 30d 天井崩壊判定の集約 (BTC天井崩壊、市場平均天井崩壊、またはアルト等天井崩壊8銘柄以上)
-    is_30d_peak_breakdown = (
-        btc_peak_breakdown_by_window.get("30d", False)
-        or market_peak_bd_by_window.get("30d", False)
-        or len(peak_breakdown_by_window.get("30d", set())) >= 8
+    # 14d 天井崩壊判定の集約 (BTC天井崩壊、市場平均天井崩壊、またはアルト等天井崩壊8銘柄以上)
+    is_14d_peak_breakdown = (
+        btc_peak_breakdown_by_window.get("14d", False)
+        or market_peak_bd_by_window.get("14d", False)
+        or len(peak_breakdown_by_window.get("14d", set())) >= 8
     )
+    is_30d_peak_breakdown = is_14d_peak_breakdown
 
-    # 30d 底打ち反転判定の集約 (BTC底打ち反転、市場平均底打ち反転、またはアルト等底打ち反転8銘柄以上)
-    is_30d_bottom_reversal = (
-        btc_bottom_rev_by_window.get("30d", False)
-        or market_bottom_rev_by_window.get("30d", False)
-        or len(bottom_reversal_by_window.get("30d", set())) >= 8
+    # 14d 底打ち反転判定の集約 (BTC底打ち反転、市場平均底打ち反転、またはアルト等底打ち反転8銘柄以上)
+    is_14d_bottom_reversal = (
+        btc_bottom_rev_by_window.get("14d", False)
+        or market_bottom_rev_by_window.get("14d", False)
+        or len(bottom_reversal_by_window.get("14d", set())) >= 8
     )
+    is_30d_bottom_reversal = is_14d_bottom_reversal
 
-    # 総合地合い判定 (5分足アクティブ稼働・実APIデモ検証モード: 過半数連動)
-    states = [period_results[w]["state"] for w in ["30d", "10d", "5d"]]
+    # 総合地合い判定 (5分足アクティブ稼働・実APIデモ検証モード: 14d/7d/2d 過半数連動)
+    states = [period_results[w]["state"] for w in ["14d", "7d", "2d"]]
     recommended_symbols = []
     regime_reason = ""
     regime_pattern = f"({states[0][:1]},{states[1][:1]},{states[2][:1]})"
@@ -7192,26 +7194,26 @@ def evaluate_market_regime_3window(
     buy_count = states.count("BUY")
     sell_count = states.count("SELL")
 
-    # 1. 買い優勢 (BUYが2つ以上、または 5dがBUYかつ30d底打ち反転)
-    if buy_count >= 2 or (states[2] == "BUY" and is_30d_bottom_reversal):
+    # 1. 買い優勢 (BUYが2つ以上、または 2dがBUYかつ14d底打ち反転)
+    if buy_count >= 2 or (states[2] == "BUY" and is_14d_bottom_reversal):
         overall_regime = "BUY"
         regime_reason = f"買い優勢地合い {regime_pattern} ➔ 全買い戦略アクティブ稼働"
         allowed_strategies = ["val_poc", "vah_break", "rsima"]
-        # 候補銘柄: 5dまたは10dで買い条件を満たした銘柄群
-        cands = eligible_buy_by_window.get("5d", set()).union(eligible_buy_by_window.get("10d", set()))
+        # 候補銘柄: 2dまたは7dで買い条件を満たした銘柄群
+        cands = eligible_buy_by_window.get("2d", set()).union(eligible_buy_by_window.get("7d", set()))
         if not cands:
-            cands = eligible_buy_by_window.get("30d", set())
+            cands = eligible_buy_by_window.get("14d", set())
         recommended_symbols = sorted([s for s in cands if s.upper().replace("-USDT", "").replace("USDT", "") != "BTC"])
 
-    # 2. 売り優勢 (SELLが2つ以上、または 5dがSELLかつ30d天井崩壊)
-    elif sell_count >= 2 or (states[2] == "SELL" and is_30d_peak_breakdown):
+    # 2. 売り優勢 (SELLが2つ以上、または 2dがSELLかつ14d天井崩壊)
+    elif sell_count >= 2 or (states[2] == "SELL" and is_14d_peak_breakdown):
         overall_regime = "SELL"
         regime_reason = f"売り優勢地合い {regime_pattern} ➔ 全売り戦略アクティブ稼働"
         allowed_strategies = ["val_break", "vah_poc", "rsima_short"]
-        # 候補銘柄: 5dまたは10dで売り条件を満たした銘柄群
-        cands = eligible_sell_by_window.get("5d", set()).union(eligible_sell_by_window.get("10d", set()))
+        # 候補銘柄: 2dまたは7dで売り条件を満たした銘柄群
+        cands = eligible_sell_by_window.get("2d", set()).union(eligible_sell_by_window.get("7d", set()))
         if not cands:
-            cands = eligible_sell_by_window.get("30d", set())
+            cands = eligible_sell_by_window.get("14d", set())
         recommended_symbols = sorted([s for s in cands if s.upper().replace("-USDT", "").replace("USDT", "") != "BTC"])
 
     # 3. 中立 (拮抗または保ち合い)
@@ -7221,16 +7223,16 @@ def evaluate_market_regime_3window(
         recommended_symbols = []
         allowed_strategies = []
 
-    # ===== 地合い強度 (Strength Tier & net_score) 算出 (全態勢・中立含む) =====
-    b_30d = period_results.get("30d", {}).get("buy_votes", 0)
-    sl_30d = period_results.get("30d", {}).get("sell_votes", 0)
-    b_10d = period_results.get("10d", {}).get("buy_votes", 0)
-    sl_10d = period_results.get("10d", {}).get("sell_votes", 0)
-    b_5d = period_results.get("5d", {}).get("buy_votes", 0)
-    sl_5d = period_results.get("5d", {}).get("sell_votes", 0)
+    # ===== 地合い強度 (Strength Tier & net_score) 算出 (14d/7d/2d 全態勢・中立含む) =====
+    b_14d = period_results.get("14d", {}).get("buy_votes", 0)
+    sl_14d = period_results.get("14d", {}).get("sell_votes", 0)
+    b_7d = period_results.get("7d", {}).get("buy_votes", 0)
+    sl_7d = period_results.get("7d", {}).get("sell_votes", 0)
+    b_2d = period_results.get("2d", {}).get("buy_votes", 0)
+    sl_2d = period_results.get("2d", {}).get("sell_votes", 0)
 
-    mean_b = (b_30d + b_10d + b_5d) / 3.0
-    mean_sl = (sl_30d + sl_10d + sl_5d) / 3.0
+    mean_b = (b_14d + b_7d + b_2d) / 3.0
+    mean_sl = (sl_14d + sl_7d + sl_2d) / 3.0
     net_score = (mean_b - mean_sl) / 22.0  # -1.0 〜 +1.0
 
     if overall_regime == "BUY":

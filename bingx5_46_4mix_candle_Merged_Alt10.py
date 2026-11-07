@@ -369,11 +369,11 @@ async def main() -> None:
 
     recommended_syms = sorted(list(set(recommended_syms)))
 
-    # 5. 30d, 10d, 5d ノーマライズ比較チャート生成 & Discord送信
+    # 5. 14d, 7d, 2d ノーマライズ比較チャート生成 & Discord送信
     windows = [
-        ("30d", 30 * 24),
-        ("10d", 10 * 24),
-        ("5d", 5 * 24),
+        ("14d", 14 * 24),
+        ("7d", 7 * 24),
+        ("2d", 2 * 24),
     ]
 
     discord = send_discord()
@@ -395,10 +395,10 @@ async def main() -> None:
     if not args.no_chart_send:
         state_label_map = {"BUY": "買い", "SELL": "売り", "NEUTRAL": "中立"}
         regime_summary_lines = [
-            "📊 **【新・全体地合い判定サマリー（30日 / 10日 / 5日）】**",
+            "📊 **【新・全体地合い判定サマリー（14日 / 7日 / 2日）】**",
             "※判定基準: アルト20銘柄(各1票) + BTC-USDT(2票) = 計22票 / 11票以上で判定"
         ]
-        for win_label in ["30d", "10d", "5d"]:
+        for win_label in ["14d", "7d", "2d"]:
             p_info = period_res.get(win_label, {})
             p_state = p_info.get("state", "NEUTRAL")
             b_votes = p_info.get("buy_votes", 0)
@@ -406,7 +406,7 @@ async def main() -> None:
             tot_v = p_info.get("total_votes", 22)
             s_label = state_label_map.get(p_state, p_state)
             icon = "🟢" if p_state == "BUY" else ("🔴" if p_state == "SELL" else "⚪")
-            win_label_jp = {"30d": "30日分", "10d": "10日分", "5d": "5日分"}.get(win_label, win_label)
+            win_label_jp = {"14d": "14日分", "7d": "7日分", "2d": "2日分"}.get(win_label, win_label)
             regime_summary_lines.append(
                 f"・**{win_label_jp} ({win_label})**: {icon} **{s_label}**（買い: `{b_votes}/{tot_v}`票, 売り: `{s_votes}/{tot_v}`票）"
             )
