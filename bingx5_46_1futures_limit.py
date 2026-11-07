@@ -345,6 +345,83 @@ entry_candle_time = None
 
 discord = send_discord()
 
+# ==============================================================================
+# 🛡️ 1日1トレード固定規約 (One Trade Per Day Guard - PROJECT_RULES 準拠)
+# ==============================================================================
+DAILY_TRADE_STATE_FILE = Path("Data/daily_trade_state.json")
+DAILY_MAX_TRADES = 1  # 1日最大1トレード固定 (直近52日間バックテスト PF 1.79 実証最適値)
+
+def get_current_trading_day() -> str:
+    """
+    東京セッション開始時刻 (09:00 JST = 00:00 UTC) を境にした営業日文字列 (YYYY-MM-DD) を取得。
+    09:00 JST 〜 翌日 08:59 JST が同一営業日となる。
+    """
+    now_utc = datetime.now(timezone.utc)
+    return now_utc.strftime("%Y-%m-%d")
+
+def load_daily_trade_state() -> Dict[str, Any]:
+    """当日の日次トレード状態を読み込む。翌朝09:00 JSTを跨いでいれば自動リセット。"""
+    cur_day = get_current_trading_day()
+    default_state = {
+        "trade_date": cur_day,
+        "trades_count": 0,
+        "last_exit_time": None,
+        "last_pnl": 0.0,
+        "last_symbol": None,
+        "last_side": None,
+        "last_reason": None,
+    }
+    DAILY_TRADE_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    if not DAILY_TRADE_STATE_FILE.exists():
+        try:
+            with open(DAILY_TRADE_STATE_FILE, "w", encoding="utf-8") as f:
+                json.dump(default_state, f, indent=2, ensure_ascii=False)
+        except Exception:
+            pass
+        return default_state
+
+    try:
+        with open(DAILY_TRADE_STATE_FILE, "r", encoding="utf-8") as f:
+            state = json.load(f)
+        if state.get("trade_date") != cur_day:
+            state = default_state
+            with open(DAILY_TRADE_STATE_FILE, "w", encoding="utf-8") as f:
+                json.dump(state, f, indent=2, ensure_ascii=False)
+            discord.print_log(f"🌅 [新営業日開始] 09:00 JST到達により日次トレード制限をリセットしました (本日上限: {DAILY_MAX_TRADES}回)")
+        return state
+    except Exception as e:
+        discord.print_log(f"⚠️ 日次トレード状態読み込みエラー: {e} -> デフォルト初期化", level="warning")
+        return default_state
+
+def record_daily_trade_completion(symbol: str, side: str, pnl: float, reason: str):
+    """ポジション決済完了時に呼び出し、当日のトレード回数を加算して永続化する"""
+    try:
+        state = load_daily_trade_state()
+        state["trades_count"] = int(state.get("trades_count", 0)) + 1
+        now_jst_str = (datetime.now(timezone.utc) + timedelta(hours=9)).strftime("%Y-%m-%d %H:%M:%S JST")
+        state["last_exit_time"] = now_jst_str
+        state["last_symbol"] = symbol
+        state["last_side"] = side
+        state["last_pnl"] = float(pnl)
+        state["last_reason"] = reason
+        with open(DAILY_TRADE_STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(state, f, indent=2, ensure_ascii=False)
+        discord.print_log(
+            f"🛡️ [1日1トレード規約] 本日のトレード完了を記録しました: "
+            f"({state['trades_count']}/{DAILY_MAX_TRADES}回完了) {symbol} {side} PnL: {pnl:+.2f} USDT ({reason}) "
+            f"➔ 翌朝09:00 JSTまで新規エントリーを物理遮断します。"
+        )
+    except Exception as e:
+        discord.print_log(f"⚠️ 日次トレード状態保存エラー: {e}", level="warning")
+
+def can_open_new_trade_today() -> Tuple[bool, str, int]:
+    """当日の新規エントリーが可能か判定する (可能フラグ, 理由文字列, 当日完了回数)"""
+    state = load_daily_trade_state()
+    cnt = int(state.get("trades_count", 0))
+    if cnt >= DAILY_MAX_TRADES:
+        return False, f"本日トレード上限到達 ({cnt}/{DAILY_MAX_TRADES}回完了) - 翌朝09:00 JSTまで新規エントリー休止", cnt
+    return True, f"本日トレード可能 ({cnt}/{DAILY_MAX_TRADES}回)", cnt
+
 def format_state_message(symbol: str, position: Dict[str, Any], open_orders_count: int, pending_flatten: bool, trade_side: str = "long") -> str:
     buy_qty = position.get("buy", 0.0)
     sell_qty = position.get("sell", 0.0)
@@ -2074,6 +2151,7 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
         f"  ポジション枠 : 最大 {MAX_ACTIVE_POSITIONS} 銘柄同時保有\n"
         f"  買い (BULL)  : 単発1本固定 (ナンピンなし) / 直近10本安値確定足SL & POC防衛SL\n"
         f"  売り (BEAR)  : 単発1本固定 (ナンピンなし) / 直近10本高値確定足SL & POC防衛SL\n"
+        f"  日次リスク管理: 1日1トレード固定規約 (One Trade Per Day - JST 09:00 リセット)\n"
         "==================================================\n"
         "```"
     )
@@ -2154,6 +2232,7 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
     missing_position_counts: Dict[str, int] = {}
     last_neutral_notice_hour: Optional[int] = None
     last_ny_notice_hour: Optional[int] = None
+    last_daily_limit_notice_hour: Optional[int] = None
 
     # ========== フェーズB: MTFリアルタイム監視ループ (30秒サイクル省エネ運用) ==========
     while True:
@@ -2343,9 +2422,11 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                     tbl_header = f"{_pad_display('銘柄', 6)} {_pad_display('現在価格', 8, 'right')} {_pad_display('ポジション', 16)} {_pad_display('クジラ', 6)}"
                     tbl_divider = "────────────────────────────────────────"
                     acct_mode_str = "Live Account" if BINGX_IS_LIVE else "VST Demo Mode"
+                    can_trade_today_h, _, daily_cnt_h = can_open_new_trade_today()
+                    daily_badge = f"🎯 本日トレード: [待機中 0/{DAILY_MAX_TRADES}回]" if can_trade_today_h else f"🏁 本日トレード: [完了 {daily_cnt_h}/{DAILY_MAX_TRADES}回 - 翌日09:00まで休止]"
                     summary_lines = [
                         f"⏰ **【BingX 毎時ステータスサマリー ({now_jst.strftime('%H:00')} JST)】**",
-                        f"💰 残高: ${h_balance:,.2f} ({acct_mode_str}) | 監視体制: 5分足 WebSocketリアルタイム稼働中",
+                        f"💰 残高: ${h_balance:,.2f} ({acct_mode_str}) | {daily_badge}",
                         "```text",
                         tbl_header,
                         tbl_divider,
@@ -2904,6 +2985,13 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                     tracked_active_positions.discard(sym)
 
                     side_tag = "SHORT" if is_short_pos else "LONG"
+                    # 1日1トレード完了の記録
+                    record_daily_trade_completion(
+                        symbol=sym,
+                        side=side_tag,
+                        pnl=pnl_current,
+                        reason=exit_reason
+                    )
                     asyncio.create_task(_async_post_exit_reporting(
                         sym=sym, side=side_tag, close_qty=pos_qty, reported_exit_px=cur_px,
                         entry_px=entry_px, pnl=pnl_current, exit_reason=exit_reason,
@@ -2962,6 +3050,26 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                 elif cycle_count % 30 == 0:
                     discord.print_log(f"🌙 [米国時間アクティブ監視] 米国セッション(22:00〜翌09:00 JST) 24時間フル稼働中 (トレール防衛＆5分足チャンス監視)", level="debug")
             total_active_count = len(active_positions) + len(pending_entry_orders)
+
+            # 🛡️ 1日1トレード固定ガードチェック (One Trade Per Day Guard)
+            can_trade_today, daily_reason, daily_cnt = can_open_new_trade_today()
+            if not can_trade_today:
+                if pending_entry_orders:
+                    for p_sym in list(pending_entry_orders.keys()):
+                        p_api = symbol_apis.get(p_sym)
+                        if p_api:
+                            try:
+                                await p_api.active_order_cancel()
+                                discord.print_log(f"🛡️ [1日1トレードガード] 本日トレード完了に伴い {p_sym} の未約定指値を安全にキャンセルしました。")
+                            except Exception:
+                                pass
+                    pending_entry_orders.clear()
+                if now_jst_b3.hour != last_daily_limit_notice_hour:
+                    last_daily_limit_notice_hour = now_jst_b3.hour
+                    discord.print_log(f"🛡️ [1日1トレード規約] {daily_reason} (既存ポジション決済監視は継続)", level="info")
+                elif cycle_count % 30 == 0:
+                    discord.print_log(f"🛡️ [1日1トレード規約] {daily_reason}", level="debug")
+                continue
 
             for sym in selected_symbols:
                 if sym in active_positions:
