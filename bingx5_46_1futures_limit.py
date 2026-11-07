@@ -2427,6 +2427,7 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                     summary_lines = [
                         f"⏰ **【BingX 毎時ステータスサマリー ({now_jst.strftime('%H:00')} JST)】**",
                         f"💰 残高: ${h_balance:,.2f} ({acct_mode_str}) | {daily_badge}",
+                        f"🌐 地合い: {overall_regime} {regime_strength.get('strength_desc', '')}",
                         "```text",
                         tbl_header,
                         tbl_divider,

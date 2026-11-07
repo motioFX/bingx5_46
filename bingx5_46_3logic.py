@@ -7184,7 +7184,7 @@ def evaluate_market_regime_3window(
     )
     is_30d_bottom_reversal = is_14d_bottom_reversal
 
-    # 総合地合い判定 (5分足アクティブ稼働・実APIデモ検証モード: 14d/7d/2d 過半数連動)
+    # 総合地合い判定 (14d/7d/2d 多数決 ＆ 全てBULL/全てBEAR過熱禁止規約)
     states = [period_results[w]["state"] for w in ["14d", "7d", "2d"]]
     recommended_symbols = []
     regime_reason = ""
@@ -7194,36 +7194,7 @@ def evaluate_market_regime_3window(
     buy_count = states.count("BUY")
     sell_count = states.count("SELL")
 
-    # 1. 買い優勢 (BUYが2つ以上、または 2dがBUYかつ14d底打ち反転)
-    if buy_count >= 2 or (states[2] == "BUY" and is_14d_bottom_reversal):
-        overall_regime = "BUY"
-        regime_reason = f"買い優勢地合い {regime_pattern} ➔ 全買い戦略アクティブ稼働"
-        allowed_strategies = ["val_poc", "vah_break", "rsima"]
-        # 候補銘柄: 2dまたは7dで買い条件を満たした銘柄群
-        cands = eligible_buy_by_window.get("2d", set()).union(eligible_buy_by_window.get("7d", set()))
-        if not cands:
-            cands = eligible_buy_by_window.get("14d", set())
-        recommended_symbols = sorted([s for s in cands if s.upper().replace("-USDT", "").replace("USDT", "") != "BTC"])
-
-    # 2. 売り優勢 (SELLが2つ以上、または 2dがSELLかつ14d天井崩壊)
-    elif sell_count >= 2 or (states[2] == "SELL" and is_14d_peak_breakdown):
-        overall_regime = "SELL"
-        regime_reason = f"売り優勢地合い {regime_pattern} ➔ 全売り戦略アクティブ稼働"
-        allowed_strategies = ["val_break", "vah_poc", "rsima_short"]
-        # 候補銘柄: 2dまたは7dで売り条件を満たした銘柄群
-        cands = eligible_sell_by_window.get("2d", set()).union(eligible_sell_by_window.get("7d", set()))
-        if not cands:
-            cands = eligible_sell_by_window.get("14d", set())
-        recommended_symbols = sorted([s for s in cands if s.upper().replace("-USDT", "").replace("USDT", "") != "BTC"])
-
-    # 3. 中立 (拮抗または保ち合い)
-    else:
-        overall_regime = "NEUTRAL"
-        regime_reason = f"拮抗・保ち合い中立 {regime_pattern} ➔ ノーポジ待機"
-        recommended_symbols = []
-        allowed_strategies = []
-
-    # ===== 地合い強度 (Strength Tier & net_score) 算出 (14d/7d/2d 全態勢・中立含む) =====
+    # ===== 地合い強度 (Strength Tier & net_score) 事前算出 =====
     b_14d = period_results.get("14d", {}).get("buy_votes", 0)
     sl_14d = period_results.get("14d", {}).get("sell_votes", 0)
     b_7d = period_results.get("7d", {}).get("buy_votes", 0)
@@ -7234,8 +7205,29 @@ def evaluate_market_regime_3window(
     mean_b = (b_14d + b_7d + b_2d) / 3.0
     mean_sl = (sl_14d + sl_7d + sl_2d) / 3.0
     net_score = (mean_b - mean_sl) / 22.0  # -1.0 〜 +1.0
+    score_pct_str = f"{net_score * 100:+.1f}%"
 
-    if overall_regime == "BUY":
+    # 1. 全てBULLで揃った場合 (BBB) ➔ 過熱・反転警戒によりトレード禁止
+    if buy_count == 3:
+        overall_regime = "NEUTRAL"
+        strength_tier = "EXCESS_BULL_BLOCK"
+        strength_tier_jp = "🚨過熱警戒(全てBULL禁止)"
+        regime_reason = f"🚨 全てBULL揃い過熱警戒 {regime_pattern} ➔ トレード禁止 (新規エントリー停止)"
+        allowed_strategies = []
+        recommended_symbols = []
+
+    # 2. 全てBEARで揃った場合 (SSS) ➔ セリクラ・底打ち反発警戒によりトレード禁止
+    elif sell_count == 3:
+        overall_regime = "NEUTRAL"
+        strength_tier = "EXCESS_BEAR_BLOCK"
+        strength_tier_jp = "🚨セリクラ警戒(全てBEAR禁止)"
+        regime_reason = f"🚨 全てBEAR揃いセリクラ警戒 {regime_pattern} ➔ トレード禁止 (新規エントリー停止)"
+        allowed_strategies = []
+        recommended_symbols = []
+
+    # 3. 買い優勢 (BUY数 > SELL数の多数決 / NEUTRAL含む)
+    elif buy_count > sell_count:
+        overall_regime = "BUY"
         if mean_b >= 16.0:
             strength_tier = "STRONG_BUY"
             strength_tier_jp = "強気買い"
@@ -7245,7 +7237,17 @@ def evaluate_market_regime_3window(
         else:
             strength_tier = "WEAK_BUY"
             strength_tier_jp = "弱気買い"
-    elif overall_regime == "SELL":
+        regime_reason = f"買い優勢地合い(多数決) {regime_pattern} ➔ 全買い戦略アクティブ稼働"
+        allowed_strategies = ["val_poc", "vah_break", "rsima"]
+        # 候補銘柄: 2dまたは7dで買い条件を満たした銘柄群
+        cands = eligible_buy_by_window.get("2d", set()).union(eligible_buy_by_window.get("7d", set()))
+        if not cands:
+            cands = eligible_buy_by_window.get("14d", set())
+        recommended_symbols = sorted([s for s in cands if s.upper().replace("-USDT", "").replace("USDT", "") != "BTC"])
+
+    # 4. 売り優勢 (SELL数 > BUY数の多数決 / NEUTRAL含む)
+    elif sell_count > buy_count:
+        overall_regime = "SELL"
         if mean_sl >= 16.0:
             strength_tier = "STRONG_SELL"
             strength_tier_jp = "強気売り"
@@ -7255,7 +7257,17 @@ def evaluate_market_regime_3window(
         else:
             strength_tier = "WEAK_SELL"
             strength_tier_jp = "弱気売り"
-    else:  # NEUTRAL
+        regime_reason = f"売り優勢地合い(多数決) {regime_pattern} ➔ 全売り戦略アクティブ稼働"
+        allowed_strategies = ["val_break", "vah_poc", "rsima_short"]
+        # 候補銘柄: 2dまたは7dで売り条件を満たした銘柄群
+        cands = eligible_sell_by_window.get("2d", set()).union(eligible_sell_by_window.get("7d", set()))
+        if not cands:
+            cands = eligible_sell_by_window.get("14d", set())
+        recommended_symbols = sorted([s for s in cands if s.upper().replace("-USDT", "").replace("USDT", "") != "BTC"])
+
+    # 5. 拮抗中立 (buy_count == sell_count)
+    else:
+        overall_regime = "NEUTRAL"
         if net_score >= 0.15:
             strength_tier = "LEAN_BUY"
             strength_tier_jp = "買い寄り中立"
@@ -7265,11 +7277,18 @@ def evaluate_market_regime_3window(
         else:
             strength_tier = "BALANCED"
             strength_tier_jp = "拮抗中立"
+        regime_reason = f"拮抗・保ち合い中立 {regime_pattern} ➔ ノーポジ待機"
+        recommended_symbols = []
+        allowed_strategies = []
+
+    strength_desc = f"【{strength_tier_jp} (強度: {score_pct_str} / 買{mean_b:.1f}票 vs 売{mean_sl:.1f}票)】"
 
     regime_strength = {
         "tier": strength_tier,
         "tier_jp": strength_tier_jp,
         "net_score": round(net_score, 3),
+        "score_pct": score_pct_str,
+        "strength_desc": strength_desc,
         "mean_buy_votes": round(mean_b, 1),
         "mean_sell_votes": round(mean_sl, 1),
     }
