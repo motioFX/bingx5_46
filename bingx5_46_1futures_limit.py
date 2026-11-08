@@ -352,6 +352,9 @@ DAILY_TRADE_STATE_FILE = Path(__file__).resolve().parent / "Data" / "daily_trade
 DAILY_MAX_TRADES = 1  # 1日最大1トレード固定 (直近52日間バックテスト PF 1.79 実証最適値)
 DAILY_MAX_LOSS_USDT = 1.50  # 1日最大許容損失額 (W7準拠: 目標投資額 $15.0 の 10% 到達で即座に当日新規停止)
 # 🚀 中堅アルト ＆ 出来高急増 (Volume Surge 1.5倍) ゲート規約 (PROJECT_RULES 準拠)
+# 直近30日検証においてTriple-Stage Recency Gate合格率0%（直近15d/7dシグナル0回）の実証データに基づき、
+# スクリーニング計算時間（CPU負荷）を約3分間削減するための高速化オプション
+EXCLUDE_MEGAS_FOR_SPEED = True
 EXCLUDED_MEGA_CAPS = ["SOL-USDT", "DOGE-USDT", "XRP-USDT"]
 MIN_VOLUME_SURGE_RATIO = 1.5  # 直近20本平均比 1.5倍以上必須 (日次勝率 57.1% / PF 2.13 実証最適値)
 
@@ -427,16 +430,17 @@ def record_daily_trade_completion(symbol: str, side: str, pnl: float, reason: st
     except Exception as e:
         discord.print_log(f"⚠️ 日次トレード状態保存エラー: {e}", level="warning")
 
-def can_open_new_trade_today() -> Tuple[bool, str, int]:
-    """当日の新規エントリーが可能か判定する (可能フラグ, 理由文字列, 当日完了回数)"""
+def can_open_new_trade_today(unrealized_pnl: float = 0.0) -> Tuple[bool, str, int]:
+    """当日の新規エントリーが可能か判定する (可能フラグ, 理由文字列, 当日完了回数、含み損考慮)"""
     state = load_daily_trade_state()
     cnt = int(state.get("trades_count", 0))
     daily_pnl = float(state.get("daily_pnl_usdt", 0.0))
-    if state.get("circuit_broken", False) or daily_pnl <= -DAILY_MAX_LOSS_USDT:
-        return False, f"🚨 日次損失サーキットブレーカー発動中 (本日累計 PnL: ${daily_pnl:+.2f} <= -${DAILY_MAX_LOSS_USDT:.2f} USDT) - 翌朝09:00 JSTまで新規エントリー完全遮断", cnt
+    effective_loss = daily_pnl + min(0.0, float(unrealized_pnl))
+    if state.get("circuit_broken", False) or effective_loss <= -DAILY_MAX_LOSS_USDT:
+        return False, f"🚨 日次損失サーキットブレーカー発動中 (本日実現+含み損: ${effective_loss:+.2f} <= -${DAILY_MAX_LOSS_USDT:.2f} USDT) - 翌朝09:00 JSTまで新規エントリー完全遮断", cnt
     if cnt >= DAILY_MAX_TRADES:
         return False, f"本日トレード上限到達 ({cnt}/{DAILY_MAX_TRADES}回完了) - 翌朝09:00 JSTまで新規エントリー休止", cnt
-    return True, f"本日トレード可能 ({cnt}/{DAILY_MAX_TRADES}回, 累計PnL: ${daily_pnl:+.2f})", cnt
+    return True, f"本日トレード可能 ({cnt}/{DAILY_MAX_TRADES}回, 実効PnL: ${effective_loss:+.2f})", cnt
 
 def format_state_message(symbol: str, position: Dict[str, Any], open_orders_count: int, pending_flatten: bool, trade_side: str = "long") -> str:
     buy_qty = position.get("buy", 0.0)
@@ -1129,16 +1133,12 @@ async def validate_profitable_candidates(trade_side: str, mode: str, base_symbol
         if not raw_cands:
             raw_cands = [s for s in FIXED_SYMBOLS if get_clean_symbol(s) not in excluded_clean]
 
-        # 🚀 【PROJECT_RULES 準拠】 超大型銘柄事前除外 (SOL, DOGE, XRP: HFT過密競争・値動き重小回避 ➔ 中堅アルト特化)
-        # 🟢 クジラ逆風銘柄事前除外 (BUY相場でのSHORT_ONLY除外)
-        excluded_megas = set(EXCLUDED_MEGA_CAPS + [get_clean_symbol(x) for x in EXCLUDED_MEGA_CAPS])
+        # 🚀 【PROJECT_RULES 準拠】 超大型銘柄事前除外オプション (SOL, DOGE, XRP: 直近不合格データに基づくスクリーニング高速化)
+        excluded_megas = set(EXCLUDED_MEGA_CAPS + [get_clean_symbol(x) for x in EXCLUDED_MEGA_CAPS]) if EXCLUDE_MEGAS_FOR_SPEED else set()
         all_candidates = []
         for cand in raw_cands:
             cand_clean = get_clean_symbol(cand)
             if cand in excluded_megas or cand_clean in excluded_megas:
-                continue
-            w_info = get_whale_sentiment_info(cand)
-            if w_info.get("signal") == "SHORT_ONLY":
                 continue
             all_candidates.append(cand)
 
@@ -1166,16 +1166,12 @@ async def validate_profitable_candidates(trade_side: str, mode: str, base_symbol
             # 売り票合致も0件の場合、固定20銘柄から売り除外(底打ち反発)を除いた銘柄をバックテスト対象とする
             raw_cands = [s for s in FIXED_SYMBOLS if get_clean_symbol(s) not in excluded_clean]
 
-        # 🚀 【PROJECT_RULES 準拠】 超大型銘柄事前除外 (SOL, DOGE, XRP: HFT過密競争・値動き重小回避 ➔ 中堅アルト特化)
-        # 🐻 クジラ逆風銘柄事前除外 (SELL相場でのLONG_ONLY除外)
-        excluded_megas = set(EXCLUDED_MEGA_CAPS + [get_clean_symbol(x) for x in EXCLUDED_MEGA_CAPS])
+        # 🚀 【PROJECT_RULES 準拠】 超大型銘柄事前除外オプション (SOL, DOGE, XRP: 直近不合格データに基づくスクリーニング高速化)
+        excluded_megas = set(EXCLUDED_MEGA_CAPS + [get_clean_symbol(x) for x in EXCLUDED_MEGA_CAPS]) if EXCLUDE_MEGAS_FOR_SPEED else set()
         all_candidates = []
         for cand in raw_cands:
             cand_clean = get_clean_symbol(cand)
             if cand in excluded_megas or cand_clean in excluded_megas:
-                continue
-            w_info = get_whale_sentiment_info(cand)
-            if w_info.get("signal") == "LONG_ONLY":
                 continue
             all_candidates.append(cand)
 
@@ -1269,12 +1265,13 @@ async def validate_profitable_candidates(trade_side: str, mode: str, base_symbol
 
                 # 4大完全必須条件 (東京レンジ または 欧州ブレイク のいずれかが合格していれば監視対象に選抜)
                 # 🚀 【W3 強化】直近7日取引回数を最低2回以上 (cnt_7d >= 2) へ強化し、1回限りの偶発的トレードによる「見せかけTier 1」を排除
+                # 4大完全必須条件 (Triple-Stage Recency Gate 準拠: cnt_7d >= 1)
                 is_tier1 = bool(
                     trade_cnt >= 10
                     and pnl_1st > 0.0
                     and pnl_2nd > pnl_1st
                     and pnl_7d > 0.0
-                    and cnt_7d >= 2
+                    and cnt_7d >= 1
                 )
                 is_tier2 = bool(
                     trade_cnt >= 10
@@ -1343,8 +1340,22 @@ async def validate_profitable_candidates(trade_side: str, mode: str, base_symbol
             pnl_2nd = float(p.get("pnl_second_half", 0.0))
             pnl_7d = float(p.get("pnl_recent_7d", 0.0))
             win_rt = float(p.get("win_rate", 0.0))
-            # 30日総合純利益に最大ウェイト(1.0)、後半加速(0.5)、直近7日利益(0.5)、勝率ボーナス(win_rt*0.05)
-            return pnl_tot * 1.0 + pnl_2nd * 0.5 + pnl_7d * 0.5 + (win_rt * 0.05)
+            cnt_7d = int(p.get("trades_recent_7d", 0))
+            # 30日総合純利益に最大ウェイト(1.0)、後半加速(0.5)、直近7日利益(0.5)、勝率ボーナス(win_rt*0.05)、直近頻度ボーナス(min(cnt_7d, 5)*0.2)
+            w_info = get_whale_sentiment_info(sym)
+            w_sig = w_info.get("signal", "NEUTRAL")
+            w_bonus = 0.0
+            if actual_side == "long":
+                if w_sig == "LONG_ONLY":
+                    w_bonus = 1.0
+                elif w_sig == "SHORT_ONLY":
+                    w_bonus = -2.0
+            elif actual_side == "short":
+                if w_sig == "SHORT_ONLY":
+                    w_bonus = 1.0
+                elif w_sig == "LONG_ONLY":
+                    w_bonus = -2.0
+            return pnl_tot * 1.0 + pnl_2nd * 0.5 + pnl_7d * 0.5 + (win_rt * 0.05) + (min(cnt_7d, 5) * 0.2) + w_bonus
 
         # Tier 1: 4大完全必須条件 (前半黒字 & 後半加速 & 直近7日取引1回以上 & 直近7日黒字) クリア銘柄を最優先選抜
         tier1_cands = [
@@ -3106,8 +3117,9 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                         discord.print_log(f"🌙 [デモアクティブ検証] 米国セッション(22:00〜翌09:00 JST) 24時間フル稼働中 (トレール防衛＆5分足チャンス監視)", level="debug")
             total_active_count = len(active_positions) + len(pending_entry_orders)
 
-            # 🛡️ 1日1トレード固定ガードチェック (One Trade Per Day Guard)
-            can_trade_today, daily_reason, daily_cnt = can_open_new_trade_today()
+            # 🛡️ 1日1トレード固定ガードチェック (One Trade Per Day Guard & 含み損考慮サーキットブレーカー)
+            total_unrealized = sum(float(v[4]) for v in active_positions.values()) if active_positions else 0.0
+            can_trade_today, daily_reason, daily_cnt = can_open_new_trade_today(unrealized_pnl=total_unrealized)
             if not can_trade_today:
                 if pending_entry_orders:
                     for p_sym in list(pending_entry_orders.keys()):
