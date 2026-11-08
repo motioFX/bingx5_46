@@ -1457,6 +1457,39 @@ def build_entry_precision_filter(df_inv: pd.DataFrame, side: str = "short", is_v
     return mask
 
 
+
+
+def compute_session_masks(df: pd.DataFrame, context_label: str = "") -> Tuple[np.ndarray, np.ndarray]:
+    """
+    DataFrame から東京セッション (09:00-16:00 JST) および 欧州セッション (16:00-22:00 JST) の
+    真偽値マスク配列 (tokyo_mask, london_mask) を生成する。
+    タイムスタンプ列の欠落時は警告ログを出力し、DatetimeIndex からの復元も試みる。
+    """
+    n = len(df)
+    if n == 0:
+        return np.ones(0, dtype=bool), np.ones(0, dtype=bool)
+
+    ts_s = None
+    if 'timestamp' in df.columns:
+        ts_s = pd.to_datetime(df['timestamp'], errors='coerce')
+    elif isinstance(df.index, pd.DatetimeIndex):
+        ts_s = pd.Series(df.index, index=df.index)
+
+    if ts_s is not None and not ts_s.isna().all():
+        try:
+            if ts_s.dt.tz is None:
+                ts_s = ts_s.dt.tz_localize('UTC')
+            hrs = ts_s.dt.tz_convert('Asia/Tokyo').dt.hour.values
+            tokyo_mask = (hrs >= 9) & (hrs < 16)
+            london_mask = (hrs >= 16) & (hrs < 22)
+            return tokyo_mask, london_mask
+        except Exception as e:
+            discord.print_log(f"⚠️ [SessionMask ERROR] {context_label}: タイムゾーン変換失敗: {e}")
+
+    # タイムスタンプ欠落の安全警告
+    discord.print_log(f"⚠️ [SessionMask WARNING] {context_label}: timestamp 列が欠落または無効です。セッションマスクは全Trueでフォールバックします。")
+    return np.ones(n, dtype=bool), np.ones(n, dtype=bool)
+
 def evaluate_entry_precision_gate(df_eval: pd.DataFrame, side: str = "short", is_vp: bool = True, is_breakout: bool = False) -> Tuple[bool, str, Dict[str, float]]:
     """
     最新確定足 (iloc[-1]) に対して Volume × OI × FR 3要素エントリー精度フィルターを判定する。
@@ -3714,17 +3747,7 @@ def _run_interval_comparison_short(df_5m: pd.DataFrame, lot: float = 1.0, data_e
         ma_filter_none = prec_vp
         ma_filter_vb = prec_vb
 
-        # セッションマスク (JST基準: 東京 09:00-16:00 / ロンドン 16:00-22:00)
-        if 'timestamp' in df_inv.columns:
-            ts_s = pd.to_datetime(df_inv['timestamp'])
-            if ts_s.dt.tz is None:
-                ts_s = ts_s.dt.tz_localize('UTC')
-            hrs_s = ts_s.dt.tz_convert('Asia/Tokyo').dt.hour.values
-            tokyo_mask = (hrs_s >= 9) & (hrs_s < 16)
-            london_mask = (hrs_s >= 16) & (hrs_s < 22)
-        else:
-            tokyo_mask = np.ones(len(df_inv), dtype=bool)
-            london_mask = np.ones(len(df_inv), dtype=bool)
+        tokyo_mask, london_mask = compute_session_masks(df_inv, f"{symbol} short inv={inv}")
 
         cd_bars = max(10, 1440 // inv) if not is_1h else 24
         to_bars = max(2, 240 // inv) if not is_1h else 4
@@ -3889,14 +3912,7 @@ def _run_interval_comparison_short(df_5m: pd.DataFrame, lot: float = 1.0, data_e
         # --- [A] RSIMA_SHORT (EMAなし / 東京セッション) ---
         cd_bars_r = max(10, 1440 // r_inv) if not is_1h else 24
         to_bars_r = max(2, 240 // r_inv) if not is_1h else 4
-        if 'timestamp' in df_r_inv.columns:
-            ts_r = pd.to_datetime(df_r_inv['timestamp'])
-            if ts_r.dt.tz is None:
-                ts_r = ts_r.dt.tz_localize('UTC')
-            hrs_r = ts_r.dt.tz_convert('Asia/Tokyo').dt.hour.values
-            tokyo_mask_r = (hrs_r >= 9) & (hrs_r < 16)
-        else:
-            tokyo_mask_r = np.ones(len(df_r_inv), dtype=bool)
+        tokyo_mask_r, _ = compute_session_masks(df_r_inv, f"{symbol} rsima_short inv={r_inv}")
 
         res_r_none = optimize_rsima3_short_fast(
             c_r, h_r, l_r, r_rsi.values, r_rsi_ma.values,
@@ -4009,14 +4025,7 @@ def _run_interval_comparison_short(df_5m: pd.DataFrame, lot: float = 1.0, data_e
         df_chart_base = winner.get('df_inv', df_5m)
         cd_bars_chart = max(10, 1440 // best_interval) if best_interval < 60 else 24
         to_bars_chart = max(2, 240 // best_interval) if best_interval < 60 else 4
-        if 'timestamp' in df_chart_base.columns:
-            ts_cb = pd.to_datetime(df_chart_base['timestamp'])
-            if ts_cb.dt.tz is None:
-                ts_cb = ts_cb.dt.tz_localize('UTC')
-            hrs_cb = ts_cb.dt.tz_convert('Asia/Tokyo').dt.hour.values
-            tokyo_mask_chart = (hrs_cb >= 9) & (hrs_cb < 16)
-        else:
-            tokyo_mask_chart = np.ones(len(df_chart_base), dtype=bool)
+        tokyo_mask_chart, _ = compute_session_masks(df_chart_base, f"{symbol} rsima_short chart")
 
         chart_df = build_rsima3_short_chart_df(
             df_chart_base, winner['rsi_s'].values, winner['rsi_ma_s'].values,
@@ -4084,16 +4093,7 @@ def _run_interval_comparison_short(df_5m: pd.DataFrame, lot: float = 1.0, data_e
         cd_b = max(10, 1440 // best_interval) if not is_1h else 24
         to_b = max(2, 240 // best_interval) if not is_1h else 4
         winner_tr = float(winner.get('target_ratio', 0.70))
-        if 'timestamp' in df_chart.columns:
-            ts_c = pd.to_datetime(df_chart['timestamp'])
-            if ts_c.dt.tz is None:
-                ts_c = ts_c.dt.tz_localize('UTC')
-            hrs_c = ts_c.dt.tz_convert('Asia/Tokyo').dt.hour.values
-            tokyo_mask_c = (hrs_c >= 9) & (hrs_c < 16)
-            london_mask_c = (hrs_c >= 16) & (hrs_c < 22)
-        else:
-            tokyo_mask_c = np.ones(len(df_chart), dtype=bool)
-            london_mask_c = np.ones(len(df_chart), dtype=bool)
+        tokyo_mask_c, london_mask_c = compute_session_masks(df_chart, f"{symbol} short chart")
 
         if is_vb_winner:
             sim_b = simulate_val_break_fast(
@@ -4291,17 +4291,7 @@ def run_interval_comparison(df_5m: pd.DataFrame, lot: float = 1.0, data_equity: 
         ma_filter_none = prec_vp
         ma_filter_vb = prec_vb
 
-        # セッションマスク (JST基準: 東京 09:00-16:00 / ロンドン 16:00-22:00)
-        if 'timestamp' in df_inv.columns:
-            ts_s = pd.to_datetime(df_inv['timestamp'])
-            if ts_s.dt.tz is None:
-                ts_s = ts_s.dt.tz_localize('UTC')
-            hrs_s = ts_s.dt.tz_convert('Asia/Tokyo').dt.hour.values
-            tokyo_mask = (hrs_s >= 9) & (hrs_s < 16)
-            london_mask = (hrs_s >= 16) & (hrs_s < 22)
-        else:
-            tokyo_mask = np.ones(len(df_inv), dtype=bool)
-            london_mask = np.ones(len(df_inv), dtype=bool)
+        tokyo_mask, london_mask = compute_session_masks(df_inv, f"{symbol} long inv={inv}")
 
         cd_bars = max(10, 1440 // inv) if not is_1h else 24
         to_bars = max(2, 240 // inv) if not is_1h else 4
@@ -4475,14 +4465,7 @@ def run_interval_comparison(df_5m: pd.DataFrame, lot: float = 1.0, data_equity: 
         # --- [A] RSIMA (EMAなし / 東京セッション) ---
         cd_bars_r = max(10, 1440 // r_inv) if not is_1h else 24
         to_bars_r = max(2, 240 // r_inv) if not is_1h else 4
-        if 'timestamp' in df_r_inv.columns:
-            ts_r = pd.to_datetime(df_r_inv['timestamp'])
-            if ts_r.dt.tz is None:
-                ts_r = ts_r.dt.tz_localize('UTC')
-            hrs_r = ts_r.dt.tz_convert('Asia/Tokyo').dt.hour.values
-            tokyo_mask_r = (hrs_r >= 9) & (hrs_r < 16)
-        else:
-            tokyo_mask_r = np.ones(len(df_r_inv), dtype=bool)
+        tokyo_mask_r, _ = compute_session_masks(df_r_inv, f"{symbol} rsima inv={r_inv}")
 
         res_r_none = optimize_rsima3_fast(
             c_r, h_r, l_r, r_rsi.values, r_rsi_ma.values,
@@ -4609,14 +4592,7 @@ def run_interval_comparison(df_5m: pd.DataFrame, lot: float = 1.0, data_equity: 
         df_chart_base = winner.get('df_inv', df_5m)
         cd_bars_chart = max(10, 1440 // best_interval) if best_interval < 60 else 24
         to_bars_chart = max(2, 240 // best_interval) if best_interval < 60 else 4
-        if 'timestamp' in df_chart_base.columns:
-            ts_cb = pd.to_datetime(df_chart_base['timestamp'])
-            if ts_cb.dt.tz is None:
-                ts_cb = ts_cb.dt.tz_localize('UTC')
-            hrs_cb = ts_cb.dt.tz_convert('Asia/Tokyo').dt.hour.values
-            tokyo_mask_chart = (hrs_cb >= 9) & (hrs_cb < 16)
-        else:
-            tokyo_mask_chart = np.ones(len(df_chart_base), dtype=bool)
+        tokyo_mask_chart, _ = compute_session_masks(df_chart_base, f"{symbol} rsima chart")
 
         chart_df = build_rsima3_chart_df(
             df_chart_base, winner['rsi_s'].values, winner['rsi_ma_s'].values,
@@ -4688,16 +4664,7 @@ def run_interval_comparison(df_5m: pd.DataFrame, lot: float = 1.0, data_equity: 
         cd_b = max(10, 1440 // best_interval) if not is_1h else 24
         to_b = max(2, 240 // best_interval) if not is_1h else 4
         winner_tr = float(winner.get('target_ratio', 0.70))
-        if 'timestamp' in df_chart.columns:
-            ts_c = pd.to_datetime(df_chart['timestamp'])
-            if ts_c.dt.tz is None:
-                ts_c = ts_c.dt.tz_localize('UTC')
-            hrs_c = ts_c.dt.tz_convert('Asia/Tokyo').dt.hour.values
-            tokyo_mask_c = (hrs_c >= 9) & (hrs_c < 16)
-            london_mask_c = (hrs_c >= 16) & (hrs_c < 22)
-        else:
-            tokyo_mask_c = np.ones(len(df_chart), dtype=bool)
-            london_mask_c = np.ones(len(df_chart), dtype=bool)
+        tokyo_mask_c, london_mask_c = compute_session_masks(df_chart, f"{symbol} long chart")
 
         if is_brk_b:
             sim_b = simulate_vah_break_fast(
