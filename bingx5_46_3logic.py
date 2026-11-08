@@ -1761,7 +1761,9 @@ def simulate_val_poc_fast(
     timeout_bars: int = 48,
     fee_rate: float = 0.0006,
     maker_fee: float = 0.0002,
-    record_chart: bool = False
+    record_chart: bool = False,
+    mp_period: int = 200,
+    session_mask: Optional[np.ndarray] = None
 ) -> Dict[str, Any]:
     """VAL_POC 高速バックテストシミュレータ (動的ストップ・4時間タイムアウト・最大3枠対応)"""
     n = len(closes)
@@ -1867,7 +1869,7 @@ def simulate_val_poc_fast(
                 # 利確 (VAL-VAH 70%水準 到達かつ建値+0.40%以上利益)
                 target_tp = val + va_spacing if va_spacing > 0 else pocs[i]
                 if (h >= target_tp or c >= target_tp) and target_tp > 0:
-                    exit_px = max(c, target_tp) if h >= target_tp else c
+                    exit_px = target_tp if h >= target_tp else c
                     if exit_px >= avg_price * 1.0040:
                         sell_val = pos_qty * exit_px
                         fee = sell_val * fee_rate
@@ -1893,7 +1895,8 @@ def simulate_val_poc_fast(
 
         # 2. エントリー / ナンピン判定
         if pending_limit < 0:
-            if pos_count == 0 and i >= cooldown_until:
+            allow_entry = (session_mask is None or bool(session_mask[i]))
+            if pos_count == 0 and i >= cooldown_until and allow_entry:
                 if not np.isnan(val) and not np.isnan(vals[i-1]):
                     # VAL下から上への確定終値ベース厳格クロスオーバー (レンジ内回帰押し目買い)
                     val_crossover = (closes[i-1] <= vals[i-1]) and (c > val)
@@ -1901,7 +1904,7 @@ def simulate_val_poc_fast(
                     val_gc = val_crossover and is_lower
                     va_width = (vah - val) / val if val > 0 else 0.0
                     # 直近レンジ滞在率 70% ゲート (MP期間の25%, 15〜40本)
-                    w_len = max(15, min(40, int(len(closes) * 0.05))) if n > 0 else 20
+                    w_len = max(15, min(40, int(mp_period * 0.25)))
                     w_start = max(0, i - w_len)
                     w_closes = closes[w_start:i+1]
                     in_range_cnt = np.sum((w_closes >= val * 0.998) & (w_closes <= vah * 1.002))
@@ -1968,7 +1971,9 @@ def simulate_vah_poc_fast(
     timeout_bars: int = 48,
     fee_rate: float = 0.0006,
     maker_fee: float = 0.0002,
-    record_chart: bool = False
+    record_chart: bool = False,
+    mp_period: int = 200,
+    session_mask: Optional[np.ndarray] = None
 ) -> Dict[str, Any]:
     """VAH_POC 高速ショートバックテストシミュレータ (単発1本固定・動的ストップ・4時間タイムアウト)"""
     n = len(closes)
@@ -2069,7 +2074,7 @@ def simulate_vah_poc_fast(
                 # ショート利確 (VAH - (VAH-VAL)*70%水準 到達かつ建値-0.40%以下利益)
                 target_tp = vah - va_spacing if va_spacing > 0 else pocs[i]
                 if (l <= target_tp or c <= target_tp) and target_tp > 0:
-                    exit_px = min(c, target_tp) if l <= target_tp else c
+                    exit_px = target_tp if l <= target_tp else c
                     if exit_px <= avg_price * 0.9960:
                         buy_val = pos_qty * exit_px
                         fee = buy_val * fee_rate
@@ -2094,7 +2099,8 @@ def simulate_vah_poc_fast(
 
         # 2. ショート新規エントリー判定 (単発1本固定・ナンピンなし)
         if pending_limit < 0:
-            if pos_count == 0 and i >= cooldown_until:
+            allow_entry = (session_mask is None or bool(session_mask[i]))
+            if pos_count == 0 and i >= cooldown_until and allow_entry:
                 if not np.isnan(vah) and not np.isnan(vahs[i-1]):
                     # VAH上から下への確定終値ベース厳格クロスアンダー (レンジ内回帰戻り売り)
                     vah_crossunder = (closes[i-1] >= vahs[i-1]) and (c < vah)
@@ -2102,7 +2108,7 @@ def simulate_vah_poc_fast(
                     vah_dc = vah_crossunder and is_upper  # VAH下抜け
                     va_width = (vah - val) / val if val > 0 else 0.0
                     # 直近レンジ滞在率 70% ゲート (MP期間の25%, 15〜40本)
-                    w_len = max(15, min(40, int(len(closes) * 0.05))) if n > 0 else 20
+                    w_len = max(15, min(40, int(mp_period * 0.25)))
                     w_start = max(0, i - w_len)
                     w_closes = closes[w_start:i+1]
                     in_range_cnt = np.sum((w_closes >= val * 0.998) & (w_closes <= vah * 1.002))
@@ -2162,7 +2168,9 @@ def simulate_vah_break_fast(
     timeout_bars: int = 48,
     fee_rate: float = 0.0006,
     maker_fee: float = 0.0002,
-    record_chart: bool = False
+    record_chart: bool = False,
+    mp_period: int = 200,
+    session_mask: Optional[np.ndarray] = None
 ) -> Dict[str, Any]:
     """VAH_BREAK 高速ロングブレイクアウトシミュレータ (VAH上抜け順張り・単発1本固定・POC直上防衛SL・RR 1:2目標・4時間タイムアウト)"""
     n = len(closes)
@@ -2270,7 +2278,7 @@ def simulate_vah_break_fast(
             else:
                 # ロングブレイク利確: RR 1:2 到達かつ建値+0.40%以上利益
                 if (h >= target_tp or c >= target_tp) and target_tp > 0:
-                    exit_px = max(c, target_tp) if h >= target_tp else c
+                    exit_px = target_tp if h >= target_tp else c
                     if exit_px >= avg_price * 1.0040:
                         sell_val = pos_qty * exit_px
                         fee = sell_val * fee_rate
@@ -2296,13 +2304,19 @@ def simulate_vah_break_fast(
 
         # 2. ロング新規ブレイクアウトエントリー判定 (単発1本固定)
         if pending_limit < 0:
-            if pos_count == 0 and i >= cooldown_until:
+            allow_entry = (session_mask is None or bool(session_mask[i]))
+            if pos_count == 0 and i >= cooldown_until and allow_entry:
                 if not np.isnan(vah) and not np.isnan(vahs[i-1]) and not np.isnan(val):
                     va_diff_e = max(0.0, vah - val)
                     vah_breakout = (closes[i-1] <= vahs[i-1]) and (c > vah)
                     not_overextended = (c <= vah + va_diff_e * 0.35) if va_diff_e > 0 else True
                     va_width = va_diff_e / val if val > 0 else 0.0
-                    if vah_breakout and not_overextended and (va_width >= 0.015) and (ma_filter is None or ma_filter[i]):
+                    w_len = max(15, min(40, int(mp_period * 0.25)))
+                    w_start = max(0, i - w_len)
+                    w_closes = closes[w_start:i+1]
+                    in_range_cnt = np.sum((w_closes >= val * 0.998) & (w_closes <= vah * 1.002))
+                    residency_ratio = in_range_cnt / len(w_closes) if len(w_closes) > 0 else 1.0
+                    if vah_breakout and not_overextended and (va_width >= 0.015) and (residency_ratio >= 0.70) and (ma_filter is None or ma_filter[i]):
                         pending_limit = c * 0.9998
 
         if pos_qty > 0:
@@ -2357,7 +2371,9 @@ def simulate_val_break_fast(
     timeout_bars: int = 48,
     fee_rate: float = 0.0006,
     maker_fee: float = 0.0002,
-    record_chart: bool = False
+    record_chart: bool = False,
+    mp_period: int = 200,
+    session_mask: Optional[np.ndarray] = None
 ) -> Dict[str, Any]:
     """VAL_BREAK 高速ショートブレイクダウンシミュレータ (VAL下抜け順張り・単発1本固定・POC直下防衛SL・RR 1:2目標・4時間タイムアウト)"""
     n = len(closes)
@@ -2465,7 +2481,7 @@ def simulate_val_break_fast(
             else:
                 # ショートブレイク利確: RR 1:2 到達
                 if (l <= target_tp or c <= target_tp) and target_tp > 0:
-                    exit_px = min(c, target_tp) if l <= target_tp else c
+                    exit_px = target_tp if l <= target_tp else c
                     if exit_px <= avg_price * 0.9960:
                         buy_val = pos_qty * exit_px
                         fee = buy_val * fee_rate
@@ -2492,13 +2508,19 @@ def simulate_val_break_fast(
 
         # 2. ショート新規ブレイクダウンエントリー判定 (単発1本固定 / VAH_BREAK の完全対称)
         if pending_limit < 0:
-            if pos_count == 0 and i >= cooldown_until:
+            allow_entry = (session_mask is None or bool(session_mask[i]))
+            if pos_count == 0 and i >= cooldown_until and allow_entry:
                 if not np.isnan(val) and not np.isnan(vals[i-1]) and not np.isnan(vah):
                     va_diff_e = max(0.0, vah - val)
                     val_breakdown = (closes[i-1] >= vals[i-1]) and (c < val)
                     not_overextended = (c >= val - va_diff_e * 0.35) if va_diff_e > 0 else True
                     va_width = va_diff_e / val if val > 0 else 0.0
-                    if val_breakdown and not_overextended and (va_width >= 0.015) and (ma_filter is None or ma_filter[i]):
+                    w_len = max(15, min(40, int(mp_period * 0.25)))
+                    w_start = max(0, i - w_len)
+                    w_closes = closes[w_start:i+1]
+                    in_range_cnt = np.sum((w_closes >= val * 0.998) & (w_closes <= vah * 1.002))
+                    residency_ratio = in_range_cnt / len(w_closes) if len(w_closes) > 0 else 1.0
+                    if val_breakdown and not_overextended and (va_width >= 0.015) and (residency_ratio >= 0.70) and (ma_filter is None or ma_filter[i]):
                         pending_limit = c * 1.0002
 
         if pos_qty > 0:
@@ -2551,7 +2573,8 @@ def optimize_rsima3_fast(
     default_sl_pct: float = 0.025,
     ma_filter: Optional[np.ndarray] = None,
     timeout_bars: int = 48,
-    cooldown_bars: int = 288
+    cooldown_bars: int = 288,
+    session_mask: Optional[np.ndarray] = None
 ) -> Dict[str, Any]:
     """RSIMA 9通り (EP 30,35,40 × CP 60,65,70, 動的ストップ・4時間タイムアウト) 超高速最適化 (MIN_TRADES=10)"""
     n = len(closes)
@@ -2585,6 +2608,8 @@ def optimize_rsima3_fast(
             ep_sig[1:] = gc_arr[1:] & ((rsi_ma[1:] < ep) | (rsi_ma[:-1] < ep))
         if ma_filter is not None and len(ma_filter) == n:
             ep_sig = ep_sig & ma_filter
+        if session_mask is not None and len(session_mask) == n:
+            ep_sig = ep_sig & session_mask
         ep_indices = np.flatnonzero(ep_sig[2:]) + 2
         n_ep = len(ep_indices)
 
@@ -2792,7 +2817,8 @@ def optimize_rsima3_short_fast(
     default_sl_pct: float = 0.025,
     ma_filter: Optional[np.ndarray] = None,
     timeout_bars: int = 48,
-    cooldown_bars: int = 288
+    cooldown_bars: int = 288,
+    session_mask: Optional[np.ndarray] = None
 ) -> Dict[str, Any]:
     """RSIMA ショート 9通り (EP 60,65,70 × CP 30,35,40, 単発1本固定・動的ストップ・4時間タイムアウト) 高速最適化"""
     n = len(closes)
@@ -2824,6 +2850,8 @@ def optimize_rsima3_short_fast(
             ep_sig[1:] = dc_arr[1:] & ((rsi_ma[1:] > ep) | (rsi_ma[:-1] > ep))
         if ma_filter is not None and len(ma_filter) == n:
             ep_sig = ep_sig & ma_filter
+        if session_mask is not None and len(session_mask) == n:
+            ep_sig = ep_sig & session_mask
         ep_indices = np.flatnonzero(ep_sig[2:]) + 2
         n_ep = len(ep_indices)
 
@@ -3017,7 +3045,8 @@ def build_rsima3_short_chart_df(
     initial_equity: float = 100.0,
     ma_filter: Optional[np.ndarray] = None,
     cooldown_bars: int = 288,
-    timeout_bars: int = 48
+    timeout_bars: int = 48,
+    session_mask: Optional[np.ndarray] = None
 ) -> pd.DataFrame:
     """RSIMA3 ショート最良パラメータでの売買マーカー・累積損益曲線付きDataFrameを生成 (optimize_rsima3_short_fastと100%完全同期)"""
     out_df = df_5m.copy().reset_index(drop=True)
@@ -3040,6 +3069,8 @@ def build_rsima3_short_chart_df(
         ep_sig[1:] = dc_arr[1:] & ((rsi_ma[1:] > s_ep) | (rsi_ma[:-1] > s_ep))
     if ma_filter is not None and len(ma_filter) == n:
         ep_sig = ep_sig & ma_filter
+    if session_mask is not None and len(session_mask) == n:
+        ep_sig = ep_sig & session_mask
 
     pos_qty = 0.0
     pos_cost = 0.0
@@ -3131,7 +3162,8 @@ def build_rsima3_chart_df(
     max_trades: int = 5,
     ma_filter: Optional[np.ndarray] = None,
     cooldown_bars: int = 288,
-    timeout_bars: int = 48
+    timeout_bars: int = 48,
+    session_mask: Optional[np.ndarray] = None
 ) -> pd.DataFrame:
     """RSIMA3 最良パラメータでの売買マーカー・累積損益曲線付きDataFrameを生成 (optimize_rsima3_fastと100%完全同期)"""
     out_df = df_5m.copy().reset_index(drop=True)
@@ -3154,6 +3186,8 @@ def build_rsima3_chart_df(
         ep_sig[1:] = gc_arr[1:] & ((rsi_ma[1:] < ep) | (rsi_ma[:-1] < ep))
     if ma_filter is not None and len(ma_filter) == n:
         ep_sig = ep_sig & ma_filter
+    if session_mask is not None and len(session_mask) == n:
+        ep_sig = ep_sig & session_mask
 
     pos_qty = 0.0
     pos_cost = 0.0
@@ -3680,6 +3714,18 @@ def _run_interval_comparison_short(df_5m: pd.DataFrame, lot: float = 1.0, data_e
         ma_filter_none = prec_vp
         ma_filter_vb = prec_vb
 
+        # セッションマスク (JST基準: 東京 09:00-16:00 / ロンドン 16:00-22:00)
+        if 'timestamp' in df_inv.columns:
+            ts_s = pd.to_datetime(df_inv['timestamp'])
+            if ts_s.dt.tz is None:
+                ts_s = ts_s.dt.tz_localize('UTC')
+            hrs_s = ts_s.dt.tz_convert('Asia/Tokyo').dt.hour.values
+            tokyo_mask = (hrs_s >= 9) & (hrs_s < 16)
+            london_mask = (hrs_s >= 16) & (hrs_s < 22)
+        else:
+            tokyo_mask = np.ones(len(df_inv), dtype=bool)
+            london_mask = np.ones(len(df_inv), dtype=bool)
+
         cd_bars = max(10, 1440 // inv) if not is_1h else 24
         to_bars = max(2, 240 // inv) if not is_1h else 4
         calc_step = 8 if inv == 5 else (3 if inv == 15 else (2 if inv == 30 else 1))
@@ -3700,7 +3746,8 @@ def _run_interval_comparison_short(df_5m: pd.DataFrame, lot: float = 1.0, data_e
                 # --- [A] VAH_POC (レンジ回帰 / EMAなし) ---
                 sim_none = simulate_vah_poc_fast(
                     c_inv, h_inv, l_inv, val_arr, vah_arr, pocs, ma_filter_none,
-                    initial_equity=fixed_initial_equity, max_trades=1, cooldown_bars=cd_bars, timeout_bars=to_bars, target_ratio=tr
+                    initial_equity=fixed_initial_equity, max_trades=1, cooldown_bars=cd_bars, timeout_bars=to_bars, target_ratio=tr,
+                    mp_period=mp, session_mask=tokyo_mask
                 )
                 vp_eval_count += 1
                 lbl_none = f"VAH_POC_{inv}m_MP{mp}_B{bins_fixed}_VA{va_name_fixed}_TR{int(tr*100)}_NoEMA"
@@ -3749,7 +3796,8 @@ def _run_interval_comparison_short(df_5m: pd.DataFrame, lot: float = 1.0, data_e
                 if inv == 5 or is_1h:
                     sim_vb = simulate_val_break_fast(
                         c_inv, h_inv, l_inv, val_arr, vah_arr, pocs, ma_filter_vb,
-                        initial_equity=fixed_initial_equity, max_trades=1, cooldown_bars=cd_bars, timeout_bars=to_bars, target_ratio=tr
+                        initial_equity=fixed_initial_equity, max_trades=1, cooldown_bars=cd_bars, timeout_bars=to_bars, target_ratio=tr,
+                        mp_period=mp, session_mask=london_mask
                     )
                     vp_eval_count += 1
                     lbl_vb = f"VAL_BREAK_{inv}m_MP{mp}_B{bins_fixed}_VA{va_name_fixed}_TR{int(tr*100)}_NoEMA"
@@ -3838,14 +3886,24 @@ def _run_interval_comparison_short(df_5m: pd.DataFrame, lot: float = 1.0, data_e
         except Exception:
             pass
 
-        # --- [A] RSIMA_SHORT (EMAなし) ---
+        # --- [A] RSIMA_SHORT (EMAなし / 東京セッション) ---
         cd_bars_r = max(10, 1440 // r_inv) if not is_1h else 24
         to_bars_r = max(2, 240 // r_inv) if not is_1h else 4
+        if 'timestamp' in df_r_inv.columns:
+            ts_r = pd.to_datetime(df_r_inv['timestamp'])
+            if ts_r.dt.tz is None:
+                ts_r = ts_r.dt.tz_localize('UTC')
+            hrs_r = ts_r.dt.tz_convert('Asia/Tokyo').dt.hour.values
+            tokyo_mask_r = (hrs_r >= 9) & (hrs_r < 16)
+        else:
+            tokyo_mask_r = np.ones(len(df_r_inv), dtype=bool)
+
         res_r_none = optimize_rsima3_short_fast(
             c_r, h_r, l_r, r_rsi.values, r_rsi_ma.values,
             initial_equity=fixed_initial_equity, max_trades=1, min_trades=MIN_TRADES,
             val_arr=val_arr_r, vah_arr=vah_arr_r, ma_filter=ma_filter_r_none,
-            cooldown_bars=cd_bars_r, timeout_bars=to_bars_r
+            cooldown_bars=cd_bars_r, timeout_bars=to_bars_r,
+            session_mask=tokyo_mask_r
         )
         rsima_none_key = f"RSIMA_SHORT_{r_inv}m_EP{int(res_r_none['s_ep'])}_CP{int(res_r_none['s_cp'])}_NoEMA"
         results[rsima_none_key] = {
@@ -3951,11 +4009,21 @@ def _run_interval_comparison_short(df_5m: pd.DataFrame, lot: float = 1.0, data_e
         df_chart_base = winner.get('df_inv', df_5m)
         cd_bars_chart = max(10, 1440 // best_interval) if best_interval < 60 else 24
         to_bars_chart = max(2, 240 // best_interval) if best_interval < 60 else 4
+        if 'timestamp' in df_chart_base.columns:
+            ts_cb = pd.to_datetime(df_chart_base['timestamp'])
+            if ts_cb.dt.tz is None:
+                ts_cb = ts_cb.dt.tz_localize('UTC')
+            hrs_cb = ts_cb.dt.tz_convert('Asia/Tokyo').dt.hour.values
+            tokyo_mask_chart = (hrs_cb >= 9) & (hrs_cb < 16)
+        else:
+            tokyo_mask_chart = np.ones(len(df_chart_base), dtype=bool)
+
         chart_df = build_rsima3_short_chart_df(
             df_chart_base, winner['rsi_s'].values, winner['rsi_ma_s'].values,
             winner['s_ep'], winner['s_cp'], winner.get('sl_pct', 0.05),
             initial_equity=fixed_initial_equity, ma_filter=winner.get('ma_filter'),
-            cooldown_bars=cd_bars_chart, timeout_bars=to_bars_chart
+            cooldown_bars=cd_bars_chart, timeout_bars=to_bars_chart,
+            session_mask=tokyo_mask_chart
         )
         pnl_final = float(winner['final_pnl'])
         cnt_final = int(winner['trade_count'])
@@ -4016,15 +4084,28 @@ def _run_interval_comparison_short(df_5m: pd.DataFrame, lot: float = 1.0, data_e
         cd_b = max(10, 1440 // best_interval) if not is_1h else 24
         to_b = max(2, 240 // best_interval) if not is_1h else 4
         winner_tr = float(winner.get('target_ratio', 0.70))
+        if 'timestamp' in df_chart.columns:
+            ts_c = pd.to_datetime(df_chart['timestamp'])
+            if ts_c.dt.tz is None:
+                ts_c = ts_c.dt.tz_localize('UTC')
+            hrs_c = ts_c.dt.tz_convert('Asia/Tokyo').dt.hour.values
+            tokyo_mask_c = (hrs_c >= 9) & (hrs_c < 16)
+            london_mask_c = (hrs_c >= 16) & (hrs_c < 22)
+        else:
+            tokyo_mask_c = np.ones(len(df_chart), dtype=bool)
+            london_mask_c = np.ones(len(df_chart), dtype=bool)
+
         if is_vb_winner:
             sim_b = simulate_val_break_fast(
                 c_b, h_b, l_b, val_b, vah_b, poc_b, mf_b,
-                initial_equity=fixed_initial_equity, max_trades=1, cooldown_bars=cd_b, timeout_bars=to_b, target_ratio=winner_tr, record_chart=True
+                initial_equity=fixed_initial_equity, max_trades=1, cooldown_bars=cd_b, timeout_bars=to_b, target_ratio=winner_tr, record_chart=True,
+                mp_period=best_mp, session_mask=london_mask_c
             )
         else:
             sim_b = simulate_vah_poc_fast(
                 c_b, h_b, l_b, val_b, vah_b, poc_b, mf_b,
-                initial_equity=fixed_initial_equity, max_trades=1, cooldown_bars=cd_b, timeout_bars=to_b, target_ratio=winner_tr, record_chart=True
+                initial_equity=fixed_initial_equity, max_trades=1, cooldown_bars=cd_b, timeout_bars=to_b, target_ratio=winner_tr, record_chart=True,
+                mp_period=best_mp, session_mask=tokyo_mask_c
             )
         df_chart['POC'] = pd.Series(poc_b).ffill().bfill().values
         df_chart['VAH'] = pd.Series(vah_b).ffill().bfill().values
@@ -4210,6 +4291,18 @@ def run_interval_comparison(df_5m: pd.DataFrame, lot: float = 1.0, data_equity: 
         ma_filter_none = prec_vp
         ma_filter_vb = prec_vb
 
+        # セッションマスク (JST基準: 東京 09:00-16:00 / ロンドン 16:00-22:00)
+        if 'timestamp' in df_inv.columns:
+            ts_s = pd.to_datetime(df_inv['timestamp'])
+            if ts_s.dt.tz is None:
+                ts_s = ts_s.dt.tz_localize('UTC')
+            hrs_s = ts_s.dt.tz_convert('Asia/Tokyo').dt.hour.values
+            tokyo_mask = (hrs_s >= 9) & (hrs_s < 16)
+            london_mask = (hrs_s >= 16) & (hrs_s < 22)
+        else:
+            tokyo_mask = np.ones(len(df_inv), dtype=bool)
+            london_mask = np.ones(len(df_inv), dtype=bool)
+
         cd_bars = max(10, 1440 // inv) if not is_1h else 24
         to_bars = max(2, 240 // inv) if not is_1h else 4
         calc_step = 8 if inv == 5 else (3 if inv == 15 else (2 if inv == 30 else 1))
@@ -4231,7 +4324,8 @@ def run_interval_comparison(df_5m: pd.DataFrame, lot: float = 1.0, data_equity: 
                 # --- [A] VAL_POC (レンジ回帰 / EMAなし / 単発1本固定) シミュレーション ---
                 sim_none = simulate_val_poc_fast(
                     c_inv, h_inv, l_inv, val_arr, vah_arr, pocs, ma_filter_none,
-                    initial_equity=fixed_initial_equity, max_trades=1, cooldown_bars=cd_bars, timeout_bars=to_bars, target_ratio=tr
+                    initial_equity=fixed_initial_equity, max_trades=1, cooldown_bars=cd_bars, timeout_bars=to_bars, target_ratio=tr,
+                    mp_period=mp, session_mask=tokyo_mask
                 )
                 vp_eval_count += 1
                 sim_none['single_pnl'] = sim_none['final_pnl']
@@ -4284,7 +4378,8 @@ def run_interval_comparison(df_5m: pd.DataFrame, lot: float = 1.0, data_equity: 
                 if inv == 5 or is_1h:
                     sim_vb = simulate_vah_break_fast(
                         c_inv, h_inv, l_inv, val_arr, vah_arr, pocs, ma_filter_vb,
-                        initial_equity=fixed_initial_equity, max_trades=1, cooldown_bars=cd_bars, timeout_bars=to_bars, target_ratio=tr
+                        initial_equity=fixed_initial_equity, max_trades=1, cooldown_bars=cd_bars, timeout_bars=to_bars, target_ratio=tr,
+                        mp_period=mp, session_mask=london_mask
                     )
                     vp_eval_count += 1
                     lbl_vb = f"VAH_BREAK_{inv}m_MP{mp}_B{bins_fixed}_VA{va_name_fixed}_TR{int(tr*100)}_NoEMA"
@@ -4377,14 +4472,24 @@ def run_interval_comparison(df_5m: pd.DataFrame, lot: float = 1.0, data_equity: 
         except Exception:
             pass
 
-        # --- [A] RSIMA (EMAなし) ---
+        # --- [A] RSIMA (EMAなし / 東京セッション) ---
         cd_bars_r = max(10, 1440 // r_inv) if not is_1h else 24
         to_bars_r = max(2, 240 // r_inv) if not is_1h else 4
+        if 'timestamp' in df_r_inv.columns:
+            ts_r = pd.to_datetime(df_r_inv['timestamp'])
+            if ts_r.dt.tz is None:
+                ts_r = ts_r.dt.tz_localize('UTC')
+            hrs_r = ts_r.dt.tz_convert('Asia/Tokyo').dt.hour.values
+            tokyo_mask_r = (hrs_r >= 9) & (hrs_r < 16)
+        else:
+            tokyo_mask_r = np.ones(len(df_r_inv), dtype=bool)
+
         res_r_none = optimize_rsima3_fast(
             c_r, h_r, l_r, r_rsi.values, r_rsi_ma.values,
             initial_equity=fixed_initial_equity, max_trades=1, min_trades=MIN_TRADES,
             val_arr=val_arr_r, vah_arr=vah_arr_r, ma_filter=ma_filter_r_none,
-            cooldown_bars=cd_bars_r, timeout_bars=to_bars_r
+            cooldown_bars=cd_bars_r, timeout_bars=to_bars_r,
+            session_mask=tokyo_mask_r
         )
         res_r_none['single_pnl'] = res_r_none['final_pnl']
         res_r_none['single_trades'] = res_r_none['trade_count']
@@ -4504,11 +4609,21 @@ def run_interval_comparison(df_5m: pd.DataFrame, lot: float = 1.0, data_equity: 
         df_chart_base = winner.get('df_inv', df_5m)
         cd_bars_chart = max(10, 1440 // best_interval) if best_interval < 60 else 24
         to_bars_chart = max(2, 240 // best_interval) if best_interval < 60 else 4
+        if 'timestamp' in df_chart_base.columns:
+            ts_cb = pd.to_datetime(df_chart_base['timestamp'])
+            if ts_cb.dt.tz is None:
+                ts_cb = ts_cb.dt.tz_localize('UTC')
+            hrs_cb = ts_cb.dt.tz_convert('Asia/Tokyo').dt.hour.values
+            tokyo_mask_chart = (hrs_cb >= 9) & (hrs_cb < 16)
+        else:
+            tokyo_mask_chart = np.ones(len(df_chart_base), dtype=bool)
+
         chart_df = build_rsima3_chart_df(
             df_chart_base, winner['rsi_s'].values, winner['rsi_ma_s'].values,
             winner['l_ep'], winner['l_cp'], winner.get('sl_pct', 0.05),
             initial_equity=fixed_initial_equity, max_trades=3, ma_filter=winner.get('ma_filter'),
-            cooldown_bars=cd_bars_chart, timeout_bars=to_bars_chart
+            cooldown_bars=cd_bars_chart, timeout_bars=to_bars_chart,
+            session_mask=tokyo_mask_chart
         )
         pnl_final = float(winner['final_pnl'])
         cnt_final = int(winner['trade_count'])
@@ -4573,15 +4688,28 @@ def run_interval_comparison(df_5m: pd.DataFrame, lot: float = 1.0, data_equity: 
         cd_b = max(10, 1440 // best_interval) if not is_1h else 24
         to_b = max(2, 240 // best_interval) if not is_1h else 4
         winner_tr = float(winner.get('target_ratio', 0.70))
+        if 'timestamp' in df_chart.columns:
+            ts_c = pd.to_datetime(df_chart['timestamp'])
+            if ts_c.dt.tz is None:
+                ts_c = ts_c.dt.tz_localize('UTC')
+            hrs_c = ts_c.dt.tz_convert('Asia/Tokyo').dt.hour.values
+            tokyo_mask_c = (hrs_c >= 9) & (hrs_c < 16)
+            london_mask_c = (hrs_c >= 16) & (hrs_c < 22)
+        else:
+            tokyo_mask_c = np.ones(len(df_chart), dtype=bool)
+            london_mask_c = np.ones(len(df_chart), dtype=bool)
+
         if is_brk_b:
             sim_b = simulate_vah_break_fast(
                 c_b, h_b, l_b, val_b, vah_b, poc_b, mf_b,
-                initial_equity=fixed_initial_equity, max_trades=1, cooldown_bars=cd_b, timeout_bars=to_b, target_ratio=winner_tr, record_chart=True
+                initial_equity=fixed_initial_equity, max_trades=1, cooldown_bars=cd_b, timeout_bars=to_b, target_ratio=winner_tr, record_chart=True,
+                mp_period=best_mp, session_mask=london_mask_c
             )
         else:
             sim_b = simulate_val_poc_fast(
                 c_b, h_b, l_b, val_b, vah_b, poc_b, mf_b,
-                initial_equity=fixed_initial_equity, cooldown_bars=cd_b, timeout_bars=to_b, target_ratio=winner_tr, record_chart=True
+                initial_equity=fixed_initial_equity, cooldown_bars=cd_b, timeout_bars=to_b, target_ratio=winner_tr, record_chart=True,
+                mp_period=best_mp, session_mask=tokyo_mask_c
             )
         df_chart['POC'] = pd.Series(poc_b).ffill().bfill().values
         df_chart['VAH'] = pd.Series(vah_b).ffill().bfill().values
