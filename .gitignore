@@ -27,3 +27,6 @@ scratch/
 traded_symbols.json
 
 *.bak
+
+# Legacy Archive
+archive/
