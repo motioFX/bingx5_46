@@ -1843,9 +1843,9 @@ def simulate_val_poc_fast(
                 px = pending_limit
                 qty = trade_size / px
                 fee = trade_size * maker_fee
-                pos_cost += trade_size + fee
-                pos_qty += qty
-                avg_price = pos_cost / pos_qty
+                pos_cost = trade_size
+                pos_qty = qty
+                avg_price = px
                 last_entry = px
                 pos_count += 1
                 if pos_count == 1:
@@ -1878,7 +1878,8 @@ def simulate_val_poc_fast(
             if is_sl:
                 sell_val = pos_qty * sl_exec_px
                 fee = sell_val * fee_rate
-                pnl = sell_val - pos_cost - fee
+                entry_fee = pos_cost * maker_fee
+                pnl = sell_val - pos_cost - fee - entry_fee
                 cum_pnl += pnl
                 if i < half_idx:
                     pnl_first_half += pnl
@@ -1906,7 +1907,8 @@ def simulate_val_poc_fast(
                     if exit_px >= avg_price * 1.0040:
                         sell_val = pos_qty * exit_px
                         fee = sell_val * fee_rate
-                        pnl = sell_val - pos_cost - fee
+                        entry_fee = pos_cost * maker_fee
+                        pnl = sell_val - pos_cost - fee - entry_fee
                         cum_pnl += pnl
                         if i < half_idx:
                             pnl_first_half += pnl
@@ -2251,9 +2253,9 @@ def simulate_vah_break_fast(
                 px = pending_limit
                 qty = trade_size / px
                 fee = trade_size * maker_fee
-                pos_cost = trade_size + fee
+                pos_cost = trade_size
                 pos_qty = qty
-                avg_price = pos_cost / pos_qty
+                avg_price = px
                 pos_count = 1
                 entry_bar_idx = i
                 # POC直上防衛SL (max(VAH - VA幅*0.35, POC*1.001)) ＆ RR 1:2 完全保証設計
@@ -2288,7 +2290,8 @@ def simulate_vah_break_fast(
             if is_sl:
                 sell_val = pos_qty * sl_exec_px
                 fee = sell_val * fee_rate
-                pnl = sell_val - pos_cost - fee
+                entry_fee = pos_cost * maker_fee
+                pnl = sell_val - pos_cost - fee - entry_fee
                 cum_pnl += pnl
                 if i < half_idx:
                     pnl_first_half += pnl
@@ -2315,7 +2318,8 @@ def simulate_vah_break_fast(
                     if exit_px >= avg_price * 1.0040:
                         sell_val = pos_qty * exit_px
                         fee = sell_val * fee_rate
-                        pnl = sell_val - pos_cost - fee
+                        entry_fee = pos_cost * maker_fee
+                        pnl = sell_val - pos_cost - fee - entry_fee
                         cum_pnl += pnl
                         if i < half_idx:
                             pnl_first_half += pnl
@@ -2688,10 +2692,10 @@ def optimize_rsima3_fast(
                     if l <= pending_px:
                         px = pending_px
                         qty = trade_size / px
-                        pos_cost += trade_size + trade_size * maker_fee
-                        pos_qty += qty
+                        pos_cost = trade_size
+                        pos_qty = qty
                         last_entry_px = px
-                        avg_px = pos_cost / pos_qty
+                        avg_px = px
                         pos_cnt += 1
                         if pos_cnt == 1:
                             entry_bar_idx = i
@@ -2716,7 +2720,8 @@ def optimize_rsima3_fast(
                     if is_sl:
                         sell_val = pos_qty * sl_exec_px
                         fee = sell_val * taker_fee
-                        pnl = sell_val - pos_cost - fee
+                        entry_fee = pos_cost * maker_fee
+                        pnl = sell_val - pos_cost - fee - entry_fee
                         cum_pnl += pnl
                         if i < half_idx:
                             pnl_first_half += pnl
@@ -2746,7 +2751,8 @@ def optimize_rsima3_fast(
                         # 利確判定: RSI > cp かつ 平均建値以上プラス
                         sell_val = pos_qty * c
                         fee = sell_val * taker_fee
-                        pnl = sell_val - pos_cost - fee
+                        entry_fee = pos_cost * maker_fee
+                        pnl = sell_val - pos_cost - fee - entry_fee
                         cum_pnl += pnl
                         if i < half_idx:
                             pnl_first_half += pnl
@@ -3240,10 +3246,10 @@ def build_rsima3_chart_df(
             if l <= pending_px:
                 px = pending_px
                 qty = trade_size / px
-                pos_cost += trade_size + trade_size * maker_fee
-                pos_qty += qty
+                pos_cost = trade_size
+                pos_qty = qty
                 last_entry_px = px
-                avg_px = pos_cost / pos_qty
+                avg_px = px
                 pos_cnt += 1
                 if pos_cnt == 1:
                     entry_bar_idx = i
@@ -3260,7 +3266,8 @@ def build_rsima3_chart_df(
             if is_sl:
                 sell_val = pos_qty * c
                 fee = sell_val * taker_fee
-                pnl = sell_val - pos_cost - fee
+                entry_fee = pos_cost * maker_fee
+                pnl = sell_val - pos_cost - fee - entry_fee
                 cum_pnl += pnl
                 exec_sell[i] = c
                 pos_qty = 0.0
@@ -3272,7 +3279,8 @@ def build_rsima3_chart_df(
             elif rsi[i] > cp and c >= avg_px * 1.006:
                 sell_val = pos_qty * c
                 fee = sell_val * taker_fee
-                pnl = sell_val - pos_cost - fee
+                entry_fee = pos_cost * maker_fee
+                pnl = sell_val - pos_cost - fee - entry_fee
                 cum_pnl += pnl
                 exec_sell[i] = c
                 pos_qty = 0.0
@@ -4067,7 +4075,7 @@ def _run_interval_comparison_short(df_5m: pd.DataFrame, lot: float = 1.0, data_e
         p7d = winner.get('pnl_recent_7d', 0.0)
         c7d = winner.get('trades_recent_7d', 0)
         qual_tag = f"🟢合格({qual_level})" if is_winner_qual else "🔴二重頑健性未達"
-        discord.print_log(f"🏆 [{symbol}] 採用ショート戦略: 【{best_strategy.upper()} ({best_interval}m/{ema_tag})】を動的採用！ (純利益: {pnl_final:+.2f} USDC [前半: {p1st:+.2f} / 後半: {p2nd:+.2f} / 直近7d: {p7d:+.2f}({c7d}回) / 単発{cnt_final}回/{win_final:.1f}%] - {qual_tag})")
+        discord.print_log(f"🏆 [{symbol}] 採用ショート戦略: 【{best_strategy.upper()} ({best_interval}m/{ema_tag})】を動的採用！ (Net純利益(往復0.08%控除後): {pnl_final:+.2f} USDT [前半: {p1st:+.2f} / 後半: {p2nd:+.2f} / 直近7d: {p7d:+.2f}({c7d}回) / 単発{cnt_final}回/{win_final:.1f}%] - {qual_tag})")
     else:
         best_strategy = chosen_strat
         best_mp = int(winner['mp_period'])
@@ -4149,7 +4157,7 @@ def _run_interval_comparison_short(df_5m: pd.DataFrame, lot: float = 1.0, data_e
         p7d = winner.get('pnl_recent_7d', 0.0)
         c7d = winner.get('trades_recent_7d', 0)
         qual_tag = f"🟢合格({qual_level})" if is_winner_qual else "🔴二重頑健性未達"
-        discord.print_log(f"🏆 [{symbol}] 採用ショート戦略: 【{best_strategy.upper()} ({best_interval}m/{ema_tag})】を動的採用！ (純利益: {pnl_final:+.2f} USDC [前半: {p1st:+.2f} / 後半: {p2nd:+.2f} / 直近7d: {p7d:+.2f}({c7d}回) / 単発{cnt_final}回/{win_final:.1f}%] - {qual_tag})")
+        discord.print_log(f"🏆 [{symbol}] 採用ショート戦略: 【{best_strategy.upper()} ({best_interval}m/{ema_tag})】を動的採用！ (Net純利益(往復0.08%控除後): {pnl_final:+.2f} USDT [前半: {p1st:+.2f} / 後半: {p2nd:+.2f} / 直近7d: {p7d:+.2f}({c7d}回) / 単発{cnt_final}回/{win_final:.1f}%] - {qual_tag})")
 
     dyn_stop, risk_prof = calculate_dynamic_mae_stop(
         df_5m=df_5m,
@@ -4636,7 +4644,7 @@ def run_interval_comparison(df_5m: pd.DataFrame, lot: float = 1.0, data_equity: 
         p7d = winner.get('pnl_recent_7d', 0.0)
         c7d = winner.get('trades_recent_7d', 0)
         qual_tag = f"🟢合格({qual_level})" if is_winner_qual else "🔴二重頑健性未達"
-        discord.print_log(f"🏆 [{symbol}] 採用戦略: 【{best_strategy.upper()} ({best_interval}m/{ema_tag})】を動的採用！ (純利益: {pnl_final:+.2f} USDC [前半: {p1st:+.2f} / 後半: {p2nd:+.2f} / 直近7d: {p7d:+.2f}({c7d}回) / ナンピン{cnt_final}回/{win_final:.1f}%] vs シングル: {s_p:+.2f} USDC [{s_c}回/{s_w:.1f}%] - {qual_tag})")
+        discord.print_log(f"🏆 [{symbol}] 採用戦略: 【{best_strategy.upper()} ({best_interval}m/{ema_tag})】を動的採用！ (Net純利益(往復0.08%控除後): {pnl_final:+.2f} USDT [前半: {p1st:+.2f} / 後半: {p2nd:+.2f} / 直近7d: {p7d:+.2f}({c7d}回) / 単発{cnt_final}回/{win_final:.1f}%] vs シングル: {s_p:+.2f} USDT [{s_c}回/{s_w:.1f}%] - {qual_tag})")
     else:
         best_strategy = chosen_strat
         best_mp = int(winner['mp_period'])
@@ -4722,7 +4730,7 @@ def run_interval_comparison(df_5m: pd.DataFrame, lot: float = 1.0, data_equity: 
         p7d = winner.get('pnl_recent_7d', 0.0)
         c7d = winner.get('trades_recent_7d', 0)
         qual_tag = f"🟢合格({qual_level})" if is_winner_qual else "🔴二重頑健性未達"
-        discord.print_log(f"🏆 [{symbol}] 採用戦略: 【{best_strategy.upper()} ({best_interval}m/{ema_tag})】を動的採用！ (純利益: {pnl_final:+.2f} USDC [前半: {p1st:+.2f} / 後半: {p2nd:+.2f} / 直近7d: {p7d:+.2f}({c7d}回) / ナンピン{cnt_final}回/{win_final:.1f}%] vs シングル: {s_p:+.2f} USDC [{s_c}回/{s_w:.1f}%] - {qual_tag})")
+        discord.print_log(f"🏆 [{symbol}] 採用戦略: 【{best_strategy.upper()} ({best_interval}m/{ema_tag})】を動的採用！ (Net純利益(往復0.08%控除後): {pnl_final:+.2f} USDT [前半: {p1st:+.2f} / 後半: {p2nd:+.2f} / 直近7d: {p7d:+.2f}({c7d}回) / 単発{cnt_final}回/{win_final:.1f}%] vs シングル: {s_p:+.2f} USDT [{s_c}回/{s_w:.1f}%] - {qual_tag})")
 
     # 直近30日の勝ちトレード MAE 95%ile に基づく動的ストップ率を算出 (安全バンド: -1.5% 〜 -3.2%)
     dyn_stop, risk_prof = calculate_dynamic_mae_stop(

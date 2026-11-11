@@ -220,7 +220,7 @@ def build_symbols_status_summary(
             badge = "⚪ 【選定上限枠外】"
             category = "OVER_LIMIT"
             counts["OVER_LIMIT"] += 1
-            detail_reason = f"個別最適化合格 (PnL:+${pnl:.2f}/{trade_count}回) だが最大監視枠超過のため待機"
+            detail_reason = f"個別最適化合格 (Net PnL:+${pnl:.2f}/{trade_count}回) だが最大監視枠超過のため待機"
         elif is_peak_dropped:
             if is_sell_mode:
                 badge = "🔴 【前半ボトム半値超え除外】"
@@ -261,7 +261,7 @@ def build_symbols_status_summary(
                     f"二重頑健性未達 [🗼東京:{r_st}(${r_pnl:+.1f}/{r_cnt}回) | 🏰欧州:{b_st}(${b_pnl:+.1f}/{b_cnt}回)]"
                 )
             elif pnl is not None:
-                detail_reason = f"個別最適化不合格 (PnL: ${pnl:+.2f}, 取引: {trade_count}回, 二重頑健性未達: 前半黒字かつ後半加速が必要)"
+                detail_reason = f"個別最適化不合格 (Net PnL: ${pnl:+.2f}, 取引: {trade_count}回, 二重頑健性未達: 前半黒字かつ後半加速が必要)"
             else:
                 detail_reason = "直近データ不足または二重頑健性基準(10回以上＆前半黒字＆後半加速)未達"
 
@@ -309,9 +309,10 @@ def format_status_table_console(summary_data: Dict[str, Any]) -> str:
     lines.append("=" * 118)
     lines.append(f"📊 【主要アルト20銘柄 選定・除外ステータス完全一覧ダッシュボード】 (評価: {eval_time[:19]})")
     lines.append(f"🛡️  3期間全体地合いディフェンス: {g_icon} [{gate_info['regime_gate']}] {gate_info['regime_desc']}")
+    lines.append("※ Net PnL は往復0.08%（Maker 0.02% + Taker 0.06%）手数料を100%控除した実質純利益です")
     lines.append("=" * 118)
     lines.append(
-        f"{'#':2s} | {'銘柄':10s} | {'ステータス':24s} | {'採用足':6s} | {'直近PnL':12s} | {'勝率':6s} | {'取引':4s} | {'詳細理由 / 採用戦略'}"
+        f"{'#':2s} | {'銘柄':10s} | {'ステータス':24s} | {'採用足':6s} | {'Net PnL':12s} | {'勝率':6s} | {'取引':4s} | {'詳細理由 / 採用戦略'}"
     )
     lines.append("-" * 118)
 
@@ -438,9 +439,9 @@ def format_status_table_discord(summary_data: Dict[str, Any]) -> str:
                 sym_clean = s["symbol"].replace("-USDT", "")
                 lines.append(f"• **{sym_clean}**: `クジラ判定売り偏重 (SHORT_ONLY)`")
 
-    lines.append("\n📱 **【全20銘柄 コンパクト一覧】**")
+    lines.append("\n📱 **【全20銘柄 コンパクト一覧】(Net PnL: 往復0.08%控除後)**")
     lines.append("```text")
-    lines.append("銘柄      | 状態       | 足種  | PnL")
+    lines.append("銘柄      | 状態       | 足種  | Net PnL")
     lines.append("------------------------------------")
 
     for s in symbols:
