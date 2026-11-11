@@ -466,6 +466,13 @@ async def main() -> None:
         json.dump(state_data, f, indent=2, ensure_ascii=False)
     log(f"Saved market state ({final_state} | overall={overall_reg}) to {state_file}")
 
+    # 7. regime_history.csv への永続時系列アペンド (PROJECT_RULES 第2項準拠)
+    try:
+        from record_regime_history import append_current_regime_to_history
+        append_current_regime_to_history(state_data)
+    except Exception as hist_err:
+        log(f"[Warning] regime_history.csv アペンド失敗: {hist_err}")
+
     log("==================================================")
     log("  BingX Screening & Multi-Window Analysis Completed!")
     log("==================================================")
