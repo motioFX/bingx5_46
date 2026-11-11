@@ -1423,14 +1423,11 @@ def build_entry_precision_filter(df_inv: pd.DataFrame, side: str = "short", is_v
         with np.errstate(divide='ignore', invalid='ignore'):
             vol_r = np.where((v_ma20 > 0) & (~np.isnan(v_ma20)), v / v_ma20, 1.0)
         if is_breakout:
-            # ブレイクアウト系 (VAH_BREAK / VAL_BREAK): アルト垂直ロケットを掴むため出来高急増 (1.3x〜4.0x) を必須化
-            mask &= (vol_r >= 1.3) & (vol_r <= 4.0)
+            # ブレイクアウト系 (VAH_BREAK / VAL_BREAK): アルト垂直ロケットを掴むため出来高急増 (1.5x〜4.0x) を必須化 (実売買 MIN_VOLUME_SURGE_RATIO=1.5 準拠)
+            mask &= (vol_r >= 1.5) & (vol_r <= 4.0)
         else:
-            # レンジ逆張り・RSIMA系: 異常スパイク足 (> 2.5x) を遮断
-            mask &= (vol_r <= 2.5)
-            # VP系 (VAL_POC / VAH_POC): 極端な薄商いダマシ (< 0.6x) も遮断
-            if is_vp:
-                mask &= (vol_r >= 0.6)
+            # レンジ逆張り・RSIMA系: 薄商いノイズ排除 (>= 1.5x) かつ 異常スパイク足 (<= 2.5x) 遮断 (実売買完全一致)
+            mask &= (vol_r >= 1.5) & (vol_r <= 2.5)
 
     # 2. OI 4時間変化率条件 (oi_chg_4h, %)
     if "oi_chg_4h" in df_inv.columns:
