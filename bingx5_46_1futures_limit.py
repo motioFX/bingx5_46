@@ -3062,8 +3062,11 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
         # -------------------------------------------------------------
         # [フェーズ B3] リアルタイム (30秒ごと): 3態勢地合いディフェンス ＆ 新規エントリー判定
         # -------------------------------------------------------------
-        if overall_regime == "NEUTRAL":
-            # ===== NEUTRAL (中立相場): 新規エントリー完全停止 ＆ 待機指値即時キャンセル =====
+        gate_allowed_macro = regime_info.get("allowed_strategies", []) if "regime_info" in locals() else []
+        is_neutral_stop = (overall_regime == "NEUTRAL" and not gate_allowed_macro)
+
+        if is_neutral_stop:
+            # ===== NEUTRAL (拮抗中立 BALANCED 相場): 新規エントリー完全停止 ＆ 待機指値即時キャンセル =====
             # 1時間に1回のみDiscord通知 (毎時初回)、それ以外のループはローカルdebugログのみ
             strength_desc = ""
             if regime_strength:
@@ -3090,7 +3093,7 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                             pass
                 pending_entry_orders.clear()
         else:
-            # ===== BULL (買い相場: ロング) または BEAR (売り相場: ショート) =====
+            # ===== トレード稼働態勢 (BUY / SELL / LEAN_BUY / LEAN_SELL) =====
             is_sell_regime = (overall_regime == "SELL")
 
             # JST 時間帯ロール制判定
@@ -3165,24 +3168,8 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                     if vol_ratio < MIN_VOLUME_SURGE_RATIO:
                         continue
 
-                    cur_px = ws_mgr.get_latest_price(sym)
-                    if not cur_px or cur_px <= 0:
-                        cur_bid, cur_ask = get_bingx_orderbook(sym, api_bingx(symbol=sym, mode=mode).bingx.base_url)
-                        cur_px = (cur_ask if is_sell_regime else cur_bid) or float(df_5m["close"].iloc[-1])
-
-                    in_cooldown, rem_h = is_in_sl_cooldown(sym)
-                    if in_cooldown:
-                        continue
-
-                    # クールダウンチェック (直近20分以内の取引除外)
-                    if time.time() - last_trade_time.get(sym, 0) < 1200:
-                        continue
-
                     raw_sym_params = symbol_params_map.get(sym, best_params)
                     # 時間帯連動デュアルパラメータ自動切替:
-                    # 東京時間 (09:00〜16:00 JST) -> レンジ逆張り最適パラメータ (range_params)
-                    # 欧州時間 (16:00〜22:00 JST) -> ブレイクアウト最適パラメータ (breakout_params)
-                    # 時間帯連動デュアルパラメータ切替 (24時間アクティブ検証モード):
                     # 東京時間 (09:00〜16:00 JST) -> レンジ逆張り最適パラメータ (range_params)
                     # 欧州時間 (16:00〜22:00 JST) -> ブレイクアウト最適パラメータ (breakout_params)
                     # 米国時間 (22:00〜翌09:00 JST) -> 合格戦略または総合最適パラメータ (raw_sym_params)
@@ -3201,6 +3188,15 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                     cand_interval_e = int(sym_params_e.get("interval", 5) or 5)
                     cand_strat_e = str(sym_params_e.get("strategy", "rsima")).lower()
 
+                    # 🚀 【売買方向の厳密判定】候補戦略が本来持つ方向 (LONG vs SHORT) を決定
+                    if cand_strat_e in ("val_poc", "vah_break", "rsima") or (cand_strat_e.startswith("val_poc") or (cand_strat_e.startswith("rsima") and not cand_strat_e.startswith("rsima_short"))):
+                        cand_side = "LONG"
+                    elif cand_strat_e in ("vah_poc", "val_break", "rsima_short") or (cand_strat_e.startswith("vah_poc") or cand_strat_e.startswith("val_break") or cand_strat_e.startswith("rsima_short")):
+                        cand_side = "SHORT"
+                    else:
+                        discord.print_log(f"⚠️ [{sym}] 未知または方向不明の戦略 '{cand_strat_e}' のためスキップします。")
+                        continue
+
                     # 許可戦略チェック (allowed_strategies が指定されている場合)
                     gate_allowed = regime_info.get("allowed_strategies", []) if "regime_info" in locals() else []
                     if gate_allowed and cand_strat_e not in gate_allowed:
@@ -3211,6 +3207,19 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                     if is_tokyo_b3 and is_brk_strat:
                         continue
                     if is_london_b3 and not is_brk_strat:
+                        continue
+
+                    cur_px = ws_mgr.get_latest_price(sym)
+                    if not cur_px or cur_px <= 0:
+                        cur_bid, cur_ask = get_bingx_orderbook(sym, api_bingx(symbol=sym, mode=mode).bingx.base_url)
+                        cur_px = (cur_ask if cand_side == "SHORT" else cur_bid) or float(df_5m["close"].iloc[-1])
+
+                    in_cooldown, rem_h = is_in_sl_cooldown(sym)
+                    if in_cooldown:
+                        continue
+
+                    # クールダウンチェック (直近20分以内の取引除外)
+                    if time.time() - last_trade_time.get(sym, 0) < 1200:
                         continue
 
                     df_entry_eval = resample_candles(df_5m, cand_interval_e, drop_unclosed=True) if cand_interval_e > 5 else df_5m.copy()
@@ -3225,8 +3234,8 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                         strategy_type=cand_strat_e,
                         num_bins=int(sym_params_e.get("num_bins", 50)),
                         value_area_pct=float(sym_params_e.get("value_area_pct", 0.70)),
-                        lEp=float(sym_params_e.get("s_ep", 60.0) if is_sell_regime else sym_params_e.get("l_ep", 40.0)),
-                        lCp=float(sym_params_e.get("s_cp", 40.0) if is_sell_regime else sym_params_e.get("l_cp", 60.0)),
+                        lEp=float(sym_params_e.get("s_ep", 60.0) if cand_side == "SHORT" else sym_params_e.get("l_ep", 40.0)),
+                        lCp=float(sym_params_e.get("s_cp", 40.0) if cand_side == "SHORT" else sym_params_e.get("l_cp", 60.0)),
                     )
 
                     vah_e = float(df_entry_eval["VAH"].iloc[-1]) if "VAH" in df_entry_eval.columns else cur_px * 1.02
@@ -3236,9 +3245,9 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                     whale_info = get_whale_sentiment_info(sym)
                     whale_sig = whale_info.get("signal", "NEUTRAL")
 
-                    if is_sell_regime:
+                    if cand_side == "SHORT":
                         # --------------------------------------------------
-                        # 【BEAR相場】ショート新規エントリー判定 (単発1本固定)
+                        # 【SHORT戦略 新規エントリー判定】(単発1本固定)
                         # --------------------------------------------------
                         if cand_strat_e == "val_break":
                             sig_entry = check_val_break_signals(
@@ -3274,7 +3283,7 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                                 is_cooldown_active=in_cooldown,
                                 use_ema_filter=use_ema_v,
                             )
-                        else:
+                        elif cand_strat_e.startswith("rsima_short"):
                             use_ema_r = ("ema" in cand_strat_e)
                             sig_entry = check_rsima3_short_signals(
                                 df_5m=df_entry_eval,
@@ -3293,12 +3302,25 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                                 vah_price=vah_e,
                                 use_ema_filter=use_ema_r,
                             )
+                        else:
+                            discord.print_log(f"⚠️ [{sym}] SHORTブロック内で非SHORT戦略 '{cand_strat_e}' が検出されたためスキップします。")
+                            continue
 
                         entry_action = sig_entry.get("action", "NONE")
                         entry_reason = sig_entry.get("reason", "INITIAL_ENTRY_SHORT")
 
                         # ケース 1: すでにショート指値待機中
                         if sym in pending_entry_orders:
+                            if pending_entry_orders[sym].get("side") != "short":
+                                # 方向不一致の古いロング指値が残っていれば安全キャンセル
+                                p_api = symbol_apis.get(sym)
+                                if p_api:
+                                    try:
+                                        await p_api.active_order_cancel()
+                                        discord.print_log(f"🛡️ [{sym}] 旧ロング指値を安全キャンセルしショート指値待機へ切り替えます。")
+                                    except Exception:
+                                        pass
+                                pending_entry_orders.pop(sym, None)
                             if is_candle_closed:
                                 if entry_action == "INITIAL_ENTRY_SHORT" and whale_sig != "LONG_ONLY":
                                     api = symbol_apis.get(sym)
@@ -3460,9 +3482,9 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                                 total_active_count += 1
                                 discord.print_log(f"📌 [{sym}] Best Ask ショート指値を配置し待機中 (数量={lot_size}, 価格=~${cur_px:.4f})")
 
-                    else:
+                    elif cand_side == "LONG":
                         # --------------------------------------------------
-                        # 【BULL相場】ロング新規エントリー判定 (単発1本固定)
+                        # 【LONG戦略 新規エントリー判定】(単発1本固定)
                         # --------------------------------------------------
                         if cand_strat_e == "vah_break":
                             sig_entry = check_vah_break_signals(
@@ -3498,7 +3520,7 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                                 is_cooldown_active=in_cooldown,
                                 use_ema_filter=use_ema_v,
                             )
-                        else:
+                        elif cand_strat_e.startswith("rsima") and not cand_strat_e.startswith("rsima_short"):
                             use_ema_r = ("ema" in cand_strat_e)
                             sig_entry = check_rsima3_signals(
                                 df_5m=df_entry_eval,
@@ -3517,12 +3539,25 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                                 vah_price=vah_e,
                                 use_ema_filter=use_ema_r,
                             )
+                        else:
+                            discord.print_log(f"⚠️ [{sym}] LONGブロック内で非LONG戦略 '{cand_strat_e}' が検出されたためスキップします。")
+                            continue
 
                         entry_action = sig_entry.get("action", "NONE")
                         entry_reason = sig_entry.get("reason", "INITIAL_ENTRY")
 
                         # ケース 1: すでにロング指値待機中
                         if sym in pending_entry_orders:
+                            if pending_entry_orders[sym].get("side") != "long":
+                                # 方向不一致の古いショート指値が残っていれば安全キャンセル
+                                p_api = symbol_apis.get(sym)
+                                if p_api:
+                                    try:
+                                        await p_api.active_order_cancel()
+                                        discord.print_log(f"🛡️ [{sym}] 旧ショート指値を安全キャンセルしロング指値待機へ切り替えます。")
+                                    except Exception:
+                                        pass
+                                pending_entry_orders.pop(sym, None)
                             if is_candle_closed:
                                 if entry_action == "INITIAL_ENTRY" and whale_sig != "SHORT_ONLY":
                                     api = symbol_apis.get(sym)
