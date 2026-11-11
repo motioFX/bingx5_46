@@ -25,6 +25,7 @@ scratch/
 
 # Dynamic State Files
 traded_symbols.json
+*.tmp
 
 *.bak
 

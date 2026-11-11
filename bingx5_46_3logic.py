@@ -7302,23 +7302,29 @@ def evaluate_market_regime_3window(
     net_score = (mean_b - mean_sl) / 22.0  # -1.0 〜 +1.0
     score_pct_str = f"{net_score * 100:+.1f}%"
 
-    # 1. 全てBULLで揃った場合 (BBB) ➔ 過熱・反転警戒によりトレード禁止
+    # 1. 全てBULLで揃った場合 (BBB) ➔ 最高強度トレンド徹底攻勢 (ULTRA_BUY)
     if buy_count == 3:
-        overall_regime = "NEUTRAL"
-        strength_tier = "EXCESS_BULL_BLOCK"
-        strength_tier_jp = "🚨過熱警戒(全てBULL禁止)"
-        regime_reason = f"🚨 全てBULL揃い過熱警戒 {regime_pattern} ➔ トレード禁止 (新規エントリー停止)"
-        allowed_strategies = []
-        recommended_symbols = []
+        overall_regime = "BUY"
+        strength_tier = "ULTRA_BUY"
+        strength_tier_jp = "🔥全揃い強気買い"
+        regime_reason = f"全期間BUY一致(最高強度トレンド) {regime_pattern} ➔ 全買い戦略フルアクティブ稼働"
+        allowed_strategies = ["val_poc", "vah_break", "rsima"]
+        cands = eligible_buy_by_window.get("2d", set()).union(eligible_buy_by_window.get("7d", set()))
+        if not cands:
+            cands = eligible_buy_by_window.get("14d", set())
+        recommended_symbols = sorted([s for s in cands if s.upper().replace("-USDT", "").replace("USDT", "") != "BTC"])
 
-    # 2. 全てBEARで揃った場合 (SSS) ➔ セリクラ・底打ち反発警戒によりトレード禁止
+    # 2. 全てBEARで揃った場合 (SSS) ➔ 最高強度トレンド徹底攻勢 (ULTRA_SELL)
     elif sell_count == 3:
-        overall_regime = "NEUTRAL"
-        strength_tier = "EXCESS_BEAR_BLOCK"
-        strength_tier_jp = "🚨セリクラ警戒(全てBEAR禁止)"
-        regime_reason = f"🚨 全てBEAR揃いセリクラ警戒 {regime_pattern} ➔ トレード禁止 (新規エントリー停止)"
-        allowed_strategies = []
-        recommended_symbols = []
+        overall_regime = "SELL"
+        strength_tier = "ULTRA_SELL"
+        strength_tier_jp = "🔥全揃い強気売り"
+        regime_reason = f"全期間SELL一致(最高強度トレンド) {regime_pattern} ➔ 全売り戦略フルアクティブ稼働"
+        allowed_strategies = ["val_break", "vah_poc", "rsima_short"]
+        cands = eligible_sell_by_window.get("2d", set()).union(eligible_sell_by_window.get("7d", set()))
+        if not cands:
+            cands = eligible_sell_by_window.get("14d", set())
+        recommended_symbols = sorted([s for s in cands if s.upper().replace("-USDT", "").replace("USDT", "") != "BTC"])
 
     # 3. 買い優勢 (BUY数 > SELL数の多数決 / NEUTRAL含む)
     elif buy_count > sell_count:
