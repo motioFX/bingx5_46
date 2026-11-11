@@ -585,7 +585,7 @@ class send_discord:
             ax1.annotate(f'VAL: {latest_val:.2f}', xy=(1.01, latest_val), xycoords=('axes fraction', 'data'), fontsize=8, color='blue', va='center')
         
         ax1.legend(loc='upper left', fontsize=8)
-        ax1.set_ylabel("Price [USDC]")
+        ax1.set_ylabel("Price [USDT]")
         ax1.grid(True, alpha=0.3)
         ax1.xaxis.set_major_formatter(md.DateFormatter("%m/%d %H:%M"))
         fig.autofmt_xdate(rotation=10)
@@ -720,14 +720,14 @@ class send_discord:
                     s=70,
                 )
 
-        ax1.set_ylabel("close [USDC]", fontsize=9)
+        ax1.set_ylabel("close [USDT]", fontsize=9)
         ax1.grid(True, axis='y', linestyle=':', alpha=0.3)
 
         # 5. 右軸 (twinx): 累積 PnL
         ax2 = ax1.twinx()
         b_plot = df['pnl'] if 'pnl' in df.columns else np.zeros(len(df))
         ax2.plot(x_indices, b_plot, "C1", label="pl", linewidth=1.5)
-        ax2.set_ylabel("pnl [USDC]", fontsize=9)
+        ax2.set_ylabel("Net pnl [USDT]", fontsize=9)
         ax2.grid(False)
 
         # 6. X軸目盛り設定 (日付表示)
@@ -743,9 +743,9 @@ class send_discord:
         first_pnl = df['pnl'].iloc[0] if 'pnl' in df.columns and len(df) > 0 else 0.0
         if first_pnl >= 50.0:
             net_profit = final_pnl - first_pnl
-            title_text = f"{title_prefix}{label} | Equity: ${final_pnl:.2f} (Net: {net_profit:+.2f} USDC)"
+            title_text = f"{title_prefix}{label} | Equity: ${final_pnl:.2f} (Net: {net_profit:+.2f} USDT)"
         else:
-            title_text = f"{title_prefix}{label} | Final PnL: {final_pnl:+.2f} USDC"
+            title_text = f"{title_prefix}{label} | Final Net PnL: {final_pnl:+.2f} USDT"
         ax1.set_title(title_text, fontsize=10, pad=10)
 
         # 7. 凡例統合
@@ -789,7 +789,7 @@ class send_discord:
             optimal_lot_usdt = optimal_lot * price
 
         onhand_amount_usdt = onhand_amount * price
-        self.print_log(f"best lot : {optimal_lot_usdt:.2f} USDC, onhand_amount : {onhand_amount_usdt:.2f} USDC")
+        self.print_log(f"best lot : {optimal_lot_usdt:.2f} USDT, onhand_amount : {onhand_amount_usdt:.2f} USDT")
         time.sleep(1)
         self.print_log("-----------------------------------------")
         time.sleep(1)
@@ -3987,10 +3987,10 @@ def _run_interval_comparison_short(df_5m: pd.DataFrame, lot: float = 1.0, data_e
 
     tr_vpn = int(best_vp_none_cfg.get('target_ratio', 0.70) * 100)
     tr_vbn = int(best_vb_none_cfg.get('target_ratio', 0.70) * 100)
-    discord.print_log(f"\n📊 【ショートPure3大基本戦略 最適化結果直接比較】 ({symbol})")
-    discord.print_log(f"🔹 [VAH_POC ({best_vp_none_cfg['interval']}m/MP{best_vp_none_cfg['mp_period']}/TR{tr_vpn}%)]: 純利益 = {pnl_vpn:+.2f} USDC (前半: {best_vp_none_cfg.get('pnl_first_half', 0.0):+.2f} / 後半: {best_vp_none_cfg.get('pnl_second_half', 0.0):+.2f}, 取引: {cnt_vpn}回, 勝率: {win_vpn:.1f}%)")
-    discord.print_log(f"⚡ [VAL_BREAK ({best_vb_none_cfg['interval']}m/MP{best_vb_none_cfg['mp_period']}/TR{tr_vbn}%)]: 純利益 = {pnl_vbn:+.2f} USDC (前半: {best_vb_none_cfg.get('pnl_first_half', 0.0):+.2f} / 後半: {best_vb_none_cfg.get('pnl_second_half', 0.0):+.2f}, 取引: {cnt_vbn}回, 勝率: {win_vbn:.1f}%)")
-    discord.print_log(f"🔸 [RSIMA_SHORT ({best_rsi_none_cfg['interval']}m/EP{int(best_rsi_none_cfg['s_ep'])}/CP{int(best_rsi_none_cfg['s_cp'])})]: 純利益 = {pnl_rsn:+.2f} USDC (前半: {best_rsi_none_cfg.get('pnl_first_half', 0.0):+.2f} / 後半: {best_rsi_none_cfg.get('pnl_second_half', 0.0):+.2f}, 取引: {cnt_rsn}回, 勝率: {win_rsn:.1f}%)")
+    discord.print_log(f"\n📊 【ショートPure3大基本戦略 最適化結果直接比較 (Net PnL: 往復0.08%控除後)】 ({symbol})")
+    discord.print_log(f"🔹 [VAH_POC ({best_vp_none_cfg['interval']}m/MP{best_vp_none_cfg['mp_period']}/TR{tr_vpn}%)]: Net純利益 = {pnl_vpn:+.2f} USDT (前半: {best_vp_none_cfg.get('pnl_first_half', 0.0):+.2f} / 後半: {best_vp_none_cfg.get('pnl_second_half', 0.0):+.2f}, 取引: {cnt_vpn}回, 勝率: {win_vpn:.1f}%)")
+    discord.print_log(f"⚡ [VAL_BREAK ({best_vb_none_cfg['interval']}m/MP{best_vb_none_cfg['mp_period']}/TR{tr_vbn}%)]: Net純利益 = {pnl_vbn:+.2f} USDT (前半: {best_vb_none_cfg.get('pnl_first_half', 0.0):+.2f} / 後半: {best_vb_none_cfg.get('pnl_second_half', 0.0):+.2f}, 取引: {cnt_vbn}回, 勝率: {win_vbn:.1f}%)")
+    discord.print_log(f"🔸 [RSIMA_SHORT ({best_rsi_none_cfg['interval']}m/EP{int(best_rsi_none_cfg['s_ep'])}/CP{int(best_rsi_none_cfg['s_cp'])})]: Net純利益 = {pnl_rsn:+.2f} USDT (前半: {best_rsi_none_cfg.get('pnl_first_half', 0.0):+.2f} / 後半: {best_rsi_none_cfg.get('pnl_second_half', 0.0):+.2f}, 取引: {cnt_rsn}回, 勝率: {win_rsn:.1f}%)")
 
     valid_cands_tier1 = []  # Tier 1: 直近7日黒字 & 取引発生 (最優先実効性)
     valid_cands_tier2 = []  # Tier 2: 従来の二重頑健性クリア (後半加速)
@@ -4546,18 +4546,18 @@ def run_interval_comparison(df_5m: pd.DataFrame, lot: float = 1.0, data_equity: 
 
     tr_vpn = int(best_vp_none_cfg.get('target_ratio', 0.70) * 100)
     tr_vbn = int(best_vb_none_cfg.get('target_ratio', 0.70) * 100)
-    discord.print_log(f"\n📊 【ロングPure3大基本戦略 最適化結果直接比較】 ({symbol})")
+    discord.print_log(f"\n📊 【ロングPure3大基本戦略 最適化結果直接比較 (Net PnL: 往復0.08%控除後)】 ({symbol})")
     discord.print_log(
         f"🔹 [VAL_POC ({best_vp_none_cfg['interval']}m/MP{best_vp_none_cfg['mp_period']}/TR{tr_vpn}%)]: "
-        f"純利益 = {pnl_vpn:+.2f} USDC (前半: {best_vp_none_cfg.get('pnl_first_half', 0.0):+.2f} / 後半: {best_vp_none_cfg.get('pnl_second_half', 0.0):+.2f}, 取引: {cnt_vpn}回, 勝率: {win_vpn:.1f}%)"
+        f"Net純利益 = {pnl_vpn:+.2f} USDT (前半: {best_vp_none_cfg.get('pnl_first_half', 0.0):+.2f} / 後半: {best_vp_none_cfg.get('pnl_second_half', 0.0):+.2f}, 取引: {cnt_vpn}回, 勝率: {win_vpn:.1f}%)"
     )
     discord.print_log(
         f"⚡ [VAH_BREAK ({best_vb_none_cfg['interval']}m/MP{best_vb_none_cfg['mp_period']}/TR{tr_vbn}%)]: "
-        f"純利益 = {pnl_vbn:+.2f} USDC (前半: {best_vb_none_cfg.get('pnl_first_half', 0.0):+.2f} / 後半: {best_vb_none_cfg.get('pnl_second_half', 0.0):+.2f}, 取引: {cnt_vbn}回, 勝率: {win_vbn:.1f}%)"
+        f"Net純利益 = {pnl_vbn:+.2f} USDT (前半: {best_vb_none_cfg.get('pnl_first_half', 0.0):+.2f} / 後半: {best_vb_none_cfg.get('pnl_second_half', 0.0):+.2f}, 取引: {cnt_vbn}回, 勝率: {win_vbn:.1f}%)"
     )
     discord.print_log(
         f"🔸 [RSIMA ({best_rsi_none_cfg['interval']}m/EP{int(best_rsi_none_cfg['l_ep'])}/CP{int(best_rsi_none_cfg['l_cp'])})]: "
-        f"純利益 = {pnl_rsn:+.2f} USDC (前半: {best_rsi_none_cfg.get('pnl_first_half', 0.0):+.2f} / 後半: {best_rsi_none_cfg.get('pnl_second_half', 0.0):+.2f}, 取引: {cnt_rsn}回, 勝率: {win_rsn:.1f}%)"
+        f"Net純利益 = {pnl_rsn:+.2f} USDT (前半: {best_rsi_none_cfg.get('pnl_first_half', 0.0):+.2f} / 後半: {best_rsi_none_cfg.get('pnl_second_half', 0.0):+.2f}, 取引: {cnt_rsn}回, 勝率: {win_rsn:.1f}%)"
     )
 
     valid_cands_tier1 = []  # Tier 1: 直近7日黒字 & 取引発生 (最優先実効性)
