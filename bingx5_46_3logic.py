@@ -7302,29 +7302,49 @@ def evaluate_market_regime_3window(
     net_score = (mean_b - mean_sl) / 22.0  # -1.0 〜 +1.0
     score_pct_str = f"{net_score * 100:+.1f}%"
 
-    # 1. 全てBULLで揃った場合 (BBB) ➔ 最高強度トレンド徹底攻勢 (ULTRA_BUY)
+    # 実運用 FIXED_SYMBOLS (主要アルト21銘柄 / 銘柄ユニバース厳格固定)
+    FIXED_TARGET_SYMBOLS = [
+        "HYPE-USDT", "SOL-USDT", "DOGE-USDT", "XRP-USDT", "SUI-USDT",
+        "AVAX-USDT", "LINK-USDT", "APT-USDT", "NEAR-USDT", "ARB-USDT",
+        "UNI-USDT", "OP-USDT", "TIA-USDT", "RENDER-USDT", "INJ-USDT",
+        "TAO-USDT", "AAVE-USDT", "ENA-USDT", "ZEC-USDT", "1000PEPE-USDT", "WIF-USDT"
+    ]
+    fixed_set = set(FIXED_TARGET_SYMBOLS)
+    fixed_clean_map = {s.upper().replace("-USDT", "").replace("USDT", ""): s for s in FIXED_TARGET_SYMBOLS}
+
+    def _filter_fixed(c_set):
+        matched = []
+        for s in c_set:
+            clean = s.upper().replace("-USDT", "").replace("USDT", "")
+            if clean in fixed_clean_map and clean != "BTC":
+                matched.append(fixed_clean_map[clean])
+            elif s in fixed_set and "BTC" not in s.upper():
+                matched.append(s)
+        return sorted(list(set(matched)))
+
+    # 1. 全てBULLで揃った場合 (BBB) ➔ 最高強度トレンド徹底攻勢 (ULTRA_BUY: 買いブレイクあり ＋ 押し目買いあり)
     if buy_count == 3:
         overall_regime = "BUY"
         strength_tier = "ULTRA_BUY"
         strength_tier_jp = "🔥全揃い強気買い"
-        regime_reason = f"全期間BUY一致(最高強度トレンド) {regime_pattern} ➔ 全買い戦略フルアクティブ稼働"
-        allowed_strategies = ["val_poc", "vah_break", "rsima"]
+        regime_reason = f"全期間BUY一致(最高強度トレンド) {regime_pattern} ➔ 買いブレイク＆押し目買いフル稼働"
+        allowed_strategies = ["vah_break", "val_poc", "rsima"]
         cands = eligible_buy_by_window.get("2d", set()).union(eligible_buy_by_window.get("7d", set()))
         if not cands:
             cands = eligible_buy_by_window.get("14d", set())
-        recommended_symbols = sorted([s for s in cands if s.upper().replace("-USDT", "").replace("USDT", "") != "BTC"])
+        recommended_symbols = _filter_fixed(cands)
 
-    # 2. 全てBEARで揃った場合 (SSS) ➔ 最高強度トレンド徹底攻勢 (ULTRA_SELL)
+    # 2. 全てBEARで揃った場合 (SSS) ➔ 最高強度トレンド徹底攻勢 (ULTRA_SELL: 売りブレイクあり ＋ 戻り売りあり)
     elif sell_count == 3:
         overall_regime = "SELL"
         strength_tier = "ULTRA_SELL"
         strength_tier_jp = "🔥全揃い強気売り"
-        regime_reason = f"全期間SELL一致(最高強度トレンド) {regime_pattern} ➔ 全売り戦略フルアクティブ稼働"
+        regime_reason = f"全期間SELL一致(最高強度トレンド) {regime_pattern} ➔ 売りブレイク＆戻り売りフル稼働"
         allowed_strategies = ["val_break", "vah_poc", "rsima_short"]
         cands = eligible_sell_by_window.get("2d", set()).union(eligible_sell_by_window.get("7d", set()))
         if not cands:
             cands = eligible_sell_by_window.get("14d", set())
-        recommended_symbols = sorted([s for s in cands if s.upper().replace("-USDT", "").replace("USDT", "") != "BTC"])
+        recommended_symbols = _filter_fixed(cands)
 
     # 3. 買い優勢 (BUY数 > SELL数の多数決 / NEUTRAL含む)
     elif buy_count > sell_count:
@@ -7332,19 +7352,26 @@ def evaluate_market_regime_3window(
         if mean_b >= 16.0:
             strength_tier = "STRONG_BUY"
             strength_tier_jp = "強気買い"
-        elif mean_b >= 13.0:
-            strength_tier = "MODERATE_BUY"
-            strength_tier_jp = "中気買い"
+            regime_reason = f"買い優勢強気地合い {regime_pattern} ➔ 買いブレイク＆押し目買いフル稼働"
+            allowed_strategies = ["vah_break", "val_poc", "rsima"]
+            cands = eligible_buy_by_window.get("2d", set()).union(eligible_buy_by_window.get("7d", set()))
+            if not cands:
+                cands = eligible_buy_by_window.get("14d", set())
         else:
-            strength_tier = "WEAK_BUY"
-            strength_tier_jp = "弱気買い"
-        regime_reason = f"買い優勢地合い(多数決) {regime_pattern} ➔ 全買い戦略アクティブ稼働"
-        allowed_strategies = ["val_poc", "vah_break", "rsima"]
-        # 候補銘柄: 2dまたは7dで買い条件を満たした銘柄群
-        cands = eligible_buy_by_window.get("2d", set()).union(eligible_buy_by_window.get("7d", set()))
-        if not cands:
-            cands = eligible_buy_by_window.get("14d", set())
-        recommended_symbols = sorted([s for s in cands if s.upper().replace("-USDT", "").replace("USDT", "") != "BTC"])
+            if mean_b >= 13.0:
+                strength_tier = "MODERATE_BUY"
+                strength_tier_jp = "中気買い"
+            else:
+                strength_tier = "WEAK_BUY"
+                strength_tier_jp = "弱気買い"
+            # 💡【弱い買い】買いブレイクアウトなし(天井警戒) ＋ レンジ押し目買いあり ＋ 売りブレイクダウンあり(反落初動)
+            regime_reason = f"買い優勢({strength_tier_jp}) {regime_pattern} ➔ 押し目買い＆反落売りブレイク(買いブレイク停止)"
+            allowed_strategies = ["val_poc", "rsima", "val_break"]
+            cands = eligible_buy_by_window.get("2d", set()).union(eligible_buy_by_window.get("7d", set()))
+            cands = cands.union(eligible_sell_by_window.get("2d", set()))
+            if not cands:
+                cands = eligible_buy_by_window.get("14d", set())
+        recommended_symbols = _filter_fixed(cands)
 
     # 4. 売り優勢 (SELL数 > BUY数の多数決 / NEUTRAL含む)
     elif sell_count > buy_count:
@@ -7352,19 +7379,26 @@ def evaluate_market_regime_3window(
         if mean_sl >= 16.0:
             strength_tier = "STRONG_SELL"
             strength_tier_jp = "強気売り"
-        elif mean_sl >= 13.0:
-            strength_tier = "MODERATE_SELL"
-            strength_tier_jp = "中気売り"
+            regime_reason = f"売り優勢強気地合い {regime_pattern} ➔ 売りブレイク＆戻り売りフル稼働"
+            allowed_strategies = ["val_break", "vah_poc", "rsima_short"]
+            cands = eligible_sell_by_window.get("2d", set()).union(eligible_sell_by_window.get("7d", set()))
+            if not cands:
+                cands = eligible_sell_by_window.get("14d", set())
         else:
-            strength_tier = "WEAK_SELL"
-            strength_tier_jp = "弱気売り"
-        regime_reason = f"売り優勢地合い(多数決) {regime_pattern} ➔ 全売り戦略アクティブ稼働"
-        allowed_strategies = ["val_break", "vah_poc", "rsima_short"]
-        # 候補銘柄: 2dまたは7dで売り条件を満たした銘柄群
-        cands = eligible_sell_by_window.get("2d", set()).union(eligible_sell_by_window.get("7d", set()))
-        if not cands:
-            cands = eligible_sell_by_window.get("14d", set())
-        recommended_symbols = sorted([s for s in cands if s.upper().replace("-USDT", "").replace("USDT", "") != "BTC"])
+            if mean_sl >= 13.0:
+                strength_tier = "MODERATE_SELL"
+                strength_tier_jp = "中気売り"
+            else:
+                strength_tier = "WEAK_SELL"
+                strength_tier_jp = "弱気売り"
+            # 💡【弱い売り】売りブレイクアウトなし(安値警戒) ＋ レンジ戻り売りあり ＋ 買いブレイクアウトあり(反発初動)
+            regime_reason = f"売り優勢({strength_tier_jp}) {regime_pattern} ➔ 戻り売り＆反発買いブレイク(売りブレイク停止)"
+            allowed_strategies = ["vah_poc", "rsima_short", "vah_break"]
+            cands = eligible_sell_by_window.get("2d", set()).union(eligible_sell_by_window.get("7d", set()))
+            cands = cands.union(eligible_buy_by_window.get("2d", set()))
+            if not cands:
+                cands = eligible_sell_by_window.get("14d", set())
+        recommended_symbols = _filter_fixed(cands)
 
     # 5. 拮抗中立 (buy_count == sell_count)
     else:
@@ -7372,15 +7406,23 @@ def evaluate_market_regime_3window(
         if net_score >= 0.15:
             strength_tier = "LEAN_BUY"
             strength_tier_jp = "買い寄り中立"
+            regime_reason = f"買い寄り中立 {regime_pattern} ➔ 押し目買い＆反落売りブレイク(買いブレイク停止)"
+            allowed_strategies = ["val_poc", "rsima", "val_break"]
+            cands = eligible_buy_by_window.get("2d", set()).union(eligible_sell_by_window.get("2d", set()))
+            recommended_symbols = _filter_fixed(cands)
         elif net_score <= -0.15:
             strength_tier = "LEAN_SELL"
             strength_tier_jp = "売り寄り中立"
+            regime_reason = f"売り寄り中立 {regime_pattern} ➔ 戻り売り＆反発買いブレイク(売りブレイク停止)"
+            allowed_strategies = ["vah_poc", "rsima_short", "vah_break"]
+            cands = eligible_sell_by_window.get("2d", set()).union(eligible_buy_by_window.get("2d", set()))
+            recommended_symbols = _filter_fixed(cands)
         else:
             strength_tier = "BALANCED"
             strength_tier_jp = "拮抗中立"
-        regime_reason = f"拮抗・保ち合い中立 {regime_pattern} ➔ ノーポジ待機"
-        recommended_symbols = []
-        allowed_strategies = []
+            regime_reason = f"拮抗・保ち合い中立 {regime_pattern} ➔ ノーポジ待機"
+            recommended_symbols = []
+            allowed_strategies = []
 
     strength_desc = f"【{strength_tier_jp} (強度: {score_pct_str} / 買{mean_b:.1f}票 vs 売{mean_sl:.1f}票)】"
 
