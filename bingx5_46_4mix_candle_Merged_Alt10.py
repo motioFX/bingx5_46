@@ -82,15 +82,12 @@ def is_forex_symbol(s: str) -> bool:
     forex_pairs = {"EURUSD", "GBPUSD", "USDJPY", "AUDUSD", "USDCAD", "USDCHF", "NZDUSD"}
     return any(clean.startswith(fp) or clean == fp for fp in forex_pairs)
 
-# 固定選定銘柄 (主要アルトコイン20銘柄 + BTC-USDT 計22票制 / PROJECT_RULES.md 準拠)
-FIXED_TARGET_SYMBOLS: List[str] = [
-    "HYPE-USDT", "SOL-USDT", "DOGE-USDT", "XRP-USDT", "SUI-USDT",
-    "AVAX-USDT", "LINK-USDT", "APT-USDT", "NEAR-USDT", "ARB-USDT",
-    "UNI-USDT", "OP-USDT", "TIA-USDT", "RENDER-USDT", "INJ-USDT",
-    "FET-USDT", "TAO-USDT", "AAVE-USDT", "ENA-USDT", "ZEC-USDT"
-]
-REGIME_SYMBOLS: List[str] = ["BTC-USDT"]
-ALL_SYMBOLS: List[str] = ["BTC-USDT"] + [s for s in FIXED_TARGET_SYMBOLS if s != "BTC-USDT"]
+from symbol_universe import BENCHMARK_SYMBOL, FIXED_TRADABLE_SYMBOLS, LAKE_UNIVERSE_SYMBOLS
+
+# 固定選定銘柄 (主要アルトコイン21銘柄 + BTC-USDT 計22銘柄 / symbol_universe.py 単一正本準拠)
+FIXED_TARGET_SYMBOLS: List[str] = list(FIXED_TRADABLE_SYMBOLS)
+REGIME_SYMBOLS: List[str] = [BENCHMARK_SYMBOL]
+ALL_SYMBOLS: List[str] = [BENCHMARK_SYMBOL] + [s for s in FIXED_TARGET_SYMBOLS if s != BENCHMARK_SYMBOL]
 
 
 class send_discord:

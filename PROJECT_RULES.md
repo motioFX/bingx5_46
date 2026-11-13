@@ -18,12 +18,12 @@ flowchart TD
     end
 
     subgraph PhaseA ["【Phase A】起動時スクリーニング & セッション連動最適化 (単発1本固定)"]
-        P0_4 --> PA_1["5分足時系列ストア差分同期 (SSoT: BingX USDT先物 65日分) ＆ 15m 動的ダウンサンプリング (30m/1h/1d生成完全廃止) + 自前OI + FR"]
-        PA_1 --> PA_2["14d / 7d / 2d ノーマライズ比較チャート出力 (Discord送信) ＆ 3段階全体地合い判定 (BTC-USDT 2票/計23票)"]
+        P0_4 --> PA_1["データレイク (bingx_lake.db) 差分追記同期 (SSoT: 5m/15m/1h/4h 無制限蓄積) + 自前OI + FR"]
+        PA_1 --> PA_2["14d / 7d / 2d ノーマライズ比較チャート出力 ＆ 3段階全体地合い判定 (BTC-USDT 2票/計23票) → regime_snapshots"]
         PA_2 --> PA_3{"総合地合い判定 (BULL / NEUTRAL / BEAR)"}
-        PA_3 -- "BULL (買い)" --> PA_4_Long["買い推奨銘柄のセッション連動個別最適化 (東京レンジ5m/15m, ロンドンブレイク5m: 単発1本固定)"]
-        PA_3 -- "NEUTRAL (中立)" --> PA_4_Neutral["地合い強度判定: BALANCEDは完全待機 / LEAN_BUY・LEAN_SELLは選別戦略で最適化"]
-        PA_3 -- "BEAR (売り)" --> PA_4_Short["売り推奨銘柄のセッション連動個別最適化 (東京レンジ5m/15m, ロンドンブレイク5m: 単発1本固定)"]
+        PA_3 -- "BULL (買い)" --> PA_4_Long["買い許可銘柄のウォークフォワード評価 (Opt→Eval OOS / 0.08%手数料 / 最良勝者1件選出)"]
+        PA_3 -- "NEUTRAL (中立)" --> PA_4_Neutral["地合い強度判定: BALANCEDは完全待機 / LEAN_BUY・LEAN_SELLはOOS基準達成の勝者1件のみ選出"]
+        PA_3 -- "BEAR (売り)" --> PA_4_Short["売り許可銘柄のウォークフォワード評価 (Opt→Eval OOS / 0.08%手数料 / 最良勝者1件選出)"]
         PA_4_Long --> PA_5["1ヶ月間最優秀成績銘柄のバックテストチャート1枚出力 (MaxDD USDT/%併記) + 全21銘柄ステータス一覧送信"]
         PA_4_Neutral --> PA_5_Neutral["地合い中立ステータス通知 (BALANCED待機またはLEAN稼働) + 全21銘柄ステータス一覧送信"]
         PA_4_Short --> PA_5
@@ -116,16 +116,40 @@ flowchart TD
 
 ## 1. 銘柄選定・検証データ収集規約 (Data Pipeline)
 
-### 💎 【単一データ源泉 (SSoT)】5分足 (5m) 差分追記型・永続ローカル時系列ストア
-* **巨大データ一括取得・ZIP送信の完全廃止**:
-  * 全市場600銘柄以上のダウンロードや巨大CSV/ZIPの生成・送信は完全に廃止し、固定選定21銘柄＋`BTC-USDT`（計22銘柄）の5分足データのみを軽量管理する。
-* **アーキテクチャ (`candle_5m_store.py`)**:
-  * BingX USDT無期限先物の 5分足（5m）OHLCV を最小データ粒度かつ「単一のデータ源泉（SSoT: Single Source of Truth）」とし、ローカルファイル（`Data/candles_5m/candles_5m_{SYMBOL}.csv`）に永続蓄積・差分追記（Append）する。
-  * **初回取得 ＆ OKX外部補完 (2ヶ月分/65日分蓄積)**: 初回または不足時は BingX API から取得可能な直近分を取得し、45日〜65日前の不足分は GCP・Oracle 等の全クラウド環境でアクセス遮断のない **OKX REST API（`/api/v5/market/history-candles`）** より価格比率 $R_{px}$・出来高比率 $R_{vol}$ 平準化補完してシームレスに結合する。
-  * **増分更新（インクリメンタル更新）とローリング管理**: 2回目以降は既存データの最新タイムスタンプ以降の差分のみを BingX API から取得してマージ（`drop_duplicates`）し、**60日〜65日分（上限18,720本＝約2ヶ月強）** でローリング保持する。これにより地合い判定（14d/7d/2d）およびウォークフォワード検証で常に安定した過去2ヶ月分の時系列データが確保される。
-* **動的ダウンサンプリング（15分足特化 ＆ 30m/1h/1d生成・CSV完全廃止）原則**:
-  * 取引戦略は東京セッション（5m/15m）およびロンドンセッション（5mのみ）に完全特化しているため、**検証および実運用に必要な足種は 5分足（5m）および 15分足（15m）のみ** とする。
-  * **30分足（30m）、1時間足（1h/60m）、日足（1d/1440m）の生成、およびディスクへのCSV保存（merged_*.csv, daily_*.csv）は完全廃止** する。5分足ストアから動的に生成するのは 15分足（15m）のみとし、無駄なファイルIO・リサンプリング計算負荷を完全に排除する。
+### 💎 【単一データ源泉 (SSoT)】データレイク基盤 (`Data/lake/bingx_lake.db`) ＆ 追記型永続時系列ストア
+* **巨大データ一括取得・ZIP送信の完全廃止 ＆ 正本一本化**:
+  * 全市場600銘柄以上のダウンロードや巨大CSV/ZIP（`daily_*.csv`, `merged_*.csv`, `bingx_all_markets_1h_*.csv/.zip`）の生成・運用は廃止し、`symbol_universe.py` で単一定義された **実取引ユニバース 21銘柄＋`BTC-USDT`（計22銘柄）** のみを管理対象とする。
+  * 唯一の正本（SSoT: Single Source of Truth）を **SQLite データレイク `Data/lake/bingx_lake.db`（WALモード・外部キー制約有効）** とし、既存の `Data/candles_5m/*.csv`、`Data/oi_store/*_oi.csv`、`Data/regime_history.csv`、`Data/trades_history.csv` を `migrate_to_lake.py` で無損失統合する（外部可視化用の読み取り専用CSVスナップショットは `Data/lake/exports/` に出力）。
+* **時系列蓄積・確定足専用原則 (`lake_store.py`, `candle_5m_store.py`)**:
+  * **65日切り捨て（`disk_max_bars`）の完全撤廃**: `market_candles` テーブルへ 5分足（`5m`）を最小粒度として無制限追記蓄積（180日超のバックフィル含む）し、確定済み `5m` 足から `15m` / `1h` / `4h` の全4時間軸を `closed='left', label='left'` で決定的生成・格納する（`PRIMARY KEY (symbol, timeframe, ts_utc)`）。
+  * **未来情報混入（未確定足リーク）の構造的遮断**: すべてのローソク足は開始時刻 `ts_utc`（UTC秒）で格納し、基準時刻 `data_cutoff_utc = T` における参照時は常に `ts_utc + tf_sec <= T` を満たす確定足のみをSQLで抽出する。
+  * **建玉 (OI)・ファンディングレート (FR) の因果結合 (`market_oi_fr`)**: `bingx_oi_collector.py` が収集する全銘柄 OI/FR を単一キー `{SYMBOL}`（`{SYM}-USDT` 統一）で追記保存し、`oi_chg_4h` 等は各足確定時刻 `bar_close_utc` 以前の最新観測値のみを後方 `merge_asof` で動的結合する（未来値の逆補間を厳禁）。
+* **テーブル構成（全9テーブル・蓄積ループ）**:
+  1. `universe_symbols`: 対象22銘柄およびメガキャップ除外定義
+  2. `market_candles`: `5m` / `15m` / `1h` / `4h` の確定OHLCV
+  3. `market_oi_fr`: 建玉・FR・マーク価格の時系列スナップショット
+  4. `regime_snapshots`: 基準時刻ごとの3段階地合い・クジラ・前半高安監査結果
+  5. `backtest_runs`: 実行ID、`data_cutoff_utc`、`opt_start/end`、`eval_start/end`、手数料設定、Gitコミット識別子
+  6. `backtest_cells`: 銘柄×戦略×方向×時間軸×パラメータごとの最適化窓・評価窓成績、格付け（`QUALIFIED` / `PROVISIONAL` / `INSUFFICIENT_N` / `REJECTED_EV`）、伸び切りバケット別統計（`eval_ext_stats_json`）
+  7. `backtest_simulated_trades`: 全擬似約定・未約定キャンセル・エントリー/決済手数料・伸び切り指標（`ext_pct`, `ext_atr`, `va_upper/lower`, `range_high/low`）の1件単位明細
+  8. `daily_selections`: 選定結果（最上位勝者1件、または基準未達時 `NO_CANDIDATE`）および実行ステータス（`SELECTED` / `NO_CANDIDATE` / `EXECUTED` / `BLOCKED_RISK`）
+  9. `live_trades`: VSTデモ実トレード約定・決済結果（`selection_id` で選定根拠と紐づけて自動書き戻し）
+
+### 🧭 【ウォークフォワード評価 ＆ 日次勝者選定仕様】(`lake_backtest_engine.py`, `lake_reproduce.py`)
+* **アウトオブサンプル (OOS) 厳格分離（インサンプル選定の禁止）**:
+  * すべてのバックテスト選定は **Stage 1: 最適化窓（`[opt_start_utc, opt_end_utc)`）** と **Stage 2: 評価窓（`[eval_start_utc, eval_end_utc]`、`opt_end_utc <= eval_start_utc`）** に分離する。
+  * パラメータ探索は最適化窓のみで行い、候補パラメータを凍結した上で境界ポジションを完全パージ・リセットし、評価窓へ1回のみ適用する。**勝者の判定は評価窓の手数料後成績のみ** で行う。
+* **手数料 ＆ Maker指値追随シミュレーション基準**:
+  * 全擬似約定に **往復 `0.08%`（エントリー Maker `0.02%` ＋ エグジット Taker `0.06%`）** を厳密算入し、`entry_fee_usdt`・`exit_fee_usdt`・`net_pnl` を個別に記録する。
+  * 実ボット（`bingx5_46_2api.py`）に合わせ、シグナル確定後の次5m足から最良気配相当（Long: `close * 0.9998`, Short: `close * 1.0002`）で指値追随し、実際に5m足高安へ到達した場合のみ約定、シグナル終了時は `CANCEL_SIGNAL_END` として即時キャンセルする（安易な無条件成行約定を禁止）。約定足の決済判定は保守的に損切り・防衛SLを利確より先行評価する。
+* **件数閾値（格付け）＆ 伸び切り度合い軸**:
+  * 評価窓トレード数により格付けを行う：**`n < 10` は不採用（`INSUFFICIENT_N`）**、**`10 <= n < 30` は「参考（`PROVISIONAL`）」として格下げ**、**`n >= 30` を本採用（`QUALIFIED`）** とする。また **`eval_ev <= 0` はすべて除外（`REJECTED_EV`）** とする。
+  * すべてのシグナル時点で VA 境界（`VAH`/`VAL`）および直近レンジ高安からの乖離を **`%` 換算（`ext_pct`）** および **`ATR_14` 換算（`ext_atr`）** として因果算出し、`< 0.5 ATR` / `0.5-1.5 ATR` / `>= 1.5 ATR` の3区分成績を `eval_ext_stats_json` に集計する。
+* **当日のトレード勝者選定（最良1件限定 ＆ 見送り原則）**:
+  * 現行リスクルール（**1日1トレード・09:00 JST リセット**、日次最大損失 `-$1.50` サーキットブレーカー、SL後24時間クールダウン、RR 1:2、`MIN_VOLUME_SURGE_RATIO = 1.5`、地合い方向ロック、既存持ち越し時のみ合計枠 `MAX_ACTIVE_POSITIONS = 2`）をすべて維持する。
+  * 合格候補の中から **最上位1件（`QUALIFIED` を `PROVISIONAL` より優先し、`eval_ev`・`eval_pf`・`eval_trades` で決定論的に順位付け）** のみを選定する。**基準を満たす候補が存在しない日は新規取引を見送り（`NO_CANDIDATE`）、枠を無理に埋めない。**
+* **再現性保証 (`lake_reproduce.py`)**:
+  * `python lake_reproduce.py --run-id <run_id>` は外部APIへ一切接続せず `Data/lake/bingx_lake.db` のみから任意の過去 `run_id` の全セル成績と日次勝者選定結果を再計算し、数値完全一致を検証できる構造を維持する。
 
 ### 🏛️ 建玉（OI）時系列蓄積 ＆ ファンディングレート（FR）モニタリング
 * **自前蓄積最優先**: 毎時 00 分およびスクリーニング時に BingX 全対象銘柄の建玉（Open Interest: USDT建て想定元本）および Funding Rate スナップショットを `Data/oi_store/` へ自動蓄積。データが存在する時間帯は BingX 純正実測建玉を最優先採用する。
@@ -274,8 +298,8 @@ USDCよりも圧倒的に出来高・流動性が厚い **USDT無期限先物ペ
     ```text
     timestamp,overall_regime,regime_pattern,strength_tier,net_score,mean_buy_votes,mean_sell_votes,allowed_strategies,recommended_symbols,excluded_symbols,selected_symbols
     ```
-* **過去データへの地合い・銘柄記録（Rollback Reconstruction）**:
-  - ローカルに蓄積されている5分足時系列ストア（過去65日分・約39万本）を用い、過去の日付ごとの地合い判定および銘柄選定結果を遡及計算して `Data/regime_history.csv` に初期蓄積する。
+* **過去データへの地合い・銘柄記録（Rollback Reconstruction ＆ レイク同期）**:
+  - `Data/lake/bingx_lake.db`（および互換出力 `Data/regime_history.csv`）の過去時系列データを用い、過去の日付ごとの地合い判定および選定結果を遡及計算して `regime_snapshots` テーブル ＆ `Data/regime_history.csv` に蓄積する。
   - これにより、過去の「いつがBULLで、いつがBEARで、いつがNEUTRALだったか」「その時どの銘柄が選定されていたか」を完全に可視化・追跡可能とする。
 * **単一状態スナップショット (`Data/market_state.json` ＆ `Data/last_selection_result.json`)**:
   - 最新時点の地合い状態、各期間（14d/7d/2d）の詳細票数、除外理由マップ、および個別最適化パラメータをアトミック書き込みで永続化。

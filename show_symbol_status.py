@@ -24,13 +24,10 @@ if hasattr(sys.stderr, "reconfigure"):
     except Exception:
         pass
 
-# 固定選定銘柄 (主要アルトコイン20銘柄 / PROJECT_RULES.md 準拠)
-FIXED_SYMBOLS = [
-    "HYPE-USDT", "SOL-USDT", "DOGE-USDT", "XRP-USDT", "SUI-USDT",
-    "AVAX-USDT", "LINK-USDT", "APT-USDT", "NEAR-USDT", "ARB-USDT",
-    "UNI-USDT", "OP-USDT", "TIA-USDT", "RENDER-USDT", "INJ-USDT",
-    "FET-USDT", "TAO-USDT", "AAVE-USDT", "ENA-USDT", "ZEC-USDT"
-]
+from symbol_universe import FIXED_TRADABLE_SYMBOLS
+
+# 固定選定銘柄 (主要アルトコイン21銘柄 / symbol_universe.py 単一正本準拠)
+FIXED_SYMBOLS = list(FIXED_TRADABLE_SYMBOLS)
 
 DATA_DIR = Path(__file__).resolve().parent / "Data"
 JST = timezone(timedelta(hours=9))

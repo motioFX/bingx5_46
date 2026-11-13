@@ -30,13 +30,9 @@ JST = timezone(timedelta(hours=9))
 BINGX_BASE_URL = "https://open-api.bingx.com"
 BYBIT_BASE_URL = "https://api.bybit.com"
 
-FIXED_TARGET_SYMBOLS: List[str] = [
-    "BTC-USDT",
-    "HYPE-USDT", "SOL-USDT", "DOGE-USDT", "XRP-USDT", "SUI-USDT",
-    "AVAX-USDT", "LINK-USDT", "APT-USDT", "NEAR-USDT", "ARB-USDT",
-    "UNI-USDT", "OP-USDT", "TIA-USDT", "RENDER-USDT", "INJ-USDT",
-    "FET-USDT", "TAO-USDT", "AAVE-USDT", "ENA-USDT", "ZEC-USDT"
-]
+from symbol_universe import LAKE_UNIVERSE_SYMBOLS
+
+FIXED_TARGET_SYMBOLS: List[str] = list(LAKE_UNIVERSE_SYMBOLS)
 
 # インメモリキャッシュ: symbol -> (cached_epoch_sec, df_oi_fr)
 _OI_FR_MEM_CACHE: Dict[str, Tuple[float, pd.DataFrame]] = {}
@@ -145,27 +141,42 @@ def save_oi_snapshot(oi_data: Dict[str, Dict[str, float]], target_ts_ms: Optiona
     for sym, item in oi_data.items():
         try:
             clean_sym = normalize_sym(sym)
-            ticker = clean_sym.replace("-USDT", "")
-            for fname in (f"{clean_sym}_oi.csv", f"{ticker}_oi.csv"):
-                csv_path = OI_STORE_DIR / fname
-                row = {
-                    "timestamp": target_ts_ms,
-                    "datetime_jst": dt_jst_str,
-                    "openInterest": item.get("openInterest", 0.0),
-                    "openInterestVal": item.get("openInterestVal", 0.0),
-                    "markPrice": item.get("markPrice", 0.0),
-                    "fundingRate": item.get("fundingRate", 0.0),
-                }
+            csv_path = OI_STORE_DIR / f"{clean_sym}_oi.csv"
+            row = {
+                "timestamp": target_ts_ms,
+                "datetime_jst": dt_jst_str,
+                "openInterest": item.get("openInterest", 0.0),
+                "openInterestVal": item.get("openInterestVal", 0.0),
+                "markPrice": item.get("markPrice", 0.0),
+                "fundingRate": item.get("fundingRate", 0.0),
+            }
 
-                if csv_path.exists():
-                    df = pd.read_csv(csv_path, encoding="utf-8")
-                    new_df = pd.DataFrame([row])
-                    df = pd.concat([df, new_df], ignore_index=True)
-                else:
-                    df = pd.DataFrame([row])
+            if csv_path.exists():
+                df = pd.read_csv(csv_path, encoding="utf-8")
+                new_df = pd.DataFrame([row])
+                df = pd.concat([df, new_df], ignore_index=True)
+            else:
+                df = pd.DataFrame([row])
 
-                df = df.drop_duplicates(subset=["timestamp"], keep="last").sort_values("timestamp").reset_index(drop=True)
-                df.to_csv(csv_path, index=False, encoding="utf-8")
+            df = df.drop_duplicates(subset=["timestamp"], keep="last").sort_values("timestamp").reset_index(drop=True)
+            df.to_csv(csv_path, index=False, encoding="utf-8")
+            try:
+                from lake_store import LakeStore
+                LakeStore().upsert_oi_fr(
+                    clean_sym,
+                    pd.DataFrame([
+                        {
+                            "ts_utc": int(target_ts_ms // 1000),
+                            "open_interest": row["openInterest"],
+                            "open_interest_val": row["openInterestVal"],
+                            "mark_price": row["markPrice"],
+                            "funding_rate": row["fundingRate"],
+                        }
+                    ]),
+                    source="bingx_oi",
+                )
+            except Exception:
+                pass
             _OI_FR_MEM_CACHE.pop(clean_sym, None)
             saved_count += 1
         except Exception:
@@ -404,11 +415,22 @@ def sync_oi_fr_history_for_symbol(symbol: str, target_days: int = 35) -> pd.Data
                 cols = ["timestamp", "datetime_jst", "openInterest", "openInterestVal", "markPrice", "fundingRate"]
                 df_bingx = df_ext[cols].copy()
 
-            # 補完済み時系列を oi_store に保存
+            # 補完済み時系列を oi_store ＆ データレイクへ保存
             try:
-                ticker = clean_sym.replace("-USDT", "")
-                for fname in (f"{clean_sym}_oi.csv", f"{ticker}_oi.csv"):
-                    df_bingx.to_csv(OI_STORE_DIR / fname, index=False, encoding="utf-8")
+                df_bingx.to_csv(OI_STORE_DIR / f"{clean_sym}_oi.csv", index=False, encoding="utf-8")
+            except Exception:
+                pass
+            try:
+                from lake_store import LakeStore
+                df_lake_oi = df_bingx.rename(
+                    columns={
+                        "openInterest": "open_interest",
+                        "openInterestVal": "open_interest_val",
+                        "markPrice": "mark_price",
+                        "fundingRate": "funding_rate",
+                    }
+                )
+                LakeStore().upsert_oi_fr(clean_sym, df_lake_oi, source="oi_sync")
             except Exception:
                 pass
 

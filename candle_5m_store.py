@@ -31,14 +31,10 @@ BINGX_REST_URL = "https://open-api.bingx.com/openApi/swap/v2/quote/klines"
 BYBIT_KLINE_URL = "https://api.bybit.com/v5/market/kline"
 OKX_CANDLES_URL = "https://www.okx.com/api/v5/market/history-candles"
 
-# 固定選定20銘柄 + 地合い用BTC (PROJECT_RULES.md 準拠)
-DEFAULT_TARGET_SYMBOLS = [
-    "BTC-USDT",
-    "HYPE-USDT", "SOL-USDT", "DOGE-USDT", "XRP-USDT", "SUI-USDT",
-    "AVAX-USDT", "LINK-USDT", "ADA-USDT", "NEAR-USDT", "APT-USDT",
-    "OP-USDT", "ARB-USDT", "TIA-USDT", "RENDER-USDT", "WIF-USDT",
-    "FET-USDT", "TAO-USDT", "AAVE-USDT", "ENA-USDT", "ZEC-USDT"
-]
+from symbol_universe import LAKE_UNIVERSE_SYMBOLS
+
+# 固定選定21銘柄 + 地合い用BTC (symbol_universe.py 単一正本準拠)
+DEFAULT_TARGET_SYMBOLS = list(LAKE_UNIVERSE_SYMBOLS)
 
 
 def normalize_symbol_name(symbol: str) -> str:
@@ -350,11 +346,23 @@ def sync_symbol_5m_candles(symbol: str, target_days: int = 65) -> pd.DataFrame:
                     existing_df = pd.concat([past_df, existing_df], ignore_index=True)
                     existing_df = existing_df.drop_duplicates(subset=["timestamp"]).sort_values("timestamp").reset_index(drop=True)
 
-        # ディスク上の SSoT ストアは常に最低 65 日分 (18,720 本) を保持し、短期差分同期で過去データが切り詰められるのを防止
-        disk_max_bars = max(target_days, 65) * 288
-        if len(existing_df) > disk_max_bars:
-            existing_df = existing_df.tail(disk_max_bars).reset_index(drop=True)
+        # 65日切り捨てを廃止し、過去データを含めて追記保持する (SSoTは Data/lake/bingx_lake.db)
+        if not existing_df.empty:
+            existing_df = existing_df.drop_duplicates(subset=["timestamp"]).sort_values("timestamp").reset_index(drop=True)
         existing_df.to_csv(csv_path, index=False)
+        try:
+            from lake_store import LakeStore
+            now_sec = int(now_ms // 1000)
+            lake = LakeStore()
+            # 差分更新時でも直近未同期分を確実にカバーするため末尾4000本をアップサート
+            up_df = existing_df.tail(4000).copy()
+            lake.upsert_candles(symbol, "5m", up_df, source="bingx", cutoff_utc=now_sec)
+            if not up_df.empty:
+                min_ts = int(pd.to_datetime(up_df["timestamp"].iloc[0], utc=True).timestamp())
+                since_bucket = (min_ts // 14400) * 14400
+                lake.rebuild_higher_timeframes_from_5m(symbol, cutoff_utc=now_sec, since_ts_utc=since_bucket)
+        except Exception:
+            pass
         if len(existing_df) > max_history_bars:
             return existing_df.tail(max_history_bars).reset_index(drop=True)
         return existing_df
@@ -373,9 +381,17 @@ def sync_symbol_5m_candles(symbol: str, target_days: int = 65) -> pd.DataFrame:
                     df_init = pd.concat([df_bybit, df_init], ignore_index=True).drop_duplicates(subset=["timestamp"]).sort_values("timestamp").reset_index(drop=True)
 
         if not df_init.empty:
-            if len(df_init) > max_history_bars:
-                df_init = df_init.tail(max_history_bars).reset_index(drop=True)
             df_init.to_csv(csv_path, index=False)
+            try:
+                from lake_store import LakeStore
+                now_sec = int(now_ms // 1000)
+                lake = LakeStore()
+                lake.upsert_candles(symbol, "5m", df_init, source="bingx", cutoff_utc=now_sec)
+                lake.rebuild_higher_timeframes_from_5m(symbol, cutoff_utc=now_sec)
+            except Exception:
+                pass
+            if len(df_init) > max_history_bars:
+                return df_init.tail(max_history_bars).reset_index(drop=True)
             return df_init
 
         return pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume", "quote_volume"])

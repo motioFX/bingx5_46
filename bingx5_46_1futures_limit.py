@@ -147,12 +147,9 @@ MAX_SELECTED_SYMBOLS: int = 20  # 最大選定・監視銘柄数 (Hyperliquid完
 MAX_TRADES_COUNT: int = 1
 
 # [ 5 ] 固定選定銘柄 (主要アルトコイン20銘柄 / Hyperliquid hype5_45 完全統一)
-FIXED_SYMBOLS: List[str] = [
-    "HYPE-USDT", "SOL-USDT", "DOGE-USDT", "XRP-USDT", "SUI-USDT",
-    "AVAX-USDT", "LINK-USDT", "APT-USDT", "NEAR-USDT", "ARB-USDT",
-    "UNI-USDT", "OP-USDT", "TIA-USDT", "RENDER-USDT", "INJ-USDT",
-    "TAO-USDT", "AAVE-USDT", "ENA-USDT", "ZEC-USDT", "1000PEPE-USDT", "WIF-USDT"
-]
+from symbol_universe import FIXED_TRADABLE_SYMBOLS
+
+FIXED_SYMBOLS: List[str] = list(FIXED_TRADABLE_SYMBOLS)
 
 # [ 6 ] 定期銘柄選定・リセット時刻（JST時間: 0〜23時）
 #       デフォルト: [1, 9, 17] (01:00, 09:00, 17:00 JST / 8時間ごと・主要セッション＆FR節目)。
@@ -1702,6 +1699,11 @@ async def wait_until_next_candle(
                         await flatten_current_position_bingx(sym, "USDT", mode, exit_reason, force_market=True)
                         from real_trade_tracker import record_real_trade
                         record_real_trade(sym, "LONG", "CLOSE", cur_px, buy_qty, pnl_est, f"実運用決済 ({exit_reason})")
+                        try:
+                            from lake_live_bridge import record_live_exit_to_lake
+                            record_live_exit_to_lake(sym, "LONG", entry_px, cur_px, buy_qty, pnl_est, exit_reason, state_meta=dict(scale_state))
+                        except Exception:
+                            pass
                         scale_in_states.pop(sym, None)
                         save_scale_in_states(scale_in_states)
                         continue
@@ -1719,6 +1721,11 @@ async def wait_until_next_candle(
                         await flatten_current_position_bingx(sym, "USDT", mode, exit_reason, force_market=True)
                         from real_trade_tracker import record_real_trade
                         record_real_trade(sym, "LONG", "CLOSE", cur_px, buy_qty, pnl_est, f"実運用決済 ({exit_reason})")
+                        try:
+                            from lake_live_bridge import record_live_exit_to_lake
+                            record_live_exit_to_lake(sym, "LONG", entry_px, cur_px, buy_qty, pnl_est, exit_reason, state_meta=dict(scale_state))
+                        except Exception:
+                            pass
                         scale_in_states.pop(sym, None)
                         save_scale_in_states(scale_in_states)
                         continue
@@ -1830,6 +1837,7 @@ async def run_screening_and_optimization(mode: str, send_charts: bool = False, s
     # 4. 3態勢地合い連動 戦略モード判定
     market_state_file = MIX_SCRIPT_PATH.parent / "Data" / "market_state.json"
     overall_reg_mode = "NEUTRAL"
+    ms_data: Dict[str, Any] = {}
     if market_state_file.exists():
         try:
             with open(market_state_file, "r", encoding="utf-8") as f:
@@ -1852,17 +1860,54 @@ async def run_screening_and_optimization(mode: str, send_charts: bool = False, s
     btc_whale_sig = btc_whale_info.get("signal", "NEUTRAL")
     print(f"[Market State] Regime: {overall_reg_mode} | Strategy Mode: {strat_mode_desc} | BTC Whale: {btc_whale_sig}")
 
-    # 5. パラメータ最適化 & バックテスト合格銘柄選抜 (MTF適格 ＆ PnL > 0)
-    base_sym = selected_symbols_info[0]["symbol"] if selected_symbols_info else "HYPE"
-    profitable_cands, symbol_params_map, default_best_params = await validate_profitable_candidates(
-        trade_side=trade_side, mode=mode, base_symbol=base_sym
-    )
+    # 5. データレイク 2段階ウォークフォワード評価による当日最良勝者 1 件の選定 (OOS 判定)
+    try:
+        from candle_5m_store import sync_all_target_symbols_5m
+        sync_all_target_symbols_5m(lookback_days=2)
+    except Exception as sync_err:
+        print(f"[Lake Sync Warning] 差分5m足同期警告: {sync_err}")
 
-    # MTF適格 かつ バックテスト合格銘柄のみを選定（超大型銘柄 EXCLUDED_MEGA_CAPS 二重除外ガード）
-    excluded_megas = set(EXCLUDED_MEGA_CAPS + [get_clean_symbol(x) for x in EXCLUDED_MEGA_CAPS])
-    filtered_cands = [s for s in profitable_cands if s not in excluded_megas and get_clean_symbol(s) not in excluded_megas]
-    selected_symbols = list(filtered_cands)[:MAX_SELECTED_SYMBOLS]
-    print(f"\n[Selection Result] 選定{len(selected_symbols)}銘柄 (サイクル適格 ＆ 個別最適化合格): {', '.join(selected_symbols) if selected_symbols else 'なし (全銘柄見送り・完全ノーポジ維持)'}")
+    # 逆風クジラ銘柄を地合い許可リストから除外してレイクへ渡す
+    whale_excluded: Dict[str, str] = {}
+    for w_sym in FIXED_SYMBOLS:
+        w_sig = get_whale_sentiment_info(w_sym).get("signal", "NEUTRAL")
+        if overall_reg_mode == "BUY" and w_sig == "SHORT_ONLY":
+            whale_excluded[w_sym] = "WHALE_SHORT_ONLY"
+        elif overall_reg_mode == "SELL" and w_sig == "LONG_ONLY":
+            whale_excluded[w_sym] = "WHALE_LONG_ONLY"
+    override_regime = dict(ms_data) if ms_data else {
+        "overall_regime": overall_reg_mode,
+        "regime_pattern": "",
+        "regime_strength": {"tier": "BALANCED", "net_score": 0.0, "mean_buy_votes": 0.0, "mean_sell_votes": 0.0},
+        "allowed_strategies": [],
+        "recommended_symbols": list(FIXED_SYMBOLS),
+    }
+    override_regime["excluded_symbols"] = whale_excluded
+    override_regime["whale_snapshot"] = {"btc_whale": btc_whale_sig, "excluded": whale_excluded}
+
+    from lake_live_bridge import run_lake_screening_for_bot
+    lake_out = await asyncio.to_thread(run_lake_screening_for_bot, override_regime)
+    selected_symbols = [
+        s for s in lake_out["selected_symbols"]
+        if s not in EXCLUDED_MEGA_CAPS and get_clean_symbol(s) not in EXCLUDED_MEGA_CAPS
+    ]
+    symbol_params_map = lake_out["symbol_params_map"]
+    default_best_params = lake_out["default_best_params"] or {
+        "strategy": "rsima_short" if trade_side == "short" else "rsima",
+        "interval": 5,
+        "mp": 150,
+        "target_ratio": 0.70,
+        "l_ep": 40.0,
+        "l_cp": 60.0,
+        "s_ep": 60.0,
+        "s_cp": 40.0,
+        "pnl": 0.0,
+        "win_rate": 0.0,
+        "trade_count": 0,
+        "max_dd": 0.0,
+    }
+    discord.print_log(lake_out["summary_log"])
+    print(f"\n[Selection Result] 当日OOS勝者選定 ({len(selected_symbols)}銘柄): {', '.join(selected_symbols) if selected_symbols else 'なし (見送り / NO_CANDIDATE)'}")
 
     # 直近の選定結果を JSON に永続化 (show_symbol_status 用 / アトミック書き込み)
     last_res_file = Path(__file__).resolve().parent / "Data" / "last_selection_result.json"
@@ -1897,8 +1942,8 @@ async def run_screening_and_optimization(mode: str, send_charts: bool = False, s
         discord.print_log(f"\n★ 【合格銘柄 デュアル最適化パラメータ一覧 ({side_strat_label} 126通り検証 / 東京レンジ＆欧州ブレイク2種保持)】")
         for sym in selected_symbols:
             p = symbol_params_map.get(sym, default_best_params)
-            rng_p = p.get("range_params", p)
-            brk_p = p.get("breakout_params", p)
+            rng_p = p.get("range_params") or p
+            brk_p = p.get("breakout_params") or p
             is_rng_q = bool(p.get("is_range_qualified", rng_p.get("is_qualified", False)))
             is_brk_q = bool(p.get("is_breakout_qualified", brk_p.get("is_qualified", False)))
 
@@ -2225,14 +2270,14 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
     except Exception as init_pnl_err:
         print(f"[Startup PnL Sync] 起動時実運用損益同期警告: {init_pnl_err}")
 
-    # ========== 【トレード前準備 ステップ2】: 5分足 SSoT 永続ストア同期 (直近65日分/2ヶ月分蓄積) ==========
-    from candle_5m_store import sync_all_target_symbols_5m
-    discord.print_log("\n📦 【トレード前準備: ステップ2】 固定選定20銘柄 + BTC-USDT の 5分足 SSoT 同期を実行します (過去65日分)...")
+    # ========== 【トレード前準備 ステップ2】: データレイク SSoT 永続ストア同期 (21アルト+BTC / 5m,15m,1h,4h) ==========
+    from lake_live_bridge import ensure_lake_ready_on_startup
+    discord.print_log("\n📦 【トレード前準備: ステップ2】 22銘柄 (21アルト+BTC) のデータレイク (bingx_lake.db) 同期を確認します...")
     try:
-        sync_all_target_symbols_5m(lookback_days=65)
-        discord.print_log("✅ 5分足 SSoT ストアの同期が正常に完了しました。")
+        lake_init_res = await asyncio.to_thread(ensure_lake_ready_on_startup, 210)
+        discord.print_log(f"✅ データレイク SSoT ストアの同期が完了しました ({lake_init_res}).")
     except Exception as sync_err:
-        discord.print_log(f"⚠️ 5分足 SSoT 同期で警告が発生しました (後続処理を継続): {sync_err}")
+        discord.print_log(f"⚠️ データレイク SSoT 同期で警告が発生しました (後続処理を継続): {sync_err}")
 
     # ========== 【トレード前準備 ステップ3 & 4 & 5】: チャート出力 ➔ MTF乖離判定＆ブレイクアウトTop10 ➔ 個別最適化 ==========
     trade_side, symbol_params_map, best_params, selected_symbols = await run_screening_and_optimization(
@@ -3032,6 +3077,7 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                                     discord.print_log(f"🚀🚀🚀 【ナンピン買い増し約定】 {sym} @ ${cur_px:.4f} (保有枠: {t_count+1}/{MAX_TRADES_COUNT})")
 
                 if closed:
+                    closed_meta = dict(scale_in_states.get(sym) or {})
                     trailing_tp_states.pop(sym, None)
                     save_trailing_tp_states(trailing_tp_states)
                     scale_in_states.pop(sym, None)
@@ -3050,6 +3096,20 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                         pnl=pnl_current,
                         reason=exit_reason
                     )
+                    try:
+                        from lake_live_bridge import record_live_exit_to_lake
+                        record_live_exit_to_lake(
+                            symbol=sym,
+                            side=side_tag,
+                            entry_px=entry_px,
+                            exit_px=cur_px,
+                            qty=pos_qty,
+                            net_pnl_usdt=pnl_current,
+                            exit_reason=exit_reason,
+                            state_meta=closed_meta,
+                        )
+                    except Exception as lake_ex_err:
+                        print(f"[Lake Write-Back Warning] {sym}: {lake_ex_err}")
                     asyncio.create_task(_async_post_exit_reporting(
                         sym=sym, side=side_tag, close_qty=pos_qty, reported_exit_px=cur_px,
                         entry_px=entry_px, pnl=pnl_current, exit_reason=exit_reason,
@@ -3344,13 +3404,18 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                                                 dyn_sl_pct_e = float(sym_params_e.get("dynamic_mae_stop", -0.025))
                                                 dyn_to_bars_e = int(sym_params_e.get("dynamic_timeout_bars", max(3, 240 // max(1, cand_interval_e))))
                                                 sl_px_val = min(max(rec_h_val, actual_fill_px * 1.0020), actual_fill_px * (1.0 + abs(dyn_sl_pct_e)))
+                                                from lake_live_bridge import record_live_entry_to_lake, interval_to_timeframe
+                                                lake_entry_meta = record_live_entry_to_lake(sym, "short", actual_fill_px, lot_size, params=sym_params_e)
                                                 scale_in_states[sym] = {
                                                     "nanpin_count": 0,
                                                     "last_entry_price": actual_fill_px,
                                                     "avg_price": actual_fill_px,
                                                     "initial_entry_time": time.time(),
+                                                    "entry_ts_utc": int(time.time()),
+                                                    "qty": float(lot_size),
                                                     "side": "short",
                                                     "interval": cand_interval_e,
+                                                    "timeframe": interval_to_timeframe(cand_interval_e),
                                                     "strategy": cand_strat_e,
                                                     "dynamic_mae_stop": dyn_sl_pct_e,
                                                     "dynamic_timeout_bars": dyn_to_bars_e,
@@ -3360,6 +3425,7 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                                                     "s_cp": float(sym_params_e.get("s_cp", 40.0)),
                                                     "recent_high": rec_h_val,
                                                     "sl_price": sl_px_val,
+                                                    **lake_entry_meta,
                                                 }
                                                 save_scale_in_states(scale_in_states)
                                                 inv_label_e = f"{cand_interval_e}m" if cand_interval_e < 60 else f"{cand_interval_e // 60}h"
@@ -3434,13 +3500,18 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                                 dyn_to_bars_e = int(sym_params_e.get("dynamic_timeout_bars", max(3, 240 // max(1, cand_interval_e))))
                                 sl_px_val = min(max(rec_h_val, actual_fill_px * 1.0020), actual_fill_px * (1.0 + abs(dyn_sl_pct_e)))
 
+                                from lake_live_bridge import record_live_entry_to_lake, interval_to_timeframe
+                                lake_entry_meta = record_live_entry_to_lake(sym, "short", actual_fill_px, lot_size, params=sym_params_e)
                                 scale_state_new = {
                                     "nanpin_count": 0,
                                     "last_entry_price": actual_fill_px,
                                     "avg_price": actual_fill_px,
                                     "initial_entry_time": time.time(),
+                                    "entry_ts_utc": int(time.time()),
+                                    "qty": float(lot_size),
                                     "side": "short",
                                     "interval": cand_interval_e,
+                                    "timeframe": interval_to_timeframe(cand_interval_e),
                                     "strategy": cand_strat_e,
                                     "dynamic_mae_stop": dyn_sl_pct_e,
                                     "dynamic_timeout_bars": dyn_to_bars_e,
@@ -3450,6 +3521,7 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                                     "s_cp": float(sym_params_e.get("s_cp", 40.0)),
                                     "recent_high": rec_h_val,
                                     "sl_price": sl_px_val,
+                                    **lake_entry_meta,
                                 }
                                 scale_in_states[sym] = scale_state_new
                                 save_scale_in_states(scale_in_states)
@@ -3581,13 +3653,18 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                                                 dyn_sl_pct_e = float(sym_params_e.get("dynamic_mae_stop", -0.025))
                                                 dyn_to_bars_e = int(sym_params_e.get("dynamic_timeout_bars", max(3, 240 // max(1, cand_interval_e))))
                                                 sl_px_val = max(min(rec_l_val, actual_fill_px * 0.9980), actual_fill_px * (1.0 - abs(dyn_sl_pct_e)))
+                                                from lake_live_bridge import record_live_entry_to_lake, interval_to_timeframe
+                                                lake_entry_meta = record_live_entry_to_lake(sym, "long", actual_fill_px, lot_size, params=sym_params_e)
                                                 scale_in_states[sym] = {
                                                     "nanpin_count": 0,
                                                     "last_entry_price": actual_fill_px,
                                                     "avg_price": actual_fill_px,
                                                     "initial_entry_time": time.time(),
+                                                    "entry_ts_utc": int(time.time()),
+                                                    "qty": float(lot_size),
                                                     "side": "long",
                                                     "interval": cand_interval_e,
+                                                    "timeframe": interval_to_timeframe(cand_interval_e),
                                                     "strategy": cand_strat_e,
                                                     "dynamic_mae_stop": dyn_sl_pct_e,
                                                     "dynamic_timeout_bars": dyn_to_bars_e,
@@ -3597,6 +3674,7 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                                                     "l_cp": float(sym_params_e.get("l_cp", 60.0)),
                                                     "recent_low": rec_l_val,
                                                     "sl_price": sl_px_val,
+                                                    **lake_entry_meta,
                                                 }
                                                 save_scale_in_states(scale_in_states)
                                                 inv_label_e = f"{cand_interval_e}m" if cand_interval_e < 60 else f"{cand_interval_e // 60}h"
@@ -3668,13 +3746,18 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                                 dyn_sl_pct_e = float(sym_params_e.get("dynamic_mae_stop", -0.025))
                                 dyn_to_bars_e = int(sym_params_e.get("dynamic_timeout_bars", max(3, 240 // max(1, cand_interval_e))))
                                 sl_px_val = max(min(rec_l_val, actual_fill_px * 0.9980), actual_fill_px * (1.0 - abs(dyn_sl_pct_e)))
+                                from lake_live_bridge import record_live_entry_to_lake, interval_to_timeframe
+                                lake_entry_meta = record_live_entry_to_lake(sym, "long", actual_fill_px, lot_size, params=sym_params_e)
                                 scale_state_new = {
                                     "nanpin_count": 0,
                                     "last_entry_price": actual_fill_px,
                                     "avg_price": actual_fill_px,
                                     "initial_entry_time": time.time(),
+                                    "entry_ts_utc": int(time.time()),
+                                    "qty": float(lot_size),
                                     "side": "long",
                                     "interval": cand_interval_e,
+                                    "timeframe": interval_to_timeframe(cand_interval_e),
                                     "strategy": cand_strat_e,
                                     "dynamic_mae_stop": dyn_sl_pct_e,
                                     "dynamic_timeout_bars": dyn_to_bars_e,
@@ -3684,6 +3767,7 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                                     "l_cp": float(sym_params_e.get("l_cp", 60.0)),
                                     "recent_low": rec_l_val,
                                     "sl_price": sl_px_val,
+                                    **lake_entry_meta,
                                 }
                                 scale_in_states[sym] = scale_state_new
                                 save_scale_in_states(scale_in_states)
