@@ -1886,7 +1886,12 @@ async def run_screening_and_optimization(mode: str, send_charts: bool = False, s
     override_regime["whale_snapshot"] = {"btc_whale": btc_whale_sig, "excluded": whale_excluded}
 
     from lake_live_bridge import run_lake_screening_for_bot
-    lake_out = await asyncio.to_thread(run_lake_screening_for_bot, override_regime)
+    lake_out = await asyncio.to_thread(
+        run_lake_screening_for_bot,
+        override_regime,
+        max_selected_symbols=MAX_SELECTED_SYMBOLS,
+        excluded_mega_caps=EXCLUDED_MEGA_CAPS,
+    )
     selected_symbols = [
         s for s in lake_out["selected_symbols"]
         if s not in EXCLUDED_MEGA_CAPS and get_clean_symbol(s) not in EXCLUDED_MEGA_CAPS
@@ -1907,7 +1912,7 @@ async def run_screening_and_optimization(mode: str, send_charts: bool = False, s
         "max_dd": 0.0,
     }
     discord.print_log(lake_out["summary_log"])
-    print(f"\n[Selection Result] 当日OOS勝者選定 ({len(selected_symbols)}銘柄): {', '.join(selected_symbols) if selected_symbols else 'なし (見送り / NO_CANDIDATE)'}")
+    print(f"\n[Selection Result] 当日OOS合格・監視採用 ({len(selected_symbols)}銘柄): {', '.join(selected_symbols) if selected_symbols else 'なし (見送り / NO_CANDIDATE)'}")
 
     # 直近の選定結果を JSON に永続化 (show_symbol_status 用 / アトミック書き込み)
     last_res_file = Path(__file__).resolve().parent / "Data" / "last_selection_result.json"
@@ -2677,13 +2682,39 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                             rec_l_val = float(l_eval.iloc[-10:].min()) if len(l_eval) >= 10 else float(l_eval.min())
                             sl_px_val = max(min(rec_l_val, entry_px * 0.9980), entry_px * (1.0 - abs(dyn_sl_p)))
 
+                    lake_entry_meta_p: Dict[str, Any] = {}
+                    try:
+                        from lake_live_bridge import record_live_entry_to_lake, interval_to_timeframe
+                        tf_p = interval_to_timeframe(opt_inv_p)
+                        lake_params_p = dict(sym_params_p)
+                        lake_params_p.update({
+                            "strategy": pos_strat_p,
+                            "interval": opt_inv_p,
+                            "timeframe": tf_p,
+                            "lake_selection_id": p_order.get("lake_selection_id") or sym_params_p.get("lake_selection_id"),
+                            "lake_run_id": p_order.get("lake_run_id") or sym_params_p.get("lake_run_id"),
+                        })
+                        lake_entry_meta_p = record_live_entry_to_lake(
+                            sym,
+                            "short" if is_short_pos else "long",
+                            entry_px,
+                            pos_qty,
+                            params=lake_params_p,
+                        )
+                    except Exception:
+                        tf_p = "15m" if opt_inv_p == 15 else "5m"
+                        lake_entry_meta_p = {}
+
                     scale_state_new = {
                         "nanpin_count": 0,
                         "last_entry_price": entry_px,
                         "avg_price": entry_px,
                         "initial_entry_time": time.time(),
+                        "entry_ts_utc": int(time.time()),
+                        "qty": float(pos_qty),
                         "side": "short" if is_short_pos else "long",
                         "interval": opt_inv_p,
+                        "timeframe": tf_p,
                         "strategy": pos_strat_p,
                         "dynamic_mae_stop": dyn_sl_p,
                         "dynamic_timeout_bars": dyn_to_p,
@@ -2696,6 +2727,7 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                         "recent_high": rec_h_val,
                         "recent_low": rec_l_val,
                         "sl_price": sl_px_val,
+                        **lake_entry_meta_p,
                     }
                     scale_in_states[sym] = scale_state_new
                     save_scale_in_states(scale_in_states)
@@ -3218,32 +3250,23 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                     continue
 
                 try:
-                    # 確定足タイミングまたは未キャッシュ時はストアから取得
-                    if is_candle_closed or sym not in cached_5m_dfs or cached_5m_dfs[sym].empty:
-                        df_raw = await fetch_bingx_candles(sym, "5m", limit=3200, mode=mode)
-                        if not df_raw.empty:
-                            cached_5m_dfs[sym] = df_raw
-
-                    df_5m = cached_5m_dfs.get(sym)
-                    if df_5m is None or df_5m.empty or len(df_5m) < 20:
-                        continue
-
                     raw_sym_params = symbol_params_map.get(sym, best_params)
-                    # 時間帯連動デュアルパラメータ自動切替:
-                    # 東京時間 (09:00〜16:00 JST) -> レンジ逆張り最適パラメータ (range_params)
-                    # 欧州時間 (16:00〜22:00 JST) -> ブレイクアウト最適パラメータ (breakout_params)
-                    # 米国時間 (22:00〜翌09:00 JST) -> 合格戦略または総合最適パラメータ (raw_sym_params)
+                    # 時間帯連動デュアルパラメータ自動切替 & セッション別合格ゲート:
+                    # 東京時間 (09:00〜16:00 JST) -> レンジ逆張り最適パラメータ (is_range_qualified 必須)
+                    # 欧州時間 (16:00〜22:00 JST) -> ブレイクアウト最適パラメータ (is_breakout_qualified 必須)
+                    # 米国時間 (22:00〜翌09:00 JST) -> OOS合格済み最良パラメータ (is_qualified 必須)
                     if is_tokyo_b3:
                         sym_params_e = raw_sym_params.get("range_params") or raw_sym_params
+                        if not bool(raw_sym_params.get("is_range_qualified", sym_params_e.get("is_qualified", False))):
+                            continue
                     elif is_london_b3:
                         sym_params_e = raw_sym_params.get("breakout_params") or raw_sym_params
+                        if not bool(raw_sym_params.get("is_breakout_qualified", sym_params_e.get("is_qualified", False))):
+                            continue
                     else:
-                        if raw_sym_params.get("is_breakout_qualified"):
-                            sym_params_e = raw_sym_params.get("breakout_params") or raw_sym_params
-                        elif raw_sym_params.get("is_range_qualified"):
-                            sym_params_e = raw_sym_params.get("range_params") or raw_sym_params
-                        else:
-                            sym_params_e = raw_sym_params
+                        if not bool(raw_sym_params.get("is_qualified", True)):
+                            continue
+                        sym_params_e = raw_sym_params
 
                     cand_interval_e = int(sym_params_e.get("interval", 5) or 5)
                     cand_strat_e = str(sym_params_e.get("strategy", "rsima")).lower()
@@ -3269,11 +3292,6 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                     if is_london_b3 and not is_brk_strat:
                         continue
 
-                    cur_px = ws_mgr.get_latest_price(sym)
-                    if not cur_px or cur_px <= 0:
-                        cur_bid, cur_ask = get_bingx_orderbook(sym, api_bingx(symbol=sym, mode=mode).bingx.base_url)
-                        cur_px = (cur_ask if cand_side == "SHORT" else cur_bid) or float(df_5m["close"].iloc[-1])
-
                     in_cooldown, rem_h = is_in_sl_cooldown(sym)
                     if in_cooldown:
                         continue
@@ -3281,6 +3299,21 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                     # クールダウンチェック (直近20分以内の取引除外)
                     if time.time() - last_trade_time.get(sym, 0) < 1200:
                         continue
+
+                    # 確定足タイミングまたは未キャッシュ時はストアから取得
+                    if is_candle_closed or sym not in cached_5m_dfs or cached_5m_dfs[sym].empty:
+                        df_raw = await fetch_bingx_candles(sym, "5m", limit=3200, mode=mode)
+                        if not df_raw.empty:
+                            cached_5m_dfs[sym] = df_raw
+
+                    df_5m = cached_5m_dfs.get(sym)
+                    if df_5m is None or df_5m.empty or len(df_5m) < 20:
+                        continue
+
+                    cur_px = ws_mgr.get_latest_price(sym)
+                    if not cur_px or cur_px <= 0:
+                        cur_bid, cur_ask = get_bingx_orderbook(sym, api_bingx(symbol=sym, mode=mode).bingx.base_url)
+                        cur_px = (cur_ask if cand_side == "SHORT" else cur_bid) or float(df_5m["close"].iloc[-1])
 
                     df_entry_eval = resample_candles(df_5m, cand_interval_e, drop_unclosed=True) if cand_interval_e > 5 else df_5m.copy()
                     try:
@@ -3550,7 +3583,9 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                                     "target_ratio": float(sym_params_e.get("target_ratio", 0.70)),
                                     "s_ep": float(sym_params_e.get("s_ep", 60.0)),
                                     "s_cp": float(sym_params_e.get("s_cp", 40.0)),
-                                    "side": "short"
+                                    "side": "short",
+                                    "lake_selection_id": sym_params_e.get("lake_selection_id"),
+                                    "lake_run_id": sym_params_e.get("lake_run_id"),
                                 }
                                 total_active_count += 1
                                 discord.print_log(f"📌 [{sym}] Best Ask ショート指値を配置し待機中 (数量={lot_size}, 価格=~${cur_px:.4f})")
@@ -3796,7 +3831,9 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                                     "target_ratio": float(sym_params_e.get("target_ratio", 0.70)),
                                     "l_ep": float(sym_params_e.get("l_ep", 40.0)),
                                     "l_cp": float(sym_params_e.get("l_cp", 60.0)),
-                                    "side": "long"
+                                    "side": "long",
+                                    "lake_selection_id": sym_params_e.get("lake_selection_id"),
+                                    "lake_run_id": sym_params_e.get("lake_run_id"),
                                 }
                                 total_active_count += 1
                                 discord.print_log(f"📌 [{sym}] Best Bid 指値を配置し待機中 (数量={lot_size}, 価格=~${cur_px:.4f})")

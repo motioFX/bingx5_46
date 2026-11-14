@@ -18,7 +18,7 @@ import json
 import math
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
@@ -94,16 +94,36 @@ def compute_live_entry_extension(
         return None, None
 
 
-def build_live_params_from_winner(winner: Dict[str, Any], selection: Dict[str, Any], regime_info: Dict[str, Any]) -> Dict[str, Any]:
-    """データレイク選定勝者を `bingx5_46_1futures_limit.py` の `symbol_params_map` 互換辞書へ変換する。"""
-    strat = str(winner["strategy"])
-    tf = str(winner["timeframe"])
-    interval_min = _TF_TO_INTERVAL_MIN.get(tf, 5)
-    raw_params = json.loads(winner["params_json"])
-    side = str(winner["side"])
+def _is_cell_qualified(c: Optional[Dict[str, Any]]) -> bool:
+    if not c:
+        return False
+    return (
+        str(c.get("eval_grade", "")) in ("QUALIFIED", "PROVISIONAL")
+        and float(c.get("eval_ev", 0.0) or 0.0) > 0.0
+        and float(c.get("eval_net_pnl", 0.0) or 0.0) > 0.0
+    )
 
-    is_brk = is_breakout_strategy(strat)
-    p_dict: Dict[str, Any] = {
+
+def _cell_sort_key(c: Dict[str, Any]) -> Tuple[int, float, float, float, int, str]:
+    g = str(c.get("eval_grade", ""))
+    grade_rank = 2 if g == "QUALIFIED" else (1 if g == "PROVISIONAL" else (0 if g == "REJECTED_EV" else -1))
+    return (
+        grade_rank,
+        round(float(c.get("eval_ev", 0.0) or 0.0), 8),
+        round(float(c.get("eval_pf", 0.0) or 0.0), 6),
+        round(float(c.get("eval_net_pnl", 0.0) or 0.0), 6),
+        int(c.get("eval_trades", 0) or 0),
+        f"{c.get('symbol', '')}|{c.get('strategy', '')}|{c.get('timeframe', '')}",
+    )
+
+
+def _build_sub_spec_from_cell(cell: Dict[str, Any], selection: Dict[str, Any], is_qualified: bool) -> Dict[str, Any]:
+    strat = str(cell["strategy"])
+    tf = str(cell["timeframe"])
+    interval_min = _TF_TO_INTERVAL_MIN.get(tf, 5)
+    raw_params = json.loads(cell["params_json"])
+    side = str(cell["side"])
+    return {
         "strategy": strat,
         "trade_side": side,
         "interval": interval_min,
@@ -114,51 +134,66 @@ def build_live_params_from_winner(winner: Dict[str, Any], selection: Dict[str, A
         "l_cp": float(raw_params.get("l_cp", 60.0)),
         "s_ep": float(raw_params.get("s_ep", 60.0)),
         "s_cp": float(raw_params.get("s_cp", 40.0)),
-        "pnl": float(winner["eval_net_pnl"]),
-        "win_rate": float(winner["eval_win_rate"]),
-        "trade_count": int(winner["eval_trades"]),
-        "max_dd": float(winner["eval_max_dd"]),
-        "ev": float(winner["eval_ev"]),
-        "pf": float(winner["eval_pf"]),
-        "regime_at_opt": str(regime_info.get("overall_regime", "NEUTRAL")),
-        "is_qualified": True,
-        "is_range_qualified": (not is_brk),
-        "is_breakout_qualified": is_brk,
-        # データレイク追跡メタ
+        "num_bins": 50,
+        "value_area_pct": 0.70,
+        "dynamic_mae_stop": -0.030,
+        "pnl": float(cell["eval_net_pnl"]),
+        "win_rate": float(cell["eval_win_rate"]),
+        "trade_count": int(cell["eval_trades"]),
+        "max_dd": float(cell["eval_max_dd"]),
+        "ev": float(cell["eval_ev"]),
+        "pf": float(cell["eval_pf"]),
+        "is_qualified": bool(is_qualified),
         "lake_selection_id": selection["selection_id"],
         "lake_run_id": selection["run_id"],
-        "lake_winner_cell_id": winner["cell_id"],
-        "lake_eval_grade": winner["eval_grade"],
-        "lake_eval_trades": int(winner["eval_trades"]),
-        "lake_eval_ev": float(winner["eval_ev"]),
-        "lake_eval_pf": float(winner["eval_pf"]),
-        "lake_eval_net_pnl": float(winner["eval_net_pnl"]),
-        "lake_reason_text": selection["reason_text"],
+        "lake_winner_cell_id": cell["cell_id"],
+        "lake_eval_grade": cell["eval_grade"],
     }
-    sub_spec = {
-        "strategy": strat,
-        "trade_side": side,
-        "interval": interval_min,
-        "mp": p_dict["mp"],
-        "target_ratio": p_dict["target_ratio"],
-        "l_ep": p_dict["l_ep"],
-        "l_cp": p_dict["l_cp"],
-        "s_ep": p_dict["s_ep"],
-        "s_cp": p_dict["s_cp"],
-        "pnl": p_dict["pnl"],
-        "win_rate": p_dict["win_rate"],
-        "trade_count": p_dict["trade_count"],
-        "max_dd": p_dict["max_dd"],
-        "is_qualified": True,
-        "lake_selection_id": selection["selection_id"],
-        "lake_run_id": selection["run_id"],
-        "lake_eval_grade": winner["eval_grade"],
-    }
-    if is_brk:
-        p_dict["breakout_params"] = sub_spec
-    else:
-        p_dict["range_params"] = sub_spec
+
+
+def build_symbol_params_from_cells(
+    sym_cells: List[Dict[str, Any]],
+    selection: Dict[str, Any],
+    regime_info: Dict[str, Any],
+) -> Dict[str, Any]:
+    """銘柄内の全評価セルから東京レンジ用・欧州ブレイク用を含む統合パラメータ辞書を構築する。"""
+    if not sym_cells:
+        return {}
+
+    rng_cells = [c for c in sym_cells if not is_breakout_strategy(str(c["strategy"]))]
+    brk_cells = [c for c in sym_cells if is_breakout_strategy(str(c["strategy"]))]
+
+    best_rng = max(rng_cells, key=_cell_sort_key) if rng_cells else None
+    best_brk = max(brk_cells, key=_cell_sort_key) if brk_cells else None
+    best_overall = max(sym_cells, key=_cell_sort_key)
+
+    is_rng_q = _is_cell_qualified(best_rng)
+    is_brk_q = _is_cell_qualified(best_brk)
+    is_q = is_rng_q or is_brk_q
+
+    p_dict = _build_sub_spec_from_cell(best_overall, selection, is_q)
+    p_dict.update(
+        {
+            "regime_at_opt": str(regime_info.get("overall_regime", "NEUTRAL")),
+            "is_range_qualified": is_rng_q,
+            "is_breakout_qualified": is_brk_q,
+            "lake_eval_trades": int(best_overall["eval_trades"]),
+            "lake_eval_ev": float(best_overall["eval_ev"]),
+            "lake_eval_pf": float(best_overall["eval_pf"]),
+            "lake_eval_net_pnl": float(best_overall["eval_net_pnl"]),
+            "lake_reason_text": selection.get("reason_text", ""),
+        }
+    )
+    if best_rng is not None:
+        p_dict["range_params"] = _build_sub_spec_from_cell(best_rng, selection, is_rng_q)
+    if best_brk is not None:
+        p_dict["breakout_params"] = _build_sub_spec_from_cell(best_brk, selection, is_brk_q)
     return p_dict
+
+
+def build_live_params_from_winner(winner: Dict[str, Any], selection: Dict[str, Any], regime_info: Dict[str, Any]) -> Dict[str, Any]:
+    """データレイク選定勝者を `bingx5_46_1futures_limit.py` の `symbol_params_map` 互換辞書へ変換する。"""
+    return build_symbol_params_from_cells([winner], selection, regime_info)
 
 
 def ensure_lake_ready_on_startup(history_days: int = 210) -> Dict[str, Any]:
@@ -188,13 +223,15 @@ def run_lake_screening_for_bot(
     override_regime_info: Dict[str, Any],
     db_path: Optional[Path] = None,
     wf_cfg: Optional[WalkForwardConfig] = None,
+    max_selected_symbols: int = 20,
+    excluded_mega_caps: Sequence[str] = ("SOL-USDT", "DOGE-USDT", "XRP-USDT"),
 ) -> Dict[str, Any]:
     """
     `bingx5_46_1futures_limit.py` Phase A/C 毎時スクリーニング用のレイク勝者選定エントリポイント。
     返却:
-      selected_symbols: [winner_sym] または [] (見送り時)
-      symbol_params_map: {winner_sym: params} または {}
-      default_best_params: params または None
+      selected_symbols: OOS合格中堅アルト全銘柄 (eval_grade in QUALIFIED/PROVISIONAL & EV>0, 上位 max_selected_symbols 件)
+      symbol_params_map: {sym: range_params/breakout_params 統合辞書}
+      default_best_params: 最上位銘柄の params または None
       selection: daily_selections レコード
       summary_log: Discord/コンソール用の根拠ログ
     """
@@ -217,30 +254,50 @@ def run_lake_screening_for_bot(
     cells = wf_res["cells"]
     run_rec = wf_res["run"]
 
-    if winner is not None:
+    by_sym: Dict[str, List[Dict[str, Any]]] = {}
+    for c in cells:
+        by_sym.setdefault(normalize_symbol(c["symbol"]), []).append(c)
+
+    mega_cap_set = {normalize_symbol(s) for s in excluded_mega_caps}
+    symbol_params_map: Dict[str, Dict[str, Any]] = {}
+    best_cell_by_sym: Dict[str, Dict[str, Any]] = {}
+    qualified_syms: List[str] = []
+
+    for sym, sym_cells in by_sym.items():
+        p_dict = build_symbol_params_from_cells(sym_cells, selection, override_regime_info)
+        symbol_params_map[sym] = p_dict
+        best_cell_by_sym[sym] = max(sym_cells, key=_cell_sort_key)
+        if p_dict.get("is_qualified") and sym not in mega_cap_set:
+            qualified_syms.append(sym)
+
+    qualified_syms.sort(key=lambda s: _cell_sort_key(best_cell_by_sym[s]), reverse=True)
+    selected_symbols = qualified_syms[: max(1, int(max_selected_symbols))] if qualified_syms else []
+
+    if selected_symbols:
+        default_best_params = dict(symbol_params_map[selected_symbols[0]])
+    elif winner is not None:
         w_sym = normalize_symbol(winner["symbol"])
-        w_params = build_live_params_from_winner(winner, selection, override_regime_info)
-        selected_symbols = [w_sym]
-        symbol_params_map = {w_sym: w_params}
-        default_best_params = dict(w_params)
+        default_best_params = dict(symbol_params_map.get(w_sym) or build_live_params_from_winner(winner, selection, override_regime_info))
     else:
-        selected_symbols = []
-        symbol_params_map = {}
         default_best_params = None
 
-    # 上位3件 (参考出力)
-    top3 = sorted(
+    # 上位5件 (参考出力)
+    top5 = sorted(
         [c for c in cells if c["eval_trades"] > 0],
-        key=lambda x: (1 if x["eval_grade"] == "QUALIFIED" else (0 if x["eval_grade"] == "PROVISIONAL" else -1), x["eval_ev"], x["eval_pf"]),
+        key=_cell_sort_key,
         reverse=True,
-    )[:3]
+    )[:5]
 
-    top3_lines = []
-    for idx, c in enumerate(top3, 1):
-        top3_lines.append(
+    top5_lines = []
+    for idx, c in enumerate(top5, 1):
+        top5_lines.append(
             f"   {idx}. {c['symbol']} {c['strategy'].upper()}({c['timeframe']}) [{c['eval_grade']}] "
             f"n={c['eval_trades']} WR={c['eval_win_rate']:.1f}% EV=${c['eval_ev']:+.4f} Net=${c['eval_net_pnl']:+.2f} PF={c['eval_pf']:.2f}"
         )
+
+    tokyo_q_cnt = sum(1 for s in selected_symbols if symbol_params_map[s].get("is_range_qualified"))
+    london_q_cnt = sum(1 for s in selected_symbols if symbol_params_map[s].get("is_breakout_qualified"))
+    monitored_str = ", ".join(s.replace("-USDT", "") for s in selected_symbols) if selected_symbols else "なし"
 
     ext_b = {}
     if winner is not None:
@@ -263,10 +320,11 @@ def run_lake_screening_for_bot(
         f"   ├ Run ID: `{run_rec['run_id']}` | Selection ID: `{selection['selection_id']}`\n"
         f"   ├ 窓分離: Opt `{sec_to_iso(run_rec['opt_start_utc'])[:10]}..{sec_to_iso(run_rec['opt_end_utc'])[:10]}` "
         f"→ Eval(OOS) `{sec_to_iso(run_rec['eval_start_utc'])[:10]}..{sec_to_iso(run_rec['eval_end_utc'])[:10]}`\n"
+        f"   ├ 監視採用銘柄数: **{len(selected_symbols)}銘柄** (🗼東京レンジ適格: {tokyo_q_cnt} / 🏰欧州ブレイク適格: {london_q_cnt}) ➔ `{monitored_str}`\n"
         f"   ├ 結論: **{selection['reason_text']}**{ext_str}"
     )
-    if top3_lines:
-        summary_log += "\n   └ 評価窓OOS上位:\n" + "\n".join(top3_lines)
+    if top5_lines:
+        summary_log += "\n   └ 評価窓OOS上位:\n" + "\n".join(top5_lines)
 
     return {
         "selected_symbols": selected_symbols,

@@ -284,8 +284,11 @@ USDCよりも圧倒的に出来高・流動性が厚い **USDT無期限先物ペ
   2. 二重頑健性クリア: 前半純利益プラス (`pnl_first_half > 0`) かつ 後半純利益加速 (`pnl_second_half > pnl_first_half`)
   3. 直近7日純利益プラス (`pnl_recent_7d > 0` かつ `trades_recent_7d >= 1`)
   4. 往復0.08%手数料控除後 **Net PnL > 0**（手数料負け戦略の完全排除）
-* **監視銘柄の確定 ＆ 最優秀チャート出力**:
-  - 合格銘柄の中から総合スコア上位 **最大2銘柄（`MAX_ACTIVE_POSITIONS = 2`）** をリアルタイム監視対象（`selected_symbols`）に採用。
+* **監視銘柄の確定 ＆ セッション別デュアルパラメータ採用 (`MAX_SELECTED_SYMBOLS = 20`)**:
+  - データレイク2段階ウォークフォワード評価（`lake_backtest_engine.py`）の検証窓（OOS）結果から、各銘柄ごとに **レンジ最良セル（`range_params` / `is_range_qualified`）** と **ブレイクアウト最良セル（`breakout_params` / `is_breakout_qualified`）** の両方を抽出・保持する。
+  - 超大型銘柄除外ガード（`EXCLUDED_MEGA_CAPS`: `SOL-USDT`, `DOGE-USDT`, `XRP-USDT`）およびクジラ逆風除外を通過した中堅アルトのうち、レンジまたはブレイクアウトのいずれかで OOS 合格基準（`QUALIFIED` [$n \ge 30, \text{EV} > 0$] または `PROVISIONAL` [$10 \le n < 30, \text{EV} > 0$]）を満たす**すべての合格銘柄**を、OOS評価スコア降順で `selected_symbols`（最大 `MAX_SELECTED_SYMBOLS = 20` 銘柄）としてリアルタイム監視対象に採用する（単一1銘柄固定は廃止）。
+  - 東京時間帯（09:00〜16:00 JST）は `is_range_qualified == True` の銘柄のみを `range_params` で評価し、欧州時間帯（16:00〜22:00 JST）は `is_breakout_qualified == True` の銘柄のみを `breakout_params` で評価する。
+  - 監視銘柄数を拡大しても、同時保有ポジション・待機指値の上限は **最大2銘柄（`MAX_ACTIVE_POSITIONS = 2`）**、1日あたりの完了トレード上限は **1日1回（`DAILY_MAX_TRADES = 1`）** を厳格維持する。
   - 最優秀成績銘柄の資産曲線チャート **1 枚のみ** を Discord 送信（MaxDD USDT/%併記）。
 
 ---
