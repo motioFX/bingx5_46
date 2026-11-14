@@ -2659,7 +2659,7 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                     sym_params_p = symbol_params_map.get(sym, best_params)
                     opt_inv_p = int(p_order.get("interval", 0) or sym_params_p.get("interval", 5) or 5)
                     pos_strat_p = str(p_order.get("strategy", "") or sym_params_p.get("strategy", "rsima")).lower()
-                    dyn_sl_p = float(p_order.get("dynamic_mae_stop", sym_params_p.get("dynamic_mae_stop", -0.025)))
+                    dyn_sl_p = float(p_order.get("dynamic_mae_stop", sym_params_p.get("dynamic_mae_stop", -0.030)))
                     dyn_to_p = int(p_order.get("dynamic_timeout_bars", sym_params_p.get("dynamic_timeout_bars", max(3, 240 // max(1, opt_inv_p)))))
 
                     # ショートの場合、直近高値と確定足SLを算出
@@ -2756,6 +2756,7 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                     strategy_type=cand_strat,
                     num_bins=int(sym_params.get("num_bins", 50)),
                     value_area_pct=float(sym_params.get("value_area_pct", 0.70)),
+                    tail_only=5,
                     lEp=pos_l_ep if not is_short_pos else pos_s_ep,
                     lCp=pos_l_cp if not is_short_pos else pos_s_cp,
                 )
@@ -2788,7 +2789,8 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                 elapsed_min = max(0.0, (time.time() - entry_ts) / 60.0)
                 # 採用足種 (cand_interval) で正確に経過バー数を算出 (単位不一致バグの完全根絶)
                 bars_held_cur = int(elapsed_min // max(1, cand_interval))
-                dyn_sl_pct = float(scale_state_cur.get("dynamic_mae_stop", 0.0) or sym_params.get("dynamic_mae_stop", -0.025))
+                is_fill_bar_cur = (elapsed_min < max(1, cand_interval))
+                dyn_sl_pct = float(scale_state_cur.get("dynamic_mae_stop", 0.0) or sym_params.get("dynamic_mae_stop", -0.030))
                 dyn_to_bars = int(scale_state_cur.get("dynamic_timeout_bars", 0) or sym_params.get("dynamic_timeout_bars", max(3, 240 // max(1, cand_interval))))
 
                 in_cooldown, rem_h = is_in_sl_cooldown(sym)
@@ -2895,6 +2897,7 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                             dynamic_sl_pct=dyn_sl_pct,
                             bars_held=bars_held_cur,
                             timeout_bars=dyn_to_bars,
+                            is_fill_bar=is_fill_bar_cur,
                         )
                     elif cand_strat.startswith("vah_poc"):
                         use_ema_v = ("ema" in cand_strat)
@@ -2920,6 +2923,7 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                             bars_held=bars_held_cur,
                             use_ema_filter=use_ema_v,
                             timeout_bars=dyn_to_bars,
+                            is_fill_bar=is_fill_bar_cur,
                         )
                     else:
                         use_ema_r = ("ema" in cand_strat)
@@ -2944,6 +2948,7 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                             bars_held=bars_held_cur,
                             use_ema_filter=use_ema_r,
                             timeout_bars=dyn_to_bars,
+                            is_fill_bar=is_fill_bar_cur,
                         )
                 else:
                     # ===== LONG ポジション監視 =====
@@ -2964,6 +2969,7 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                             dynamic_sl_pct=dyn_sl_pct,
                             bars_held=bars_held_cur,
                             timeout_bars=dyn_to_bars,
+                            is_fill_bar=is_fill_bar_cur,
                         )
                     elif cand_strat.startswith("val_poc"):
                         use_ema_v = ("ema" in cand_strat)
@@ -2989,6 +2995,7 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                             use_ema_filter=use_ema_v,
                             timeout_bars=dyn_to_bars,
                             recent_low=recent_low_val,
+                            is_fill_bar=is_fill_bar_cur,
                         )
                     else:
                         use_ema_r = ("ema" in cand_strat)
@@ -3013,6 +3020,7 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                             use_ema_filter=use_ema_r,
                             timeout_bars=dyn_to_bars,
                             recent_low=recent_low_val,
+                            is_fill_bar=is_fill_bar_cur,
                         )
 
                 if ny_trail_triggered:
@@ -3220,14 +3228,6 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                     if df_5m is None or df_5m.empty or len(df_5m) < 20:
                         continue
 
-                    # 🚀 【PROJECT_RULES 準拠】 出来高急増ゲート (Volume Surge 1.5倍)
-                    # 直近20本平均比 1.5倍以上の出来高流入が確認できない薄商いノイズを物理遮断
-                    cur_vol = float(df_5m["volume"].iloc[-1]) if "volume" in df_5m.columns else 0.0
-                    vol_avg_20 = float(df_5m["volume"].iloc[-21:-1].mean()) if len(df_5m) >= 21 else float(df_5m["volume"].mean())
-                    vol_ratio = cur_vol / max(0.0001, vol_avg_20)
-                    if vol_ratio < MIN_VOLUME_SURGE_RATIO:
-                        continue
-
                     raw_sym_params = symbol_params_map.get(sym, best_params)
                     # 時間帯連動デュアルパラメータ自動切替:
                     # 東京時間 (09:00〜16:00 JST) -> レンジ逆張り最適パラメータ (range_params)
@@ -3294,6 +3294,7 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                         strategy_type=cand_strat_e,
                         num_bins=int(sym_params_e.get("num_bins", 50)),
                         value_area_pct=float(sym_params_e.get("value_area_pct", 0.70)),
+                        tail_only=5,
                         lEp=float(sym_params_e.get("s_ep", 60.0) if cand_side == "SHORT" else sym_params_e.get("l_ep", 40.0)),
                         lCp=float(sym_params_e.get("s_cp", 40.0) if cand_side == "SHORT" else sym_params_e.get("l_cp", 60.0)),
                     )
@@ -3401,7 +3402,7 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                                                 tracked_active_positions.add(sym)
                                                 h_eval = df_entry_eval["high"].astype(float) if "high" in df_entry_eval.columns else df_entry_eval["close"].astype(float)
                                                 rec_h_val = float(h_eval.iloc[-10:].max()) if len(h_eval) >= 10 else float(h_eval.max())
-                                                dyn_sl_pct_e = float(sym_params_e.get("dynamic_mae_stop", -0.025))
+                                                dyn_sl_pct_e = float(sym_params_e.get("dynamic_mae_stop", -0.030))
                                                 dyn_to_bars_e = int(sym_params_e.get("dynamic_timeout_bars", max(3, 240 // max(1, cand_interval_e))))
                                                 sl_px_val = min(max(rec_h_val, actual_fill_px * 1.0020), actual_fill_px * (1.0 + abs(dyn_sl_pct_e)))
                                                 from lake_live_bridge import record_live_entry_to_lake, interval_to_timeframe
@@ -3496,7 +3497,7 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                                 # ショート直近高値(Swing High) & 確定足SL基準価格の算出
                                 h_eval = df_entry_eval["high"].astype(float) if "high" in df_entry_eval.columns else df_entry_eval["close"].astype(float)
                                 rec_h_val = float(h_eval.iloc[-10:].max()) if len(h_eval) >= 10 else float(h_eval.max())
-                                dyn_sl_pct_e = float(sym_params_e.get("dynamic_mae_stop", -0.025))
+                                dyn_sl_pct_e = float(sym_params_e.get("dynamic_mae_stop", -0.030))
                                 dyn_to_bars_e = int(sym_params_e.get("dynamic_timeout_bars", max(3, 240 // max(1, cand_interval_e))))
                                 sl_px_val = min(max(rec_h_val, actual_fill_px * 1.0020), actual_fill_px * (1.0 + abs(dyn_sl_pct_e)))
 
@@ -3543,7 +3544,7 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                                     "reason": entry_reason,
                                     "interval": cand_interval_e,
                                     "strategy": cand_strat_e,
-                                    "dynamic_mae_stop": float(sym_params_e.get("dynamic_mae_stop", -0.025)),
+                                    "dynamic_mae_stop": float(sym_params_e.get("dynamic_mae_stop", -0.030)),
                                     "dynamic_timeout_bars": int(sym_params_e.get("dynamic_timeout_bars", max(3, 240 // max(1, cand_interval_e)))),
                                     "mp": int(sym_params_e.get("mp", 200)),
                                     "target_ratio": float(sym_params_e.get("target_ratio", 0.70)),
@@ -3650,7 +3651,7 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                                                 tracked_active_positions.add(sym)
                                                 l_eval = df_entry_eval["low"].astype(float) if "low" in df_entry_eval.columns else df_entry_eval["close"].astype(float)
                                                 rec_l_val = float(l_eval.iloc[-10:].min()) if len(l_eval) >= 10 else float(l_eval.min())
-                                                dyn_sl_pct_e = float(sym_params_e.get("dynamic_mae_stop", -0.025))
+                                                dyn_sl_pct_e = float(sym_params_e.get("dynamic_mae_stop", -0.030))
                                                 dyn_to_bars_e = int(sym_params_e.get("dynamic_timeout_bars", max(3, 240 // max(1, cand_interval_e))))
                                                 sl_px_val = max(min(rec_l_val, actual_fill_px * 0.9980), actual_fill_px * (1.0 - abs(dyn_sl_pct_e)))
                                                 from lake_live_bridge import record_live_entry_to_lake, interval_to_timeframe
@@ -3743,7 +3744,7 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                                 tracked_active_positions.add(sym)
                                 l_eval = df_entry_eval["low"].astype(float) if "low" in df_entry_eval.columns else df_entry_eval["close"].astype(float)
                                 rec_l_val = float(l_eval.iloc[-10:].min()) if len(l_eval) >= 10 else float(l_eval.min())
-                                dyn_sl_pct_e = float(sym_params_e.get("dynamic_mae_stop", -0.025))
+                                dyn_sl_pct_e = float(sym_params_e.get("dynamic_mae_stop", -0.030))
                                 dyn_to_bars_e = int(sym_params_e.get("dynamic_timeout_bars", max(3, 240 // max(1, cand_interval_e))))
                                 sl_px_val = max(min(rec_l_val, actual_fill_px * 0.9980), actual_fill_px * (1.0 - abs(dyn_sl_pct_e)))
                                 from lake_live_bridge import record_live_entry_to_lake, interval_to_timeframe
@@ -3789,7 +3790,7 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                                     "reason": entry_reason,
                                     "interval": cand_interval_e,
                                     "strategy": cand_strat_e,
-                                    "dynamic_mae_stop": float(sym_params_e.get("dynamic_mae_stop", -0.025)),
+                                    "dynamic_mae_stop": float(sym_params_e.get("dynamic_mae_stop", -0.030)),
                                     "dynamic_timeout_bars": int(sym_params_e.get("dynamic_timeout_bars", max(3, 240 // max(1, cand_interval_e)))),
                                     "mp": int(sym_params_e.get("mp", 200)),
                                     "target_ratio": float(sym_params_e.get("target_ratio", 0.70)),

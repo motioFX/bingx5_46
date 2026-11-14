@@ -757,13 +757,13 @@ def _simulate_window(
                     tf_k = int(tf_at_5m_close[k])
                     if tf_k >= 0 and (int(ts5[k]) + 300 == int(ts_close_tf[tf_k]) or tf == "5m"):
                         cur_rsi = float(rsi_tf[tf_k])
-                        if side == "long" and cur_rsi > l_cp and c5[k] > fill_px * 1.0016:
+                        if side == "long" and cur_rsi > l_cp and c5[k] >= fill_px * 1.0040:
                             exit_bar = k
                             exit_px = float(c5[k])
                             exit_reason = "RSI_TP"
                             exit_ts = int(ts5[k]) + 300
                             break
-                        if side == "short" and cur_rsi < s_cp and c5[k] < fill_px * 0.9984:
+                        if side == "short" and cur_rsi < s_cp and c5[k] <= fill_px * 0.9960:
                             exit_bar = k
                             exit_px = float(c5[k])
                             exit_reason = "RSI_TP"
