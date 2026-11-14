@@ -2583,7 +2583,7 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
 
         active_positions = {}
         first_api = next(iter(symbol_apis.values())) if symbol_apis else None
-        cycle_balance = await first_api.get_account() if first_api else 1000.0
+        cycle_balance = await first_api.get_account(silent=True) if first_api else 1000.0
 
         for sym, api in list(symbol_apis.items()):
             try:

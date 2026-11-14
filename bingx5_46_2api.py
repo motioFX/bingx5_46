@@ -316,7 +316,7 @@ class api_bingx_helper:
         except Exception:
             return float(round(price, 2))
 
-    async def get_account(self) -> float:
+    async def get_account(self, silent: bool = False) -> float:
         if not self.api_key or self.api_key.startswith("YOUR_") or is_air:
             return 1000.0  # Fallback demo/air balance
 
@@ -330,10 +330,11 @@ class api_bingx_helper:
                 balance_data = data.get("balance", {})
                 equity = float(balance_data.get("equity") or balance_data.get("balance") or 0.0)
                 available = float(balance_data.get("availableMargin") or 0.0)
-                discord.print_log(
-                    f"BingX {self.coin} 口座総残高: {equity:.2f} USDT (利用可能: {available:.2f} USDT) [mode={self.mode}]",
-                    level="debug"
-                )
+                if not silent:
+                    discord.print_log(
+                        f"BingX {self.coin} 口座総残高: {equity:.2f} USDT (利用可能: {available:.2f} USDT) [mode={self.mode}]",
+                        level="debug"
+                    )
                 return equity if equity > 0 else 1000.0
         except Exception as e:
             discord.print_log(f"BingX get_account error: {e}")
@@ -562,8 +563,8 @@ class api_bingx:
     def _quantize_price(self, price: float) -> float:
         return self.bingx._quantize_price(price)
 
-    async def get_account(self):
-        return await self.bingx.get_account()
+    async def get_account(self, silent: bool = False):
+        return await self.bingx.get_account(silent=silent)
 
     async def get_candle(self, df, interval, interval_int):
         return await self.bingx.get_candle(df, interval, interval_int)
