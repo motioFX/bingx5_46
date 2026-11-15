@@ -7,8 +7,9 @@ Muse（あんこ）様 検収基準 (a)〜(f) の全自動・非モック緩和�
   (b) 未来情報の混入がないこと（cutoff不変テスト・未確定足遮断・因果OI結合）
   (c) 手数料 0.08% (Maker 0.02% + Taker 0.06%) が全擬似約定に算入されていること
   (d) その日の勝者が、保存された評価窓成績・格付けルール・明細集計と完全一致すること
-  (e) 現行リスクルール（1日1件・09:00 JSTリセット・-$1.50 CB・24hクールダウン・地合い・出来高ゲート）維持 + 書戻し
+  (e) 現行リスクルール（回数制限解除・09:00 JSTリセット・-$1.50 CB・24hクールダウン・地合い・出来高ゲート）維持 + 書戻し
   (f) ネットワーク遮断状態でレイク単体 (`lake_reproduce.py`) から同一結果を完全再現できること
+  (g) NY独自トレール廃止 ＆ ブレイク約定足内 (is_fill_bar=True) 即決済抑止の回帰検証
 """
 
 from __future__ import annotations
@@ -31,7 +32,12 @@ if str(ROOT_DIR) not in sys.path:
 
 import bingx5_46_1futures_limit as bot_main
 import lake_reproduce
-from bingx5_46_3logic import build_entry_precision_filter, check_market_regime_safe
+from bingx5_46_3logic import (
+    build_entry_precision_filter,
+    check_market_regime_safe,
+    check_vah_break_signals,
+    check_val_break_signals,
+)
 from lake_backtest_engine import (
     WalkForwardConfig,
     _grade_eval_cell,
@@ -327,7 +333,7 @@ class TestDataLakeAcceptance(unittest.TestCase):
                 self.assertAlmostEqual(float(sel["eval_ev"]), float(cell["eval_ev"]), places=6)
 
     def test_e_risk_rules_and_live_writeback(self):
-        """(e) 現行リスクルール (1日1件・09:00 JSTリセット・CB -$1.50・24h SLクールダウン・出来高1.5x・地合い制限) と実運用書戻し検証。"""
+        """(e) 現行リスクルール (回数制限解除・09:00 JSTリセット・CB -$1.50・24h SLクールダウン・出来高1.5x・地合い制限) と実運用書戻し検証。"""
         with tempfile.TemporaryDirectory() as tmp:
             tmp_dir = Path(tmp)
             orig_daily_file = bot_main.DAILY_TRADE_STATE_FILE
@@ -345,7 +351,8 @@ class TestDataLakeAcceptance(unittest.TestCase):
                     mock_dt.now.return_value = dt_0900_jst.astimezone(timezone.utc)
                     self.assertEqual(bot_main.get_current_trading_day(), "2026-11-13")
 
-                # 2. 日次上限 (1日1トレード)
+                # 2. 日次トレード回数制限解除 ＆ 日次損失サーキットブレーカー
+                self.assertEqual(bot_main.DAILY_MAX_TRADES, 0)
                 ok0, _, cnt0 = bot_main.can_open_new_trade_today(unrealized_pnl=0.0)
                 self.assertTrue(ok0)
                 self.assertEqual(cnt0, 0)
@@ -355,11 +362,18 @@ class TestDataLakeAcceptance(unittest.TestCase):
                 self.assertFalse(ok_cb)
                 self.assertIn("サーキットブレーカー", reason_cb)
 
-                # 1トレード完了後ブロック
+                # 1トレード完了後も回数上限なしのため取引可能
                 bot_main.record_daily_trade_completion("HYPE-USDT", "LONG", pnl=0.45, reason="TARGET_TP")
                 ok1, reason1, cnt1 = bot_main.can_open_new_trade_today(unrealized_pnl=0.0)
-                self.assertFalse(ok1)
+                self.assertTrue(ok1, f"回数制限解除後に取引がブロックされました: {reason1}")
                 self.assertEqual(cnt1, 1)
+
+                # 累積確定損失が -$1.50 以下に到達した場合はCB発動して物理遮断
+                bot_main.record_daily_trade_completion("ARB-USDT", "SHORT", pnl=-2.00, reason="STOP_LOSS")
+                ok2, reason2, cnt2 = bot_main.can_open_new_trade_today(unrealized_pnl=0.0)
+                self.assertFalse(ok2)
+                self.assertEqual(cnt2, 2)
+                self.assertIn("サーキットブレーカー", reason2)
 
                 # 3. 24時間 SL クールダウン
                 self.assertFalse(bot_main.is_in_sl_cooldown("SOL-USDT")[0])
@@ -498,6 +512,57 @@ class TestDataLakeAcceptance(unittest.TestCase):
                 with real_lake._conn(write=True) as conn:
                     conn.execute("DELETE FROM daily_selections WHERE run_id = ?", (real_res["run"]["run_id"],))
                     conn.execute("DELETE FROM backtest_runs WHERE run_id = ?", (real_res["run"]["run_id"],))
+
+    def test_g_ny_trail_removed_and_fill_bar_hold(self):
+        """(g) NY独自トレール (NY_VAL_TRAIL_TP 等) が実ボットに存在せず、約定足内で即決済されないこと。"""
+        bot_src = (ROOT_DIR / "bingx5_46_1futures_limit.py").read_text(encoding="utf-8")
+        for forbidden in ("NY_VAL_TRAIL_TP", "NY_VAH_TRAIL_TP", "NY_SESSION_TRAILING_STOP"):
+            self.assertNotIn(forbidden, bot_src, f"バックテスト外の独自決済 {forbidden} が残存しています")
+
+        # TAO-USDT 相当のブレイク約定足ケース: VAL=$188.47 付近、Entry=$188.73、現在値=$188.66 でも HOLD 維持
+        n_bars = 120
+        closes = np.linspace(191.0, 189.0, n_bars)
+        closes[-1] = 188.29
+        df = pd.DataFrame({
+            "open": closes + 0.1,
+            "high": closes + 0.25,
+            "low": closes - 0.25,
+            "close": closes,
+            "volume": np.full(n_bars, 1000.0),
+        })
+        sig_short = check_val_break_signals(
+            df_5m=df,
+            current_pos_qty=-0.08,
+            current_trades_count=1,
+            avg_entry_price=188.73,
+            last_entry_price=188.73,
+            current_price=188.66,
+            recent_high=191.2,
+            vp_period=100,
+            is_fill_bar=True,
+        )
+        self.assertEqual(sig_short["action"], "HOLD", f"約定当足で予期せぬ決済判定が発生: {sig_short}")
+
+        closes_long = np.linspace(186.0, 188.0, n_bars)
+        closes_long[-1] = 189.10
+        df_long = pd.DataFrame({
+            "open": closes_long - 0.1,
+            "high": closes_long + 0.25,
+            "low": closes_long - 0.25,
+            "close": closes_long,
+            "volume": np.full(n_bars, 1000.0),
+        })
+        sig_long = check_vah_break_signals(
+            df_5m=df_long,
+            current_pos_qty=0.08,
+            current_trades_count=1,
+            avg_entry_price=188.73,
+            last_entry_price=188.73,
+            current_price=188.80,
+            vp_period=100,
+            is_fill_bar=True,
+        )
+        self.assertEqual(sig_long["action"], "HOLD", f"約定当足で予期せぬロング決済判定が発生: {sig_long}")
 
 
 if __name__ == "__main__":

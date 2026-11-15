@@ -343,10 +343,10 @@ entry_candle_time = None
 discord = send_discord()
 
 # ==============================================================================
-# 🛡️ 1日1トレード固定規約 (One Trade Per Day Guard - PROJECT_RULES 準拠)
+# 🛡️ 日次リスク管理規約 (回数制限解除 ＆ 日次損失サーキットブレーカー - PROJECT_RULES 準拠)
 # ==============================================================================
 DAILY_TRADE_STATE_FILE = Path(__file__).resolve().parent / "Data" / "daily_trade_state.json"
-DAILY_MAX_TRADES = 1  # 1日最大1トレード固定 (直近52日間バックテスト PF 1.79 実証最適値)
+DAILY_MAX_TRADES = 0  # 0=1日トレード回数制限なし (回数制限解除 / 最大2枠・損失CB -$1.50・24h SL冷却は維持)
 DAILY_MAX_LOSS_USDT = 1.50  # 1日最大許容損失額 (W7準拠: 目標投資額 $15.0 の 10% 到達で即座に当日新規停止)
 # 🚀 中堅アルト ＆ 出来高急増 (Volume Surge 1.5倍) ゲート規約 (PROJECT_RULES 準拠)
 # 直近30日検証においてTriple-Stage Recency Gate合格率0%（直近15d/7dシグナル0回）の実証データに基づき、
@@ -393,7 +393,8 @@ def load_daily_trade_state() -> Dict[str, Any]:
             state = default_state
             with open(DAILY_TRADE_STATE_FILE, "w", encoding="utf-8") as f:
                 json.dump(state, f, indent=2, ensure_ascii=False)
-            discord.print_log(f"🌅 [新営業日開始] 09:00 JST到達により日次トレード制限および損失サーキットブレーカーをリセットしました (本日上限: {DAILY_MAX_TRADES}回 / 最大許容損失: -${DAILY_MAX_LOSS_USDT:.2f})")
+            limit_desc = f"{DAILY_MAX_TRADES}回" if DAILY_MAX_TRADES > 0 else "なし"
+            discord.print_log(f"🌅 [新営業日開始] 09:00 JST到達により日次トレード集計および損失サーキットブレーカーをリセットしました (回数制限: {limit_desc} / 最大許容損失: -${DAILY_MAX_LOSS_USDT:.2f})")
         return state
     except Exception as e:
         discord.print_log(f"⚠️ 日次トレード状態読み込みエラー: {e} -> デフォルト初期化", level="warning")
@@ -418,11 +419,14 @@ def record_daily_trade_completion(symbol: str, side: str, pnl: float, reason: st
         with open(DAILY_TRADE_STATE_FILE, "w", encoding="utf-8") as f:
             json.dump(state, f, indent=2, ensure_ascii=False)
 
-        cb_warning = f" 🚨【損失サーキットブレーカー発動】累計損失 -${abs(current_daily_pnl):.2f} 到達のため本日エントリー完全遮断！" if state.get("circuit_broken") else ""
+        if state.get("circuit_broken"):
+            cb_warning = f" 🚨【損失サーキットブレーカー発動】累計損失 -${abs(current_daily_pnl):.2f} 到達のため翌朝09:00 JSTまで新規エントリーを物理遮断します！"
+        else:
+            cb_warning = ""
+        count_desc = f"{state['trades_count']}/{DAILY_MAX_TRADES}回完了" if DAILY_MAX_TRADES > 0 else f"本日{state['trades_count']}回完了 / 回数制限なし"
         discord.print_log(
-            f"🛡️ [1日1トレード規約] 本日のトレード完了を記録しました: "
-            f"({state['trades_count']}/{DAILY_MAX_TRADES}回完了, 本日累計PnL: ${current_daily_pnl:+.2f}) {symbol} {side} PnL: {pnl:+.2f} USDT ({reason}){cb_warning} "
-            f"➔ 翌朝09:00 JSTまで新規エントリーを物理遮断します。"
+            f"📝 [日次トレード記録] 本日のトレード完了を記録しました: "
+            f"({count_desc}, 本日累計PnL: ${current_daily_pnl:+.2f}) {symbol} {side} PnL: {pnl:+.2f} USDT ({reason}){cb_warning}"
         )
     except Exception as e:
         discord.print_log(f"⚠️ 日次トレード状態保存エラー: {e}", level="warning")
@@ -435,9 +439,10 @@ def can_open_new_trade_today(unrealized_pnl: float = 0.0) -> Tuple[bool, str, in
     effective_loss = daily_pnl + min(0.0, float(unrealized_pnl))
     if state.get("circuit_broken", False) or effective_loss <= -DAILY_MAX_LOSS_USDT:
         return False, f"🚨 日次損失サーキットブレーカー発動中 (本日実現+含み損: ${effective_loss:+.2f} <= -${DAILY_MAX_LOSS_USDT:.2f} USDT) - 翌朝09:00 JSTまで新規エントリー完全遮断", cnt
-    if cnt >= DAILY_MAX_TRADES:
+    if DAILY_MAX_TRADES > 0 and cnt >= DAILY_MAX_TRADES:
         return False, f"本日トレード上限到達 ({cnt}/{DAILY_MAX_TRADES}回完了) - 翌朝09:00 JSTまで新規エントリー休止", cnt
-    return True, f"本日トレード可能 ({cnt}/{DAILY_MAX_TRADES}回, 実効PnL: ${effective_loss:+.2f})", cnt
+    count_desc = f"{cnt}/{DAILY_MAX_TRADES}回" if DAILY_MAX_TRADES > 0 else f"回数制限なし / 本日{cnt}回完了"
+    return True, f"本日トレード可能 ({count_desc}, 実効PnL: ${effective_loss:+.2f})", cnt
 
 def format_state_message(symbol: str, position: Dict[str, Any], open_orders_count: int, pending_flatten: bool, trade_side: str = "long") -> str:
     buy_qty = position.get("buy", 0.0)
@@ -2257,7 +2262,7 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
         f"  ポジション枠 : 最大 {MAX_ACTIVE_POSITIONS} 銘柄同時保有\n"
         f"  買い (BULL)  : 単発1本固定 (ナンピンなし) / 直近10本安値確定足SL & POC防衛SL\n"
         f"  売り (BEAR)  : 単発1本固定 (ナンピンなし) / 直近10本高値確定足SL & POC防衛SL\n"
-        f"  日次リスク管理: 1日1トレード固定規約 (One Trade Per Day - JST 09:00 リセット)\n"
+        f"  日次リスク管理: 回数制限なし / 損失CB -${DAILY_MAX_LOSS_USDT:.2f} (JST 09:00 リセット)\n"
         f"  銘柄＆出来高 : 中堅アルト特化 (超大型SOL/DOGE/XRP除外) ＆ 出来高急増1.5倍ゲート\n"
         "==================================================\n"
         "```"
@@ -2530,7 +2535,10 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                     tbl_divider = "────────────────────────────────────────"
                     acct_mode_str = "Live Account" if BINGX_IS_LIVE else "VST Demo Mode"
                     can_trade_today_h, _, daily_cnt_h = can_open_new_trade_today()
-                    daily_badge = f"🎯 本日トレード: [待機中 0/{DAILY_MAX_TRADES}回]" if can_trade_today_h else f"🏁 本日トレード: [完了 {daily_cnt_h}/{DAILY_MAX_TRADES}回 - 翌日09:00まで休止]"
+                    if DAILY_MAX_TRADES > 0:
+                        daily_badge = f"🎯 本日トレード: [待機中 {daily_cnt_h}/{DAILY_MAX_TRADES}回]" if can_trade_today_h else f"🏁 本日トレード: [完了 {daily_cnt_h}/{DAILY_MAX_TRADES}回 - 翌日09:00まで休止]"
+                    else:
+                        daily_badge = f"🎯 本日トレード: [回数制限なし / {daily_cnt_h}回完了]" if can_trade_today_h else f"🚨 本日トレード: [CB停止中 ({daily_cnt_h}回) - 翌日09:00まで休止]"
                     summary_lines = [
                         f"⏰ **【BingX 毎時ステータスサマリー ({now_jst.strftime('%H:00')} JST)】**",
                         f"💰 残高: ${h_balance:,.2f} ({acct_mode_str}) | {daily_badge}",
@@ -2831,65 +2839,6 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                 # ロング保有中かつ非BUY ➔ 建値+0.20%撤退 / ショート保有中かつ非SELL ➔ 建値-0.20%撤退
                 pos_emergency_be = (overall_regime != "SELL") if is_short_pos else (overall_regime != "BUY")
 
-                # 【時間帯別3大ロール ＆ 米国時間トレーリングストップ判定】
-                # JST時間を算出 (東京: 09:00〜16:00 / 欧州: 16:00〜22:00 / 米国: 22:00〜翌09:00)
-                current_dt_jst = datetime.now(timezone.utc) + timedelta(hours=9)
-                cur_hour_jst = current_dt_jst.hour
-                is_ny_session = (cur_hour_jst >= 22 or cur_hour_jst < 9)
-
-                # 米国時間トレーリングストップ用ピーク価格の更新・保持
-                trail_act_pct = 0.006  # +0.60% でトレール発動
-                trail_dist_pct = 0.004 # ピークから 0.40% 戻しで利確
-                ny_trail_triggered = False
-                ny_trail_reason = ""
-
-                if is_short_pos:
-                    lowest_px = float(scale_state_cur.get("peak_trough_price", entry_px) or entry_px)
-                    if cur_px < lowest_px:
-                        lowest_px = cur_px
-                        scale_state_cur["peak_trough_price"] = lowest_px
-                        scale_in_states[sym] = scale_state_cur
-                        save_scale_in_states(scale_in_states)
-
-                    if is_ny_session and entry_px > 0:
-                        # ショート: VAL境界線トレーリング (VAL上抜け逆戻りで即座に利確撤退、最低でも建値-0.20%確保)
-                        if cand_strat == "val_break":
-                            trail_stop_px = min(val, entry_px * 0.9980)
-                            if cur_px >= trail_stop_px:
-                                ny_trail_triggered = True
-                                pnl_pct_trail = (entry_px - cur_px) / entry_px
-                                ny_trail_reason = f"NY_VAL_TRAIL_TP: 米国時間VAL境界線トレール利確 (VAL=${val:.4f}復帰到達=${trail_stop_px:.4f}, PnL={pnl_pct_trail:+.2%})"
-                        else:
-                            if lowest_px <= entry_px * (1.0 - trail_act_pct):
-                                trail_stop_px = min(lowest_px * (1.0 + trail_dist_pct), entry_px * 0.9980)
-                                if cur_px >= trail_stop_px:
-                                    ny_trail_triggered = True
-                                    pnl_pct_trail = (entry_px - cur_px) / entry_px
-                                    ny_trail_reason = f"NY_SESSION_TRAILING_STOP: 米国時間トレール利確 (最安値=${lowest_px:.4f}から0.4%戻し到達=${trail_stop_px:.4f}, PnL={pnl_pct_trail:+.2%})"
-                else:
-                    highest_px = float(scale_state_cur.get("peak_trough_price", entry_px) or entry_px)
-                    if cur_px > highest_px:
-                        highest_px = cur_px
-                        scale_state_cur["peak_trough_price"] = highest_px
-                        scale_in_states[sym] = scale_state_cur
-                        save_scale_in_states(scale_in_states)
-
-                    if is_ny_session and entry_px > 0:
-                        # ロング: VAH境界線トレーリング (VAH割れ逆戻りで即座に利確撤退、最低でも建値+0.20%確保)
-                        if cand_strat == "vah_break":
-                            trail_stop_px = max(vah, entry_px * 1.0020)
-                            if cur_px <= trail_stop_px:
-                                ny_trail_triggered = True
-                                pnl_pct_trail = (cur_px - entry_px) / entry_px
-                                ny_trail_reason = f"NY_VAH_TRAIL_TP: 米国時間VAH境界線トレール利確 (VAH=${vah:.4f}割れ到達=${trail_stop_px:.4f}, PnL={pnl_pct_trail:+.2%})"
-                        else:
-                            if highest_px >= entry_px * (1.0 + trail_act_pct):
-                                trail_stop_px = max(highest_px * (1.0 - trail_dist_pct), entry_px * 1.0020)
-                                if cur_px <= trail_stop_px:
-                                    ny_trail_triggered = True
-                                    pnl_pct_trail = (cur_px - entry_px) / entry_px
-                                    ny_trail_reason = f"NY_SESSION_TRAILING_STOP: 米国時間トレール利確 (最高値=${highest_px:.4f}から0.4%押し到達=${trail_stop_px:.4f}, PnL={pnl_pct_trail:+.2%})"
-
                 # ショート・ロングポジションの直近10本高安(Swing High / Low)復元・自動補完
                 recent_high_val = float(scale_state_cur.get("recent_high", 0.0) or 0.0)
                 recent_low_val = float(scale_state_cur.get("recent_low", 0.0) or 0.0)
@@ -3055,12 +3004,9 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                             is_fill_bar=is_fill_bar_cur,
                         )
 
-                if ny_trail_triggered:
-                    pos_action = "CLOSE_ALL"
-                    exit_reason = ny_trail_reason
-                else:
-                    pos_action = sig_eval.get("action", "HOLD")
-                    exit_reason = sig_eval.get("reason", "HOLD")
+                # 決済判定はバックテスト SSoT (lake_backtest_engine / bingx5_46_3logic) と完全統一
+                pos_action = sig_eval.get("action", "HOLD")
+                exit_reason = sig_eval.get("reason", "HOLD")
                 whale_info = get_whale_sentiment_info(sym)
                 whale_sig = whale_info.get("signal", "NEUTRAL")
 
@@ -3129,7 +3075,7 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                     tracked_active_positions.discard(sym)
 
                     side_tag = "SHORT" if is_short_pos else "LONG"
-                    # 1日1トレード完了の記録
+                    # 日次トレード実績および損失サーキットブレーカー用累計の記録
                     record_daily_trade_completion(
                         symbol=sym,
                         side=side_tag,
@@ -3205,22 +3151,22 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
 
             if is_ny_b3:
                 if BINGX_IS_LIVE:
-                    # 本番リアル運用規約 (PROJECT_RULES.md W1準拠):
-                    # 米国セッション(22:00〜翌09:00 JST)は乱高下・ヒゲ狩り回避のため新規エントリー完全停止 (ノーポジ待機 ＆ 既存ポジション境界トレールのみ)
+                    # 本番リアル運用規約:
+                    # 米国セッション(22:00〜翌09:00 JST)は新規エントリー停止 (ノーポジ待機 ＆ 既存ポジション標準出口監視のみ)
                     if now_jst_b3.hour != last_ny_notice_hour:
                         last_ny_notice_hour = now_jst_b3.hour
-                        discord.print_log("🌙 [本番リアル運用] 米国セッション(22:00〜翌09:00 JST) 新規エントリー完全停止中 (ノーポジ待機 ＆ 既存トレール防衛のみ)", level="info")
+                        discord.print_log("🌙 [本番リアル運用] 米国セッション(22:00〜翌09:00 JST) 新規エントリー停止中 (既存ポジション標準出口監視のみ)", level="info")
                     continue
                 else:
-                    # デモアクティブ検証モード: 米国セッションもエントリー監視継続
+                    # デモアクティブ検証モード: 米国セッションもバックテストSSoT準拠で24時間監視
                     if now_jst_b3.hour != last_ny_notice_hour:
                         last_ny_notice_hour = now_jst_b3.hour
-                        discord.print_log(f"🌙 [デモアクティブ検証] 米国セッション(22:00〜翌09:00 JST) 24時間フル稼働中 (トレール防衛＆5分足チャンス監視)", level="info")
+                        discord.print_log(f"🌙 [デモアクティブ検証] 米国セッション(22:00〜翌09:00 JST) 24時間フル稼働中 (バックテストSSoT準拠監視)", level="info")
                     elif cycle_count % 30 == 0:
-                        discord.print_log(f"🌙 [デモアクティブ検証] 米国セッション(22:00〜翌09:00 JST) 24時間フル稼働中 (トレール防衛＆5分足チャンス監視)", level="debug")
+                        discord.print_log(f"🌙 [デモアクティブ検証] 米国セッション(22:00〜翌09:00 JST) 24時間フル稼働中 (バックテストSSoT準拠監視)", level="debug")
             total_active_count = len(active_positions) + len(pending_entry_orders)
 
-            # 🛡️ 1日1トレード固定ガードチェック (One Trade Per Day Guard & 含み損考慮サーキットブレーカー)
+            # 🛡️ 日次リスクガードチェック (含み損考慮サーキットブレーカー / 回数制限解除済み)
             total_unrealized = sum(float(v[4]) for v in active_positions.values()) if active_positions else 0.0
             can_trade_today, daily_reason, daily_cnt = can_open_new_trade_today(unrealized_pnl=total_unrealized)
             if not can_trade_today:
@@ -3230,15 +3176,15 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                         if p_api:
                             try:
                                 await p_api.active_order_cancel()
-                                discord.print_log(f"🛡️ [1日1トレードガード] 本日トレード完了に伴い {p_sym} の未約定指値を安全にキャンセルしました。")
+                                discord.print_log(f"🛡️ [日次損失CBガード] CB/日次制限に伴い {p_sym} の未約定指値を安全にキャンセルしました。")
                             except Exception:
                                 pass
                     pending_entry_orders.clear()
                 if now_jst_b3.hour != last_daily_limit_notice_hour:
                     last_daily_limit_notice_hour = now_jst_b3.hour
-                    discord.print_log(f"🛡️ [1日1トレード規約] {daily_reason} (既存ポジション決済監視は継続)", level="info")
+                    discord.print_log(f"🛡️ [日次リスク管理] {daily_reason} (既存ポジション決済監視は継続)", level="info")
                 elif cycle_count % 30 == 0:
-                    discord.print_log(f"🛡️ [1日1トレード規約] {daily_reason}", level="debug")
+                    discord.print_log(f"🛡️ [日次リスク管理] {daily_reason}", level="debug")
                 continue
 
             for sym in selected_symbols:
