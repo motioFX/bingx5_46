@@ -32,16 +32,22 @@ def reproduce_run(
     stored_cells = lake.get_cells_for_run(run_id)
     stored_sel = lake.get_selection_for_run(run_id)
 
-    cfg = WalkForwardConfig.from_dict(json.loads(run_rec["config_json"]))
+    raw_cfg = json.loads(run_rec["config_json"])
+    if "use_point_in_time_regime" not in raw_cfg:
+        raw_cfg["use_point_in_time_regime"] = False
+    cfg = WalkForwardConfig.from_dict(raw_cfg)
     allowed_strategies = json.loads(run_rec["allowed_strategies_json"])
     cutoff_utc = int(run_rec["data_cutoff_utc"])
+    stored_strats = sorted(set(str(c["strategy"]) for c in stored_cells))
+    stored_syms = sorted(set(str(c["symbol"]) for c in stored_cells))
 
     # regime_snapshots に記録されている当時の推奨銘柄・除外銘柄・地合いをそのまま復元 (オフライン)
     with lake._conn(write=False) as conn:
         r_snap = conn.execute("SELECT * FROM regime_snapshots WHERE cutoff_utc = ?", (cutoff_utc,)).fetchone()
 
     override_regime_info: Optional[Dict[str, Any]] = None
-    symbols_override: Optional[List[str]] = None
+    symbols_override: Optional[List[str]] = stored_syms if stored_syms else None
+    strats_override: Optional[List[str]] = stored_strats if stored_strats else allowed_strategies
     if r_snap:
         rec_syms = json.loads(r_snap["recommended_symbols_json"])
         exc_syms = json.loads(r_snap["excluded_symbols_json"])
@@ -59,7 +65,8 @@ def reproduce_run(
             "excluded_symbols": exc_syms if isinstance(exc_syms, dict) else {},
             "whale_snapshot": json.loads(r_snap["whale_snapshot_json"]),
         }
-        symbols_override = sorted(set(c["symbol"] for c in stored_cells)) if stored_cells else rec_syms
+        if not symbols_override:
+            symbols_override = rec_syms
 
     re_res = run_walkforward_from_lake(
         lake=lake,
@@ -67,7 +74,7 @@ def reproduce_run(
         cfg=cfg,
         override_regime_info=override_regime_info,
         symbols=symbols_override,
-        allowed_strategies_override=allowed_strategies,
+        allowed_strategies_override=strats_override,
         run_id=run_id,
         persist=False,
     )

@@ -25,7 +25,12 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 import numpy as np
 import pandas as pd
 
-from bingx5_46_3logic import calc_rsi_ema, evaluate_market_regime_3window, make_market_profile_dual_va
+from bingx5_46_3logic import (
+    calc_rsi_ema,
+    evaluate_market_regime_3window,
+    evaluate_market_regime_3window_from_close_arrays,
+    make_market_profile_dual_va,
+)
 from lake_store import (
     TIMEFRAME_SECONDS,
     LakeStore,
@@ -39,6 +44,8 @@ JST = timezone(timedelta(hours=9))
 
 LONG_STRATEGIES = ("val_poc", "vah_break", "rsima")
 SHORT_STRATEGIES = ("vah_poc", "val_break", "rsima_short")
+ALL_STRATEGIES = LONG_STRATEGIES + SHORT_STRATEGIES
+_PIT_MIN_SYMBOLS = 15
 
 
 @dataclass(frozen=True)
@@ -60,6 +67,7 @@ class WalkForwardConfig:
     enforce_oi_fr: bool = True
     oi_missing_policy: str = "when_available"  # "when_available" | "strict_zero_fill"
     enforce_session_mask: bool = True
+    use_point_in_time_regime: bool = True
     min_eval_trades_provisional: int = 10
     min_eval_trades_qualified: int = 30
     gil_yield_sec: float = 0.005
@@ -153,6 +161,138 @@ def compute_regime_from_lake(
     res["excluded_symbols"] = {}
     res["whale_snapshot"] = {"source": "lake_offline_1h"}
     return res
+
+
+def _compact_period_results(period_results: Optional[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    compact: Dict[str, Dict[str, Any]] = {}
+    if not period_results:
+        return compact
+    for w_name in ("14d", "7d", "2d"):
+        w = period_results.get(w_name)
+        if not isinstance(w, dict):
+            continue
+        compact[w_name] = {
+            "state": str(w.get("state", "NEUTRAL")),
+            "buy_votes": int(w.get("buy_votes", 0)),
+            "sell_votes": int(w.get("sell_votes", 0)),
+            "total_votes": int(w.get("total_votes", 0)),
+        }
+    return compact
+
+
+def _snapshot_from_regime_dict(
+    ts_hr: int,
+    reg: Dict[str, Any],
+    source_label: str,
+    fallback_all_strategies: bool = False,
+) -> Dict[str, Any]:
+    strength_obj = reg.get("regime_strength", {}) or {}
+    allowed_raw = [str(s) for s in reg.get("allowed_strategies", []) if str(s) in ALL_STRATEGIES]
+    if not allowed_raw and fallback_all_strategies:
+        allowed_raw = list(ALL_STRATEGIES)
+    return {
+        "cutoff_utc": int(ts_hr),
+        "cutoff_iso": sec_to_iso(ts_hr),
+        "overall_regime": str(reg.get("overall_regime", "NEUTRAL")).upper(),
+        "regime_pattern": str(reg.get("regime_pattern", "(N,N,N)")),
+        "strength_tier": str(strength_obj.get("tier", "BALANCED")),
+        "net_score": float(strength_obj.get("net_score", 0.0) or 0.0),
+        "mean_buy_votes": float(strength_obj.get("mean_buy_votes", 0.0) or 0.0),
+        "mean_sell_votes": float(strength_obj.get("mean_sell_votes", 0.0) or 0.0),
+        "allowed_strategies": allowed_raw,
+        "allowed_strategies_set": frozenset(allowed_raw),
+        "recommended_symbols": list(reg.get("recommended_symbols", [])),
+        "excluded_symbols": reg.get("excluded_symbols", {}) if isinstance(reg.get("excluded_symbols"), dict) else {},
+        "whale_snapshot": {
+            "source": source_label,
+            "period_results": _compact_period_results(reg.get("period_results")),
+        },
+    }
+
+
+def compute_hourly_regime_series_from_lake(
+    lake: LakeStore,
+    start_utc: int,
+    end_utc: int,
+    override_regime_info: Optional[Dict[str, Any]] = None,
+    use_point_in_time_regime: bool = True,
+    gil_yield_sec: float = 0.0,
+) -> Tuple[Dict[int, Dict[str, Any]], bool]:
+    """
+    `[start_utc, end_utc]` 内の全正時 (`3600s` 刻み) における時点地合い系列を構築する。
+    返却: `(hourly_regime_map, pit_active)`
+      - 本番相当 (`use_point_in_time_regime=True` かつ 1h足保有銘柄 >= 15):
+        `override_regime_info` が渡されていても、各正時 `t_hr` について `ts_utc + 3600 <= t_hr`
+        を満たす確定 `1h` 足のみから SSoT `evaluate_market_regime_3window` を因果再計算する (`pit_active=True`)。
+      - 小規模合成DB (< 15銘柄) または `use_point_in_time_regime=False`:
+        互換性のため `override_regime_info`（未指定時は合成フォールバック）を全時間へ適用する (`pit_active=False`)。
+    """
+    start_hr = (int(start_utc) // 3600) * 3600
+    end_hr = (int(end_utc) // 3600) * 3600
+    if end_hr < start_hr:
+        return {}, False
+
+    pre_start = start_hr - (20 * 86400)
+    preloaded_1h: Dict[str, Tuple[np.ndarray, np.ndarray]] = {}
+    for sym in LAKE_UNIVERSE_SYMBOLS:
+        df_1h = lake.load_candles(sym, "1h", cutoff_utc=end_utc, start_utc=pre_start)
+        if not df_1h.empty and len(df_1h) >= 24:
+            ts_close_arr = df_1h["ts_utc"].to_numpy(dtype=np.int64) + 3600
+            close_arr = df_1h["close"].to_numpy(dtype=np.float64)
+            preloaded_1h[sym] = (ts_close_arr, close_arr)
+
+    pit_active = bool(use_point_in_time_regime and len(preloaded_1h) >= _PIT_MIN_SYMBOLS)
+    hourly_map: Dict[int, Dict[str, Any]] = {}
+
+    if not pit_active:
+        base_reg = override_regime_info or {
+            "overall_regime": "NEUTRAL",
+            "regime_pattern": "(N,N,N)",
+            "regime_strength": {"tier": "BALANCED", "net_score": 0.0, "mean_buy_votes": 0.0, "mean_sell_votes": 0.0},
+            "allowed_strategies": list(ALL_STRATEGIES),
+            "recommended_symbols": [],
+            "excluded_symbols": {},
+        }
+        src = "override_static" if override_regime_info is not None else "synthetic_fallback"
+        fallback_all = override_regime_info is None
+        for t_hr in range(start_hr, end_hr + 1, 3600):
+            hourly_map[t_hr] = _snapshot_from_regime_dict(
+                t_hr, base_reg, source_label=src, fallback_all_strategies=fallback_all
+            )
+        return hourly_map, False
+
+    max_window_bars = 14 * 24  # 336h (evaluate_market_regime_3window 最大参照長)
+    t_hrs = np.arange(start_hr, end_hr + 1, 3600, dtype=np.int64)
+    idx_by_sym: Dict[str, Tuple[np.ndarray, np.ndarray]] = {
+        sym: (np.searchsorted(ts_close_arr, t_hrs, side="right"), close_arr)
+        for sym, (ts_close_arr, close_arr) in preloaded_1h.items()
+    }
+    for step_idx, t_hr_np in enumerate(t_hrs):
+        t_hr = int(t_hr_np)
+        hourly_arrays_at_t: Dict[str, np.ndarray] = {}
+        for sym, (idx_arr, close_arr) in idx_by_sym.items():
+            idx = int(idx_arr[step_idx])
+            if idx >= 24:
+                lo = max(0, idx - max_window_bars)
+                hourly_arrays_at_t[sym] = close_arr[lo:idx]
+
+        if len(hourly_arrays_at_t) < _PIT_MIN_SYMBOLS:
+            empty_reg = {
+                "overall_regime": "NEUTRAL",
+                "regime_pattern": "(N,N,N)",
+                "regime_strength": {"tier": "BALANCED", "net_score": 0.0, "mean_buy_votes": 0.0, "mean_sell_votes": 0.0},
+                "allowed_strategies": [],
+                "recommended_symbols": [],
+            }
+            hourly_map[t_hr] = _snapshot_from_regime_dict(t_hr, empty_reg, source_label="lake_hourly_warmup")
+        else:
+            reg_t = evaluate_market_regime_3window_from_close_arrays(hourly_arrays_at_t)
+            hourly_map[t_hr] = _snapshot_from_regime_dict(t_hr, reg_t, source_label="lake_hourly_1h")
+
+        if gil_yield_sec > 0 and ((step_idx + 1) % 200) == 0:
+            time.sleep(gil_yield_sec)
+
+    return hourly_map, True
 
 
 def _compute_causal_features(
@@ -483,6 +623,7 @@ def _simulate_window(
     win_start_utc: int,
     win_end_utc: int,
     cfg: WalkForwardConfig,
+    hourly_regime_map: Optional[Dict[int, Dict[str, Any]]] = None,
 ) -> List[Dict[str, Any]]:
     """
     指定窓 `[win_start_utc, win_end_utc]` 上で 5m 足ベースの厳密 Maker 指値追随・
@@ -541,6 +682,26 @@ def _simulate_window(
         sig_close_utc = int(ts_close_tf[i])
         if sig_close_utc < cooldown_until_utc or sig_close_utc < next_allowed_order_utc:
             continue
+
+        sig_regime_meta: Dict[str, Any] = {
+            "regime_at_signal": None,
+            "strength_tier_at_signal": None,
+            "net_score_at_signal": None,
+            "buy_votes_at_signal": None,
+            "sell_votes_at_signal": None,
+        }
+        if hourly_regime_map is not None:
+            t_hr = (sig_close_utc // 3600) * 3600
+            snap = hourly_regime_map.get(t_hr)
+            if snap is None or strategy not in snap["allowed_strategies_set"]:
+                continue
+            sig_regime_meta = {
+                "regime_at_signal": snap["overall_regime"],
+                "strength_tier_at_signal": snap["strength_tier"],
+                "net_score_at_signal": snap["net_score"],
+                "buy_votes_at_signal": snap["mean_buy_votes"],
+                "sell_votes_at_signal": snap["mean_sell_votes"],
+            }
 
         # 次 5m 足 (t_order >= sig_close_utc) を検索
         m_start = int(np.searchsorted(ts5[:valid_5m_end], sig_close_utc, side="left"))
@@ -647,6 +808,7 @@ def _simulate_window(
                     "va_lower": round(va_l, 8),
                     "range_high": round(rh, 8),
                     "range_low": round(rl, 8),
+                    **sig_regime_meta,
                 }
             )
             next_allowed_order_utc = int(cancel_ts or (first_order_ts + 300))
@@ -833,6 +995,7 @@ def _simulate_window(
                 "va_lower": round(va_l, 8),
                 "range_high": round(rh, 8),
                 "range_low": round(rl, 8),
+                **sig_regime_meta,
             }
         )
 
@@ -849,13 +1012,27 @@ def _grade_eval_cell(eval_trades: int, eval_ev: float, cfg: WalkForwardConfig) -
     return "PROVISIONAL"
 
 
-def select_eval_winner(cells: Sequence[Dict[str, Any]], cfg: WalkForwardConfig) -> Optional[Dict[str, Any]]:
+def select_eval_winner(
+    cells: Sequence[Dict[str, Any]],
+    cfg: WalkForwardConfig,
+    allowed_strategies: Optional[Sequence[str]] = None,
+    excluded_symbols: Optional[Sequence[str]] = None,
+) -> Optional[Dict[str, Any]]:
     """
     評価窓 (OOS) 成績のみから当日の勝者1件を決定論的に選出する。
+    `allowed_strategies` / `excluded_symbols` が指定された場合は現時点の許可条件に合致するセルのみ対象とする。
     `QUALIFIED` (n>=30) を `PROVISIONAL` (10<=n<30) より優先し、
     同一格付け内では (eval_ev, eval_pf, eval_net_pnl, eval_trades) の降順で決定する。
     """
-    eligible = [c for c in cells if c["eval_grade"] in ("QUALIFIED", "PROVISIONAL") and c["eval_ev"] > 0.0]
+    allowed_set = {str(s) for s in allowed_strategies} if allowed_strategies is not None else None
+    excluded_set = {normalize_symbol(str(s)) for s in excluded_symbols} if excluded_symbols else set()
+    eligible = [
+        c for c in cells
+        if c["eval_grade"] in ("QUALIFIED", "PROVISIONAL")
+        and float(c["eval_ev"]) > 0.0
+        and (allowed_set is None or str(c["strategy"]) in allowed_set)
+        and normalize_symbol(str(c["symbol"])) not in excluded_set
+    ]
     if not eligible:
         return None
 
@@ -908,43 +1085,78 @@ def run_walkforward_from_lake(
     strength_obj = regime_info.get("regime_strength", {}) or {}
     strength_tier = str(strength_obj.get("tier", "BALANCED"))
 
-    if allowed_strategies_override is not None:
-        allowed_strategies = [str(s) for s in allowed_strategies_override if str(s) in (LONG_STRATEGIES + SHORT_STRATEGIES)]
-    else:
-        raw_allowed = regime_info.get("allowed_strategies", [])
-        allowed_strategies = [str(s) for s in raw_allowed if str(s) in (LONG_STRATEGIES + SHORT_STRATEGIES)]
-
-    rec_syms = regime_info.get("recommended_symbols")
-    if symbols is not None:
-        target_symbols = [normalize_symbol(s) for s in symbols if normalize_symbol(s) != BENCHMARK_SYMBOL]
-    elif rec_syms:
-        target_symbols = [normalize_symbol(s) for s in rec_syms if normalize_symbol(s) != BENCHMARK_SYMBOL]
-    else:
-        target_symbols = list(FIXED_TRADABLE_SYMBOLS)
-
-    excluded_syms = set(normalize_symbol(s) for s in (regime_info.get("excluded_symbols") or {}).keys())
-    target_symbols = [s for s in target_symbols if s not in excluded_syms]
-
-    lake.upsert_regime_snapshot(
-        {
-            "cutoff_utc": cutoff,
-            "cutoff_iso": sec_to_iso(cutoff),
-            "overall_regime": overall_regime,
-            "regime_pattern": str(regime_info.get("regime_pattern", "")),
-            "strength_tier": strength_tier,
-            "net_score": float(strength_obj.get("net_score", 0.0) or 0.0),
-            "mean_buy_votes": float(strength_obj.get("mean_buy_votes", 0.0) or 0.0),
-            "mean_sell_votes": float(strength_obj.get("mean_sell_votes", 0.0) or 0.0),
-            "allowed_strategies": allowed_strategies,
-            "recommended_symbols": target_symbols,
-            "excluded_symbols": regime_info.get("excluded_symbols", {}),
-            "whale_snapshot": regime_info.get("whale_snapshot", {}),
-        }
+    hourly_regime_map, pit_active = compute_hourly_regime_series_from_lake(
+        lake=lake,
+        start_utc=opt_start_utc,
+        end_utc=eval_end_utc,
+        override_regime_info=override_regime_info,
+        use_point_in_time_regime=cfg.use_point_in_time_regime,
+        gil_yield_sec=cfg.gil_yield_sec,
     )
+
+    raw_excl = regime_info.get("excluded_symbols") or {}
+    cutoff_excluded = set(
+        normalize_symbol(str(s))
+        for s in (raw_excl.keys() if isinstance(raw_excl, dict) else raw_excl)
+    )
+    if override_regime_info is not None:
+        cutoff_allowed = [str(s) for s in regime_info.get("allowed_strategies", []) if str(s) in ALL_STRATEGIES]
+    elif allowed_strategies_override is not None:
+        cutoff_allowed = [str(s) for s in allowed_strategies_override if str(s) in ALL_STRATEGIES]
+    else:
+        cutoff_allowed = [str(s) for s in regime_info.get("allowed_strategies", []) if str(s) in ALL_STRATEGIES]
+
+    if pit_active:
+        eval_strategies = (
+            [str(s) for s in allowed_strategies_override if str(s) in ALL_STRATEGIES]
+            if allowed_strategies_override is not None
+            else list(ALL_STRATEGIES)
+        )
+        if symbols is not None:
+            target_symbols = [normalize_symbol(s) for s in symbols if normalize_symbol(s) != BENCHMARK_SYMBOL]
+        else:
+            target_symbols = list(FIXED_TRADABLE_SYMBOLS)
+    else:
+        if allowed_strategies_override is not None:
+            eval_strategies = [str(s) for s in allowed_strategies_override if str(s) in ALL_STRATEGIES]
+        elif override_regime_info is not None:
+            eval_strategies = list(cutoff_allowed)
+        else:
+            eval_strategies = list(ALL_STRATEGIES)
+
+        rec_syms = regime_info.get("recommended_symbols")
+        if symbols is not None:
+            target_symbols = [normalize_symbol(s) for s in symbols if normalize_symbol(s) != BENCHMARK_SYMBOL]
+        elif rec_syms:
+            target_symbols = [normalize_symbol(s) for s in rec_syms if normalize_symbol(s) != BENCHMARK_SYMBOL]
+        else:
+            target_symbols = list(FIXED_TRADABLE_SYMBOLS)
+        target_symbols = [s for s in target_symbols if s not in cutoff_excluded]
+
+    cutoff_rec_syms = regime_info.get("recommended_symbols")
+    cutoff_snap_rec = (
+        [normalize_symbol(s) for s in cutoff_rec_syms if normalize_symbol(s) != BENCHMARK_SYMBOL]
+        if cutoff_rec_syms
+        else list(target_symbols)
+    )
+    cutoff_snap = {
+        "cutoff_utc": cutoff,
+        "cutoff_iso": sec_to_iso(cutoff),
+        "overall_regime": overall_regime,
+        "regime_pattern": str(regime_info.get("regime_pattern", "")),
+        "strength_tier": strength_tier,
+        "net_score": float(strength_obj.get("net_score", 0.0) or 0.0),
+        "mean_buy_votes": float(strength_obj.get("mean_buy_votes", 0.0) or 0.0),
+        "mean_sell_votes": float(strength_obj.get("mean_sell_votes", 0.0) or 0.0),
+        "allowed_strategies": cutoff_allowed,
+        "recommended_symbols": cutoff_snap_rec,
+        "excluded_symbols": regime_info.get("excluded_symbols", {}),
+        "whale_snapshot": regime_info.get("whale_snapshot", {}),
+    }
 
     cfg_json = json.dumps(cfg.to_dict(), sort_keys=True, ensure_ascii=False)
     if run_id is None:
-        id_seed = f"{cutoff}|{cfg_json}|{overall_regime}|{','.join(sorted(allowed_strategies))}|{','.join(sorted(target_symbols))}"
+        id_seed = f"{cutoff}|{cfg_json}|{overall_regime}|{','.join(sorted(cutoff_allowed))}|{','.join(sorted(target_symbols))}"
         run_id = f"wf_{cutoff}_{hashlib.sha1(id_seed.encode('utf-8')).hexdigest()[:10]}"
     if selection_id is None:
         selection_id = f"sel_{run_id}"
@@ -960,7 +1172,7 @@ def run_walkforward_from_lake(
         "embargo_bars": cfg.embargo_bars,
         "regime": overall_regime,
         "strength_tier": strength_tier,
-        "allowed_strategies_json": json.dumps(allowed_strategies, ensure_ascii=False),
+        "allowed_strategies_json": json.dumps(cutoff_allowed, ensure_ascii=False),
         "fee_maker": cfg.fee_maker,
         "fee_taker": cfg.fee_taker,
         "code_git_sha": get_git_sha_short(),
@@ -968,13 +1180,13 @@ def run_walkforward_from_lake(
     }
 
     # ウォームアップ用余白は個別最適化/評価ループ側で足種ごとに最小限 (max(2d, 220*tf)) を厳密切り出しする
-    has_vp_strat = any(s in ("val_poc", "vah_poc", "vah_break", "val_break") for s in allowed_strategies)
+    has_vp_strat = any(s in ("val_poc", "vah_poc", "vah_break", "val_break") for s in eval_strategies)
     opt_mps: Tuple[int, ...] = (100, 150, 200) if has_vp_strat else ()
 
     cell_rows: List[Dict[str, Any]] = []
     sim_trade_rows: List[Dict[str, Any]] = []
 
-    if allowed_strategies and target_symbols:
+    if eval_strategies and target_symbols:
         opt_warmup_5m = max(2 * 86400, 220 * 300)
         eval_warmup_5m = max(2 * 86400, 220 * 300)
         for sym in target_symbols:
@@ -998,10 +1210,10 @@ def run_walkforward_from_lake(
 
                 feat_opt = _compute_causal_features(df_tf_opt, tf, cfg, needed_mps=opt_mps)
 
-                # Stage 1: 全許可戦略を最適化窓のみで探索し、Stage 2 に渡すパラメータと必要な MP のみを特定
+                # Stage 1: 対象戦略を最適化窓のみで探索し、Stage 2 に渡すパラメータと必要な MP のみを特定
                 frozen_choices: List[Tuple[str, Dict[str, Any], Dict[str, Any]]] = []
                 eval_needed_mps = set()
-                for strat in allowed_strategies:
+                for strat in eval_strategies:
                     grid = get_param_grid(strat)
                     best_opt_score = (-1e18, -1e18, -1e18)
                     best_params: Optional[Dict[str, Any]] = None
@@ -1011,7 +1223,8 @@ def run_walkforward_from_lake(
                         sig_opt = _generate_signal_array(feat_opt, strat, params, cfg)
                         opt_trades_list = _simulate_window(
                             feat_opt, sig_opt, df_5m_opt, sym, strat, params,
-                            window_type="OPT", win_start_utc=opt_start_utc, win_end_utc=opt_end_utc, cfg=cfg
+                            window_type="OPT", win_start_utc=opt_start_utc, win_end_utc=opt_end_utc, cfg=cfg,
+                            hourly_regime_map=hourly_regime_map,
                         )
                         m_opt = _compute_metrics(opt_trades_list)
                         has_min = 1 if m_opt["trades"] >= 3 else 0
@@ -1034,14 +1247,15 @@ def run_walkforward_from_lake(
                 if not frozen_choices:
                     continue
 
-                # Stage 2: 凍結パラメータが必要とする MP のみを計算して OOS 評価
+                # Stage 2: 凍結パラメータが必要とする MP のみを計算して OOS 評価 (時点地合いゲート適用)
                 feat_eval = _compute_causal_features(df_tf_eval, tf, cfg, needed_mps=sorted(eval_needed_mps))
 
                 for strat, best_params, best_opt_metrics in frozen_choices:
                     sig_eval = _generate_signal_array(feat_eval, strat, best_params, cfg)
                     eval_trades_list = _simulate_window(
                         feat_eval, sig_eval, df_5m_eval, sym, strat, best_params,
-                        window_type="EVAL", win_start_utc=eval_start_utc, win_end_utc=eval_end_utc, cfg=cfg
+                        window_type="EVAL", win_start_utc=eval_start_utc, win_end_utc=eval_end_utc, cfg=cfg,
+                        hourly_regime_map=hourly_regime_map,
                     )
                     m_eval = _compute_metrics(eval_trades_list)
                     eval_grade = _grade_eval_cell(m_eval["trades"], m_eval["ev"], cfg)
@@ -1089,7 +1303,12 @@ def run_walkforward_from_lake(
             if cfg.gil_yield_sec > 0:
                 time.sleep(cfg.gil_yield_sec)
 
-    winner = select_eval_winner(cell_rows, cfg)
+    winner = select_eval_winner(
+        cell_rows,
+        cfg,
+        allowed_strategies=cutoff_allowed if pit_active else eval_strategies,
+        excluded_symbols=cutoff_excluded,
+    )
     trade_date_jst = datetime.fromtimestamp(cutoff, tz=timezone.utc).astimezone(JST).strftime("%Y-%m-%d")
 
     if winner is not None:
@@ -1150,6 +1369,9 @@ def run_walkforward_from_lake(
         }
 
     if persist:
+        if pit_active and hourly_regime_map:
+            lake.upsert_regime_snapshots_batch(list(hourly_regime_map.values()))
+        lake.upsert_regime_snapshot(cutoff_snap)
         lake.save_backtest_bundle(run_row, cell_rows, sim_trade_rows, selection_row=selection_row)
 
     return {
@@ -1159,4 +1381,6 @@ def run_walkforward_from_lake(
         "sim_trades": sim_trade_rows,
         "winner": winner,
         "selection": selection_row,
+        "pit_active": pit_active,
+        "hourly_regime_count": len(hourly_regime_map) if pit_active else 0,
     }

@@ -253,9 +253,17 @@ def run_lake_screening_for_bot(
     selection = wf_res["selection"]
     cells = wf_res["cells"]
     run_rec = wf_res["run"]
+    cur_regime = wf_res.get("regime_info") or override_regime_info or {}
+    cur_allowed = {str(s) for s in cur_regime.get("allowed_strategies", [])}
+    raw_excl = cur_regime.get("excluded_symbols") or {}
+    cur_excluded = {
+        normalize_symbol(str(s))
+        for s in (raw_excl.keys() if isinstance(raw_excl, dict) else raw_excl)
+    }
 
+    live_cells = [c for c in cells if str(c["strategy"]) in cur_allowed]
     by_sym: Dict[str, List[Dict[str, Any]]] = {}
-    for c in cells:
+    for c in live_cells:
         by_sym.setdefault(normalize_symbol(c["symbol"]), []).append(c)
 
     mega_cap_set = {normalize_symbol(s) for s in excluded_mega_caps}
@@ -267,7 +275,7 @@ def run_lake_screening_for_bot(
         p_dict = build_symbol_params_from_cells(sym_cells, selection, override_regime_info)
         symbol_params_map[sym] = p_dict
         best_cell_by_sym[sym] = max(sym_cells, key=_cell_sort_key)
-        if p_dict.get("is_qualified") and sym not in mega_cap_set:
+        if p_dict.get("is_qualified") and sym not in mega_cap_set and sym not in cur_excluded:
             qualified_syms.append(sym)
 
     qualified_syms.sort(key=lambda s: _cell_sort_key(best_cell_by_sym[s]), reverse=True)
@@ -281,9 +289,10 @@ def run_lake_screening_for_bot(
     else:
         default_best_params = None
 
-    # 上位5件 (参考出力)
+    # 上位5件 (参考出力: 現時点許可戦略のセル優先、なければ全評価セル)
+    top5_pool = live_cells if live_cells else cells
     top5 = sorted(
-        [c for c in cells if c["eval_trades"] > 0],
+        [c for c in top5_pool if c["eval_trades"] > 0],
         key=_cell_sort_key,
         reverse=True,
     )[:5]

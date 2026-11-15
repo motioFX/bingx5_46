@@ -129,7 +129,7 @@ flowchart TD
   4. `regime_snapshots`: 基準時刻ごとの3段階地合い・クジラ・前半高安監査結果
   5. `backtest_runs`: 実行ID、`data_cutoff_utc`、`opt_start/end`、`eval_start/end`、手数料設定、Gitコミット識別子
   6. `backtest_cells`: 銘柄×戦略×方向×時間軸×パラメータごとの最適化窓・評価窓成績、格付け（`QUALIFIED` / `PROVISIONAL` / `INSUFFICIENT_N` / `REJECTED_EV`）、伸び切りバケット別統計（`eval_ext_stats_json`）
-  7. `backtest_simulated_trades`: 全擬似約定・未約定キャンセル・エントリー/決済手数料・伸び切り指標（`ext_pct`, `ext_atr`, `va_upper/lower`, `range_high/low`）の1件単位明細
+  7. `backtest_simulated_trades`: 全擬似約定・未約定キャンセル・エントリー/決済手数料・伸び切り指標（`ext_pct`, `ext_atr`, `va_upper/lower`, `range_high/low`）およびシグナル時点地合い（`regime_at_signal`, `strength_tier_at_signal`, `net_score_at_signal`, `buy_votes_at_signal`, `sell_votes_at_signal`）の1件単位明細
   8. `daily_selections`: 選定結果（最上位勝者1件、または基準未達時 `NO_CANDIDATE`）および実行ステータス（`SELECTED` / `NO_CANDIDATE` / `EXECUTED` / `BLOCKED_RISK`）
   9. `live_trades`: VSTデモ実トレード約定・決済結果（`selection_id` で選定根拠と紐づけて自動書き戻し）
 
@@ -137,6 +137,11 @@ flowchart TD
 * **アウトオブサンプル (OOS) 厳格分離（インサンプル選定の禁止）**:
   * すべてのバックテスト選定は **Stage 1: 最適化窓（`[opt_start_utc, opt_end_utc)`）** と **Stage 2: 評価窓（`[eval_start_utc, eval_end_utc]`、`opt_end_utc <= eval_start_utc`）** に分離する。
   * パラメータ探索は最適化窓のみで行い、候補パラメータを凍結した上で境界ポジションを完全パージ・リセットし、評価窓へ1回のみ適用する。**勝者の判定は評価窓の手数料後成績のみ** で行う。
+* **時点地合い（1時間周期）因果再計算 ＆ 全6戦略セル採点**:
+  * 評価期間および最適化期間の各正時（1時間周期 `3600s`、当該時刻時点で確定済みの `1h` 足 `ts_utc + 3600 <= t_hr` のみ参照）において、SSoT 関数 `evaluate_market_regime_3window`（21アルト各1票＋BTC 2票＝計23票構成）により `overall_regime`・`strength_tier`・`allowed_strategies` を因果的に再計算する。
+  * セル評価（`backtest_cells`）は全21アルト銘柄 × 全6戦略（LONG 3戦略: `val_poc`, `vah_break`, `rsima` ／ SHORT 3戦略: `vah_poc`, `val_break`, `rsima_short`）を対象とし、各シグナル発生時刻 `sig_close_utc` の直近確定1時間地合い（`t_hr = (sig_close_utc // 3600) * 3600`）の `allowed_strategies` に当該戦略が含まれる場合のみエントリーを許可する（`BALANCED` 中立時は `allowed_strategies = []` により全停止）。
+  * 再計算した1時間ごとの地合い系列（`regime` / `strength_tier` / 14d・7d・2d票数内訳）を `regime_snapshots` テーブルへ一括保存し、全シミュレーション取引（`backtest_simulated_trades`）にもシグナル時点の `regime_at_signal`・`strength_tier_at_signal`・`net_score_at_signal`・`buy_votes_at_signal`・`sell_votes_at_signal` を記録して監査可能とする。
+  * 実売買候補の勝者選定（`select_eval_winner` / `lake_live_bridge.py`）では、OOS評価済み全6戦略セルの中から **実行時点（`cutoff`）の `allowed_strategies`（および逆風クジラ除外銘柄フィルタ）に合致するセル** を選出する。
 * **手数料 ＆ Maker指値追随シミュレーション基準**:
   * 全擬似約定に **往復 `0.08%`（エントリー Maker `0.02%` ＋ エグジット Taker `0.06%`）** を厳密算入し、`entry_fee_usdt`・`exit_fee_usdt`・`net_pnl` を個別に記録する。
   * 実ボット（`bingx5_46_2api.py`）に合わせ、シグナル確定後の次5m足から最良気配相当（Long: `close * 0.9998`, Short: `close * 1.0002`）で指値追随し、実際に5m足高安へ到達した場合のみ約定、シグナル終了時は `CANCEL_SIGNAL_END` として即時キャンセルする（安易な無条件成行約定を禁止）。約定足の決済判定は保守的に損切り・防衛SLを利確より先行評価する。

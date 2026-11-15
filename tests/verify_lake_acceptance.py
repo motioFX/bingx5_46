@@ -37,6 +37,8 @@ from bingx5_46_3logic import (
     check_market_regime_safe,
     check_vah_break_signals,
     check_val_break_signals,
+    evaluate_market_regime_3window,
+    evaluate_market_regime_3window_from_close_arrays,
 )
 from lake_backtest_engine import (
     WalkForwardConfig,
@@ -46,6 +48,7 @@ from lake_backtest_engine import (
 )
 from lake_live_bridge import record_live_entry_to_lake, record_live_exit_to_lake
 from lake_store import DEFAULT_LAKE_DB_PATH, TIMEFRAME_SECONDS, LakeStore, sec_to_iso
+from symbol_universe import FIXED_TRADABLE_SYMBOLS, LAKE_UNIVERSE_SYMBOLS
 
 
 def _populate_synthetic_lake(db_path: Path) -> dict:
@@ -563,6 +566,157 @@ class TestDataLakeAcceptance(unittest.TestCase):
             is_fill_bar=True,
         )
         self.assertEqual(sig_long["action"], "HOLD", f"約定当足で予期せぬロング決済判定が発生: {sig_long}")
+
+    def test_h_point_in_time_regime_recalculation(self):
+        """(h) 時点地合い再計算により上昇期ロング・下落期ショートが混在し、約定履歴に時点地合いが記録・再現されること。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "lake_pit.db"
+            lake = LakeStore(db_path=db_path)
+
+            cutoff_utc = int(datetime(2026, 10, 15, 0, 0, tzinfo=timezone.utc).timestamp())
+            total_days = 85  # warmup 20d + opt 25d + eval 40d
+            start_utc = cutoff_utc - (total_days * 86400)
+            n_1h = total_days * 24
+            ts_1h = start_utc + np.arange(n_1h, dtype=np.int64) * 3600
+            day_off_1h = (ts_1h - cutoff_utc) / 86400.0
+
+            def _piecewise_trend(d_arr: np.ndarray) -> np.ndarray:
+                base = np.empty_like(d_arr, dtype=np.float64)
+                m1 = d_arr < -50.0
+                m2 = (d_arr >= -50.0) & (d_arr < -19.0)
+                m3 = d_arr >= -19.0
+                base[m1] = 1.40 - 0.014 * (d_arr[m1] + 85.0)
+                low_50 = 1.40 - 0.014 * (-50.0 + 85.0)
+                base[m2] = low_50 + 0.025 * (d_arr[m2] + 50.0)
+                high_19 = low_50 + 0.025 * (-19.0 + 50.0)
+                base[m3] = high_19 - 0.025 * (d_arr[m3] + 19.0)
+                return np.maximum(0.2, base)
+
+            trend_1h = _piecewise_trend(day_off_1h)
+            bg_symbols = ["BTC-USDT"] + [s for s in FIXED_TRADABLE_SYMBOLS[:15] if s not in ("HYPE-USDT", "SOL-USDT")]
+            for s_idx, sym in enumerate(bg_symbols):
+                mult = 70000.0 if sym == "BTC-USDT" else (10.0 + s_idx)
+                c_1h = mult * trend_1h
+                df_1h = pd.DataFrame({
+                    "ts_utc": ts_1h,
+                    "open": c_1h,
+                    "high": c_1h * 1.002,
+                    "low": c_1h * 0.998,
+                    "close": c_1h,
+                    "volume": np.full(n_1h, 1000.0),
+                    "quote_volume": c_1h * 1000.0,
+                })
+                lake.upsert_candles(sym, "1h", df_1h, source="synthetic_pit", cutoff_utc=cutoff_utc)
+
+            n_5m = total_days * 288
+            ts_5m = start_utc + np.arange(n_5m, dtype=np.int64) * 300
+            day_off_5m = (ts_5m - cutoff_utc) / 86400.0
+            trend_5m = _piecewise_trend(day_off_5m)
+            t_phase = np.arange(n_5m, dtype=np.float64)
+            rng = np.random.default_rng(7)
+            for s_idx, sym in enumerate(("HYPE-USDT", "SOL-USDT")):
+                base_px = 25.0 if sym == "HYPE-USDT" else 100.0
+                wave = np.sin(t_phase * (2.0 * np.pi / 48.0) + s_idx) * 0.015
+                noise = rng.normal(0.0, 0.0008, size=n_5m)
+                c_5m = np.maximum(0.1, base_px * (trend_5m + wave + noise))
+                o_5m = np.roll(c_5m, 1)
+                o_5m[0] = c_5m[0]
+                spread = np.full(n_5m, base_px * 0.004)
+                h_5m = np.maximum(o_5m, c_5m) + spread
+                l_5m = np.minimum(o_5m, c_5m) - spread
+                vol_5m = np.full(n_5m, 1500.0)
+                df_5m = pd.DataFrame({
+                    "ts_utc": ts_5m,
+                    "open": o_5m,
+                    "high": h_5m,
+                    "low": l_5m,
+                    "close": c_5m,
+                    "volume": vol_5m,
+                    "quote_volume": c_5m * vol_5m,
+                })
+                lake.upsert_candles(sym, "5m", df_5m, source="synthetic_pit", cutoff_utc=cutoff_utc)
+                lake.rebuild_higher_timeframes_from_5m(sym, timeframes=("15m", "1h"), cutoff_utc=cutoff_utc)
+
+            cfg = WalkForwardConfig(
+                opt_days=25,
+                eval_days=40,
+                timeframes=("15m",),
+                enforce_vol_surge=False,
+                enforce_oi_fr=False,
+                enforce_session_mask=False,
+                min_eval_trades_provisional=3,
+                gil_yield_sec=0.0,
+            )
+            res = run_walkforward_from_lake(
+                lake=lake,
+                data_cutoff_utc=cutoff_utc,
+                cfg=cfg,
+                symbols=["HYPE-USDT", "SOL-USDT"],
+                persist=True,
+            )
+            self.assertTrue(res["pit_active"], "16銘柄存在するため時点地合い再計算が有効化されるべきです")
+            self.assertEqual(res["run"]["regime"], "SELL", "cutoff時点は下落フェーズのためSELLのはずです")
+
+            filled = [t for t in res["sim_trades"] if t.get("fill_ts_utc") is not None]
+            long_trades = [t for t in filled if t["side"] == "long"]
+            short_trades = [t for t in filled if t["side"] == "short"]
+            self.assertGreater(len(long_trades), 0, "上昇フェーズでロング取引が発生していません")
+            self.assertGreater(len(short_trades), 0, "下落フェーズでショート取引が発生していません")
+
+            tier_allowed_map = {
+                "ULTRA_BUY": {"vah_break", "val_poc", "rsima"},
+                "STRONG_BUY": {"vah_break", "val_poc", "rsima"},
+                "MODERATE_BUY": {"val_poc", "rsima", "val_break"},
+                "WEAK_BUY": {"val_poc", "rsima", "val_break"},
+                "LEAN_BUY": {"val_poc", "rsima", "val_break"},
+                "ULTRA_SELL": {"val_break", "vah_poc", "rsima_short"},
+                "STRONG_SELL": {"val_break", "vah_poc", "rsima_short"},
+                "MODERATE_SELL": {"vah_poc", "rsima_short", "vah_break"},
+                "WEAK_SELL": {"vah_poc", "rsima_short", "vah_break"},
+                "LEAN_SELL": {"vah_poc", "rsima_short", "vah_break"},
+            }
+            for tr in filled:
+                tier = str(tr["strength_tier_at_signal"])
+                self.assertIn(tier, tier_allowed_map, f"予期せぬTier: {tier}")
+                self.assertIn(tr["strategy"], tier_allowed_map[tier], f"{tier} で非許可戦略 {tr['strategy']} が発火")
+                if tier in ("ULTRA_BUY", "STRONG_BUY"):
+                    self.assertEqual(tr["side"], "long")
+                elif tier in ("ULTRA_SELL", "STRONG_SELL"):
+                    self.assertEqual(tr["side"], "short")
+
+            strong_longs = [t for t in long_trades if t["strength_tier_at_signal"] in ("ULTRA_BUY", "STRONG_BUY")]
+            strong_shorts = [t for t in short_trades if t["strength_tier_at_signal"] in ("ULTRA_SELL", "STRONG_SELL")]
+            self.assertGreater(len(strong_longs), 0, "STRONG/ULTRA_BUY 期間のロング取引が存在しません")
+            self.assertGreater(len(strong_shorts), 0, "STRONG/ULTRA_SELL 期間のショート取引が存在しません")
+
+            # DataFrame版 vs NumPy配列版の SSoT ビット完全一致検証 (複数時点サンプリング)
+            for sample_days_ago in (30, 22, 12, 5, 1):
+                sample_cut = cutoff_utc - sample_days_ago * 86400
+                dfs_sample = {}
+                arrs_sample = {}
+                for sym_s in LAKE_UNIVERSE_SYMBOLS:
+                    d_1h = lake.load_candles(sym_s, "1h", cutoff_utc=sample_cut, start_utc=sample_cut - 20 * 86400)
+                    if not d_1h.empty and len(d_1h) >= 24:
+                        dfs_sample[sym_s] = d_1h[["close"]].astype(float)
+                        arrs_sample[sym_s] = d_1h["close"].to_numpy(dtype=np.float64)
+                r_df = evaluate_market_regime_3window(dfs_sample)
+                r_np = evaluate_market_regime_3window_from_close_arrays(arrs_sample)
+                self.assertEqual(r_df["overall_regime"], r_np["overall_regime"])
+                self.assertEqual(r_df["regime_pattern"], r_np["regime_pattern"])
+                self.assertEqual(r_df["allowed_strategies"], r_np["allowed_strategies"])
+                self.assertEqual(r_df["regime_strength"]["tier"], r_np["regime_strength"]["tier"])
+                self.assertAlmostEqual(r_df["regime_strength"]["net_score"], r_np["regime_strength"]["net_score"], places=6)
+
+            with lake._conn(write=False) as conn:
+                reg_rows = conn.execute(
+                    "SELECT overall_regime, COUNT(*) AS cnt FROM regime_snapshots GROUP BY overall_regime"
+                ).fetchall()
+                reg_counts = {str(r["overall_regime"]): int(r["cnt"]) for r in reg_rows}
+            self.assertGreater(reg_counts.get("BUY", 0), 0, "regime_snapshots に BUY 時点が保存されていません")
+            self.assertGreater(reg_counts.get("SELL", 0), 0, "regime_snapshots に SELL 時点が保存されていません")
+
+            repro = lake_reproduce.reproduce_run(res["run"]["run_id"], db_path=db_path)
+            self.assertTrue(repro["matched"], f"PITラン再現不一致: {repro['mismatches']}")
 
 
 if __name__ == "__main__":

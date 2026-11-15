@@ -232,7 +232,12 @@ CREATE TABLE IF NOT EXISTS backtest_simulated_trades (
     va_upper REAL,
     va_lower REAL,
     range_high REAL,
-    range_low REAL
+    range_low REAL,
+    regime_at_signal TEXT,
+    strength_tier_at_signal TEXT,
+    net_score_at_signal REAL,
+    buy_votes_at_signal REAL,
+    sell_votes_at_signal REAL
 );
 CREATE INDEX IF NOT EXISTS idx_simtrades_cell ON backtest_simulated_trades(cell_id);
 CREATE INDEX IF NOT EXISTS idx_simtrades_run ON backtest_simulated_trades(run_id);
@@ -319,6 +324,17 @@ class LakeStore:
     def init_schema(self) -> None:
         with self._conn(write=True) as conn:
             conn.executescript(_SCHEMA_SQL)
+            cols = {str(r[1]) for r in conn.execute("PRAGMA table_info(backtest_simulated_trades)").fetchall()}
+            migrations = (
+                ("regime_at_signal", "TEXT"),
+                ("strength_tier_at_signal", "TEXT"),
+                ("net_score_at_signal", "REAL"),
+                ("buy_votes_at_signal", "REAL"),
+                ("sell_votes_at_signal", "REAL"),
+            )
+            for col_name, col_type in migrations:
+                if col_name not in cols:
+                    conn.execute(f"ALTER TABLE backtest_simulated_trades ADD COLUMN {col_name} {col_type}")
         self.sync_universe_symbols()
 
     def sync_universe_symbols(self) -> None:
@@ -774,10 +790,11 @@ class LakeStore:
     # Regime Snapshots, Backtest Runs / Cells / SimTrades / Selections / Live Trades
     # ------------------------------------------------------------------
 
-    def upsert_regime_snapshot(self, record: Dict[str, Any]) -> None:
+    @staticmethod
+    def _regime_row_tuple(record: Dict[str, Any]) -> Tuple[Any, ...]:
         cutoff_utc = int(record["cutoff_utc"])
         cutoff_iso = str(record.get("cutoff_iso") or sec_to_iso(cutoff_utc))
-        row = (
+        return (
             cutoff_utc,
             cutoff_iso,
             str(record["overall_regime"]),
@@ -791,8 +808,17 @@ class LakeStore:
             json.dumps(record.get("excluded_symbols", {}), ensure_ascii=False),
             json.dumps(record.get("whale_snapshot", {}), ensure_ascii=False),
         )
+
+    def upsert_regime_snapshot(self, record: Dict[str, Any]) -> None:
+        self.upsert_regime_snapshots_batch([record])
+
+    def upsert_regime_snapshots_batch(self, records: Sequence[Dict[str, Any]]) -> int:
+        """複数時点（1時間周期等）の地合いスナップショットを単一トランザクションで一括保存する。"""
+        if not records:
+            return 0
+        rows = [self._regime_row_tuple(r) for r in records]
         with self._conn(write=True) as conn:
-            conn.execute(
+            conn.executemany(
                 """
                 INSERT INTO regime_snapshots (
                     cutoff_utc, cutoff_iso, overall_regime, regime_pattern, strength_tier,
@@ -814,8 +840,9 @@ class LakeStore:
                     excluded_symbols_json=excluded.excluded_symbols_json,
                     whale_snapshot_json=excluded.whale_snapshot_json
                 """,
-                row,
+                rows,
             )
+        return len(rows)
 
     def save_backtest_bundle(
         self,
@@ -942,9 +969,11 @@ class LakeStore:
                         fill_ts_utc, fill_px, cancel_ts_utc, cancel_reason,
                         exit_ts_utc, exit_px, exit_reason,
                         qty, pos_cost_usdt, gross_pnl, entry_fee_usdt, exit_fee_usdt, net_pnl,
-                        ext_pct, ext_atr, va_upper, va_lower, range_high, range_low
+                        ext_pct, ext_atr, va_upper, va_lower, range_high, range_low,
+                        regime_at_signal, strength_tier_at_signal, net_score_at_signal,
+                        buy_votes_at_signal, sell_votes_at_signal
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(sim_trade_id) DO NOTHING
                     """,
                     [
@@ -979,6 +1008,11 @@ class LakeStore:
                             t.get("va_lower"),
                             t.get("range_high"),
                             t.get("range_low"),
+                            t.get("regime_at_signal"),
+                            t.get("strength_tier_at_signal"),
+                            t.get("net_score_at_signal"),
+                            t.get("buy_votes_at_signal"),
+                            t.get("sell_votes_at_signal"),
                         )
                         for t in sim_trade_rows
                     ],
@@ -1122,6 +1156,7 @@ class LakeStore:
             "regime_snapshots",
             "backtest_runs",
             "backtest_cells",
+            "backtest_simulated_trades",
             "daily_selections",
             "live_trades",
         ]

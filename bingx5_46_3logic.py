@@ -7069,7 +7069,44 @@ def evaluate_market_regime_3window(
     )
     is_30d_bottom_reversal = is_14d_bottom_reversal
 
-    # 総合地合い判定 (14d/7d/2d 多数決 ＆ 全てBULL/全てBEAR過熱禁止規約)
+    return _finalize_regime_result(
+        period_results=period_results,
+        eligible_buy_by_window=eligible_buy_by_window,
+        eligible_sell_by_window=eligible_sell_by_window,
+        is_30d_peak_breakdown=is_30d_peak_breakdown,
+        is_30d_bottom_reversal=is_30d_bottom_reversal,
+    )
+
+
+_FIXED_TARGET_SYMBOLS = [
+    "HYPE-USDT", "SOL-USDT", "DOGE-USDT", "XRP-USDT", "SUI-USDT",
+    "AVAX-USDT", "LINK-USDT", "APT-USDT", "NEAR-USDT", "ARB-USDT",
+    "UNI-USDT", "OP-USDT", "TIA-USDT", "RENDER-USDT", "INJ-USDT",
+    "TAO-USDT", "AAVE-USDT", "ENA-USDT", "ZEC-USDT", "1000PEPE-USDT", "WIF-USDT",
+]
+_FIXED_TARGET_SET = set(_FIXED_TARGET_SYMBOLS)
+_FIXED_CLEAN_MAP = {s.upper().replace("-USDT", "").replace("USDT", ""): s for s in _FIXED_TARGET_SYMBOLS}
+
+
+def _filter_fixed_regime_symbols(c_set) -> list:
+    matched = []
+    for s in c_set:
+        clean = s.upper().replace("-USDT", "").replace("USDT", "")
+        if clean in _FIXED_CLEAN_MAP and clean != "BTC":
+            matched.append(_FIXED_CLEAN_MAP[clean])
+        elif s in _FIXED_TARGET_SET and "BTC" not in s.upper():
+            matched.append(s)
+    return sorted(list(set(matched)))
+
+
+def _finalize_regime_result(
+    period_results: dict,
+    eligible_buy_by_window: dict,
+    eligible_sell_by_window: dict,
+    is_30d_peak_breakdown: bool = False,
+    is_30d_bottom_reversal: bool = False,
+) -> dict:
+    """14d/7d/2d の集計結果から 3態勢・強度Tier・許可戦略・推奨銘柄を決定する共通 SSoT 分類器。"""
     states = [period_results[w]["state"] for w in ["14d", "7d", "2d"]]
     recommended_symbols = []
     regime_reason = ""
@@ -7079,7 +7116,6 @@ def evaluate_market_regime_3window(
     buy_count = states.count("BUY")
     sell_count = states.count("SELL")
 
-    # ===== 地合い強度 (Strength Tier & net_score) 事前算出 =====
     b_14d = period_results.get("14d", {}).get("buy_votes", 0)
     sl_14d = period_results.get("14d", {}).get("sell_votes", 0)
     b_7d = period_results.get("7d", {}).get("buy_votes", 0)
@@ -7089,30 +7125,9 @@ def evaluate_market_regime_3window(
 
     mean_b = (b_14d + b_7d + b_2d) / 3.0
     mean_sl = (sl_14d + sl_7d + sl_2d) / 3.0
-    net_score = (mean_b - mean_sl) / 22.0  # -1.0 〜 +1.0
+    net_score = (mean_b - mean_sl) / 22.0
     score_pct_str = f"{net_score * 100:+.1f}%"
 
-    # 実運用 FIXED_SYMBOLS (主要アルト21銘柄 / 銘柄ユニバース厳格固定)
-    FIXED_TARGET_SYMBOLS = [
-        "HYPE-USDT", "SOL-USDT", "DOGE-USDT", "XRP-USDT", "SUI-USDT",
-        "AVAX-USDT", "LINK-USDT", "APT-USDT", "NEAR-USDT", "ARB-USDT",
-        "UNI-USDT", "OP-USDT", "TIA-USDT", "RENDER-USDT", "INJ-USDT",
-        "TAO-USDT", "AAVE-USDT", "ENA-USDT", "ZEC-USDT", "1000PEPE-USDT", "WIF-USDT"
-    ]
-    fixed_set = set(FIXED_TARGET_SYMBOLS)
-    fixed_clean_map = {s.upper().replace("-USDT", "").replace("USDT", ""): s for s in FIXED_TARGET_SYMBOLS}
-
-    def _filter_fixed(c_set):
-        matched = []
-        for s in c_set:
-            clean = s.upper().replace("-USDT", "").replace("USDT", "")
-            if clean in fixed_clean_map and clean != "BTC":
-                matched.append(fixed_clean_map[clean])
-            elif s in fixed_set and "BTC" not in s.upper():
-                matched.append(s)
-        return sorted(list(set(matched)))
-
-    # 1. 全てBULLで揃った場合 (BBB) ➔ 最高強度トレンド徹底攻勢 (ULTRA_BUY: 買いブレイクあり ＋ 押し目買いあり)
     if buy_count == 3:
         overall_regime = "BUY"
         strength_tier = "ULTRA_BUY"
@@ -7122,9 +7137,7 @@ def evaluate_market_regime_3window(
         cands = eligible_buy_by_window.get("2d", set()).union(eligible_buy_by_window.get("7d", set()))
         if not cands:
             cands = eligible_buy_by_window.get("14d", set())
-        recommended_symbols = _filter_fixed(cands)
-
-    # 2. 全てBEARで揃った場合 (SSS) ➔ 最高強度トレンド徹底攻勢 (ULTRA_SELL: 売りブレイクあり ＋ 戻り売りあり)
+        recommended_symbols = _filter_fixed_regime_symbols(cands)
     elif sell_count == 3:
         overall_regime = "SELL"
         strength_tier = "ULTRA_SELL"
@@ -7134,9 +7147,7 @@ def evaluate_market_regime_3window(
         cands = eligible_sell_by_window.get("2d", set()).union(eligible_sell_by_window.get("7d", set()))
         if not cands:
             cands = eligible_sell_by_window.get("14d", set())
-        recommended_symbols = _filter_fixed(cands)
-
-    # 3. 買い優勢 (BUY数 > SELL数の多数決 / NEUTRAL含む)
+        recommended_symbols = _filter_fixed_regime_symbols(cands)
     elif buy_count > sell_count:
         overall_regime = "BUY"
         if mean_b >= 16.0:
@@ -7154,16 +7165,13 @@ def evaluate_market_regime_3window(
             else:
                 strength_tier = "WEAK_BUY"
                 strength_tier_jp = "弱気買い"
-            # 💡【弱い買い】買いブレイクアウトなし(天井警戒) ＋ レンジ押し目買いあり ＋ 売りブレイクダウンあり(反落初動)
             regime_reason = f"買い優勢({strength_tier_jp}) {regime_pattern} ➔ 押し目買い＆反落売りブレイク(買いブレイク停止)"
             allowed_strategies = ["val_poc", "rsima", "val_break"]
             cands = eligible_buy_by_window.get("2d", set()).union(eligible_buy_by_window.get("7d", set()))
             cands = cands.union(eligible_sell_by_window.get("2d", set()))
             if not cands:
                 cands = eligible_buy_by_window.get("14d", set())
-        recommended_symbols = _filter_fixed(cands)
-
-    # 4. 売り優勢 (SELL数 > BUY数の多数決 / NEUTRAL含む)
+        recommended_symbols = _filter_fixed_regime_symbols(cands)
     elif sell_count > buy_count:
         overall_regime = "SELL"
         if mean_sl >= 16.0:
@@ -7181,16 +7189,13 @@ def evaluate_market_regime_3window(
             else:
                 strength_tier = "WEAK_SELL"
                 strength_tier_jp = "弱気売り"
-            # 💡【弱い売り】売りブレイクアウトなし(安値警戒) ＋ レンジ戻り売りあり ＋ 買いブレイクアウトあり(反発初動)
             regime_reason = f"売り優勢({strength_tier_jp}) {regime_pattern} ➔ 戻り売り＆反発買いブレイク(売りブレイク停止)"
             allowed_strategies = ["vah_poc", "rsima_short", "vah_break"]
             cands = eligible_sell_by_window.get("2d", set()).union(eligible_sell_by_window.get("7d", set()))
             cands = cands.union(eligible_buy_by_window.get("2d", set()))
             if not cands:
                 cands = eligible_sell_by_window.get("14d", set())
-        recommended_symbols = _filter_fixed(cands)
-
-    # 5. 拮抗中立 (buy_count == sell_count)
+        recommended_symbols = _filter_fixed_regime_symbols(cands)
     else:
         overall_regime = "NEUTRAL"
         if net_score >= 0.15:
@@ -7199,14 +7204,14 @@ def evaluate_market_regime_3window(
             regime_reason = f"買い寄り中立 {regime_pattern} ➔ 押し目買い＆反落売りブレイク(買いブレイク停止)"
             allowed_strategies = ["val_poc", "rsima", "val_break"]
             cands = eligible_buy_by_window.get("2d", set()).union(eligible_sell_by_window.get("2d", set()))
-            recommended_symbols = _filter_fixed(cands)
+            recommended_symbols = _filter_fixed_regime_symbols(cands)
         elif net_score <= -0.15:
             strength_tier = "LEAN_SELL"
             strength_tier_jp = "売り寄り中立"
             regime_reason = f"売り寄り中立 {regime_pattern} ➔ 戻り売り＆反発買いブレイク(売りブレイク停止)"
             allowed_strategies = ["vah_poc", "rsima_short", "vah_break"]
             cands = eligible_sell_by_window.get("2d", set()).union(eligible_buy_by_window.get("2d", set()))
-            recommended_symbols = _filter_fixed(cands)
+            recommended_symbols = _filter_fixed_regime_symbols(cands)
         else:
             strength_tier = "BALANCED"
             strength_tier_jp = "拮抗中立"
@@ -7238,8 +7243,90 @@ def evaluate_market_regime_3window(
         "is_30d_bottom_reversal": is_30d_bottom_reversal,
         "period_results": period_results,
         "recommended_symbols": recommended_symbols,
-        "timestamp": datetime.now(timezone.utc).isoformat()
+        "timestamp": datetime.now(timezone.utc).isoformat(),
     }
+
+
+def evaluate_market_regime_3window_from_close_arrays(symbol_close_arrays: Dict[str, np.ndarray]) -> dict:
+    """
+    `evaluate_market_regime_3window` と数式・条件・閾値・丸めが完全同一の NumPy 高速配列版。
+    各銘柄の 1h 終値 1次元 ndarray の辞書を受け取り、pandas オーバーヘッドなしで地合いを算出する。
+    """
+    windows = (
+        ("14d", 14 * 24),
+        ("7d", 7 * 24),
+        ("2d", 2 * 24),
+    )
+
+    unique_arrays = {}
+    for k_sym, k_arr in symbol_close_arrays.items():
+        k_ticker = k_sym.upper().replace("-USDT", "").replace("USDT", "")
+        if k_ticker not in unique_arrays:
+            votes = 2 if k_ticker == "BTC" else 1
+            unique_arrays[k_ticker] = (k_sym, k_arr, votes)
+
+    period_results = {}
+    eligible_buy_by_window = {}
+    eligible_sell_by_window = {}
+
+    for w_name, w_hours in windows:
+        buy_votes = 0
+        sell_votes = 0
+        buy_passed = set()
+        sell_passed = set()
+        total_votes = 0
+
+        for _ticker, (sym, arr, votes) in unique_arrays.items():
+            if arr is None or len(arr) < 24:
+                continue
+            sub_c = arr[-w_hours:] if len(arr) > w_hours else arr
+            n_sub = len(sub_c)
+            if n_sub < 24:
+                continue
+
+            base_c = float(sub_c[0])
+            if base_c <= 0.0:
+                continue
+            final_norm = float(sub_c[-1]) / base_c
+            c_min = float(sub_c.min()) / base_c
+            c_max = float(sub_c.max()) / base_c
+            half_level = c_min + (c_max - c_min) * 0.5
+
+            peak_ratio = int(sub_c.argmax()) / n_sub
+            trough_ratio = int(sub_c.argmin()) / n_sub
+            total_votes += votes
+
+            if final_norm >= 1.0:
+                if peak_ratio >= 0.50 or final_norm >= half_level:
+                    buy_votes += votes
+                    buy_passed.add(sym)
+            else:
+                if trough_ratio >= 0.50 or final_norm <= half_level:
+                    sell_votes += votes
+                    sell_passed.add(sym)
+
+        state = "NEUTRAL"
+        if buy_votes >= 11:
+            state = "BUY"
+        elif sell_votes >= 11:
+            state = "SELL"
+
+        period_results[w_name] = {
+            "state": state,
+            "buy_votes": buy_votes,
+            "sell_votes": sell_votes,
+            "total_votes": total_votes,
+            "buy_passed": list(buy_passed),
+            "sell_passed": list(sell_passed),
+        }
+        eligible_buy_by_window[w_name] = buy_passed
+        eligible_sell_by_window[w_name] = sell_passed
+
+    return _finalize_regime_result(
+        period_results=period_results,
+        eligible_buy_by_window=eligible_buy_by_window,
+        eligible_sell_by_window=eligible_sell_by_window,
+    )
 
 
 def check_market_regime_safe(
