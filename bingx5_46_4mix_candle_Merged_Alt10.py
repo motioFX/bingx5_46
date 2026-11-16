@@ -4,9 +4,9 @@ bingx5_46_4mix_candle_Merged_Alt10.py
 BingX USDT無期限先物 20銘柄 + BTC ノーマライズ比較 ＆ 3段階全体地合い判定スクリプト (PROJECT_RULES.md 準拠)
 
 - 5分足 SSoT ストア (candle_5m_store) より高速に 1H足 / 日足 を動的生成
-- 30d, 10d, 5d ノーマライズ比較チャート（先月高安 PMH/PML 点線入り）を出力・Discord送信
+- 14d, 7d, 2d ノーマライズ比較チャート（先月高安 PMH/PML 点線入り）を出力・Discord送信
 - 前半高値ピークアウト監査・レンジ半値維持補完ルールによる崩壊銘柄除外
-- 3段階全体地合い判定（BTC 2票 / 計22票制、11票以上過半数）により BULL / NEUTRAL / BEAR を算出
+- 3段階全体地合い判定（BTC 2票 / 計23票制、12票以上過半数）により BULL / NEUTRAL / BEAR を算出
 - 結果を Data/market_state.json に永続化
 """
 
@@ -147,7 +147,8 @@ def generate_normalized_charts(
     hours_limit: int,
     excluded_symbols: Optional[Set[str]] = None,
 ) -> Tuple[Optional[Path], float, str, float]:
-    """指定期間 (30d / 10d / 5d) の指定全20銘柄の正規化比較チャートを作成し、地合いを判定"""
+    """指定期間 (14d / 7d / 2d) の指定全20銘柄の正規化比較チャートを作成し、地合いを判定"""
+    plt.rcParams["text.parse_math"] = False
     if not all_dfs:
         return None, 1.0, "NEUTRAL", 0.5
 
@@ -312,7 +313,7 @@ async def main() -> None:
 
     log(f"[SSoT Evaluation] 全 {len(all_dfs)} 銘柄の地合いデータをメモリ上で準備完了 (不要なCSV生成・ディスク保存完全廃止)")
 
-    # 3. 3段階全体地合い判定 (30d / 10d / 5d 22票制) を先行判定
+    # 3. 3段階全体地合い判定 (14d / 7d / 2d 23票制) を先行判定
     regime_eval_res = evaluate_market_regime_3window(symbol_1h_dict)
     overall_reg = regime_eval_res.get("overall_regime", "NEUTRAL")
     period_res = regime_eval_res.get("period_results", {})

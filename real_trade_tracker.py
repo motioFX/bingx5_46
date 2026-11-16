@@ -28,6 +28,7 @@ def _configure_japanese_font():
             plt.rcParams['font.family'] = _font_name
             break
     plt.rcParams['axes.unicode_minus'] = False
+    plt.rcParams['text.parse_math'] = False
 
 _configure_japanese_font()
 

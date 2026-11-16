@@ -37,10 +37,9 @@ flowchart TD
         PA_8 --> PB_Loop["メイン常駐ループ (15秒インターバル)"]
 
         subgraph PhaseB1 ["毎時タスク (正時 00分05秒 JST)"]
-            PB_Loop --> PB1_1["クジラセンチメント更新 (fetch_whale_sentiment.py)"]
-            PB1_1 --> PB1_2["BingX 全対象銘柄建玉 (OI) ＆ FR スナップショット自動蓄積"]
+            PB_Loop --> PB1_2["BingX 全対象銘柄建玉 (OI) ＆ FR スナップショット自動蓄積"]
             PB1_2 --> PB1_3["BTC-USDT 単独地合い監視足 (1H) & 21銘柄日足・先月高安(PMH/PML)キャッシュ更新"]
-            PB1_3 --> PB1_4["毎時ステータスサマリーテーブル送信 (VST/USDT残高・ポジション・クジラ / ティッカー整形表示)"]
+            PB1_3 --> PB1_4["毎時ステータスサマリーテーブル送信 (VST/USDT残高・ポジション / ティッカー整形表示)"]
             PB1_4 --> PB1_5["月初判定 (毎月1日なら月次確定レポート自動送信)"]
         end
 
@@ -100,7 +99,7 @@ flowchart TD
   - **BEAR (売り)**: 売り推奨銘柄を対象にセッション連動個別バックテスト（東京レンジ逆張り5m/15m、ロンドンブレイクアウト5m: 全戦略 単発1本固定・計126通り）を実行。
   厳格基準（全体10回以上 ＆ 前半純利益>0 ＆ 後半純利益>前半純利益、後半利益最大選抜）クリア銘柄を選定し最優秀銘柄チャート1枚を送信、既存ポジション監査（`avgPrice` 基準・単発Graceful Exit引継ぎ）、直近10日間実損益レポート送信、pybotters WebSocket 5分足リアルタイム購読開始。
 * **【Phase B】リアルタイム MTF 監視ループ (15秒サイクル)**:
-  * **Phase B1 (毎時 00:05 JST)**: クジラセンチメント更新、BingX OI/FR スナップショット自動蓄積、BTC地合い足更新、**Hype版と完全統一した毎時ステータス配信（`-USDT` 省略・4カラム整列）**、月初レポート送信。
+  * **Phase B1 (毎時 00:05 JST)**: BingX OI/FR スナップショット自動蓄積、BTC地合い足更新、**Hype版と統一した毎時ステータス配信（`-USDT` 省略・3カラム整列）**、月初レポート送信。
   * **Phase B2 (ポジション監視 & 決済判定)**: 保有銘柄の利確（Normal TP または 非合致時の建値早期撤退、数学的RR 1:2）・戦略別主軸損切り（レンジ逆張りは直近10本高安確定足SL［上限キャップ: 動的MAE］、ブレイクアウトはPOC直上/直下防衛SL ＆ 24hクールダウン）・動的タイムアウト撤退（1〜4時間経過で含み損なら微損撤退）。**全戦略単発1本固定（ナンピン完全撤廃・追加発注物理遮断）**。決済ロジックは24時間全セッションを通じて `lake_backtest_engine.py`（SSoT）と完全一致させる。決済時は必ず既存の未約定指値をすべてキャンセルしてから成行決済を実行する。
   * **Phase B3 (3セッション役割分担 ＆ 3態勢地合いディフェンス)**:
     - **東京セッション (09:00〜16:00 JST)**: レンジ逆張り専用（`VAL_POC` / `VAH_POC` / `RSIMA` / `RSIMA_SHORT`: 5m/15m）。地合い連動（BULLは買い、BEARは売り、BALANCEDは待機、LEANは選別取引）。
@@ -126,7 +125,7 @@ flowchart TD
   1. `universe_symbols`: 対象22銘柄およびメガキャップ除外定義
   2. `market_candles`: `5m` / `15m` / `1h` / `4h` の確定OHLCV
   3. `market_oi_fr`: 建玉・FR・マーク価格の時系列スナップショット
-  4. `regime_snapshots`: 基準時刻ごとの3段階地合い・クジラ・前半高安監査結果
+  4. `regime_snapshots`: 基準時刻ごとの3段階地合い・前半高安監査結果
   5. `backtest_runs`: 実行ID、`data_cutoff_utc`、`opt_start/end`、`eval_start/end`、手数料設定、Gitコミット識別子
   6. `backtest_cells`: 銘柄×戦略×方向×時間軸×パラメータごとの最適化窓・評価窓成績、格付け（`QUALIFIED` / `PROVISIONAL` / `INSUFFICIENT_N` / `REJECTED_EV`）、伸び切りバケット別統計（`eval_ext_stats_json`）
   7. `backtest_simulated_trades`: 全擬似約定・未約定キャンセル・エントリー/決済手数料・伸び切り指標（`ext_pct`, `ext_atr`, `va_upper/lower`, `range_high/low`）およびシグナル時点地合い（`regime_at_signal`, `strength_tier_at_signal`, `net_score_at_signal`, `buy_votes_at_signal`, `sell_votes_at_signal`）の1件単位明細
@@ -141,7 +140,7 @@ flowchart TD
   * 評価期間および最適化期間の各正時（1時間周期 `3600s`、当該時刻時点で確定済みの `1h` 足 `ts_utc + 3600 <= t_hr` のみ参照）において、SSoT 関数 `evaluate_market_regime_3window`（21アルト各1票＋BTC 2票＝計23票構成）により `overall_regime`・`strength_tier`・`allowed_strategies` を因果的に再計算する。
   * セル評価（`backtest_cells`）は全21アルト銘柄 × 全6戦略（LONG 3戦略: `val_poc`, `vah_break`, `rsima` ／ SHORT 3戦略: `vah_poc`, `val_break`, `rsima_short`）を対象とし、各シグナル発生時刻 `sig_close_utc` の直近確定1時間地合い（`t_hr = (sig_close_utc // 3600) * 3600`）の `allowed_strategies` に当該戦略が含まれる場合のみエントリーを許可する（`BALANCED` 中立時は `allowed_strategies = []` により全停止）。
   * 再計算した1時間ごとの地合い系列（`regime` / `strength_tier` / 14d・7d・2d票数内訳）を `regime_snapshots` テーブルへ一括保存し、全シミュレーション取引（`backtest_simulated_trades`）にもシグナル時点の `regime_at_signal`・`strength_tier_at_signal`・`net_score_at_signal`・`buy_votes_at_signal`・`sell_votes_at_signal` を記録して監査可能とする。
-  * 実売買候補の勝者選定（`select_eval_winner` / `lake_live_bridge.py`）では、OOS評価済み全6戦略セルの中から **実行時点（`cutoff`）の `allowed_strategies`（および逆風クジラ除外銘柄フィルタ）に合致するセル** を選出する。
+  * 実売買候補の勝者選定（`select_eval_winner` / `lake_live_bridge.py`）では、OOS評価済み全6戦略セルの中から **実行時点（`cutoff`）の `allowed_strategies`（および前半高安監査の除外対象外銘柄）に合致するセル** を選出する（クジラ逆風除外フィルターは廃止済み）。
 * **手数料 ＆ Maker指値追随シミュレーション基準**:
   * 全擬似約定に **往復 `0.08%`（エントリー Maker `0.02%` ＋ エグジット Taker `0.06%`）** を厳密算入し、`entry_fee_usdt`・`exit_fee_usdt`・`net_pnl` を個別に記録する。
   * 実ボット（`bingx5_46_2api.py`）に合わせ、シグナル確定後の次5m足から最良気配相当（Long: `close * 0.9998`, Short: `close * 1.0002`）で指値追随し、実際に5m足高安へ到達した場合のみ約定、シグナル終了時は `CANCEL_SIGNAL_END` として即時キャンセルする（安易な無条件成行約定を禁止）。約定足の決済判定は保守的に損切り・防衛SLを利確より先行評価する。
@@ -172,7 +171,7 @@ flowchart TD
 flowchart TD
     Step1["【Step 1】対象ユニバース確定 (SSoT)<br>FIXED_SYMBOLS 21銘柄 (アルト20 + BTC 1 / 計23票)"] --> Step2
     Step2["【Step 2】全体地合い判定の完全確定 (Market Regime)<br>3期間 (14d/7d/2d) ノーマライズ比較 ＆ 多数決 (過半数12票)<br>➔ 地合い方向 (BUY/SELL/NEUTRAL) ＆ 強度Tier (ULTRA/STRONG/MODERATE/WEAK)<br>➔ 許可戦略配分 (動的ハイブリッド) を完全確定"] --> Step3
-    Step3["【Step 3】地合い連動 銘柄選定 ＆ 多層除外監査 (Screening & Audit)<br>① 超大型除外 (SELL時 SOL/DOGE/XRP)<br>② クジラ監査 (BUY時 SHORT_ONLY除外 / SELL時 LONG_ONLY除外)<br>③ ノーマライズ前半高安監査 (ピーク割れ除外 / ボトム超え除外)<br>④ 出来高・OI・FR 3要素フィルター"] --> Step4
+    Step3["【Step 3】地合い連動 銘柄選定 ＆ 多層除外監査 (Screening & Audit)<br>① 超大型除外 (SOL/DOGE/XRP)<br>② ノーマライズ前半高安監査 (ピーク割れ除外 / ボトム超え除外)<br>③ 出来高・OI・FR 3要素フィルター<br>※クジラフィルター廃止"] --> Step4
     Step4["【Step 4】地合い連動 バックテスト・個別最適化 (Dynamic Optimization)<br>確定地合いの許可戦略 (各126通り) を候補銘柄にのみ実行<br>二重頑健性 (前半黒字・後半加速・直近7d黒字) ＆ Net PnL > 0 判定"] --> Step5
     Step5["【Step 5】地合い ＆ 銘柄選定の永続履歴記録 (Regime & Symbol History)<br>Data/regime_history.csv への時系列アペンド記録<br>ダッシュボード・Discord通知・JSON永続化"]
 ```
@@ -240,10 +239,8 @@ USDCよりも圧倒的に出来高・流動性が厚い **USDT無期限先物ペ
 * **全態勢（買い・売り）共通の物理遮断**:
   `SOL-USDT`, `DOGE-USDT`, `XRP-USDT` の超大型3銘柄は、板が厚くHFT機関投資家のストップ狩り・リバウンド急変動が激しく、時価総額の重さによる利確到達率低迷・タイムアウト率高止まりを回避するため、**ロング・ショート問わず全エントリー対象から物理的に完全事前除外** する（第5章および実運用コードと完全統一）。
 
-#### ② クジラセンチメント逆風監査
-大口投資家の資金動向（`fetch_whale_sentiment.py`）に基づき、地合いと逆行する銘柄を事前除外：
-* **買い態勢 (BULL) 時**: 大口売り偏重（`SHORT_ONLY`）の銘柄を除外（下落リスク回避）。
-* **売り態勢 (BEAR) 時**: 大口買い偏重（`LONG_ONLY`）の銘柄を除外（踏み上げリスク回避）。大口売り偏重（`SHORT_ONLY`）は追い風として採用。
+#### ② クジラセンチメント逆風監査（2026-11-16 廃止）
+* 後追い・少数アドレス偏重による不要な機会損失を排除するため、**クジラセンチメントによる銘柄除外およびエントリー遮断フィルターは完全撤廃**する（`fetch_whale_sentiment.py` の定期呼び出し・スクリーニング除外も停止）。
 
 #### ③ ノーマライズ前半高安監査 (完全対称マトリクス)
 14d / 7d / 2d の正規化推移に基づき、相場の天井打ち崩壊・底打ち反発を精密監査：
@@ -289,7 +286,7 @@ USDCよりも圧倒的に出来高・流動性が厚い **USDT無期限先物ペ
   4. 往復0.08%手数料控除後 **Net PnL > 0**（手数料負け戦略の完全排除）
 * **監視銘柄の確定 ＆ セッション別デュアルパラメータ採用 (`MAX_SELECTED_SYMBOLS = 20`)**:
   - データレイク2段階ウォークフォワード評価（`lake_backtest_engine.py`）の検証窓（OOS）結果から、各銘柄ごとに **レンジ最良セル（`range_params` / `is_range_qualified`）** と **ブレイクアウト最良セル（`breakout_params` / `is_breakout_qualified`）** の両方を抽出・保持する。
-  - 超大型銘柄除外ガード（`EXCLUDED_MEGA_CAPS`: `SOL-USDT`, `DOGE-USDT`, `XRP-USDT`）およびクジラ逆風除外を通過した中堅アルトのうち、レンジまたはブレイクアウトのいずれかで OOS 合格基準（`QUALIFIED` [$n \ge 30, \text{EV} > 0$] または `PROVISIONAL` [$10 \le n < 30, \text{EV} > 0$]）を満たす**すべての合格銘柄**を、OOS評価スコア降順で `selected_symbols`（最大 `MAX_SELECTED_SYMBOLS = 20` 銘柄）としてリアルタイム監視対象に採用する（単一1銘柄固定は廃止）。
+  - 超大型銘柄除外ガード（`EXCLUDED_MEGA_CAPS`: `SOL-USDT`, `DOGE-USDT`, `XRP-USDT`）および前半高安監査を通過した中堅アルトのうち、レンジまたはブレイクアウトのいずれかで OOS 合格基準（`QUALIFIED` [$n \ge 30, \text{EV} > 0$] または `PROVISIONAL` [$10 \le n < 30, \text{EV} > 0$]）を満たす**すべての合格銘柄**を、OOS評価スコア降順で `selected_symbols`（最大 `MAX_SELECTED_SYMBOLS = 20` 銘柄）としてリアルタイム監視対象に採用する（単一1銘柄固定は廃止）。
   - 東京時間帯（09:00〜16:00 JST）は `is_range_qualified == True` の銘柄のみを `range_params` で評価し、欧州時間帯（16:00〜22:00 JST）は `is_breakout_qualified == True` の銘柄のみを `breakout_params` で評価する。
   - 監視銘柄数を拡大しても、同時保有ポジション・待機指値の上限は **最大2銘柄（`MAX_ACTIVE_POSITIONS = 2`）** を厳格維持する（1日あたりのトレード回数上限は解除し、回数制限なしで運用する。安全制御は最大2枠・日次最大損失 `-$1.50` サーキットブレーカー・24時間SLクールダウンで担保する）。
   - 最優秀成績銘柄の資産曲線チャート **1 枚のみ** を Discord 送信（MaxDD USDT/%併記）。
@@ -717,9 +714,9 @@ BINGX_IS_AIR = ("--air" in sys.argv or "--mock" in sys.argv)
   * **見出し・残高のコードブロック外表示**:
     `⏰ 【BingX 毎時ステータスサマリー (HH:00 JST)】`
     `💰 残高: $XXX.XX VST (VST Demo Mode) | 監視体制: 5分足 WebSocketリアルタイム稼働中`
-  * **テーブル整形規約（列ズレ防止・4カラム統一）**:
+  * **テーブル整形規約（列ズレ防止・3カラム統一）**:
     * 銘柄名は表示時に `.replace("-USDT", "")` でティッカーのみ（`HYPE`, `RENDER` 等）に整形し、固定幅フォーマット（`f"{sym:<8}"`）で列ズレを完全に排除する。
-    * カラム構成は `銘柄` / `現在価格` / `ポジション` / `クジラ` の4列に統一する。
+    * カラム構成は `銘柄` / `現在価格` / `ポジション` の3列に統一する（クジラフィルター廃止に伴いクジラ列を削除）。
     * ポジション表記規約:
       * **ショート保有時**: **`保有S({sign}${abs(pnl):.2f}/1枠)`**（例: `保有S(-$0.13/1枠)`）と表記（売り建玉を確実に反映し虚偽ノーポジ表示を完全防止）。
       * **ロング保有時**: **`保有L({sign}${abs(pnl):.2f}/1枠)`**（例: `保有L(+$0.50/1枠)`）と表記。
@@ -753,7 +750,7 @@ BINGX_IS_AIR = ("--air" in sys.argv or "--mock" in sys.argv)
   * ボット起動・再起動時および定期選定時刻到達時、`AUTO TRADING SYSTEM START` および `PERIODIC SCREENING & OPTIMIZE` のアスキーアート・システム概要バナーを `force_send=True` で Discord へ即座に送信する。
   * バナー内の戦略表記は「3態勢地合い連動（BULL:買い / NEUTRAL:待機 / BEAR:売り）」および最新のポジション枠・ナンピン・動的MAE仕様を明記する。
 * **エントリー・決済時のDiscord通知＆チャート画像出力規約**:
-  * **エントリー時**: チャート画像出力を廃止。約定価格、発注数量、想定元本、適用戦略、利確目標、損切り仕様、クジラ流入等の詳細テキスト通知のみを即時送信する。
+  * **エントリー時**: チャート画像出力を廃止。約定価格、発注数量、想定元本、適用戦略、利確目標、損切り仕様の詳細テキスト通知のみを即時送信する。
   * **エグジット時（利確・損切り確定時）**: エントリー位置からエグジット位置までのトレード軌跡（点線）、確定損益（PnL）、決済理由（TP/SL/建値撤退）を明確に描画した決済チャート画像（`plot_exit_chart`）を出力・送信する。
 
 ---

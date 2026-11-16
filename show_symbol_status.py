@@ -33,37 +33,16 @@ DATA_DIR = Path(__file__).resolve().parent / "Data"
 JST = timezone(timedelta(hours=9))
 
 
-def get_whale_sig_quick(symbol: str) -> str:
-    """Data/whale_market_state.json よりクジラセンチメント情報を取得 (存在しない場合はNEUTRAL)"""
-    whale_file = DATA_DIR / "whale_market_state.json"
-    if not whale_file.exists():
-        whale_file = DATA_DIR / "whale_sentiment.json"
-    if not whale_file.exists():
-        return "NEUTRAL"
-    try:
-        with open(whale_file, "r", encoding="utf-8") as f:
-            w_data = json.load(f)
-            coins_sentiment = w_data.get("coins_sentiment", w_data)
-            clean = symbol.replace("-USDT", "").replace("USDT", "").upper()
-            if symbol in coins_sentiment and isinstance(coins_sentiment[symbol], dict):
-                return coins_sentiment[symbol].get("signal", "NEUTRAL")
-            if clean in coins_sentiment and isinstance(coins_sentiment[clean], dict):
-                return coins_sentiment[clean].get("signal", "NEUTRAL")
-            return "NEUTRAL"
-    except Exception:
-        return "NEUTRAL"
-
-
 def get_macro_gate_summary() -> Dict[str, Any]:
-    """Data/market_state.json より3段階全体地合い情報 (30d/10d/5d) を取得"""
+    """Data/market_state.json より3段階全体地合い情報 (14d/7d/2d) を取得"""
     state_file = DATA_DIR / "market_state.json"
     default_res = {
         "overall_regime": "NEUTRAL",
         "regime_gate": "ALLOW",
         "regime_desc": "NEUTRAL (3期間混在・慎重運用)",
-        "w30": "NEUTRAL",
-        "w10": "NEUTRAL",
-        "w5": "NEUTRAL",
+        "w14": "NEUTRAL",
+        "w7": "NEUTRAL",
+        "w2": "NEUTRAL",
         "excluded_symbols": [],
         "exclusion_reasons": {},
         "recommended_symbols": [],
@@ -75,18 +54,24 @@ def get_macro_gate_summary() -> Dict[str, Any]:
             data = json.load(f)
             overall = data.get("overall_regime", "NEUTRAL")
             p_res = data.get("period_results", {})
-            w30 = p_res.get("30d", {}).get("state", "NEUTRAL")
-            w10 = p_res.get("10d", {}).get("state", "NEUTRAL")
-            w5 = p_res.get("5d", {}).get("state", "NEUTRAL")
+            if any(k in p_res for k in ("14d", "7d", "2d")):
+                w14 = p_res.get("14d", {}).get("state", "NEUTRAL")
+                w7 = p_res.get("7d", {}).get("state", "NEUTRAL")
+                w2 = p_res.get("2d", {}).get("state", "NEUTRAL")
+                desc = f"総合:{overall} (14d:{w14}/7d:{w7}/2d:{w2})"
+            else:
+                w14 = p_res.get("30d", {}).get("state", "NEUTRAL")
+                w7 = p_res.get("10d", {}).get("state", "NEUTRAL")
+                w2 = p_res.get("5d", {}).get("state", "NEUTRAL")
+                desc = f"総合:{overall} (30d:{w14}/10d:{w7}/5d:{w2})"
             gate = "ALLOW" if overall in ("BUY", "SELL") else "STOP"
-            desc = f"総合:{overall} (30d:{w30}/10d:{w10}/5d:{w5})"
             return {
                 "overall_regime": overall,
                 "regime_gate": gate,
                 "regime_desc": desc,
-                "w30": w30,
-                "w10": w10,
-                "w5": w5,
+                "w14": w14,
+                "w7": w7,
+                "w2": w2,
                 "excluded_symbols": data.get("excluded_symbols", []),
                 "exclusion_reasons": data.get("exclusion_reasons", {}),
                 "recommended_symbols": data.get("recommended_symbols", []),
@@ -135,7 +120,6 @@ def build_symbols_status_summary(
         "OVER_LIMIT": 0,
         "OPT_REJECTED": 0,
         "PEAK_DROP": 0,
-        "WHALE_SHORT": 0,
         "OTHER_REJECTED": 0,
     }
     overall_reg = gate_info.get("overall_regime", "NEUTRAL")
@@ -145,8 +129,6 @@ def build_symbols_status_summary(
         clean_sym = sym.replace("-USDT", "").replace("USDT", "").upper()
         is_peak_dropped = (sym.upper() in excluded_list) or (clean_sym in excluded_list)
         peak_reasons = exclusion_reasons_map.get(sym) or exclusion_reasons_map.get(clean_sym) or []
-
-        whale_sig = get_whale_sig_quick(sym)
 
         # 最適化結果の取得
         opt_info = symbol_params_map.get(sym, {})
@@ -203,21 +185,6 @@ def build_symbols_status_summary(
                     detail_reason = f"戦略={strat or 'RSIMA'} ({interval_val}m / R9, M7, EP={ep_val}, CP={cp_val}, {sl_label}, TO={dyn_to}本)"
             if is_peak_dropped:
                 detail_reason += " [※3期間比較:前半高値警戒]"
-        elif not is_sell_mode and whale_sig == "SHORT_ONLY":
-            badge = "🔴 【大口売り優勢】"
-            category = "WHALE_EXCLUDE"
-            counts["WHALE_SHORT"] += 1
-            detail_reason = "クジラセンチメントが売り偏重 (SHORT_ONLY除外)"
-        elif is_sell_mode and whale_sig == "LONG_ONLY":
-            badge = "🔴 【大口買い優勢】"
-            category = "WHALE_EXCLUDE"
-            counts["WHALE_SHORT"] += 1
-            detail_reason = "クジラセンチメントが買い偏重 (LONG_ONLY除外)"
-        elif pnl is not None and pnl > 0 and trade_count >= 10:
-            badge = "⚪ 【選定上限枠外】"
-            category = "OVER_LIMIT"
-            counts["OVER_LIMIT"] += 1
-            detail_reason = f"個別最適化合格 (Net PnL:+${pnl:.2f}/{trade_count}回) だが最大監視枠超過のため待機"
         elif is_peak_dropped:
             if is_sell_mode:
                 badge = "🔴 【前半ボトム半値超え除外】"
@@ -241,6 +208,11 @@ def build_symbols_status_summary(
                     detail_reason = "3期間ノーマライズ前半高値・半値割れ除外"
             if pnl is not None:
                 detail_reason += f" (BT不合格: ${pnl:+.2f}/{trade_count}回)"
+        elif pnl is not None and pnl > 0 and trade_count >= 10:
+            badge = "⚪ 【選定上限枠外】"
+            category = "OVER_LIMIT"
+            counts["OVER_LIMIT"] += 1
+            detail_reason = f"個別最適化合格 (Net PnL:+${pnl:.2f}/{trade_count}回) だが最大監視枠超過のため待機"
         else:
             badge = "🔴 【個別最適化不合格】"
             category = "OPT_REJECTED"
@@ -331,13 +303,11 @@ def format_status_table_console(summary_data: Dict[str, Any]) -> str:
     total_peak = counts.get("PEAK_DROP", 0)
     total_opt = counts.get("OPT_REJECTED", 0)
     total_over = counts.get("OVER_LIMIT", 0)
-    total_whale = counts.get("WHALE_SHORT", 0)
     overall_val = gate_info.get("overall_regime", "NEUTRAL")
     peak_label = "前半ボトム反発除外" if overall_val == "SELL" else "前半ピーク割れ除外"
-    whale_label = "クジラ買い除外" if overall_val == "SELL" else "クジラ売り除外"
     lines.append(
         f"💡 【内訳】選定・監視中: {total_sel}銘柄 | {peak_label}: {total_peak}銘柄 | "
-        f"最適化不合格: {total_opt}銘柄 | 上限枠外: {total_over}銘柄 | {whale_label}: {total_whale}銘柄"
+        f"最適化不合格: {total_opt}銘柄 | 上限枠外: {total_over}銘柄"
     )
     lines.append("=" * 118)
     return "\n".join(lines)
@@ -349,7 +319,7 @@ def shorten_reason_for_discord(reason: str) -> str:
         return ""
     if "前半ピーク半値割れ" in reason:
         matched_wins = []
-        for w in ["5d", "10d", "30d"]:
+        for w in ["2d", "7d", "14d", "5d", "10d", "30d"]:
             if f"{w}前半ピーク" in reason:
                 matched_wins.append(w)
         win_str = "/".join(matched_wins) if matched_wins else "3期間"
@@ -362,7 +332,7 @@ def shorten_reason_for_discord(reason: str) -> str:
         return f"{win_str}前半ピーク警戒{bt_part}"
     elif "前半ボトム半値超え" in reason:
         matched_wins = []
-        for w in ["5d", "10d", "30d"]:
+        for w in ["2d", "7d", "14d", "5d", "10d", "30d"]:
             if f"{w}前半ボトム" in reason:
                 matched_wins.append(w)
         win_str = "/".join(matched_wins) if matched_wins else "3期間"
@@ -394,12 +364,11 @@ def format_status_table_discord(summary_data: Dict[str, Any]) -> str:
     lines.append(f"🛡️ **3期間地合い判定**: {g_icon}`{gate_info['regime_gate']}` ({gate_info['regime_desc']})")
     lines.append(
         f"💡 **内訳**: 監視: `{counts.get('SELECTED', 0)}` | ピーク割れ除外: `{counts.get('PEAK_DROP', 0)}` | "
-        f"最適化不合格: `{counts.get('OPT_REJECTED', 0)}` | クジラ除外: `{counts.get('WHALE_SHORT', 0)}`"
+        f"最適化不合格: `{counts.get('OPT_REJECTED', 0)}` | 上限枠外: `{counts.get('OVER_LIMIT', 0)}`"
     )
 
     selected_list = [s for s in symbols if s["category"] == "SELECTED"]
     peak_list = [s for s in symbols if s["category"] == "PEAK_DROP"]
-    whale_list = [s for s in symbols if s["category"] == "WHALE_SHORT"]
 
     if selected_list:
         lines.append("\n🟢 **【トレード選定・監視中】**")
@@ -424,18 +393,6 @@ def format_status_table_discord(summary_data: Dict[str, Any]) -> str:
             s_reason = shorten_reason_for_discord(s.get("detail_reason", ""))
             lines.append(f"• **{sym_clean}**: `{s_reason}`")
 
-    if whale_list:
-        if is_sell:
-            lines.append("\n🔴 **【大口買い優勢 (Whale除外)】**")
-            for s in whale_list:
-                sym_clean = s["symbol"].replace("-USDT", "")
-                lines.append(f"• **{sym_clean}**: `クジラ判定買い偏重 (LONG_ONLY)`")
-        else:
-            lines.append("\n🔴 **【大口売り優勢 (Whale除外)】**")
-            for s in whale_list:
-                sym_clean = s["symbol"].replace("-USDT", "")
-                lines.append(f"• **{sym_clean}**: `クジラ判定売り偏重 (SHORT_ONLY)`")
-
     lines.append("\n📱 **【全20銘柄 コンパクト一覧】(Net PnL: 往復0.08%控除後)**")
     lines.append("```text")
     lines.append("銘柄      | 状態       | 足種  | Net PnL")
@@ -448,8 +405,6 @@ def format_status_table_discord(summary_data: Dict[str, Any]) -> str:
             b_short = "🟢選定監視"
         elif cat == "PEAK_DROP":
             b_short = "🔴反発除外" if is_sell else "🔴ピーク割"
-        elif cat in ("WHALE_SHORT", "WHALE_EXCLUDE"):
-            b_short = "🔴大口買い" if is_sell else "🔴大口売り"
         elif cat == "OVER_LIMIT":
             b_short = "⚪上限枠外"
         else:

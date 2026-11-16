@@ -718,6 +718,141 @@ class TestDataLakeAcceptance(unittest.TestCase):
             repro = lake_reproduce.reproduce_run(res["run"]["run_id"], db_path=db_path)
             self.assertTrue(repro["matched"], f"PITラン再現不一致: {repro['mismatches']}")
 
+    def test_i_whale_filter_removed_and_display_fixes(self):
+        """(i) クジラフィルター撤廃・14d/7d/2d表示追従・Top15ダミー撤去・matplotlib数式誤爆防止の回帰検証。"""
+        import warnings
+        import matplotlib.pyplot as plt
+        import real_trade_tracker as rtt
+        import show_symbol_status as sss
+        from bingx5_46_3logic import (
+            check_bottom_reversal_recovery,
+            check_normalized_peak_timing,
+            check_normalized_trough_timing,
+            check_peak_breakdown_trend,
+        )
+
+        # 1. ボット本体からクジラ呼び出し/エントリー遮断およびTop15ダミー表示が撤廃されていること
+        bot_src = (ROOT_DIR / "bingx5_46_1futures_limit.py").read_text(encoding="utf-8")
+        self.assertNotIn("fetch_whale_sentiment.py", bot_src)
+        self.assertNotIn("select_top_bingx_symbols(top_n=15", bot_src)
+        self.assertNotIn('whale_sig == "LONG_ONLY"', bot_src)
+        self.assertNotIn('whale_sig == "SHORT_ONLY"', bot_src)
+        self.assertNotIn('whale_sig != "LONG_ONLY"', bot_src)
+        self.assertNotIn('whale_sig != "SHORT_ONLY"', bot_src)
+
+        # 2. ノーマライズ前半高安監査が 2d / 7d / 14d を評価し、30d/10d/5d を出さないこと
+        n_1h = 15 * 24
+        closes = np.linspace(1.0, 2.0, n_1h)
+        closes[24] = 3.0  # 14d/7d前半付近に高値があるが2d外・半値割れを作れる系列
+        df_norm = pd.DataFrame({"close": closes})
+        # 全期間で前半ピーク半値割れを起こす系列
+        c_drop = np.concatenate([np.array([1.0, 2.0]), np.linspace(1.8, 0.8, n_1h - 2)])
+        is_bad_p, reasons_p = check_normalized_peak_timing(pd.DataFrame({"close": c_drop}))
+        self.assertTrue(is_bad_p)
+        self.assertTrue(any(r.startswith(("2d", "7d", "14d")) for r in reasons_p))
+        self.assertFalse(any(r.startswith(("5d", "10d", "30d")) for r in reasons_p))
+        is_bd, reasons_bd = check_peak_breakdown_trend(pd.DataFrame({"close": c_drop}))
+        self.assertTrue(is_bd)
+        self.assertFalse(any(r.startswith(("5d", "10d", "30d")) for r in reasons_bd))
+
+        c_reb = np.concatenate([np.array([2.0, 0.5]), np.linspace(0.7, 1.8, n_1h - 2)])
+        is_bad_t, reasons_t = check_normalized_trough_timing(pd.DataFrame({"close": c_reb}))
+        self.assertTrue(is_bad_t)
+        self.assertFalse(any(r.startswith(("5d", "10d", "30d")) for r in reasons_t))
+        is_rec, reasons_rec = check_bottom_reversal_recovery(pd.DataFrame({"close": c_reb}))
+        self.assertTrue(is_rec)
+        self.assertFalse(any(r.startswith(("5d", "10d", "30d")) for r in reasons_rec))
+
+        # 3. show_symbol_status が 14d/7d/2d を表示し、クジラ除外を行わないこと
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_data = Path(tmp)
+            (tmp_data / "market_state.json").write_text(
+                json.dumps(
+                    {
+                        "overall_regime": "SELL",
+                        "period_results": {
+                            "14d": {"state": "SELL"},
+                            "7d": {"state": "SELL"},
+                            "2d": {"state": "SELL"},
+                        },
+                        "excluded_symbols": ["APT-USDT", "APT"],
+                        "exclusion_reasons": {"APT": "2d前半ボトム半値超え(...)"},
+                        "timestamp": "2026-11-16T09:00:00+00:00",
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            (tmp_data / "whale_market_state.json").write_text(
+                json.dumps({"coins_sentiment": {"HYPE": {"signal": "LONG_ONLY"}, "APT": {"signal": "LONG_ONLY"}}}),
+                encoding="utf-8",
+            )
+            orig_data_dir = sss.DATA_DIR
+            try:
+                sss.DATA_DIR = tmp_data
+                gate = sss.get_macro_gate_summary()
+                self.assertEqual(gate["regime_desc"], "総合:SELL (14d:SELL/7d:SELL/2d:SELL)")
+                summary = sss.build_symbols_status_summary(
+                    selected_symbols=["HYPE-USDT"],
+                    symbol_params_map={
+                        "HYPE-USDT": {"pnl": 1.2, "trade_count": 20, "win_rate": 40.0, "strategy": "vah_poc", "interval": 15},
+                        "APT-USDT": {"pnl": 0.9, "trade_count": 15, "win_rate": 50.0, "strategy": "vah_poc", "interval": 5},
+                    },
+                    save_json=False,
+                )
+                self.assertNotIn("WHALE_SHORT", summary["counts"])
+                by_sym = {s["symbol"]: s for s in summary["symbols"]}
+                self.assertEqual(by_sym["HYPE-USDT"]["category"], "SELECTED")
+                self.assertEqual(by_sym["APT-USDT"]["category"], "PEAK_DROP")
+                discord_msg = sss.format_status_table_discord(summary)
+                self.assertIn("14d:SELL/7d:SELL/2d:SELL", discord_msg)
+                self.assertNotIn("クジラ", discord_msg)
+            finally:
+                sss.DATA_DIR = orig_data_dir
+
+        # 4. real_trade_tracker: text.parse_math=False により $ を複数含む日本語決済理由でも Font 'rm' 警告が出ないこと
+        self.assertFalse(bool(plt.rcParams["text.parse_math"]))
+        with tempfile.TemporaryDirectory() as tmp:
+            orig_rtt_data = rtt.DATA_DIR
+            orig_rtt_trades = rtt.TRADES_FILE
+            orig_rtt_charts = rtt.CHARTS_DIR
+            try:
+                rtt.DATA_DIR = Path(tmp)
+                rtt.TRADES_FILE = Path(tmp) / "real_trades_history.json"
+                rtt.CHARTS_DIR = Path(tmp) / "charts"
+                rtt.TRADES_FILE.write_text("[]", encoding="utf-8")
+                n_bars = 80
+                ts_idx = pd.date_range("2026-11-16 00:00", periods=n_bars, freq="5min", tz="UTC")
+                df_exit = pd.DataFrame({
+                    "timestamp": ts_idx,
+                    "open": np.linspace(1.38, 1.40, n_bars),
+                    "high": np.linspace(1.385, 1.405, n_bars),
+                    "low": np.linspace(1.375, 1.395, n_bars),
+                    "close": np.linspace(1.38, 1.401, n_bars),
+                    "volume": np.full(n_bars, 1000.0),
+                })
+                with warnings.catch_warnings(record=True) as w_rec:
+                    warnings.simplefilter("always")
+                    chart_out = rtt.plot_exit_chart(
+                        symbol="RENDER-USDT",
+                        df=df_exit,
+                        exit_price=1.402,
+                        entry_price=1.395,
+                        pnl=-0.06,
+                        exit_reason="VAH_POC_SWING_HIGH_SL: 確定終値($1.4010) > 直近高値SL($1.4000, 損失-0.43%)",
+                        side="SHORT",
+                        interval_label="5m",
+                        mp_period=200,
+                    )
+                self.assertIsNotNone(chart_out)
+                self.assertTrue(Path(chart_out).exists())
+                rm_warnings = [str(w.message) for w in w_rec if "Font 'rm'" in str(w.message)]
+                self.assertEqual(rm_warnings, [], f"Font 'rm' 数式誤爆警告が発生しました: {rm_warnings}")
+            finally:
+                rtt.DATA_DIR = orig_rtt_data
+                rtt.TRADES_FILE = orig_rtt_trades
+                rtt.CHARTS_DIR = orig_rtt_charts
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

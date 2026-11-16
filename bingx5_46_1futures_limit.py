@@ -599,51 +599,6 @@ def wait_until_analysis_time(target_hour: int = 9, target_minute: int = 0) -> No
     time.sleep(wait_seconds)
 
 
-def get_whale_sentiment_info(symbol: str) -> Dict[str, Any]:
-    """Data/whale_market_state.json より銘柄のクジラセンチメント情報 (signal, long_ratio, short_ratio) を取得"""
-    whale_file = Path(__file__).resolve().parent / "Data" / "whale_market_state.json"
-    default_res = {
-        "signal": "NEUTRAL",
-        "long_ratio": 0.5,
-        "short_ratio": 0.5,
-        "whales_holding": 0,
-        "net_val_usd": 0.0,
-        "net_val_formatted": "$0"
-    }
-    if not whale_file.exists():
-        return default_res
-    try:
-        with open(whale_file, "r", encoding="utf-8") as f:
-            data = json.load(f)
-            coins_sentiment = data.get("coins_sentiment", {})
-
-            # 1. 完全一致チェック
-            if symbol in coins_sentiment:
-                return coins_sentiment[symbol]
-
-            # 2. 通貨コード正規化 (-USDT, -USDC, _, / を除去)
-            clean_coin = str(symbol).upper().split("-")[0].split("_")[0].split("/")[0]
-            clean_coin = clean_coin.replace("USDT", "").replace("USDC", "")
-            if clean_coin in coins_sentiment:
-                return coins_sentiment[clean_coin]
-
-            # 3. 1000倍プレフィックス銘柄対応 (1000SHIB -> kSHIB, 1000PEPE -> kPEPE, etc.)
-            if clean_coin.startswith("1000"):
-                k_coin = "k" + clean_coin[4:]
-                if k_coin in coins_sentiment:
-                    return coins_sentiment[k_coin]
-
-            # 4. BTC自身のリクエストの場合はBTCを返す
-            if clean_coin == "BTC" and "BTC" in coins_sentiment:
-                return coins_sentiment["BTC"]
-
-            # 5. 個別クジラデータが存在しないアルト銘柄は「中立 (NEUTRAL)」として扱う（BTC誤フォールバック防止）
-            return default_res
-    except Exception as e:
-        discord.print_log(f"[Whale Sentiment Error] 読み込み失敗: {e}")
-    return default_res
-
-
 def get_regime_gate_info(symbol: str) -> Dict[str, Any]:
     """Data/market_state.json より3段階全体地合い情報（BULL / NEUTRAL / BEAR）および個別前半ピークアウト除外判定を取得 (PROJECT_RULES.md 準拠)"""
     state_file = MIX_SCRIPT_PATH.parent / "Data" / "market_state.json"
@@ -1145,7 +1100,7 @@ async def validate_profitable_candidates(trade_side: str, mode: str, base_symbol
             all_candidates.append(cand)
 
         discord.print_log(
-            f"【全体地合い判定: BUY 🟢】買い推奨中堅アルト銘柄（計 {len(all_candidates)} 銘柄: {', '.join(all_candidates) if all_candidates else 'なし'} / 超大型・クジラ逆風除外済）"
+            f"【全体地合い判定: BUY 🟢】買い推奨中堅アルト銘柄（計 {len(all_candidates)} 銘柄: {', '.join(all_candidates) if all_candidates else 'なし'} / 超大型除外済）"
             f"のロングPure3大戦略個別最適化（108通り: 単発厳選 ➔ 3枠ナンピン検証 ※ブレイクは単発固定）を開始します..."
         )
     elif overall_reg == "SELL":
@@ -1178,7 +1133,7 @@ async def validate_profitable_candidates(trade_side: str, mode: str, base_symbol
             all_candidates.append(cand)
 
         discord.print_log(
-            f"【全体地合い判定: SELL 🔴】売り推奨中堅アルト銘柄（計 {len(all_candidates)} 銘柄: {', '.join(all_candidates) if all_candidates else 'なし'} / 超大型・クジラ逆風除外済）"
+            f"【全体地合い判定: SELL 🔴】売り推奨中堅アルト銘柄（計 {len(all_candidates)} 銘柄: {', '.join(all_candidates) if all_candidates else 'なし'} / 超大型除外済）"
             f"のショートPure3大戦略個別最適化（108通り: 単発1本固定・ナンピン完全なし）を開始します..."
         )
     else:
@@ -1200,9 +1155,6 @@ async def validate_profitable_candidates(trade_side: str, mode: str, base_symbol
         cand_clean = get_clean_symbol(cand)
         if cand_clean == "BTC":
             continue
-
-        cand_whale_info = get_whale_sentiment_info(cand)
-        cand_whale_sig = cand_whale_info.get("signal", "NEUTRAL")
 
         # 1. SSoT 5分足時系列ストアから取得 (1H足/日足生成は廃止し5分足ストアから直接個別最適化)
         cand_df_5m = load_5m_candles(cand)
@@ -1343,21 +1295,8 @@ async def validate_profitable_candidates(trade_side: str, mode: str, base_symbol
             pnl_7d = float(p.get("pnl_recent_7d", 0.0))
             win_rt = float(p.get("win_rate", 0.0))
             cnt_7d = int(p.get("trades_recent_7d", 0))
-            # 30日総合純利益に最大ウェイト(1.0)、後半加速(0.5)、直近7日利益(0.5)、勝率ボーナス(win_rt*0.05)、直近頻度ボーナス(min(cnt_7d, 5)*0.2)
-            w_info = get_whale_sentiment_info(sym)
-            w_sig = w_info.get("signal", "NEUTRAL")
-            w_bonus = 0.0
-            if actual_side == "long":
-                if w_sig == "LONG_ONLY":
-                    w_bonus = 1.0
-                elif w_sig == "SHORT_ONLY":
-                    w_bonus = -2.0
-            elif actual_side == "short":
-                if w_sig == "SHORT_ONLY":
-                    w_bonus = 1.0
-                elif w_sig == "LONG_ONLY":
-                    w_bonus = -2.0
-            return pnl_tot * 1.0 + pnl_2nd * 0.5 + pnl_7d * 0.5 + (win_rt * 0.05) + (min(cnt_7d, 5) * 0.2) + w_bonus
+            # 総合純利益に最大ウェイト(1.0)、後半加速(0.5)、直近7日利益(0.5)、勝率ボーナス(win_rt*0.05)、直近頻度ボーナス(min(cnt_7d, 5)*0.2)
+            return pnl_tot * 1.0 + pnl_2nd * 0.5 + pnl_7d * 0.5 + (win_rt * 0.05) + (min(cnt_7d, 5) * 0.2)
 
         # Tier 1: 4大完全必須条件 (前半黒字 & 後半加速 & 直近7日取引1回以上 & 直近7日黒字) クリア銘柄を最優先選抜
         tier1_cands = [
@@ -1433,47 +1372,6 @@ async def validate_profitable_candidates(trade_side: str, mode: str, base_symbol
         default_best_params = symbol_params_map.get(first_sym, default_best_params)
 
     return profitable_cands, symbol_params_map, default_best_params
-
-
-async def select_top_bingx_symbols(top_n: int = 20, mode: str = 'demo') -> List[Dict[str, Any]]:
-    """固定選定20銘柄および market_state.json の推奨銘柄に基づいて選定候補を返す"""
-    state_file = Path(__file__).resolve().parent / "Data" / "market_state.json"
-    target_symbols = list(FIXED_SYMBOLS)
-
-    # 1. market_state.json が存在する場合は推奨銘柄を優先配置
-    if state_file.exists():
-        try:
-            with open(state_file, "r", encoding="utf-8") as f:
-                st = json.load(f)
-            rec_syms = st.get("recommended_symbols", [])
-            if rec_syms:
-                # 推奨銘柄を先頭にし、残りの固定銘柄を後ろに配置
-                combined = []
-                for s in rec_syms:
-                    if s in FIXED_SYMBOLS and s not in combined:
-                        combined.append(s)
-                for s in FIXED_SYMBOLS:
-                    if s not in combined:
-                        combined.append(s)
-                target_symbols = combined
-        except Exception as st_err:
-            print(f"[Symbol Selection Warning] market_state.json 読み込み失敗: {st_err}")
-
-    # 2. 取引所 universe 存在チェック
-    valid_symbols = target_symbols
-    try:
-        from bingx5_46_2api import get_bingx_universe_symbols
-        valid_universe = get_bingx_universe_symbols(mode=mode)
-        if valid_universe:
-            filtered = [s for s in target_symbols if normalize_symbol(s).upper() in valid_universe]
-            if filtered:
-                valid_symbols = filtered
-    except Exception as filter_err:
-        print(f"[Symbol Selection Warning] Universe フィルタエラー: {filter_err}")
-
-    results = [{"symbol": s, "lastPr": 1.0, "usdtVolume": 1e8} for s in valid_symbols[:top_n]]
-    print(f"[Symbol Selection] 候補銘柄選定完了 ({len(results)}銘柄): {', '.join([r['symbol'] for r in results])}")
-    return results
 
 
 TRAILING_TP_FILE = Path(__file__).resolve().parent / "Data" / "trailing_tp_state.json"
@@ -1816,30 +1714,7 @@ async def run_screening_and_optimization(mode: str, send_charts: bool = False, s
         except Exception as sub_err:
             print(f"[Screening Error] 銘柄スクリーニング実行エラー: {sub_err}")
 
-    # 2. クジラセンチメント更新
-    whale_script = Path(__file__).resolve().parent / "fetch_whale_sentiment.py"
-    if whale_script.exists():
-        try:
-            subprocess.run([sys.executable, str(whale_script)], check=True)
-        except Exception:
-            pass
-
-    # 3. 上位候補銘柄取得 (前兆スコア & クジラ優先順位付き)
-    selected_symbols_info = await select_top_bingx_symbols(top_n=15, mode=mode)
-    print(f"\n[Selection] Top {len(selected_symbols_info)} Selected Symbols (Precursor & Whale Prioritized):")
-    for rank, info in enumerate(selected_symbols_info, 1):
-        sym = info.get("symbol", "")
-        last_pr = float(info.get("lastPr", 0))
-        tier = info.get("tier", 2)
-        tag = info.get("whale_tag", "⚪ クジラ中立")
-        w_fmt = info.get("whale_net_val_fmt", "$0")
-        score_val = float(info.get("score", 0.0))
-        gk_r = float(info.get("gk_vol_rank", 0.5))
-        fr_pct = float(info.get("fr_annual_pct", 0.0))
-        r_pos = float(info.get("range_pos_24", 0.5))
-        print(f"   #{rank:2d} [Tier {tier}] {sym:8s} | Px: ${last_pr:9.4f} | Score: {score_val:5.1f} | GK_Vol: {gk_r:.2f} | FR: {fr_pct:+6.1f}%/年 | Pos: {r_pos:.2f} | Whale: {w_fmt} ({tag})")
-
-    # 4. 3態勢地合い連動 戦略モード判定
+    # 2. 3態勢地合い連動 戦略モード判定 (クジラフィルター廃止済み)
     market_state_file = MIX_SCRIPT_PATH.parent / "Data" / "market_state.json"
     overall_reg_mode = "NEUTRAL"
     ms_data: Dict[str, Any] = {}
@@ -1861,25 +1736,28 @@ async def run_screening_and_optimization(mode: str, send_charts: bool = False, s
         trade_side = "none"
         strat_mode_desc = "FLAT / NO TRADING (中立相場・新規エントリー完全停止・撤退のみ)"
 
-    btc_whale_info = get_whale_sentiment_info("BTC")
-    btc_whale_sig = btc_whale_info.get("signal", "NEUTRAL")
-    print(f"[Market State] Regime: {overall_reg_mode} | Strategy Mode: {strat_mode_desc} | BTC Whale: {btc_whale_sig}")
+    print(f"[Market State] Regime: {overall_reg_mode} | Strategy Mode: {strat_mode_desc} | Whale Filter: OFF")
 
-    # 5. データレイク 2段階ウォークフォワード評価による当日最良勝者 1 件の選定 (OOS 判定)
+    # 3. データレイク 2段階ウォークフォワード評価による監視銘柄の選定 (OOS 判定)
     try:
         from candle_5m_store import sync_all_target_symbols_5m
         sync_all_target_symbols_5m(lookback_days=2)
     except Exception as sync_err:
         print(f"[Lake Sync Warning] 差分5m足同期警告: {sync_err}")
 
-    # 逆風クジラ銘柄を地合い許可リストから除外してレイクへ渡す
-    whale_excluded: Dict[str, str] = {}
-    for w_sym in FIXED_SYMBOLS:
-        w_sig = get_whale_sentiment_info(w_sym).get("signal", "NEUTRAL")
-        if overall_reg_mode == "BUY" and w_sig == "SHORT_ONLY":
-            whale_excluded[w_sym] = "WHALE_SHORT_ONLY"
-        elif overall_reg_mode == "SELL" and w_sig == "LONG_ONLY":
-            whale_excluded[w_sym] = "WHALE_LONG_ONLY"
+    # ノーマライズ前半高安監査の除外リストを辞書形式へ正規化 (クジラ除外は完全撤廃)
+    ms_excl_raw = ms_data.get("excluded_symbols") or {}
+    ms_reasons = ms_data.get("exclusion_reasons") or {}
+    if isinstance(ms_excl_raw, dict):
+        norm_excluded: Dict[str, str] = {normalize_symbol(str(k)): str(v) for k, v in ms_excl_raw.items()}
+    else:
+        ms_excl_clean = {get_clean_symbol(str(s)) for s in ms_excl_raw}
+        norm_excluded = {
+            s: str(ms_reasons.get(get_clean_symbol(s), "NORMALIZED_AUDIT_EXCLUDED"))
+            for s in FIXED_SYMBOLS
+            if (s in ms_excl_raw or get_clean_symbol(s) in ms_excl_clean)
+        }
+
     override_regime = dict(ms_data) if ms_data else {
         "overall_regime": overall_reg_mode,
         "regime_pattern": "",
@@ -1887,8 +1765,8 @@ async def run_screening_and_optimization(mode: str, send_charts: bool = False, s
         "allowed_strategies": [],
         "recommended_symbols": list(FIXED_SYMBOLS),
     }
-    override_regime["excluded_symbols"] = whale_excluded
-    override_regime["whale_snapshot"] = {"btc_whale": btc_whale_sig, "excluded": whale_excluded}
+    override_regime["excluded_symbols"] = norm_excluded
+    override_regime["whale_snapshot"] = {"source": "disabled", "filter_enabled": False}
 
     from lake_live_bridge import run_lake_screening_for_bot
     lake_out = await asyncio.to_thread(
@@ -2131,8 +2009,8 @@ async def _async_post_entry_reporting(
     val_val: float,
     poc_val: float,
     strat_desc: str,
-    whale_sig: str,
-    whale_flow_val: float,
+    whale_sig: str = "",
+    whale_flow_val: float = 0.0,
     interval_label: str = "5m",
     side: str = "LONG"
 ):
@@ -2170,7 +2048,6 @@ async def _async_post_entry_reporting(
             f"🎯 **利確目標**: `{target_tp_desc}`\n"
             f"📉 **ナンピン設計**: `{nanpin_desc}`\n"
             f"🛑 **損切り仕様**: `{sl_desc}`\n"
-            f"🐋 **クジラ判定**: `{whale_sig}` (流入: `${whale_flow_val:+,.0f}`)\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
         )
 
@@ -2189,8 +2066,8 @@ async def _async_post_exit_reporting(
     pnl: float,
     exit_reason: str,
     df_chart: pd.DataFrame,
-    whale_sig: str,
-    cycle_balance: float,
+    whale_sig: str = "",
+    cycle_balance: float = 0.0,
     interval_label: str = "5m",
     mp_period: int = 100
 ):
@@ -2207,7 +2084,7 @@ async def _async_post_exit_reporting(
         exit_chart_file = await asyncio.to_thread(
             plot_exit_chart,
             symbol=sym, df=df_chart, exit_price=reported_exit_px, entry_price=entry_px,
-            pnl=pnl, exit_reason=exit_reason, side=side_upper, whale_signal=whale_sig,
+            pnl=pnl, exit_reason=exit_reason, side=side_upper,
             interval_label=interval_label, mp_period=mp_period
         )
         if exit_chart_file and Path(exit_chart_file).exists():
@@ -2448,19 +2325,12 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                 await send_periodic_performance_report(symbol_apis, mode, label="定期パフォーマンスレポート")
 
         # -------------------------------------------------------------
-        # [フェーズ B1] 毎時タスク (正時00:05 JST: クジラ更新 & OI蓄積 & 毎時サマリー送信)
+        # [フェーズ B1] 毎時タスク (正時00:05 JST: OI蓄積 & 毎時サマリー送信)
         # -------------------------------------------------------------
         is_new_hour = (now_jst.hour != last_hourly_slot)
         if is_new_hour and now_jst.minute < 5:
             last_hourly_slot = now_jst.hour
             try:
-                whale_script = Path(__file__).resolve().parent / "fetch_whale_sentiment.py"
-                if whale_script.exists():
-                    try:
-                        subprocess.run([sys.executable, str(whale_script)], check=True, timeout=60)
-                    except Exception:
-                        pass
-
                 # BingX 全対象銘柄の建玉(OI)＆FRスナップショット自動蓄積
                 try:
                     from bingx_oi_collector import collect_and_save_oi_snapshot
@@ -2507,9 +2377,6 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                                 pass
                     if not h_px or h_px <= 0:
                         h_px = 1.0
-                    h_whale_info = get_whale_sentiment_info(h_sym)
-                    h_whale_sig = h_whale_info.get("signal", "NEUTRAL")
-                    h_whale_tag = "🟢買い" if h_whale_sig == "LONG_ONLY" else ("🔴売り" if h_whale_sig == "SHORT_ONLY" else "⚪中立")
 
                     if h_has_short:
                         h_sign = "+" if h_pnl >= 0 else "-"
@@ -2527,12 +2394,11 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                         "sym": h_sym,
                         "price": h_px,
                         "pos": h_pos_tag,
-                        "whale": h_whale_tag,
                     })
 
                 if hourly_summary_rows:
-                    tbl_header = f"{_pad_display('銘柄', 6)} {_pad_display('現在価格', 8, 'right')} {_pad_display('ポジション', 16)} {_pad_display('クジラ', 6)}"
-                    tbl_divider = "────────────────────────────────────────"
+                    tbl_header = f"{_pad_display('銘柄', 6)} {_pad_display('現在価格', 8, 'right')} {_pad_display('ポジション', 16)}"
+                    tbl_divider = "────────────────────────────────"
                     acct_mode_str = "Live Account" if BINGX_IS_LIVE else "VST Demo Mode"
                     can_trade_today_h, _, daily_cnt_h = can_open_new_trade_today()
                     if DAILY_MAX_TRADES > 0:
@@ -2552,7 +2418,7 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                         px_str = f"${px:,.4f}" if px < 10 else (f"${px:,.2f}" if px < 1000 else f"${px:,.1f}")
                         clean_sym = r["sym"].replace("-USDT", "").replace("USDT", "")
                         summary_lines.append(
-                            f"{_pad_display(clean_sym, 6)} {_pad_display(px_str, 8, 'right')} {_pad_display(r['pos'], 16)} {_pad_display(r['whale'], 6)}"
+                            f"{_pad_display(clean_sym, 6)} {_pad_display(px_str, 8, 'right')} {_pad_display(r['pos'], 16)}"
                         )
                     summary_lines.append(tbl_divider)
                     next_hour_jst = (now_jst.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)).strftime('%H:00')
@@ -2752,9 +2618,6 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                     vah_val = getattr(api, "entry_vah", entry_px * 1.02)
                     val_val = getattr(api, "entry_val", entry_px * 0.98)
                     poc_val = (vah_val + val_val) / 2.0
-                    whale_info = get_whale_sentiment_info(sym)
-                    whale_sig = whale_info.get("signal", "NEUTRAL")
-                    whale_flow_val = float(whale_info.get("net_flow", 0.0)) if whale_info else 0.0
                     cur_strat = pos_strat_p.upper()
                     side_label = "SHORT" if is_short_pos else "LONG"
                     strat_desc = f"{side_label} {cur_strat} ({inv_label_p}足 / MP={scale_state_new.get('mp', '-')})"
@@ -2763,8 +2626,7 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                     asyncio.create_task(_async_post_entry_reporting(
                         sym=sym, entry_px=entry_px, lot_size=pos_qty, entry_full_reason=entry_reason_val,
                         df_chart=df_report, vah_val=vah_val, val_val=val_val, poc_val=poc_val,
-                        strat_desc=strat_desc, whale_sig=whale_sig, whale_flow_val=whale_flow_val,
-                        interval_label=inv_label_p, side=side_label
+                        strat_desc=strat_desc, interval_label=inv_label_p, side=side_label
                     ))
 
                 tracked_active_positions.add(sym)
@@ -3007,8 +2869,6 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                 # 決済判定はバックテスト SSoT (lake_backtest_engine / bingx5_46_3logic) と完全統一
                 pos_action = sig_eval.get("action", "HOLD")
                 exit_reason = sig_eval.get("reason", "HOLD")
-                whale_info = get_whale_sentiment_info(sym)
-                whale_sig = whale_info.get("signal", "NEUTRAL")
 
                 closed = False
                 if pos_action == "STOP_LOSS":
@@ -3099,7 +2959,7 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                     asyncio.create_task(_async_post_exit_reporting(
                         sym=sym, side=side_tag, close_qty=pos_qty, reported_exit_px=cur_px,
                         entry_px=entry_px, pnl=pnl_current, exit_reason=exit_reason,
-                        df_chart=df_eval, whale_sig=whale_sig, cycle_balance=cycle_balance,
+                        df_chart=df_eval, cycle_balance=cycle_balance,
                         interval_label=inv_label_p, mp_period=pos_mp
                     ))
             except Exception as pos_err:
@@ -3282,9 +3142,6 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                     val_e = float(df_entry_eval["VAL"].iloc[-1]) if "VAL" in df_entry_eval.columns else cur_px * 0.98
                     poc_e = float(df_entry_eval["POC"].iloc[-1]) if "POC" in df_entry_eval.columns else cur_px
 
-                    whale_info = get_whale_sentiment_info(sym)
-                    whale_sig = whale_info.get("signal", "NEUTRAL")
-
                     if cand_side == "SHORT":
                         # --------------------------------------------------
                         # 【SHORT戦略 新規エントリー判定】(単発1本固定)
@@ -3362,7 +3219,7 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                                         pass
                                 pending_entry_orders.pop(sym, None)
                             if is_candle_closed:
-                                if entry_action == "INITIAL_ENTRY_SHORT" and whale_sig != "LONG_ONLY":
+                                if entry_action == "INITIAL_ENTRY_SHORT":
                                     api = symbol_apis.get(sym)
                                     if api:
                                         spec = api.bingx.instrument_spec or {}
@@ -3409,13 +3266,11 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                                                 }
                                                 save_scale_in_states(scale_in_states)
                                                 inv_label_e = f"{cand_interval_e}m" if cand_interval_e < 60 else f"{cand_interval_e // 60}h"
-                                                whale_flow_val = float(whale_info.get("net_flow", 0.0)) if whale_info else 0.0
                                                 strat_desc = f"SHORT {cand_strat_e.upper()} ({inv_label_e}足 / MP={sym_params_e.get('mp', '-')})"
                                                 asyncio.create_task(_async_post_entry_reporting(
                                                     sym=sym, entry_px=actual_fill_px, lot_size=lot_size, entry_full_reason=entry_reason,
                                                     df_chart=df_entry_eval, vah_val=vah_e, val_val=val_e, poc_val=poc_e,
-                                                    strat_desc=strat_desc, whale_sig=whale_sig, whale_flow_val=whale_flow_val,
-                                                    interval_label=inv_label_e, side="SHORT"
+                                                    strat_desc=strat_desc, interval_label=inv_label_e, side="SHORT"
                                                 ))
                                             else:
                                                 pending_entry_orders[sym]["price"] = cur_px
@@ -3435,8 +3290,6 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                         if total_active_count >= MAX_ACTIVE_POSITIONS:
                             continue
                         if entry_action != "INITIAL_ENTRY_SHORT":
-                            continue
-                        if whale_sig == "LONG_ONLY":
                             continue
 
                         api = symbol_apis.get(sym)
@@ -3459,7 +3312,7 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                         api.entry_val = val_e
                         api.entry_vah = vah_e
 
-                        discord.print_log(f"⚡ [{sym}] [{cand_strat_e.upper()} 初期ショートエントリー>>] {entry_reason} (クジラ: {whale_sig})")
+                        discord.print_log(f"⚡ [{sym}] [{cand_strat_e.upper()} 初期ショートエントリー>>] {entry_reason}")
                         df_entry_send = df_entry_eval.copy()
                         df_entry_send["short"] = True
                         entered = await api.short_entry(df_entry_send, pos, cycle_balance, lot_size, max_lot)
@@ -3507,13 +3360,11 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                                 save_scale_in_states(scale_in_states)
                                 total_active_count += 1
                                 inv_label_e = f"{cand_interval_e}m" if cand_interval_e < 60 else f"{cand_interval_e // 60}h"
-                                whale_flow_val = float(whale_info.get("net_flow", 0.0)) if whale_info else 0.0
                                 strat_desc = f"SHORT {cand_strat_e.upper()} ({inv_label_e}足 / MP={sym_params_e.get('mp', '-')})"
                                 asyncio.create_task(_async_post_entry_reporting(
                                     sym=sym, entry_px=actual_fill_px, lot_size=lot_size, entry_full_reason=entry_reason,
                                     df_chart=df_entry_eval, vah_val=vah_e, val_val=val_e, poc_val=poc_e,
-                                    strat_desc=strat_desc, whale_sig=whale_sig, whale_flow_val=whale_flow_val,
-                                    interval_label=inv_label_e, side="SHORT"
+                                    strat_desc=strat_desc, interval_label=inv_label_e, side="SHORT"
                                 ))
                             else:
                                 pending_entry_orders[sym] = {
@@ -3613,7 +3464,7 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                                         pass
                                 pending_entry_orders.pop(sym, None)
                             if is_candle_closed:
-                                if entry_action == "INITIAL_ENTRY" and whale_sig != "SHORT_ONLY":
+                                if entry_action == "INITIAL_ENTRY":
                                     api = symbol_apis.get(sym)
                                     if api:
                                         spec = api.bingx.instrument_spec or {}
@@ -3660,13 +3511,11 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                                                 }
                                                 save_scale_in_states(scale_in_states)
                                                 inv_label_e = f"{cand_interval_e}m" if cand_interval_e < 60 else f"{cand_interval_e // 60}h"
-                                                whale_flow_val = float(whale_info.get("net_flow", 0.0)) if whale_info else 0.0
                                                 strat_desc = f"{cand_strat_e.upper()} ({inv_label_e}足 / MP={sym_params_e.get('mp', '-')})"
                                                 asyncio.create_task(_async_post_entry_reporting(
                                                     sym=sym, entry_px=actual_fill_px, lot_size=lot_size, entry_full_reason=entry_reason,
                                                     df_chart=df_entry_eval, vah_val=vah_e, val_val=val_e, poc_val=poc_e,
-                                                    strat_desc=strat_desc, whale_sig=whale_sig, whale_flow_val=whale_flow_val,
-                                                    interval_label=inv_label_e, side="LONG"
+                                                    strat_desc=strat_desc, interval_label=inv_label_e, side="LONG"
                                                 ))
                                             else:
                                                 pending_entry_orders[sym]["price"] = cur_px
@@ -3686,8 +3535,6 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                         if total_active_count >= MAX_ACTIVE_POSITIONS:
                             continue
                         if entry_action != "INITIAL_ENTRY":
-                            continue
-                        if whale_sig == "SHORT_ONLY":
                             continue
 
                         api = symbol_apis.get(sym)
@@ -3710,7 +3557,7 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                         api.entry_val = val_e
                         api.entry_vah = vah_e
 
-                        discord.print_log(f"⚡ [{sym}] [{cand_strat_e.upper()} 初期エントリー>>] {entry_reason} (クジラ: {whale_sig})")
+                        discord.print_log(f"⚡ [{sym}] [{cand_strat_e.upper()} 初期エントリー>>] {entry_reason}")
                         df_entry_send = df_entry_eval.copy()
                         df_entry_send["long"] = True
                         entered = await api.long_entry(df_entry_send, pos, cycle_balance, lot_size, max_lot)
@@ -3755,13 +3602,11 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                                 save_scale_in_states(scale_in_states)
                                 total_active_count += 1
                                 inv_label_e = f"{cand_interval_e}m" if cand_interval_e < 60 else f"{cand_interval_e // 60}h"
-                                whale_flow_val = float(whale_info.get("net_flow", 0.0)) if whale_info else 0.0
                                 strat_desc = f"{cand_strat_e.upper()} ({inv_label_e}足 / MP={sym_params_e.get('mp', '-')})"
                                 asyncio.create_task(_async_post_entry_reporting(
                                     sym=sym, entry_px=actual_fill_px, lot_size=lot_size, entry_full_reason=entry_reason,
                                     df_chart=df_entry_eval, vah_val=vah_e, val_val=val_e, poc_val=poc_e,
-                                    strat_desc=strat_desc, whale_sig=whale_sig, whale_flow_val=whale_flow_val,
-                                    interval_label=inv_label_e, side="LONG"
+                                    strat_desc=strat_desc, interval_label=inv_label_e, side="LONG"
                                 ))
                             else:
                                 pending_entry_orders[sym] = {

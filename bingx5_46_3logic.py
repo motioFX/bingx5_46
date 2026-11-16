@@ -6698,25 +6698,26 @@ def simulate_val_poc_strategy(
 # 【新戦略】固定20銘柄 + BTC単独地合い監視 + 日足押し目 + 1H VPブレイク + 5M動的決済
 # ==============================================================================
 
-def check_normalized_peak_timing(df: pd.DataFrame) -> Tuple[bool, List[str]]:
-    """
-    【PROJECT_RULES 第2項準拠】3期間ノーマライズ前半高値検出規約 (ピークアウト除外フィルター)
-    対象期間: 5d (120h) / 10d (240h) / 30d (720h) 全期間統一基準
-    判定条件: 最高値(Max)が「前半50%以内」に位置している場合、
-             現在値が期間レンジの半値ライン (Min + (Max - Min) * 0.5) を維持できているか検証。
-    除外基準: 前半ピーク かつ 現在値がレンジ半値未満（維持率50%未満）に沈んでいる銘柄は、
-             「ピークアウト（行って来い崩壊）または長期衰退中で反発力なし」とみなして除外。
-             ※一度大きく下落しても、現在値がレンジ半値以上まで買い戻されて盛り上がっている銘柄はセーフ。
-    """
-    windows = [
-        ("5d", 5 * 24),    # 120h
-        ("10d", 10 * 24),  # 240h
-        ("30d", 30 * 24),  # 720h
-    ]
-    reasons = []
-    is_bad = False
+NORMALIZED_AUDIT_WINDOWS: Tuple[Tuple[str, int], ...] = (
+    ("2d", 2 * 24),    # 48h
+    ("7d", 7 * 24),    # 168h
+    ("14d", 14 * 24),  # 336h
+)
 
-    for w_name, w_hours in windows:
+
+def _scan_normalized_window_extremum(
+    df: pd.DataFrame,
+    use_peak: bool,
+    below_half: bool,
+    strict_cmp: bool,
+    reason_fmt: str,
+) -> Tuple[bool, List[str]]:
+    """3期間 (2d/7d/14d) 正規化推移で前半ピーク/ボトムと半値維持/反発を統一判定する共通ヘルパー。"""
+    reasons: List[str] = []
+    matched = False
+    ext_key = "peak" if use_peak else "trough"
+
+    for w_name, w_hours in NORMALIZED_AUDIT_WINDOWS:
         if len(df) < 24:
             continue
         sub = df.tail(w_hours).reset_index(drop=True)
@@ -6724,7 +6725,7 @@ def check_normalized_peak_timing(df: pd.DataFrame) -> Tuple[bool, List[str]]:
             continue
 
         c_series = sub["close"].astype(float)
-        base_c = c_series.iloc[0]
+        base_c = float(c_series.iloc[0])
         if base_c <= 0:
             continue
         norm_c = c_series / base_c
@@ -6733,65 +6734,59 @@ def check_normalized_peak_timing(df: pd.DataFrame) -> Tuple[bool, List[str]]:
         c_max = float(norm_c.max())
         half_level = c_min + (c_max - c_min) * 0.5
 
-        peak_idx = int(norm_c.argmax())
-        peak_ratio = peak_idx / len(norm_c)
+        ext_idx = int(norm_c.argmax() if use_peak else norm_c.argmin())
+        ext_ratio = ext_idx / len(norm_c)
+        if ext_ratio >= 0.50:
+            continue
 
-        if peak_ratio < 0.50:
-            if final_norm < half_level:
-                is_bad = True
-                reasons.append(
-                    f"{w_name}前半ピーク半値割れ(peak={peak_ratio:.2f}, max={c_max:.2f}x, curr={final_norm:.2f}x < half={half_level:.2f}x)"
+        if below_half:
+            cond = (final_norm < half_level) if strict_cmp else (final_norm <= half_level)
+        else:
+            cond = (final_norm > half_level) if strict_cmp else (final_norm >= half_level)
+
+        if cond:
+            matched = True
+            ext_val = c_max if use_peak else c_min
+            reasons.append(
+                reason_fmt.format(
+                    w_name=w_name,
+                    ext_key=ext_key,
+                    ext_ratio=ext_ratio,
+                    ext_val=ext_val,
+                    final_norm=final_norm,
+                    half_level=half_level,
                 )
+            )
 
-    return is_bad, reasons
+    return matched, reasons
+
+
+def check_normalized_peak_timing(df: pd.DataFrame) -> Tuple[bool, List[str]]:
+    """
+    【PROJECT_RULES 第2項準拠】3期間ノーマライズ前半高値検出規約 (ピークアウト除外フィルター)
+    対象期間: 2d (48h) / 7d (168h) / 14d (336h) 全期間統一基準
+    """
+    return _scan_normalized_window_extremum(
+        df,
+        use_peak=True,
+        below_half=True,
+        strict_cmp=True,
+        reason_fmt="{w_name}前半ピーク半値割れ({ext_key}={ext_ratio:.2f}, max={ext_val:.2f}x, curr={final_norm:.2f}x < half={half_level:.2f}x)",
+    )
 
 
 def check_normalized_trough_timing(df: pd.DataFrame) -> Tuple[bool, List[str]]:
     """
     【PROJECT_RULES 第2項準拠】3期間ノーマライズ前半安値検出規約 (ショート用: 底打ち反発・踏み上げ除外フィルター)
-    対象期間: 5d (120h) / 10d (240h) / 30d (720h) 全期間統一基準
-    判定条件: 最安値(Min)が「前半50%以内」に位置している場合、
-             現在値が期間レンジの半値ライン (Min + (Max - Min) * 0.5) を上回っているか検証。
-    除外基準: 前半ボトム かつ 現在値がレンジ半値以上（戻し率50%以上）に反発・上昇している銘柄は、
-             「底打ち反転（踏み上げショートスクイズリスク大）」とみなしてショート候補から除外。
-             ※前半高値をつけて下落基調の銘柄や、安値圏で低迷している下落トレンド銘柄はショート適格としてセーフ。
+    対象期間: 2d (48h) / 7d (168h) / 14d (336h) 全期間統一基準
     """
-    windows = [
-        ("5d", 5 * 24),    # 120h
-        ("10d", 10 * 24),  # 240h
-        ("30d", 30 * 24),  # 720h
-    ]
-    reasons = []
-    is_bad = False
-
-    for w_name, w_hours in windows:
-        if len(df) < 24:
-            continue
-        sub = df.tail(w_hours).reset_index(drop=True)
-        if len(sub) < 24:
-            continue
-
-        c_series = sub["close"].astype(float)
-        base_c = c_series.iloc[0]
-        if base_c <= 0:
-            continue
-        norm_c = c_series / base_c
-        final_norm = float(norm_c.iloc[-1])
-        c_min = float(norm_c.min())
-        c_max = float(norm_c.max())
-        half_level = c_min + (c_max - c_min) * 0.5
-
-        trough_idx = int(norm_c.argmin())
-        trough_ratio = trough_idx / len(norm_c)
-
-        if trough_ratio < 0.50:
-            if final_norm > half_level:
-                is_bad = True
-                reasons.append(
-                    f"{w_name}前半ボトム半値超え(trough={trough_ratio:.2f}, min={c_min:.2f}x, curr={final_norm:.2f}x > half={half_level:.2f}x)"
-                )
-
-    return is_bad, reasons
+    return _scan_normalized_window_extremum(
+        df,
+        use_peak=False,
+        below_half=False,
+        strict_cmp=True,
+        reason_fmt="{w_name}前半ボトム半値超え({ext_key}={ext_ratio:.2f}, min={ext_val:.2f}x, curr={final_norm:.2f}x > half={half_level:.2f}x)",
+    )
 
 
 def check_normalized_timing_by_regime(df: pd.DataFrame, regime: str = "BUY") -> Tuple[bool, List[str]]:
@@ -6812,93 +6807,29 @@ def check_normalized_timing_by_regime(df: pd.DataFrame, regime: str = "BUY") -> 
 def check_bottom_reversal_recovery(df: pd.DataFrame) -> Tuple[bool, List[str]]:
     """
     【PROJECT_RULES 第2項準拠】3期間ノーマライズ前半安値反発検出規約 (買い相場用: セリクラ底打ち反転・V字回復銘柄)
-    対象期間: 5d (120h) / 10d (240h) / 30d (720h)
-    判定条件: 最安値(Min)が「前半50%以内」に位置し、現在値がレンジ半値ライン
-             (Min + (Max - Min) * 0.5) 以上まで力強く買い戻されているか検証。
-    採用基準: 前半に大底を打ち、後半にかけてレンジ半値以上へ急反発している銘柄は、
-             「セリクラ底打ち反転・上昇トレンド転換（V字回復）」とみなして買い候補銘柄に追加採用する。
+    対象期間: 2d (48h) / 7d (168h) / 14d (336h)
     """
-    windows = [
-        ("5d", 5 * 24),    # 120h
-        ("10d", 10 * 24),  # 240h
-        ("30d", 30 * 24),  # 720h
-    ]
-    reasons = []
-    is_recovery = False
-
-    for w_name, w_hours in windows:
-        if len(df) < 24:
-            continue
-        sub = df.tail(w_hours).reset_index(drop=True)
-        if len(sub) < 24:
-            continue
-
-        c_series = sub["close"].astype(float)
-        base_c = c_series.iloc[0]
-        if base_c <= 0:
-            continue
-        norm_c = c_series / base_c
-        final_norm = float(norm_c.iloc[-1])
-        c_min = float(norm_c.min())
-        c_max = float(norm_c.max())
-        half_level = c_min + (c_max - c_min) * 0.5
-
-        trough_idx = int(norm_c.argmin())
-        trough_ratio = trough_idx / len(norm_c)
-
-        if trough_ratio < 0.50 and final_norm >= half_level:
-            is_recovery = True
-            reasons.append(
-                f"{w_name}底打ち反転(trough={trough_ratio:.2f}, min={c_min:.2f}x, curr={final_norm:.2f}x >= half={half_level:.2f}x)"
-            )
-
-    return is_recovery, reasons
+    return _scan_normalized_window_extremum(
+        df,
+        use_peak=False,
+        below_half=False,
+        strict_cmp=False,
+        reason_fmt="{w_name}底打ち反転({ext_key}={ext_ratio:.2f}, min={ext_val:.2f}x, curr={final_norm:.2f}x >= half={half_level:.2f}x)",
+    )
 
 
 def check_peak_breakdown_trend(df: pd.DataFrame) -> Tuple[bool, List[str]]:
     """
     【PROJECT_RULES 第2項準拠】3期間ノーマライズ前半高値急落検出規約 (売り相場用: 天井崩壊トレンド銘柄)
-    対象期間: 5d (120h) / 10d (240h) / 30d (720h)
-    判定条件: 最高値(Max)が「前半50%以内」に位置し、現在値がレンジ半値ライン
-             (Min + (Max - Min) * 0.5) 以下に沈み込んでいるか検証。
-    採用基準: 前半に天井をつけ、後半にかけてレンジ半値以下へ崩落している銘柄は、
-             「天井崩壊トレンド・下落モメンタム発生」とみなして売り候補銘柄に追加採用する。
+    対象期間: 2d (48h) / 7d (168h) / 14d (336h)
     """
-    windows = [
-        ("5d", 5 * 24),    # 120h
-        ("10d", 10 * 24),  # 240h
-        ("30d", 30 * 24),  # 720h
-    ]
-    reasons = []
-    is_breakdown = False
-
-    for w_name, w_hours in windows:
-        if len(df) < 24:
-            continue
-        sub = df.tail(w_hours).reset_index(drop=True)
-        if len(sub) < 24:
-            continue
-
-        c_series = sub["close"].astype(float)
-        base_c = c_series.iloc[0]
-        if base_c <= 0:
-            continue
-        norm_c = c_series / base_c
-        final_norm = float(norm_c.iloc[-1])
-        c_min = float(norm_c.min())
-        c_max = float(norm_c.max())
-        half_level = c_min + (c_max - c_min) * 0.5
-
-        peak_idx = int(norm_c.argmax())
-        peak_ratio = peak_idx / len(norm_c)
-
-        if peak_ratio < 0.50 and final_norm <= half_level:
-            is_breakdown = True
-            reasons.append(
-                f"{w_name}天井崩壊下落(peak={peak_ratio:.2f}, max={c_max:.2f}x, curr={final_norm:.2f}x <= half={half_level:.2f}x)"
-            )
-
-    return is_breakdown, reasons
+    return _scan_normalized_window_extremum(
+        df,
+        use_peak=True,
+        below_half=True,
+        strict_cmp=False,
+        reason_fmt="{w_name}天井崩壊下落({ext_key}={ext_ratio:.2f}, max={ext_val:.2f}x, curr={final_norm:.2f}x <= half={half_level:.2f}x)",
+    )
 
 
 def evaluate_market_regime_3window(
@@ -6906,11 +6837,9 @@ def evaluate_market_regime_3window(
 ) -> Dict[str, Any]:
     """
     【PROJECT_RULES 第2項準拠】新・全体地合い判定規約
-    30d / 10d / 5d の 3期間ノーマライズ比較チャート（20銘柄＋BTC 2票＝計22票）を用いて
+    14d / 7d / 2d の 3期間ノーマライズ比較チャート（21アルト＋BTC 2票＝計23票）を用いて
     各期間の買い/売り票（前半高値・安値の半値維持監査）を集計し、
-    3期間すべてが買い判定なら総合地合い「BUY」および買い推奨銘柄を返す。
-    3期間すべてが売り判定なら総合地合い「SELL」を返す。
-    それ以外は総合地合い「NEUTRAL」（トレードなし）。
+    総合地合い（BUY / SELL / NEUTRAL）および推奨銘柄を返す。
     """
     windows = [
         ("14d", 14 * 24),  # 336h
@@ -7338,9 +7267,9 @@ def check_market_regime_safe(
 ) -> Tuple[bool, str, Dict[str, Any]]:
     """【PROJECT_RULES 第2項準拠】市場全体地合い判定
     総合地合い判定 (market_state_info 連携):
-       - 3期間 (30d/10d/5d) すべてが「買い (BUY)」であれば安全（新規エントリー可）。
+       - 3期間 (14d/7d/2d) の総合地合いを参照。
        - 買い (BUY) でなければ新規ロングを即座にブロック（ノーポジ待機）。
-       ※BTC単独パニック急落チェックは3期間ノーマライズ判定（BTC 2票/計22票）に統合され不要のため廃止。
+       ※BTC単独パニック急落チェックは3期間ノーマライズ判定（BTC 2票/計23票）に統合され不要のため廃止。
     """
     metrics: Dict[str, Any] = {}
 
