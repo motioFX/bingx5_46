@@ -8,9 +8,10 @@
   3. SSH into the VPS and pull the latest code (`cd /home/ubuntu/bitbank5_46 && git pull origin bitbank`).
   4. Safely verify/restart the bot process on the VPS (`bitbank5_46_1spot_limit.py --loop`).
 
-## 2. Operation Mode (Pure Monitor & Overseas Data Collection)
+## 2. Operation Mode (Pure Portfolio Monitor / Overseas 5m Sync Disabled by Default)
 - **No Order Placement / No Air Trade**:
-  - 発注処理・売買シグナル判定・エアトレード（ペーパートレード）は完全に廃止し、ボットは「実保有ポジション監査」および「海外取引所データ収集＆配信」に専念する。
+  - 発注処理・売買シグナル判定・エアトレード（ペーパートレード）は完全に廃止し、ボットは「実保有ポジション監査（保有銘柄レポート）」に専念する。
+  - 海外取引所（Hyperliquid & BingX）5分足データ収集はデフォルトで停止中（手動実行時のみ `--enable-history` で有効化可能）。
   - レバレッジや余計な戦略バックテスト最適化・トレーリング等は行わない。
 
 ## 3. Cross-Exchange Portfolio Tracking & Asset Protection

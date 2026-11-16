@@ -1231,10 +1231,24 @@ async def sync_historical_and_charts(
 
 
 async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60'):
+    enable_history = (
+        ("--enable-history" in sys.argv or "--with-history" in sys.argv)
+        and "--skip-history" not in sys.argv
+        and "--no-history" not in sys.argv
+    )
     account_mode_str = "[LIVE Account] (Bitbank ＆ Binance Japan 本番口座 接続中)" if BITBANK_IS_LIVE else "[OFFLINE/MOCK]"
-    op_mode_str = "ポジション監査 ＆ データ収集配信 (売買発注なし)"
-
     hours_str = ", ".join([f"{h:02d}:00" for h in sorted(ANALYSIS_HOURS)])
+    if enable_history:
+        op_mode_str = "ポジション監査 ＆ データ収集配信 (売買発注なし)"
+        strategy_dir_str = "現物ポジション自動監査 ＆ 海外全銘柄データ収集"
+        candle_info_str = "5分足 (5M) (BingX 3カテゴリー ＆ Hyperliquid全銘柄)"
+        schedule_line = f"  定期同期時刻 : 毎日 {hours_str} JST (8時間ごと)"
+    else:
+        op_mode_str = "ポジション監査専用 (売買発注なし / 海外5分足収集停止)"
+        strategy_dir_str = "Bitbank ＆ Binance Japan 現物保有銘柄レポート専用"
+        candle_info_str = "停止中 (毎時06分 REST API 保有銘柄監査のみ稼働)"
+        schedule_line = f"  定期監査時刻 : 毎日 {hours_str} JST (8時間ごと)"
+
     start_msg = (
         "```\n"
         " ____  _ _   _                 _    \n"
@@ -1251,9 +1265,9 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
         f"  取引口座設定 : {account_mode_str}\n"
         f"  動作モード   : {op_mode_str}\n"
         f"  目標投資額   : {BITBANK_TARGET_POSITION_VALUE_JPY:,.0f} JPY (1,000万円 / 現物 1.0倍)\n"
-        f"  戦略方向     : 現物ポジション自動監査 ＆ 海外全銘柄データ収集\n"
-        f"  ローソク足   : 5分足 (5M) (BingX 3カテゴリー ＆ Hyperliquid全銘柄)\n"
-        f"  定期同期時刻 : 毎日 {hours_str} JST (8時間ごと)\n"
+        f"  戦略方向     : {strategy_dir_str}\n"
+        f"  ローソク足   : {candle_info_str}\n"
+        f"{schedule_line}\n"
         f"=================================================="
     )
     if "--no-banner" not in sys.argv:
@@ -1268,9 +1282,8 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
     except Exception as port_err:
         discord.print_log(f"⚠️ 起動時 総合ポジション監査エラー: {port_err}")
 
-    # ========== 【起動時 ステップ2】: 全銘柄ヒストリカルデータ同期 (非同期バックグラウンド実行) ==========
-    skip_history = ("--skip-history" in sys.argv or "--no-history" in sys.argv)
-    if not skip_history:
+    # ========== 【起動時 ステップ2】: 全銘柄ヒストリカルデータ同期 (--enable-history 指定時のみ実行) ==========
+    if enable_history:
         should_upload = should_perform_8h_full_data_upload(datetime.now(JST))
         if not should_upload:
             discord.print_log("📌 [8H Sync Guard] 直近8時間スロットで全収集データは既にDiscord送信済みです。ローカル差分同期のみ行い、Discordアップロードはスキップします。")
@@ -1278,6 +1291,8 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
             record_full_sync_slot(datetime.now(JST), status="in_progress")
         # ポジション監査ループをブロックしないよう非同期バックグラウンドで起動
         asyncio.create_task(sync_historical_and_charts(incremental_hours=8, skip_upload=(not should_upload)))
+    else:
+        discord.print_log("📌 [Monitor Mode] 海外取引所5分足データ収集は無効化されています。保有銘柄レポートのみ継続稼働します。")
 
     last_screening_slot = (datetime.now(JST).date(), datetime.now(JST).hour)
     cycle_count = 0
@@ -1328,11 +1343,12 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
             last_screening_slot = current_slot
             gc.collect()
 
-            # 2. 海外取引所（Hyperliquid & BingX 4大カテゴリー別）全銘柄データ同期をバックグラウンド非同期実行
-            should_upload_periodic = should_perform_8h_full_data_upload(now_jst)
-            if should_upload_periodic:
-                record_full_sync_slot(now_jst, status="in_progress")
-            asyncio.create_task(sync_historical_and_charts(incremental_hours=8, skip_upload=(not should_upload_periodic)))
+            # 2. 海外取引所（Hyperliquid & BingX 3カテゴリー別）全銘柄データ同期をバックグラウンド非同期実行 (--enable-history 指定時のみ)
+            if enable_history:
+                should_upload_periodic = should_perform_8h_full_data_upload(now_jst)
+                if should_upload_periodic:
+                    record_full_sync_slot(now_jst, status="in_progress")
+                asyncio.create_task(sync_historical_and_charts(incremental_hours=8, skip_upload=(not should_upload_periodic)))
 
             # 古いZIP・チャート画像の自動クリーンアップ
             try:
@@ -1361,6 +1377,7 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
         except Exception:
             pass
 
+        gc.collect()
         await asyncio.sleep(1)
 
 
