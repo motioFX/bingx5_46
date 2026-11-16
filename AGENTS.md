@@ -58,3 +58,6 @@
 
 ## 8. Implementation Plan & Walkthrough Rule
 - ALWAYS write the Implementation Plan and Walkthrough artifacts entirely in Japanese.
+
+## 9. Polymarket Top 20 Daily Normalized Chart
+- `polymarket_top20_chart.py` fetches top 20 active non-closed Polymarket events by 24h volume (excluding placeholders, <1d short-lived events, and settled extremes), plots 1-month normalized probability charts (Base = 100%, split into Top 1-10 & Top 11-20), and posts to Discord (`real1_bitbank`) once daily at 09:00 JST via VPS cron.
