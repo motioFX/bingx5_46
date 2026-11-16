@@ -16,6 +16,7 @@ from typing import Dict, Iterable, List
 BENCHMARK_SYMBOL: str = "BTC-USDT"
 
 EXCLUDED_MEGA_CAPS: List[str] = ["BTC-USDT", "ETH-USDT"]
+EXCLUDED_TRADE_MEGA_CAPS: List[str] = ["SOL-USDT", "DOGE-USDT", "XRP-USDT"]
 
 FIXED_TRADABLE_SYMBOLS: List[str] = [
     "HYPE-USDT",
@@ -43,6 +44,11 @@ FIXED_TRADABLE_SYMBOLS: List[str] = [
 
 # データレイク蓄積対象 (実取引21銘柄 + 地合いベンチマークBTC-USDT = 計22銘柄)
 LAKE_UNIVERSE_SYMBOLS: List[str] = list(FIXED_TRADABLE_SYMBOLS) + [BENCHMARK_SYMBOL]
+
+# 超大型除外済みの中堅アルト実取引ユニバース (18銘柄 / PROJECT_RULES.md 準拠)
+TRADABLE_MID_CAP_SYMBOLS: List[str] = [
+    s for s in FIXED_TRADABLE_SYMBOLS if s not in EXCLUDED_TRADE_MEGA_CAPS
+]
 
 # OKX / Binance 等の外部取引所シンボル補完時に、BingX表記へ正規化するためのエイリアス
 _CANONICAL_ALIASES: Dict[str, str] = {

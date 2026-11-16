@@ -378,12 +378,13 @@ class TestDataLakeAcceptance(unittest.TestCase):
                 self.assertEqual(cnt2, 2)
                 self.assertIn("サーキットブレーカー", reason2)
 
-                # 3. 24時間 SL クールダウン
+                # 3. 24時間 SL クールダウン廃止仕様 (常時未冷却 False, 0.0)
+                self.assertEqual(bot_main.SL_COOLDOWN_HOURS, 0.0)
                 self.assertFalse(bot_main.is_in_sl_cooldown("SOL-USDT")[0])
                 bot_main.record_sl_cooldown("SOL-USDT")
                 in_cd, rem_h = bot_main.is_in_sl_cooldown("SOL-USDT")
-                self.assertTrue(in_cd)
-                self.assertGreater(rem_h, 23.0)
+                self.assertFalse(in_cd)
+                self.assertEqual(rem_h, 0.0)
 
                 # 4. 出来高 1.5倍サージゲート
                 n_v = 25
@@ -852,6 +853,378 @@ class TestDataLakeAcceptance(unittest.TestCase):
                 rtt.DATA_DIR = orig_rtt_data
                 rtt.TRADES_FILE = orig_rtt_trades
                 rtt.CHARTS_DIR = orig_rtt_charts
+
+    def test_j_backtest_live_1to1_parity_and_portfolio(self):
+        """J: BT-実ロジック 1対1 完全同期・Portfolio Replay (2枠/3態勢/8h上限/緊急BE/セッション切替キャンセル) 検証"""
+        import asyncio
+        import time
+        from unittest.mock import AsyncMock, patch
+        import numpy as np
+        import pandas as pd
+        import bingx5_46_1futures_limit as bot_main
+        import bingx5_46_2api as api_mod
+        from bingx_oi_collector import enrich_candles_with_oi_fr
+        from lake_store import LakeStore, TIMEFRAME_SECONDS
+        from bingx5_46_3logic import (
+            check_val_poc_signals,
+            check_vah_poc_signals,
+            evaluate_market_regime_3window_from_close_arrays,
+            compute_normalized_exclusions_from_close_arrays,
+            compute_dynamic_exit_levels,
+            evaluate_dynamic_exit_decision,
+        )
+        from lake_backtest_engine import (
+            WalkForwardConfig,
+            _compute_causal_features,
+            _LazyMPSeries,
+            build_portfolio_params_map_from_cells,
+            simulate_portfolio_on_window,
+        )
+        from symbol_universe import EXCLUDED_TRADE_MEGA_CAPS, TRADABLE_MID_CAP_SYMBOLS
+
+        # 1. 中堅アルト固定ユニバースと 23票過半数 (>=12) 判定の検証
+        self.assertEqual(set(EXCLUDED_TRADE_MEGA_CAPS), {"SOL-USDT", "DOGE-USDT", "XRP-USDT"})
+        self.assertEqual(len(TRADABLE_MID_CAP_SYMBOLS), 18)
+        for mc in EXCLUDED_TRADE_MEGA_CAPS:
+            self.assertNotIn(mc, TRADABLE_MID_CAP_SYMBOLS)
+            self.assertIn(mc, bot_main.EXCLUDED_MEGA_CAPS)
+
+        # 23票過半数 (>=12 BUY / 11 NEUTRAL) の検証 (全ウィンドウで24..48本共通評価)
+        close_arrs = {"BTC-USDT": np.linspace(100.0, 120.0, 48)}
+        neutral_arr = np.concatenate([[10.0, 8.0], np.full(46, 9.9)])
+        for idx_s, s_name in enumerate([f"ALT{i}-USDT" for i in range(21)]):
+            if idx_s < 10:
+                close_arrs[s_name] = np.linspace(10.0, 12.0, 48)
+            else:
+                close_arrs[s_name] = neutral_arr.copy()
+        # BTC(+2) + ALT0..9(+10) = 12票 (23票過半数ちょうど) -> BUY
+        res_23 = evaluate_market_regime_3window_from_close_arrays(close_arrs)
+        self.assertEqual(res_23["period_results"]["2d"]["total_votes"], 23)
+        self.assertEqual(res_23["period_results"]["2d"]["buy_votes"], 12)
+        self.assertEqual(res_23["overall_regime"], "BUY")
+
+        # 11票 (<12) では BUY にならず NEUTRAL であること
+        close_arrs_11 = dict(close_arrs)
+        close_arrs_11["ALT9-USDT"] = neutral_arr.copy()
+        res_11 = evaluate_market_regime_3window_from_close_arrays(close_arrs_11)
+        self.assertEqual(res_11["period_results"]["2d"]["buy_votes"], 11)
+        self.assertEqual(res_11["overall_regime"], "NEUTRAL")
+
+        # ノーマライズ PIT 除外ロジック検証: BULL時は前半ピーク半値割れ除外、BEAR時は前半ボトム半値超え除外
+        ex_arrs = {
+            "GOOD-USDT": np.concatenate([np.full(80, 10.0), np.linspace(10.0, 15.0, 88)]),
+            "PEAKDROP-USDT": np.concatenate([np.linspace(10.0, 20.0, 50), np.linspace(19.5, 11.0, 118)]),
+            "CAPUP-USDT": np.concatenate([np.linspace(20.0, 10.0, 40), np.linspace(10.5, 19.0, 128)]),
+        }
+        bull_ex = compute_normalized_exclusions_from_close_arrays(ex_arrs, "BUY")
+        bear_ex = compute_normalized_exclusions_from_close_arrays(ex_arrs, "SELL")
+        self.assertIn("PEAKDROP-USDT", bull_ex)
+        self.assertNotIn("GOOD-USDT", bull_ex)
+        self.assertIn("CAPUP-USDT", bear_ex)
+
+        # 2. Shifted 10-bar Swing ＆ Lazy step=1 MP と Live 3logic の 1対1 一致検証
+        n_b = 180
+        rng = np.random.default_rng(77)
+        t_open = np.arange(n_b, dtype=np.int64) * 300 + 1_760_000_000
+        close_p = 10.0 + np.cumsum(rng.normal(0.0, 0.03, n_b))
+        high_p = close_p + 0.05
+        low_p = close_p - 0.05
+        open_p = np.roll(close_p, 1)
+        open_p[0] = close_p[0]
+        # 末尾バーで急落して直近10本前 (iloc[-11:-1]) の安値を明確に下抜けさせる
+        prior10_min = float(np.min(low_p[-11:-1]))
+        low_p[-1] = prior10_min - 0.25
+        close_p[-1] = prior10_min - 0.15
+
+        df_sim = pd.DataFrame({
+            "ts_utc": t_open,
+            "ts_open": t_open,
+            "ts_close": t_open + 300,
+            "timestamp": pd.to_datetime(t_open, unit="s", utc=True),
+            "open": open_p,
+            "high": high_p,
+            "low": low_p,
+            "close": close_p,
+            "volume": np.full(n_b, 2000.0),
+            "quote_volume": close_p * 2000.0,
+            "oi_chg_4h": np.full(n_b, 1.0),
+            "fundingRate": np.full(n_b, 0.0001),
+        })
+        cfg_1 = WalkForwardConfig(mp_step=1, sl_cooldown_hours=0.0, allow_ny_session=True, enable_emergency_breakeven=True)
+        feat_5m = _compute_causal_features(df_sim, "5m", cfg_1, needed_mps=[100])
+        lazy_mp = _LazyMPSeries(
+            feat_5m["open"],
+            feat_5m["high"],
+            feat_5m["low"],
+            feat_5m["close"],
+            feat_5m["volume"],
+            period=100,
+        )
+        bt_val, bt_vah, bt_poc = lazy_mp.get_bar(n_b - 1)
+        self.assertAlmostEqual(float(feat_5m["swing_low_10"][-1]), prior10_min, places=8)
+
+        # Live側で recent_low=None を渡したとき prior10_min (iloc[-11:-1]) で Swing SL 判定が発火し BT と一致すること
+        entry_ref = float(prior10_min + 0.20)
+        sig_live_sw = check_val_poc_signals(
+            df_5m=df_sim,
+            current_pos_qty=10.0,
+            current_trades_count=1,
+            avg_entry_price=entry_ref,
+            last_entry_price=entry_ref,
+            current_price=float(close_p[-1]),
+            vp_period=100,
+            dynamic_sl_pct=-0.030,
+            is_fill_bar=False,
+            recent_low=None,
+            elapsed_minutes=15.0,
+            timeout_minutes=240.0,
+            max_hold_minutes=480.0,
+            has_new_tf_bar_after_fill=True,
+        )
+        bt_levels = compute_dynamic_exit_levels(
+            strategy="val_poc",
+            avg_entry_px=entry_ref,
+            val=bt_val,
+            vah=bt_vah,
+            poc=bt_poc,
+            prev10_swing_px=float(feat_5m["swing_low_10"][-1]),
+            target_ratio=0.70,
+            eff_hard_sl_pct=0.030,
+            min_sl_pct=0.0020,
+        )
+        bt_dec = evaluate_dynamic_exit_decision(
+            strategy="val_poc",
+            avg_entry_px=entry_ref,
+            levels=bt_levels,
+            is_fill_bar=False,
+            can_check_close_exit=True,
+            is_emergency_breakeven=False,
+            high_px=float(close_p[-1]),
+            low_px=float(close_p[-1]),
+            close_check_px=float(close_p[-1]),
+            live_px=float(close_p[-1]),
+            cur_rsi=50.0,
+            rsi_exit_thresh=60.0,
+            elapsed_minutes=15.0,
+            timeout_minutes=240.0,
+            max_hold_minutes=480.0,
+            prefer_limit_fill_px=False,
+        )
+        self.assertEqual(sig_live_sw["action"], bt_dec["action"])
+        self.assertEqual(sig_live_sw["action"], "STOP_LOSS")
+
+        # 約定当足 (is_fill_bar=True) では確定足SL・緊急BE・480分決済いずれも発火しないこと
+        sig_fill_bar = check_val_poc_signals(
+            df_5m=df_sim,
+            current_pos_qty=10.0,
+            current_trades_count=1,
+            avg_entry_price=entry_ref,
+            last_entry_price=entry_ref,
+            current_price=entry_ref * 1.003,
+            vp_period=100,
+            is_emergency_breakeven=True,
+            dynamic_sl_pct=-0.030,
+            is_fill_bar=True,
+            recent_low=None,
+            elapsed_minutes=500.0,
+            timeout_minutes=240.0,
+            max_hold_minutes=480.0,
+            has_new_tf_bar_after_fill=False,
+        )
+        self.assertEqual(sig_fill_bar["action"], "HOLD")
+
+        # 8時間上限決済 (MAX_HOLD_CLOSE: 480分到達かつ含み益でも強制決済)
+        df_calm = df_sim.copy()
+        df_calm["low"] = entry_ref * 1.0005
+        df_calm["high"] = entry_ref * 1.002
+        df_calm["close"] = entry_ref * 1.001
+        sig_max_hold = check_val_poc_signals(
+            df_5m=df_calm,
+            current_pos_qty=10.0,
+            current_trades_count=1,
+            avg_entry_price=entry_ref,
+            last_entry_price=entry_ref,
+            current_price=entry_ref * 1.001,
+            vp_period=100,
+            target_ratio=10.0,
+            is_emergency_breakeven=False,
+            dynamic_sl_pct=-0.050,
+            is_fill_bar=False,
+            recent_low=entry_ref * 0.98,
+            elapsed_minutes=480.0,
+            timeout_minutes=240.0,
+            max_hold_minutes=480.0,
+            has_new_tf_bar_after_fill=False,
+        )
+        self.assertEqual(sig_max_hold["action"], "CLOSE_ALL")
+        self.assertIn("MAX_HOLD_CLOSE", sig_max_hold["reason"])
+
+        # 緊急建値撤退 (SHORT 時 建値-0.20%)
+        sig_short_be = check_vah_poc_signals(
+            df_5m=df_calm,
+            current_pos_qty=10.0,
+            current_trades_count=1,
+            avg_entry_price=entry_ref * 1.01,
+            last_entry_price=entry_ref * 1.01,
+            current_price=entry_ref * 1.01 * 0.9975,
+            recent_high=entry_ref * 1.05,
+            vp_period=100,
+            target_ratio=10.0,
+            is_emergency_breakeven=True,
+            dynamic_sl_pct=0.050,
+            is_fill_bar=False,
+            elapsed_minutes=30.0,
+            timeout_minutes=240.0,
+            max_hold_minutes=480.0,
+            has_new_tf_bar_after_fill=False,
+        )
+        self.assertEqual(sig_short_be["action"], "CLOSE_ALL")
+        self.assertIn("EMERGENCY_BREAKEVEN", sig_short_be["reason"])
+
+        # 3. bingx_oi_collector 欠損 OI/FR NaN 保持 (0.0/0.0001 で埋めない)
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch("bingx_oi_collector.OI_STORE_DIR", Path(tmp)):
+                df_no_oi = df_sim[["timestamp", "open", "high", "low", "close", "volume"]].head(10).copy()
+                enriched = enrich_candles_with_oi_fr(df_no_oi, "FAKECOIN-USDT", auto_sync=False, timeframe="15m")
+                self.assertIn("oi_chg_4h", enriched.columns)
+                self.assertIn("fundingRate", enriched.columns)
+                self.assertTrue(enriched["oi_chg_4h"].isna().all())
+                self.assertTrue(enriched["fundingRate"].isna().all())
+
+        # 4. bingx5_46_2api short_entry 非ブロッキング即時リターン検証
+        orig_air = api_mod.is_air
+        try:
+            api_mod.is_air = True
+            with patch("bingx5_46_2api.fetch_instrument_spec_bingx", return_value={"quantityPrecision": 2, "pricePrecision": 4, "tradeMinQuantity": 1.0}), \
+                 patch("bingx5_46_2api.get_bingx_orderbook", return_value=(9.99, 10.01)):
+                api_inst = api_mod.api_bingx(symbol="SUI-USDT", mode="demo")
+                df_ord = df_sim.tail(15).copy()
+                df_ord["short"] = True
+                t0 = time.monotonic()
+                ok_short = asyncio.run(api_inst.short_entry(df_ord, {"pos_count": 0}, 500.0, 2.0, 10.0))
+                elapsed_s = time.monotonic() - t0
+                self.assertTrue(ok_short)
+                self.assertLess(elapsed_s, 2.0, "short_entry が 240秒ブロッキング待機しています")
+        finally:
+            api_mod.is_air = orig_air
+
+        # 5. Live セッション切替時の待機指値キャンセル検証
+        mock_api = AsyncMock()
+        pending_map = {
+            "SUI-USDT": {"side": "long", "strategy": "val_poc", "interval": 15, "price": 1.0, "chase_count": 0},
+            "LINK-USDT": {"side": "long", "strategy": "val_poc", "interval": 15, "price": 10.0, "chase_count": 0},
+        }
+        apis_map = {"SUI-USDT": mock_api, "LINK-USDT": mock_api}
+        raw_sui = {
+            "range_params": {"strategy": "val_poc", "interval": 15, "is_qualified": True},
+            "breakout_params": {"strategy": "vah_break", "interval": 5, "is_qualified": True},
+            "is_range_qualified": True,
+            "is_breakout_qualified": True,
+            "is_qualified": True,
+            "strategy": "val_poc",
+            "interval": 15,
+        }
+        raw_link = {
+            "range_params": {"strategy": "val_poc", "interval": 15, "is_qualified": True},
+            "breakout_params": {"strategy": "vah_break", "interval": 5, "is_qualified": False},
+            "is_range_qualified": True,
+            "is_breakout_qualified": False,
+            "is_qualified": True,
+            "strategy": "val_poc",
+            "interval": 15,
+        }
+        # 東京 -> ロンドンへ切替時: 戦略切替側も不合格側も旧東京待機指値が即キャンセルされること
+        sp_s, _, _ = asyncio.run(bot_main.check_and_reconcile_symbol_gate(
+            "SUI-USDT", raw_sui, is_tokyo=False, is_london=True,
+            gate_allowed=["vah_break"], excluded_mega_caps=EXCLUDED_TRADE_MEGA_CAPS,
+            pending_entry_orders=pending_map, symbol_apis=apis_map,
+        ))
+        sp_l, _, _ = asyncio.run(bot_main.check_and_reconcile_symbol_gate(
+            "LINK-USDT", raw_link, is_tokyo=False, is_london=True,
+            gate_allowed=["vah_break"], excluded_mega_caps=EXCLUDED_TRADE_MEGA_CAPS,
+            pending_entry_orders=pending_map, symbol_apis=apis_map,
+        ))
+        self.assertIsNone(sp_s)
+        self.assertIsNone(sp_l)
+        self.assertNotIn("SUI-USDT", pending_map)
+        self.assertNotIn("LINK-USDT", pending_map)
+        self.assertEqual(mock_api.active_order_cancel.await_count, 2)
+
+        # 6. Portfolio Replay バックテスト検証 (最大2枠制約 ＆ 実 ext_pct/ext_atr 算出)
+        with tempfile.TemporaryDirectory() as tmp:
+            db_p = Path(tmp) / "port_test.db"
+            store = LakeStore(db_path=db_p)
+            n_tot = 220
+            ts_0 = int(pd.Timestamp("2026-10-01 00:00:00", tz="UTC").timestamp())  # JST 09:00〜
+            t_arr = ts_0 + np.arange(n_tot, dtype=np.int64) * 300
+            win_start = ts_0 + 180 * 300
+            win_end = ts_0 + n_tot * 300
+            for idx_p, s_p in enumerate(["SUI-USDT", "LINK-USDT", "NEAR-USDT", "BTC-USDT"]):
+                base = 10.0 * (idx_p + 1)
+                c_p = np.full(n_tot, base)
+                l_p = c_p - base * 0.002
+                h_p = c_p + base * 0.002
+                o_p = c_p.copy()
+                v_p = np.full(n_tot, 1000.0)
+                if s_p != "BTC-USDT":
+                    # 窓内で VA 下限割れ後に急騰させる
+                    for bar_k in range(180, 185):
+                        c_p[bar_k] = base * 0.95
+                        l_p[bar_k] = base * 0.945
+                        v_p[bar_k] = 2000.0
+                    c_p[185:] = base * 1.05
+                    h_p[185:] = base * 1.06
+                df_c = pd.DataFrame({
+                    "ts_utc": t_arr,
+                    "open": o_p,
+                    "high": h_p,
+                    "low": l_p,
+                    "close": c_p,
+                    "volume": v_p,
+                    "quote_volume": c_p * v_p,
+                })
+                store.upsert_candles(s_p, "5m", df_c, cutoff_utc=win_end + 300)
+                store.rebuild_higher_timeframes_from_5m(s_p, cutoff_utc=win_end + 300)
+
+            cells_list = [
+                {
+                    "symbol": s_p,
+                    "strategy": "val_poc",
+                    "side": "long",
+                    "timeframe": "5m",
+                    "params_json": json.dumps({"mp": 60, "target_ratio": 0.50, "l_ep": 40.0, "l_cp": 60.0, "s_ep": 60.0, "s_cp": 40.0}),
+                    "eval_grade": "QUALIFIED",
+                    "eval_ev": 0.25,
+                    "eval_net_pnl": 3.0,
+                    "eval_pf": 2.0,
+                    "eval_trades": 12,
+                }
+                for s_p in ("SUI-USDT", "LINK-USDT", "NEAR-USDT")
+            ]
+            ranked_syms, p_map = build_portfolio_params_map_from_cells(cells_list)
+            hourly_map = {
+                (t_sec // 3600) * 3600: {
+                    "overall_regime": "BUY",
+                    "allowed_strategies": ["val_poc", "rsima", "vah_break"],
+                    "allowed_strategies_set": frozenset(["val_poc", "rsima", "vah_break"]),
+                    "excluded_symbols_set": frozenset(),
+                }
+                for t_sec in range(win_start, win_end + 3600, 3600)
+            }
+            port_res = simulate_portfolio_on_window(
+                store,
+                p_map,
+                ranked_syms,
+                hourly_map,
+                win_start,
+                win_end,
+                WalkForwardConfig(max_active_positions=2, mp_step=1, sl_cooldown_hours=0.0),
+            )
+            self.assertIn("metrics", port_res)
+            self.assertLessEqual(len([t for t in port_res["sim_trades"] if t.get("fill_ts_utc") is not None]), 3)
+            for tr in port_res["sim_trades"]:
+                self.assertTrue(np.isfinite(float(tr["ext_pct"])))
+                self.assertTrue(np.isfinite(float(tr["ext_atr"])))
 
 
 if __name__ == "__main__":

@@ -147,7 +147,7 @@ MAX_SELECTED_SYMBOLS: int = 20  # 最大選定・監視銘柄数 (Hyperliquid完
 MAX_TRADES_COUNT: int = 1
 
 # [ 5 ] 固定選定銘柄 (主要アルトコイン20銘柄 / Hyperliquid hype5_45 完全統一)
-from symbol_universe import FIXED_TRADABLE_SYMBOLS
+from symbol_universe import FIXED_TRADABLE_SYMBOLS, EXCLUDED_TRADE_MEGA_CAPS
 
 FIXED_SYMBOLS: List[str] = list(FIXED_TRADABLE_SYMBOLS)
 
@@ -346,13 +346,12 @@ discord = send_discord()
 # 🛡️ 日次リスク管理規約 (回数制限解除 ＆ 日次損失サーキットブレーカー - PROJECT_RULES 準拠)
 # ==============================================================================
 DAILY_TRADE_STATE_FILE = Path(__file__).resolve().parent / "Data" / "daily_trade_state.json"
-DAILY_MAX_TRADES = 0  # 0=1日トレード回数制限なし (回数制限解除 / 最大2枠・損失CB -$1.50・24h SL冷却は維持)
-DAILY_MAX_LOSS_USDT = 1.50  # 1日最大許容損失額 (W7準拠: 目標投資額 $15.0 の 10% 到達で即座に当日新規停止)
+DAILY_MAX_TRADES = 0  # 0=1日トレード回数制限なし (回数制限解除 / 最大2枠・損失CB -$1.50・24h冷却なし)
+DAILY_MAX_LOSS_USDT = 1.50  # 1日最大許容損失額 (目標投資額 $15.0 の 10% 到達で即座に当日新規停止)
 # 🚀 中堅アルト ＆ 出来高急増 (Volume Surge 1.5倍) ゲート規約 (PROJECT_RULES 準拠)
-# 直近30日検証においてTriple-Stage Recency Gate合格率0%（直近15d/7dシグナル0回）の実証データに基づき、
-# スクリーニング計算時間（CPU負荷）を約3分間削減するための高速化オプション
+# 直近検証においてメガキャップ3銘柄をエントリー対象外として統一（地合い投票は23票維持）
 EXCLUDE_MEGAS_FOR_SPEED = True
-EXCLUDED_MEGA_CAPS = ["SOL-USDT", "DOGE-USDT", "XRP-USDT"]
+EXCLUDED_MEGA_CAPS = list(EXCLUDED_TRADE_MEGA_CAPS)
 MIN_VOLUME_SURGE_RATIO = 1.5  # 直近20本平均比 1.5倍以上必須 (日次勝率 57.1% / PF 2.13 実証最適値)
 
 def get_current_trading_day() -> str:
@@ -1417,7 +1416,7 @@ def save_scale_in_states(states: dict):
             pass
 
 SL_COOLDOWN_FILE = Path(__file__).resolve().parent / "Data" / "sl_cooldown_states.json"
-SL_COOLDOWN_HOURS = 24.0
+SL_COOLDOWN_HOURS = 0.0
 
 def load_sl_cooldown_states() -> dict:
     if SL_COOLDOWN_FILE.exists():
@@ -1437,21 +1436,11 @@ def save_sl_cooldown_states(states: dict):
         pass
 
 def record_sl_cooldown(symbol: str):
-    """損切り発生時に24時間クールダウンを記録"""
-    states = load_sl_cooldown_states()
-    states[symbol] = time.time()
-    save_sl_cooldown_states(states)
+    """24時間 SL クールダウン廃止仕様: 互換維持のための no-op。"""
+    return None
 
 def is_in_sl_cooldown(symbol: str) -> Tuple[bool, float]:
-    """過去24時間以内に損切りが発生した銘柄かを判定 (残り時間を返却)"""
-    states = load_sl_cooldown_states()
-    last_t = float(states.get(symbol, 0.0))
-    if last_t <= 0:
-        return False, 0.0
-    elapsed = time.time() - last_t
-    rem_hours = SL_COOLDOWN_HOURS - (elapsed / 3600.0)
-    if rem_hours > 0:
-        return True, rem_hours
+    """24時間 SL クールダウン廃止仕様: 常に未冷却 (False, 0.0) を返す。"""
     return False, 0.0
 
 
@@ -2026,14 +2015,14 @@ async def _async_post_entry_reporting(
             target_tp_val = vah_val - (vah_val - val_val) * 0.50 if (vah_val > val_val and val_val > 0) else poc_val
             target_tp_desc = f"VAH-VAL 50%水準 (${target_tp_val:.6f}) / RSI冷却利確"
             nanpin_desc = "単発1本固定 (ナンピン完全なし)"
-            sl_desc = "直近高値確定足ストップ (Swing High SL) ＋ 24hクールダウン"
+            sl_desc = "直近10本高値確定足ストップ (Swing High SL) / 8h上限決済"
             side_badge = "SHORT 🔴"
             header_title = f"🚀🚀🚀 **【新規ショートエントリー約定 [{interval_label}足]】** 🚀🚀🚀"
         else:
             target_tp_val = val_val + (vah_val - val_val) * 0.50 if (vah_val > val_val and val_val > 0) else poc_val
             target_tp_desc = f"VAL-VAH 50%水準 (${target_tp_val:.6f}) / RSI過熱利確"
-            nanpin_desc = "VA 50%間隔・均等1倍ロット (最大2回追加 / 合計最大3枠)"
-            sl_desc = "動的MAEストップ (直近30d 95%ile) ＋ 24hクールダウン"
+            nanpin_desc = "単発1本固定 (ナンピン完全なし)"
+            sl_desc = "直近10本安値確定足ストップ (Swing Low SL) / 8h上限決済"
             side_badge = "LONG 🟢"
             header_title = f"🚀🚀🚀 **【新規ロングエントリー約定 [{interval_label}足]】** 🚀🚀🚀"
 
@@ -2098,6 +2087,467 @@ async def _async_post_exit_reporting(
             discord.send_file(detail_file, f"🔍 【実運用実績】累積損益パフォーマンス (直近10日 - Detail版 / 今回決済: {pnl:+.2f} USDT)")
     except Exception as e:
         discord.print_log(f"⚠️ [{sym}] 決済レポート非同期タスクエラー: {e}", level="warning")
+
+
+def _extract_latest_close_ts_utc(df_eval: Optional[pd.DataFrame], interval_min: int) -> int:
+    """確定足DataFrameの最新バー終端UTC秒を取得する (5m/15m約定バー・同一バー再エントリー抑止用)。"""
+    if df_eval is None or df_eval.empty:
+        return 0
+    inv_sec = max(1, int(interval_min or 5)) * 60
+    try:
+        if "ts_close" in df_eval.columns:
+            return int(df_eval["ts_close"].iloc[-1])
+        if "ts_open" in df_eval.columns:
+            return int(df_eval["ts_open"].iloc[-1]) + inv_sec
+        if "timestamp" in df_eval.columns:
+            val = df_eval["timestamp"].iloc[-1]
+            if isinstance(val, (int, float, np.integer, np.floating)):
+                sec = int(float(val) // 1000) if float(val) > 1e11 else int(val)
+                return sec + inv_sec
+            return int(pd.to_datetime(val, utc=True).timestamp()) + inv_sec
+        if isinstance(df_eval.index, pd.DatetimeIndex):
+            return int(pd.to_datetime(df_eval.index[-1], utc=True).timestamp()) + inv_sec
+    except Exception:
+        pass
+    return 0
+
+
+def _evaluate_strategy_signal(
+    cand_strat: str,
+    df_eval: pd.DataFrame,
+    current_pos_qty: float,
+    current_trades_count: int,
+    avg_entry_price: float,
+    last_entry_price: float,
+    current_price: float,
+    sym_params: Dict[str, Any],
+    val_price: float,
+    vah_price: float,
+    pos_mp: int,
+    pos_tr: float,
+    pos_l_ep: float,
+    pos_l_cp: float,
+    pos_s_ep: float,
+    pos_s_cp: float,
+    is_cooldown_active: bool = False,
+    is_emergency_breakeven: bool = False,
+    dynamic_sl_pct: float = -0.030,
+    bars_held: int = 0,
+    timeout_bars: int = 48,
+    is_fill_bar: bool = False,
+    elapsed_minutes: Optional[float] = None,
+    timeout_minutes: float = 240.0,
+    max_hold_minutes: float = 480.0,
+    has_new_tf_bar_after_fill: bool = True,
+) -> Dict[str, Any]:
+    """全6戦略 (LONG/SHORT) 共通のエントリー・エグジット判定ディスパッチャ (SSoT準拠)。"""
+    from bingx5_46_3logic import (
+        check_rsima3_signals,
+        check_val_poc_signals,
+        check_vah_poc_signals,
+        check_rsima3_short_signals,
+        check_vah_break_signals,
+        check_val_break_signals,
+    )
+
+    strat = str(cand_strat or "rsima").lower()
+    num_bins = int(sym_params.get("num_bins", 50))
+    va_pct = float(sym_params.get("value_area_pct", 0.70))
+    use_ema = ("ema" in strat)
+
+    if strat == "val_break":
+        return check_val_break_signals(
+            df_5m=df_eval,
+            current_pos_qty=current_pos_qty,
+            current_trades_count=current_trades_count,
+            avg_entry_price=avg_entry_price,
+            last_entry_price=last_entry_price,
+            current_price=current_price,
+            recent_high=None,
+            vp_period=pos_mp,
+            num_bins=num_bins,
+            value_area_pct=va_pct,
+            target_ratio=pos_tr,
+            is_cooldown_active=is_cooldown_active,
+            is_emergency_breakeven=is_emergency_breakeven,
+            dynamic_sl_pct=dynamic_sl_pct,
+            bars_held=bars_held,
+            timeout_bars=timeout_bars,
+            is_fill_bar=is_fill_bar,
+            elapsed_minutes=elapsed_minutes,
+            timeout_minutes=timeout_minutes,
+            max_hold_minutes=max_hold_minutes,
+            has_new_tf_bar_after_fill=has_new_tf_bar_after_fill,
+        )
+    if strat.startswith("vah_poc"):
+        return check_vah_poc_signals(
+            df_5m=df_eval,
+            current_pos_qty=current_pos_qty,
+            current_trades_count=current_trades_count,
+            avg_entry_price=avg_entry_price,
+            last_entry_price=last_entry_price,
+            current_price=current_price,
+            recent_high=None,
+            vp_period=pos_mp,
+            num_bins=num_bins,
+            value_area_pct=va_pct,
+            ma_type=str(sym_params.get("ma_type", "EMA" if use_ema else "NONE")),
+            ma_condition=str(sym_params.get("ma_condition", "close_below" if use_ema else "none")),
+            max_trades=1,
+            target_ratio=pos_tr,
+            sl_pct=abs(dynamic_sl_pct),
+            is_cooldown_active=is_cooldown_active,
+            is_emergency_breakeven=is_emergency_breakeven,
+            dynamic_sl_pct=dynamic_sl_pct,
+            bars_held=bars_held,
+            use_ema_filter=use_ema,
+            timeout_bars=timeout_bars,
+            is_fill_bar=is_fill_bar,
+            elapsed_minutes=elapsed_minutes,
+            timeout_minutes=timeout_minutes,
+            max_hold_minutes=max_hold_minutes,
+            has_new_tf_bar_after_fill=has_new_tf_bar_after_fill,
+        )
+    if strat.startswith("rsima_short"):
+        return check_rsima3_short_signals(
+            df_5m=df_eval,
+            current_pos_qty=current_pos_qty,
+            current_trades_count=current_trades_count,
+            avg_entry_price=avg_entry_price,
+            current_price=current_price,
+            recent_high=None,
+            rsi_len=9,
+            ema_len=7,
+            s_ep=pos_s_ep,
+            s_cp=pos_s_cp,
+            sl_pct=abs(dynamic_sl_pct),
+            max_trades=1,
+            last_entry_price=last_entry_price,
+            val_price=val_price,
+            vah_price=vah_price,
+            is_emergency_breakeven=is_emergency_breakeven,
+            dynamic_sl_pct=dynamic_sl_pct,
+            bars_held=bars_held,
+            use_ema_filter=use_ema,
+            timeout_bars=timeout_bars,
+            is_fill_bar=is_fill_bar,
+            elapsed_minutes=elapsed_minutes,
+            timeout_minutes=timeout_minutes,
+            max_hold_minutes=max_hold_minutes,
+            has_new_tf_bar_after_fill=has_new_tf_bar_after_fill,
+        )
+    if strat == "vah_break":
+        return check_vah_break_signals(
+            df_5m=df_eval,
+            current_pos_qty=current_pos_qty,
+            current_trades_count=current_trades_count,
+            avg_entry_price=avg_entry_price,
+            last_entry_price=last_entry_price,
+            current_price=current_price,
+            vp_period=pos_mp,
+            num_bins=num_bins,
+            value_area_pct=va_pct,
+            target_ratio=pos_tr,
+            is_cooldown_active=is_cooldown_active,
+            is_emergency_breakeven=is_emergency_breakeven,
+            dynamic_sl_pct=dynamic_sl_pct,
+            bars_held=bars_held,
+            timeout_bars=timeout_bars,
+            is_fill_bar=is_fill_bar,
+            elapsed_minutes=elapsed_minutes,
+            timeout_minutes=timeout_minutes,
+            max_hold_minutes=max_hold_minutes,
+            has_new_tf_bar_after_fill=has_new_tf_bar_after_fill,
+        )
+    if strat.startswith("val_poc"):
+        return check_val_poc_signals(
+            df_5m=df_eval,
+            current_pos_qty=current_pos_qty,
+            current_trades_count=current_trades_count,
+            avg_entry_price=avg_entry_price,
+            last_entry_price=last_entry_price,
+            current_price=current_price,
+            vp_period=pos_mp,
+            num_bins=num_bins,
+            value_area_pct=va_pct,
+            ma_type=str(sym_params.get("ma_type", "EMA" if use_ema else "NONE")),
+            ma_condition=str(sym_params.get("ma_condition", "close_above" if use_ema else "none")),
+            max_trades=MAX_TRADES_COUNT,
+            target_ratio=pos_tr,
+            sl_pct=abs(dynamic_sl_pct),
+            is_cooldown_active=is_cooldown_active,
+            is_emergency_breakeven=is_emergency_breakeven,
+            dynamic_sl_pct=dynamic_sl_pct,
+            bars_held=bars_held,
+            use_ema_filter=use_ema,
+            timeout_bars=timeout_bars,
+            recent_low=None,
+            is_fill_bar=is_fill_bar,
+            elapsed_minutes=elapsed_minutes,
+            timeout_minutes=timeout_minutes,
+            max_hold_minutes=max_hold_minutes,
+            has_new_tf_bar_after_fill=has_new_tf_bar_after_fill,
+        )
+    if strat.startswith("rsima"):
+        return check_rsima3_signals(
+            df_5m=df_eval,
+            current_pos_qty=current_pos_qty,
+            current_trades_count=current_trades_count,
+            avg_entry_price=avg_entry_price,
+            current_price=current_price,
+            rsi_len=9,
+            ema_len=7,
+            l_ep=pos_l_ep,
+            l_cp=pos_l_cp,
+            sl_pct=abs(dynamic_sl_pct),
+            max_trades=MAX_TRADES_COUNT,
+            last_entry_price=last_entry_price,
+            val_price=val_price,
+            vah_price=vah_price,
+            is_cooldown_active=is_cooldown_active,
+            is_emergency_breakeven=is_emergency_breakeven,
+            dynamic_sl_pct=dynamic_sl_pct,
+            bars_held=bars_held,
+            use_ema_filter=use_ema,
+            timeout_bars=timeout_bars,
+            recent_low=None,
+            is_fill_bar=is_fill_bar,
+            elapsed_minutes=elapsed_minutes,
+            timeout_minutes=timeout_minutes,
+            max_hold_minutes=max_hold_minutes,
+            has_new_tf_bar_after_fill=has_new_tf_bar_after_fill,
+        )
+    return {"action": "NONE", "reason": f"UNKNOWN_STRATEGY({strat})", "lot_multiplier": 1.0, "metrics": {}}
+
+
+async def _cancel_pending_order_for_symbol(
+    sym: str,
+    reason: str,
+    pending_entry_orders: Dict[str, Dict[str, Any]],
+    symbol_apis: Dict[str, Any],
+) -> bool:
+    """指定銘柄の未約定指値を安全キャンセルし pending_entry_orders から除去する。"""
+    if sym not in pending_entry_orders:
+        return False
+    p_api = symbol_apis.get(sym)
+    if p_api:
+        try:
+            await p_api.active_order_cancel()
+        except Exception:
+            pass
+    pending_entry_orders.pop(sym, None)
+    discord.print_log(f"🛡️ [{sym}] 未約定指値を安全キャンセルしました ({reason})")
+    return True
+
+
+async def _cancel_all_pending_orders(
+    reason: str,
+    pending_entry_orders: Dict[str, Dict[str, Any]],
+    symbol_apis: Dict[str, Any],
+) -> int:
+    """現在残っている全未約定指値を安全キャンセルする。"""
+    cnt = 0
+    for p_sym in list(pending_entry_orders.keys()):
+        if await _cancel_pending_order_for_symbol(p_sym, reason, pending_entry_orders, symbol_apis):
+            cnt += 1
+    return cnt
+
+
+def _build_and_store_live_fill_state(
+    sym: str,
+    side: str,
+    actual_fill_px: float,
+    lot_size: float,
+    df_eval: Optional[pd.DataFrame],
+    sym_params_e: Dict[str, Any],
+    cand_interval_e: int,
+    cand_strat_e: str,
+    entry_reason: str,
+    vah_e: float,
+    val_e: float,
+    poc_e: float,
+    scale_in_states: Dict[str, Any],
+    trade_counts: Dict[str, int],
+    last_trade_time: Dict[str, float],
+    last_nanpin_time: Dict[str, float],
+    tracked_active_positions: Set[str],
+    pending_info: Optional[Dict[str, Any]] = None,
+    fill_ts_override: Optional[float] = None,
+    spawn_reporting: bool = True,
+) -> Dict[str, Any]:
+    """約定直後の状態 (fill_5m_open_ts / Data Lake / scale_in_states / 非同期通知) を共通構築する。"""
+    side_low = "short" if str(side).lower() == "short" else "long"
+    is_short = (side_low == "short")
+    now_val = float(fill_ts_override if fill_ts_override is not None else time.time())
+    fill_5m_open_ts = (int(now_val) // 300) * 300
+
+    dyn_sl_pct_e = float(sym_params_e.get("dynamic_mae_stop", -0.030))
+    dyn_to_bars_e = int(sym_params_e.get("dynamic_timeout_bars", max(3, 240 // max(1, cand_interval_e))))
+    rec_h_val = 0.0
+    rec_l_val = 0.0
+    sl_px_val = 0.0
+    if df_eval is not None and not df_eval.empty:
+        if is_short:
+            h_eval = df_eval["high"].astype(float) if "high" in df_eval.columns else df_eval["close"].astype(float)
+            rec_h_val = float(h_eval.iloc[-10:].max()) if len(h_eval) >= 10 else float(h_eval.max())
+            sl_px_val = min(max(rec_h_val, actual_fill_px * 1.0020), actual_fill_px * (1.0 + abs(dyn_sl_pct_e)))
+        else:
+            l_eval = df_eval["low"].astype(float) if "low" in df_eval.columns else df_eval["close"].astype(float)
+            rec_l_val = float(l_eval.iloc[-10:].min()) if len(l_eval) >= 10 else float(l_eval.min())
+            sl_px_val = max(min(rec_l_val, actual_fill_px * 0.9980), actual_fill_px * (1.0 - abs(dyn_sl_pct_e)))
+
+    lake_entry_meta: Dict[str, Any] = {}
+    tf_p = "15m" if int(cand_interval_e) == 15 else "5m"
+    try:
+        from lake_live_bridge import record_live_entry_to_lake, interval_to_timeframe
+        tf_p = interval_to_timeframe(cand_interval_e)
+        lake_params = dict(sym_params_e)
+        lake_params.update({
+            "strategy": cand_strat_e,
+            "interval": cand_interval_e,
+            "timeframe": tf_p,
+        })
+        if pending_info:
+            lake_params["lake_selection_id"] = pending_info.get("lake_selection_id") or sym_params_e.get("lake_selection_id")
+            lake_params["lake_run_id"] = pending_info.get("lake_run_id") or sym_params_e.get("lake_run_id")
+        lake_entry_meta = record_live_entry_to_lake(sym, side_low, actual_fill_px, lot_size, params=lake_params)
+    except Exception:
+        lake_entry_meta = {}
+
+    scale_state_new: Dict[str, Any] = {
+        "nanpin_count": 0,
+        "last_entry_price": actual_fill_px,
+        "avg_price": actual_fill_px,
+        "initial_entry_time": now_val,
+        "entry_ts_utc": int(now_val),
+        "fill_5m_open_ts": fill_5m_open_ts,
+        "qty": float(lot_size),
+        "side": side_low,
+        "interval": cand_interval_e,
+        "timeframe": tf_p,
+        "strategy": cand_strat_e,
+        "dynamic_mae_stop": dyn_sl_pct_e,
+        "dynamic_timeout_bars": dyn_to_bars_e,
+        "mp": int(sym_params_e.get("mp", 200)),
+        "target_ratio": float(sym_params_e.get("target_ratio", 0.70)),
+        "s_ep": float(sym_params_e.get("s_ep", 60.0)),
+        "s_cp": float(sym_params_e.get("s_cp", 40.0)),
+        "l_ep": float(sym_params_e.get("l_ep", 40.0)),
+        "l_cp": float(sym_params_e.get("l_cp", 60.0)),
+        "recent_high": rec_h_val,
+        "recent_low": rec_l_val,
+        "sl_price": sl_px_val,
+        **lake_entry_meta,
+    }
+    scale_in_states[sym] = scale_state_new
+    save_scale_in_states(scale_in_states)
+    trade_counts[sym] = 1
+    last_trade_time[sym] = now_val
+    last_nanpin_time[sym] = now_val
+    tracked_active_positions.add(sym)
+
+    if spawn_reporting:
+        inv_label_e = f"{cand_interval_e}m" if cand_interval_e < 60 else f"{cand_interval_e // 60}h"
+        side_label = "SHORT" if is_short else "LONG"
+        strat_desc = f"{side_label} {cand_strat_e.upper()} ({inv_label_e}足 / MP={sym_params_e.get('mp', '-')})"
+        df_rep = df_eval if (df_eval is not None and not df_eval.empty) else pd.DataFrame()
+        try:
+            asyncio.create_task(_async_post_entry_reporting(
+                sym=sym, entry_px=actual_fill_px, lot_size=lot_size, entry_full_reason=entry_reason,
+                df_chart=df_rep, vah_val=vah_e, val_val=val_e, poc_val=poc_e,
+                strat_desc=strat_desc, interval_label=inv_label_e, side=side_label,
+            ))
+        except RuntimeError:
+            pass
+
+    return scale_state_new
+
+
+def select_session_entry_spec(
+    raw_sym_params: Dict[str, Any],
+    is_tokyo: bool,
+    is_london: bool,
+) -> Tuple[Optional[Dict[str, Any]], str]:
+    """JST時間帯に応じた最適パラメータと合格ゲートを検証する (BT _pick_session_spec 完全対称)。"""
+    if is_tokyo:
+        sp = raw_sym_params.get("range_params") or raw_sym_params
+        if not bool(raw_sym_params.get("is_range_qualified", sp.get("is_qualified", False))):
+            return None, "東京RANGE不合格"
+        strat = str(sp.get("strategy", "rsima")).lower()
+        if strat in ("vah_break", "val_break"):
+            return None, f"東京ブレイク対象外({strat})"
+        return sp, "OK"
+    if is_london:
+        sp = raw_sym_params.get("breakout_params") or raw_sym_params
+        if not bool(raw_sym_params.get("is_breakout_qualified", sp.get("is_qualified", False))):
+            return None, "欧州BREAKOUT不合格"
+        strat = str(sp.get("strategy", "rsima")).lower()
+        if strat not in ("vah_break", "val_break"):
+            return None, f"欧州レンジ対象外({strat})"
+        return sp, "OK"
+    if not bool(raw_sym_params.get("is_qualified", True)):
+        return None, "NY総合OOS不合格"
+    return raw_sym_params, "OK"
+
+
+def resolve_strategy_side(cand_strat: str) -> Optional[str]:
+    """戦略名から売買方向 ('LONG' / 'SHORT') を決定する。"""
+    s = str(cand_strat or "").lower()
+    if s in ("val_poc", "vah_break", "rsima") or s.startswith("val_poc") or (s.startswith("rsima") and not s.startswith("rsima_short")):
+        return "LONG"
+    if s in ("vah_poc", "val_break", "rsima_short") or s.startswith("vah_poc") or s.startswith("val_break") or s.startswith("rsima_short"):
+        return "SHORT"
+    return None
+
+
+async def check_and_reconcile_symbol_gate(
+    sym: str,
+    raw_sym_params: Dict[str, Any],
+    is_tokyo: bool,
+    is_london: bool,
+    gate_allowed: List[str],
+    excluded_mega_caps: List[str],
+    pending_entry_orders: Dict[str, Dict[str, Any]],
+    symbol_apis: Dict[str, Any],
+) -> Tuple[Optional[Dict[str, Any]], str, Optional[str]]:
+    """時間帯合格ゲート・許可戦略・方向を検証し、不適合・切替時は既存待機指値を安全キャンセルする。"""
+    if sym in excluded_mega_caps:
+        await _cancel_pending_order_for_symbol(sym, "除外対象メガキャップ", pending_entry_orders, symbol_apis)
+        return None, "", None
+
+    sym_params_e, skip_reason = select_session_entry_spec(raw_sym_params, is_tokyo, is_london)
+    if sym_params_e is None:
+        await _cancel_pending_order_for_symbol(sym, skip_reason, pending_entry_orders, symbol_apis)
+        return None, "", None
+
+    cand_strat_e = str(sym_params_e.get("strategy", "rsima")).lower()
+    cand_side = resolve_strategy_side(cand_strat_e)
+    if cand_side is None:
+        await _cancel_pending_order_for_symbol(sym, f"方向不明戦略({cand_strat_e})", pending_entry_orders, symbol_apis)
+        return None, "", None
+
+    if gate_allowed and cand_strat_e not in gate_allowed:
+        await _cancel_pending_order_for_symbol(sym, f"地合い許可外({cand_strat_e})", pending_entry_orders, symbol_apis)
+        return None, "", None
+
+    if sym in pending_entry_orders:
+        po_prev = pending_entry_orders[sym]
+        cand_interval_e = int(sym_params_e.get("interval", 5) or 5)
+        same_pending_spec = (
+            str(po_prev.get("side", "")).lower() == cand_side.lower()
+            and str(po_prev.get("strategy", "")).lower() == cand_strat_e
+            and int(po_prev.get("interval", 5) or 5) == cand_interval_e
+        )
+        if not same_pending_spec:
+            await _cancel_pending_order_for_symbol(
+                sym,
+                f"セッション/戦略切替({po_prev.get('strategy')}/{po_prev.get('interval')}m -> {cand_strat_e}/{cand_interval_e}m)",
+                pending_entry_orders,
+                symbol_apis,
+            )
+            return None, "", None
+
+    return sym_params_e, cand_strat_e, cand_side
 
 
 async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60'):
@@ -2212,6 +2662,7 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
     pending_entry_orders: Dict[str, Dict[str, Any]] = {}
     trade_counts: Dict[str, int] = {}
     last_candle_sync_minute: int = -1
+    last_signal_tf_close_map: Dict[Tuple[str, str, int], int] = {}
     last_trade_time: Dict[str, float] = {}
     last_nanpin_time: Dict[str, float] = {}
     cached_5m_dfs: Dict[str, pd.DataFrame] = {}
@@ -2530,104 +2981,55 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                 # 保有中: 出しっぱなし指値の約定検知！
                 if sym in pending_entry_orders:
                     p_order = pending_entry_orders.pop(sym)
-                    trade_counts[sym] = 1
-                    last_trade_time[sym] = time.time()
-                    last_nanpin_time[sym] = time.time()
-                    tracked_active_positions.add(sym)
-
-                    sym_params_p = symbol_params_map.get(sym, best_params)
+                    sym_params_p = dict(symbol_params_map.get(sym, best_params))
                     opt_inv_p = int(p_order.get("interval", 0) or sym_params_p.get("interval", 5) or 5)
                     pos_strat_p = str(p_order.get("strategy", "") or sym_params_p.get("strategy", "rsima")).lower()
-                    dyn_sl_p = float(p_order.get("dynamic_mae_stop", sym_params_p.get("dynamic_mae_stop", -0.030)))
-                    dyn_to_p = int(p_order.get("dynamic_timeout_bars", sym_params_p.get("dynamic_timeout_bars", max(3, 240 // max(1, opt_inv_p)))))
+                    for pk in ("dynamic_mae_stop", "dynamic_timeout_bars", "mp", "target_ratio", "s_ep", "s_cp", "l_ep", "l_cp"):
+                        if pk in p_order and p_order[pk] is not None:
+                            sym_params_p[pk] = p_order[pk]
 
-                    # ショートの場合、直近高値と確定足SLを算出
-                    rec_h_val = 0.0
-                    rec_l_val = 0.0
-                    sl_px_val = 0.0
-                    if df_sym is not None and not df_sym.empty:
-                        df_p_eval = resample_candles(df_sym, opt_inv_p, drop_unclosed=True) if opt_inv_p > 5 else df_sym.copy()
-                        if is_short_pos:
-                            h_eval = df_p_eval["high"].astype(float) if "high" in df_p_eval.columns else df_p_eval["close"].astype(float)
-                            rec_h_val = float(h_eval.iloc[-10:].max()) if len(h_eval) >= 10 else float(h_eval.max())
-                            sl_px_val = min(max(rec_h_val, entry_px * 1.0020), entry_px * (1.0 + abs(dyn_sl_p)))
-                        else:
-                            l_eval = df_p_eval["low"].astype(float) if "low" in df_p_eval.columns else df_p_eval["close"].astype(float)
-                            rec_l_val = float(l_eval.iloc[-10:].min()) if len(l_eval) >= 10 else float(l_eval.min())
-                            sl_px_val = max(min(rec_l_val, entry_px * 0.9980), entry_px * (1.0 - abs(dyn_sl_p)))
+                    api_upd_ms = float(pos.get("updateTime", 0) or 0) if isinstance(pos, dict) else 0.0
+                    fill_event_ts = (
+                        api_upd_ms / 1000.0
+                        if (api_upd_ms > 0 and (api_upd_ms / 1000.0) >= float(p_order.get("placed_at", 0) or 0) - 300)
+                        else time.time()
+                    )
+                    df_p_eval = (
+                        (resample_candles(df_sym, opt_inv_p, drop_unclosed=True) if opt_inv_p > 5 else df_sym.copy())
+                        if (df_sym is not None and not df_sym.empty)
+                        else pd.DataFrame()
+                    )
+                    vah_val = getattr(api, "entry_vah", entry_px * 1.02)
+                    val_val = getattr(api, "entry_val", entry_px * 0.98)
+                    poc_val = (vah_val + val_val) / 2.0
 
-                    lake_entry_meta_p: Dict[str, Any] = {}
-                    try:
-                        from lake_live_bridge import record_live_entry_to_lake, interval_to_timeframe
-                        tf_p = interval_to_timeframe(opt_inv_p)
-                        lake_params_p = dict(sym_params_p)
-                        lake_params_p.update({
-                            "strategy": pos_strat_p,
-                            "interval": opt_inv_p,
-                            "timeframe": tf_p,
-                            "lake_selection_id": p_order.get("lake_selection_id") or sym_params_p.get("lake_selection_id"),
-                            "lake_run_id": p_order.get("lake_run_id") or sym_params_p.get("lake_run_id"),
-                        })
-                        lake_entry_meta_p = record_live_entry_to_lake(
-                            sym,
-                            "short" if is_short_pos else "long",
-                            entry_px,
-                            pos_qty,
-                            params=lake_params_p,
-                        )
-                    except Exception:
-                        tf_p = "15m" if opt_inv_p == 15 else "5m"
-                        lake_entry_meta_p = {}
-
-                    scale_state_new = {
-                        "nanpin_count": 0,
-                        "last_entry_price": entry_px,
-                        "avg_price": entry_px,
-                        "initial_entry_time": time.time(),
-                        "entry_ts_utc": int(time.time()),
-                        "qty": float(pos_qty),
-                        "side": "short" if is_short_pos else "long",
-                        "interval": opt_inv_p,
-                        "timeframe": tf_p,
-                        "strategy": pos_strat_p,
-                        "dynamic_mae_stop": dyn_sl_p,
-                        "dynamic_timeout_bars": dyn_to_p,
-                        "mp": int(p_order.get("mp", sym_params_p.get("mp", 200))),
-                        "target_ratio": float(p_order.get("target_ratio", sym_params_p.get("target_ratio", 0.70))),
-                        "s_ep": float(p_order.get("s_ep", sym_params_p.get("s_ep", 60.0))),
-                        "s_cp": float(p_order.get("s_cp", sym_params_p.get("s_cp", 40.0))),
-                        "l_ep": float(p_order.get("l_ep", sym_params_p.get("l_ep", 40.0))),
-                        "l_cp": float(p_order.get("l_cp", sym_params_p.get("l_cp", 60.0))),
-                        "recent_high": rec_h_val,
-                        "recent_low": rec_l_val,
-                        "sl_price": sl_px_val,
-                        **lake_entry_meta_p,
-                    }
-                    scale_in_states[sym] = scale_state_new
-                    save_scale_in_states(scale_in_states)
-                    entry_reason_val = p_order.get("reason", "指値約定")
-                    inv_label_p = f"{opt_inv_p}m" if opt_inv_p < 60 else f"{opt_inv_p // 60}h"
-
+                    _build_and_store_live_fill_state(
+                        sym=sym,
+                        side="short" if is_short_pos else "long",
+                        actual_fill_px=entry_px,
+                        lot_size=pos_qty,
+                        df_eval=df_p_eval,
+                        sym_params_e=sym_params_p,
+                        cand_interval_e=opt_inv_p,
+                        cand_strat_e=pos_strat_p,
+                        entry_reason=p_order.get("reason", "指値約定"),
+                        vah_e=vah_val,
+                        val_e=val_val,
+                        poc_e=poc_val,
+                        scale_in_states=scale_in_states,
+                        trade_counts=trade_counts,
+                        last_trade_time=last_trade_time,
+                        last_nanpin_time=last_nanpin_time,
+                        tracked_active_positions=tracked_active_positions,
+                        pending_info=p_order,
+                        fill_ts_override=fill_event_ts,
+                        spawn_reporting=True,
+                    )
                     # 余剰指値キャンセル
                     try:
                         await api.active_order_cancel()
                     except Exception:
                         pass
-
-                    # エントリー後非同期レポーティング
-                    vah_val = getattr(api, "entry_vah", entry_px * 1.02)
-                    val_val = getattr(api, "entry_val", entry_px * 0.98)
-                    poc_val = (vah_val + val_val) / 2.0
-                    cur_strat = pos_strat_p.upper()
-                    side_label = "SHORT" if is_short_pos else "LONG"
-                    strat_desc = f"{side_label} {cur_strat} ({inv_label_p}足 / MP={scale_state_new.get('mp', '-')})"
-
-                    df_report = cached_5m_dfs.get(sym, pd.DataFrame())
-                    asyncio.create_task(_async_post_entry_reporting(
-                        sym=sym, entry_px=entry_px, lot_size=pos_qty, entry_full_reason=entry_reason_val,
-                        df_chart=df_report, vah_val=vah_val, val_val=val_val, poc_val=poc_val,
-                        strat_desc=strat_desc, interval_label=inv_label_p, side=side_label
-                    ))
 
                 tracked_active_positions.add(sym)
                 active_positions[sym] = (has_pos, pos, entry_px, pos_qty, pnl_current)
@@ -2689,182 +3091,56 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                     scale_in_states[sym] = scale_state_cur
                     save_scale_in_states(scale_in_states)
                 elapsed_min = max(0.0, (time.time() - entry_ts) / 60.0)
-                # 採用足種 (cand_interval) で正確に経過バー数を算出 (単位不一致バグの完全根絶)
+                fill_5m_open_ts = int(scale_state_cur.get("fill_5m_open_ts", 0) or ((int(entry_ts) // 300) * 300))
+                if int(scale_state_cur.get("fill_5m_open_ts", 0) or 0) <= 0:
+                    scale_state_cur["fill_5m_open_ts"] = fill_5m_open_ts
+                    scale_in_states[sym] = scale_state_cur
+                    save_scale_in_states(scale_in_states)
+                cur_5m_open_ts = (int(time.time()) // 300) * 300
+                is_fill_bar_cur = (cur_5m_open_ts == fill_5m_open_ts)
+                latest_tf_close_ts = _extract_latest_close_ts_utc(df_eval, cand_interval)
+                has_new_tf_bar = (
+                    (not is_fill_bar_cur)
+                    and (latest_tf_close_ts > fill_5m_open_ts)
+                    and (cand_interval <= 5 or cur_5m_open_ts == latest_tf_close_ts)
+                )
                 bars_held_cur = int(elapsed_min // max(1, cand_interval))
-                is_fill_bar_cur = (elapsed_min < max(1, cand_interval))
                 dyn_sl_pct = float(scale_state_cur.get("dynamic_mae_stop", 0.0) or sym_params.get("dynamic_mae_stop", -0.030))
                 dyn_to_bars = int(scale_state_cur.get("dynamic_timeout_bars", 0) or sym_params.get("dynamic_timeout_bars", max(3, 240 // max(1, cand_interval))))
-
-                in_cooldown, rem_h = is_in_sl_cooldown(sym)
 
                 # 地合い変化による緊急建値撤退判定
                 # ロング保有中かつ非BUY ➔ 建値+0.20%撤退 / ショート保有中かつ非SELL ➔ 建値-0.20%撤退
                 pos_emergency_be = (overall_regime != "SELL") if is_short_pos else (overall_regime != "BUY")
 
-                # ショート・ロングポジションの直近10本高安(Swing High / Low)復元・自動補完
-                recent_high_val = float(scale_state_cur.get("recent_high", 0.0) or 0.0)
-                recent_low_val = float(scale_state_cur.get("recent_low", 0.0) or 0.0)
-                if is_short_pos and recent_high_val <= 0.0 and df_eval is not None and not df_eval.empty:
-                    h_eval = df_eval["high"].astype(float) if "high" in df_eval.columns else df_eval["close"].astype(float)
-                    recent_high_val = float(h_eval.iloc[-10:].max()) if len(h_eval) >= 10 else float(h_eval.max())
-                    scale_state_cur["recent_high"] = recent_high_val
-                    scale_state_cur["sl_price"] = min(max(recent_high_val, entry_px * 1.0020), entry_px * (1.0 + abs(dyn_sl_pct)))
-                    scale_in_states[sym] = scale_state_cur
-                    save_scale_in_states(scale_in_states)
-                elif not is_short_pos and recent_low_val <= 0.0 and df_eval is not None and not df_eval.empty:
-                    l_eval = df_eval["low"].astype(float) if "low" in df_eval.columns else df_eval["close"].astype(float)
-                    recent_low_val = float(l_eval.iloc[-10:].min()) if len(l_eval) >= 10 else float(l_eval.min())
-                    scale_state_cur["recent_low"] = recent_low_val
-                    scale_state_cur["sl_price"] = max(min(recent_low_val, entry_px * 0.9980), entry_px * (1.0 - abs(dyn_sl_pct)))
-                    scale_in_states[sym] = scale_state_cur
-                    save_scale_in_states(scale_in_states)
-
-                # 戦略シグナル評価 (ロング・ショート完全分岐)
-                if is_short_pos:
-                    # ===== SHORT ポジション監視 =====
-                    if cand_strat == "val_break":
-                        sig_eval = check_val_break_signals(
-                            df_5m=df_eval,
-                            current_pos_qty=pos_qty,
-                            current_trades_count=1,
-                            avg_entry_price=entry_px,
-                            last_entry_price=last_px_cur,
-                            current_price=cur_px,
-                            recent_high=recent_high_val,
-                            vp_period=pos_mp,
-                            num_bins=int(sym_params.get("num_bins", 50)),
-                            value_area_pct=float(sym_params.get("value_area_pct", 0.70)),
-                            target_ratio=pos_tr,
-                            is_cooldown_active=in_cooldown,
-                            is_emergency_breakeven=pos_emergency_be,
-                            dynamic_sl_pct=dyn_sl_pct,
-                            bars_held=bars_held_cur,
-                            timeout_bars=dyn_to_bars,
-                            is_fill_bar=is_fill_bar_cur,
-                        )
-                    elif cand_strat.startswith("vah_poc"):
-                        use_ema_v = ("ema" in cand_strat)
-                        sig_eval = check_vah_poc_signals(
-                            df_5m=df_eval,
-                            current_pos_qty=pos_qty,
-                            current_trades_count=1,
-                            avg_entry_price=entry_px,
-                            last_entry_price=last_px_cur,
-                            current_price=cur_px,
-                            recent_high=recent_high_val,
-                            vp_period=pos_mp,
-                            num_bins=int(sym_params.get("num_bins", 50)),
-                            value_area_pct=float(sym_params.get("value_area_pct", 0.70)),
-                            ma_type=str(sym_params.get("ma_type", "EMA" if use_ema_v else "NONE")),
-                            ma_condition=str(sym_params.get("ma_condition", "close_below" if use_ema_v else "none")),
-                            max_trades=1,
-                            target_ratio=pos_tr,
-                            sl_pct=abs(dyn_sl_pct),
-                            is_cooldown_active=in_cooldown,
-                            is_emergency_breakeven=pos_emergency_be,
-                            dynamic_sl_pct=dyn_sl_pct,
-                            bars_held=bars_held_cur,
-                            use_ema_filter=use_ema_v,
-                            timeout_bars=dyn_to_bars,
-                            is_fill_bar=is_fill_bar_cur,
-                        )
-                    else:
-                        use_ema_r = ("ema" in cand_strat)
-                        sig_eval = check_rsima3_short_signals(
-                            df_5m=df_eval,
-                            current_pos_qty=pos_qty,
-                            current_trades_count=1,
-                            avg_entry_price=entry_px,
-                            current_price=cur_px,
-                            recent_high=recent_high_val,
-                            rsi_len=9,
-                            ema_len=7,
-                            s_ep=pos_s_ep,
-                            s_cp=pos_s_cp,
-                            sl_pct=abs(dyn_sl_pct),
-                            max_trades=1,
-                            last_entry_price=last_px_cur,
-                            val_price=val,
-                            vah_price=vah,
-                            is_emergency_breakeven=pos_emergency_be,
-                            dynamic_sl_pct=dyn_sl_pct,
-                            bars_held=bars_held_cur,
-                            use_ema_filter=use_ema_r,
-                            timeout_bars=dyn_to_bars,
-                            is_fill_bar=is_fill_bar_cur,
-                        )
-                else:
-                    # ===== LONG ポジション監視 =====
-                    if cand_strat == "vah_break":
-                        sig_eval = check_vah_break_signals(
-                            df_5m=df_eval,
-                            current_pos_qty=buy_qty,
-                            current_trades_count=t_count,
-                            avg_entry_price=entry_px,
-                            last_entry_price=last_px_cur,
-                            current_price=cur_px,
-                            vp_period=pos_mp,
-                            num_bins=int(sym_params.get("num_bins", 50)),
-                            value_area_pct=float(sym_params.get("value_area_pct", 0.70)),
-                            target_ratio=pos_tr,
-                            is_cooldown_active=in_cooldown,
-                            is_emergency_breakeven=pos_emergency_be,
-                            dynamic_sl_pct=dyn_sl_pct,
-                            bars_held=bars_held_cur,
-                            timeout_bars=dyn_to_bars,
-                            is_fill_bar=is_fill_bar_cur,
-                        )
-                    elif cand_strat.startswith("val_poc"):
-                        use_ema_v = ("ema" in cand_strat)
-                        sig_eval = check_val_poc_signals(
-                            df_5m=df_eval,
-                            current_pos_qty=buy_qty,
-                            current_trades_count=t_count,
-                            avg_entry_price=entry_px,
-                            last_entry_price=last_px_cur,
-                            current_price=cur_px,
-                            vp_period=pos_mp,
-                            num_bins=int(sym_params.get("num_bins", 50)),
-                            value_area_pct=float(sym_params.get("value_area_pct", 0.70)),
-                            ma_type=str(sym_params.get("ma_type", "EMA" if use_ema_v else "NONE")),
-                            ma_condition=str(sym_params.get("ma_condition", "close_above" if use_ema_v else "none")),
-                            max_trades=MAX_TRADES_COUNT,
-                            target_ratio=pos_tr,
-                            sl_pct=abs(dyn_sl_pct),
-                            is_cooldown_active=in_cooldown,
-                            is_emergency_breakeven=pos_emergency_be,
-                            dynamic_sl_pct=dyn_sl_pct,
-                            bars_held=bars_held_cur,
-                            use_ema_filter=use_ema_v,
-                            timeout_bars=dyn_to_bars,
-                            recent_low=recent_low_val,
-                            is_fill_bar=is_fill_bar_cur,
-                        )
-                    else:
-                        use_ema_r = ("ema" in cand_strat)
-                        sig_eval = check_rsima3_signals(
-                            df_5m=df_eval,
-                            current_pos_qty=buy_qty,
-                            current_trades_count=t_count,
-                            avg_entry_price=entry_px,
-                            current_price=cur_px,
-                            rsi_len=9,
-                            ema_len=7,
-                            l_ep=pos_l_ep,
-                            l_cp=pos_l_cp,
-                            sl_pct=abs(dyn_sl_pct),
-                            max_trades=MAX_TRADES_COUNT,
-                            last_entry_price=last_px_cur,
-                            val_price=val,
-                            vah_price=vah,
-                            is_emergency_breakeven=pos_emergency_be,
-                            dynamic_sl_pct=dyn_sl_pct,
-                            bars_held=bars_held_cur,
-                            use_ema_filter=use_ema_r,
-                            timeout_bars=dyn_to_bars,
-                            recent_low=recent_low_val,
-                            is_fill_bar=is_fill_bar_cur,
-                        )
+                # 毎足動的再計算 (SSoT): recent_low/recent_high は None を渡し 3logic 側で iloc[-11:-1] を毎回最新化
+                sig_eval = _evaluate_strategy_signal(
+                    cand_strat=cand_strat,
+                    df_eval=df_eval,
+                    current_pos_qty=pos_qty if is_short_pos else buy_qty,
+                    current_trades_count=1 if is_short_pos else t_count,
+                    avg_entry_price=entry_px,
+                    last_entry_price=last_px_cur,
+                    current_price=cur_px,
+                    sym_params=sym_params,
+                    val_price=val,
+                    vah_price=vah,
+                    pos_mp=pos_mp,
+                    pos_tr=pos_tr,
+                    pos_l_ep=pos_l_ep,
+                    pos_l_cp=pos_l_cp,
+                    pos_s_ep=pos_s_ep,
+                    pos_s_cp=pos_s_cp,
+                    is_cooldown_active=False,
+                    is_emergency_breakeven=pos_emergency_be,
+                    dynamic_sl_pct=dyn_sl_pct,
+                    bars_held=bars_held_cur,
+                    timeout_bars=dyn_to_bars,
+                    is_fill_bar=is_fill_bar_cur,
+                    elapsed_minutes=elapsed_min,
+                    timeout_minutes=240.0,
+                    max_hold_minutes=480.0,
+                    has_new_tf_bar_after_fill=has_new_tf_bar,
+                )
 
                 # 決済判定はバックテスト SSoT (lake_backtest_engine / bingx5_46_3logic) と完全統一
                 pos_action = sig_eval.get("action", "HOLD")
@@ -2874,12 +3150,10 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                 if pos_action == "STOP_LOSS":
                     discord.print_log(f"🛑 [{sym}] [{cand_strat.upper()} DYNAMIC MAE STOP LOSS] {exit_reason} ➔ 成行損切り", level="warning")
                     await flatten_current_position_bingx(sym, "USDT", mode, exit_reason, force_market=True)
-                    record_sl_cooldown(sym)
                     closed = True
                 elif pos_action == "TIMEOUT_EXIT":
-                    discord.print_log(f"⏰ [{sym}] [{cand_strat.upper()} DYNAMIC TIMEOUT EXIT] {exit_reason} ➔ 動的タイムアウト成行撤退 (24hクールダウン移行)", level="warning")
+                    discord.print_log(f"⏰ [{sym}] [{cand_strat.upper()} DYNAMIC TIMEOUT EXIT] {exit_reason} ➔ 動的タイムアウト成行撤退", level="warning")
                     await flatten_current_position_bingx(sym, "USDT", mode, exit_reason, force_market=True)
-                    record_sl_cooldown(sym)
                     closed = True
                 elif pos_action == "CLOSE_ALL":
                     discord.print_log(f"🎯 [{sym}] [{cand_strat.upper()} CLOSE ALL] {exit_reason} ➔ 一括成行決済")
@@ -2988,16 +3262,7 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                 discord.print_log(notice_msg, level="info")
             elif cycle_count % 20 == 0:
                 discord.print_log(notice_msg, level="debug")
-            if pending_entry_orders:
-                for p_sym in list(pending_entry_orders.keys()):
-                    p_api = symbol_apis.get(p_sym)
-                    if p_api:
-                        try:
-                            await p_api.active_order_cancel()
-                            discord.print_log(f"🛡️ [中立相場退避] 地合い中立に伴い {p_sym} の未約定指値を安全にキャンセルしました。")
-                        except Exception:
-                            pass
-                pending_entry_orders.clear()
+            await _cancel_all_pending_orders("地合い中立退避", pending_entry_orders, symbol_apis)
         else:
             # ===== トレード稼働態勢 (BUY / SELL / LEAN_BUY / LEAN_SELL) =====
             is_sell_regime = (overall_regime == "SELL")
@@ -3012,10 +3277,11 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
             if is_ny_b3:
                 if BINGX_IS_LIVE:
                     # 本番リアル運用規約:
-                    # 米国セッション(22:00〜翌09:00 JST)は新規エントリー停止 (ノーポジ待機 ＆ 既存ポジション標準出口監視のみ)
+                    # 米国セッション(22:00〜翌09:00 JST)は新規エントリー停止 (待機指値も安全キャンセル)
                     if now_jst_b3.hour != last_ny_notice_hour:
                         last_ny_notice_hour = now_jst_b3.hour
                         discord.print_log("🌙 [本番リアル運用] 米国セッション(22:00〜翌09:00 JST) 新規エントリー停止中 (既存ポジション標準出口監視のみ)", level="info")
+                    await _cancel_all_pending_orders("本番NYセッション停止", pending_entry_orders, symbol_apis)
                     continue
                 else:
                     # デモアクティブ検証モード: 米国セッションもバックテストSSoT準拠で24時間監視
@@ -3024,22 +3290,12 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                         discord.print_log(f"🌙 [デモアクティブ検証] 米国セッション(22:00〜翌09:00 JST) 24時間フル稼働中 (バックテストSSoT準拠監視)", level="info")
                     elif cycle_count % 30 == 0:
                         discord.print_log(f"🌙 [デモアクティブ検証] 米国セッション(22:00〜翌09:00 JST) 24時間フル稼働中 (バックテストSSoT準拠監視)", level="debug")
-            total_active_count = len(active_positions) + len(pending_entry_orders)
 
             # 🛡️ 日次リスクガードチェック (含み損考慮サーキットブレーカー / 回数制限解除済み)
             total_unrealized = sum(float(v[4]) for v in active_positions.values()) if active_positions else 0.0
             can_trade_today, daily_reason, daily_cnt = can_open_new_trade_today(unrealized_pnl=total_unrealized)
             if not can_trade_today:
-                if pending_entry_orders:
-                    for p_sym in list(pending_entry_orders.keys()):
-                        p_api = symbol_apis.get(p_sym)
-                        if p_api:
-                            try:
-                                await p_api.active_order_cancel()
-                                discord.print_log(f"🛡️ [日次損失CBガード] CB/日次制限に伴い {p_sym} の未約定指値を安全にキャンセルしました。")
-                            except Exception:
-                                pass
-                    pending_entry_orders.clear()
+                await _cancel_all_pending_orders("日次損失CBガード", pending_entry_orders, symbol_apis)
                 if now_jst_b3.hour != last_daily_limit_notice_hour:
                     last_daily_limit_notice_hour = now_jst_b3.hour
                     discord.print_log(f"🛡️ [日次リスク管理] {daily_reason} (既存ポジション決済監視は継続)", level="info")
@@ -3047,63 +3303,31 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                     discord.print_log(f"🛡️ [日次リスク管理] {daily_reason}", level="debug")
                 continue
 
+            gate_allowed = regime_info.get("allowed_strategies", []) if "regime_info" in locals() else []
+
             for sym in selected_symbols:
                 if sym in active_positions:
                     continue
 
-                # 🚀 【PROJECT_RULES 準拠】 超大型銘柄除外 (HFT狩り場・値動き重小回避 ➔ 中堅アルト特化)
-                if sym in EXCLUDED_MEGA_CAPS:
-                    continue
-
                 try:
                     raw_sym_params = symbol_params_map.get(sym, best_params)
-                    # 時間帯連動デュアルパラメータ自動切替 & セッション別合格ゲート:
-                    # 東京時間 (09:00〜16:00 JST) -> レンジ逆張り最適パラメータ (is_range_qualified 必須)
-                    # 欧州時間 (16:00〜22:00 JST) -> ブレイクアウト最適パラメータ (is_breakout_qualified 必須)
-                    # 米国時間 (22:00〜翌09:00 JST) -> OOS合格済み最良パラメータ (is_qualified 必須)
-                    if is_tokyo_b3:
-                        sym_params_e = raw_sym_params.get("range_params") or raw_sym_params
-                        if not bool(raw_sym_params.get("is_range_qualified", sym_params_e.get("is_qualified", False))):
-                            continue
-                    elif is_london_b3:
-                        sym_params_e = raw_sym_params.get("breakout_params") or raw_sym_params
-                        if not bool(raw_sym_params.get("is_breakout_qualified", sym_params_e.get("is_qualified", False))):
-                            continue
-                    else:
-                        if not bool(raw_sym_params.get("is_qualified", True)):
-                            continue
-                        sym_params_e = raw_sym_params
+                    sym_params_e, cand_strat_e, cand_side = await check_and_reconcile_symbol_gate(
+                        sym=sym,
+                        raw_sym_params=raw_sym_params,
+                        is_tokyo=is_tokyo_b3,
+                        is_london=is_london_b3,
+                        gate_allowed=gate_allowed,
+                        excluded_mega_caps=EXCLUDED_MEGA_CAPS,
+                        pending_entry_orders=pending_entry_orders,
+                        symbol_apis=symbol_apis,
+                    )
+                    if sym_params_e is None or cand_side is None:
+                        continue
 
                     cand_interval_e = int(sym_params_e.get("interval", 5) or 5)
-                    cand_strat_e = str(sym_params_e.get("strategy", "rsima")).lower()
 
-                    # 🚀 【売買方向の厳密判定】候補戦略が本来持つ方向 (LONG vs SHORT) を決定
-                    if cand_strat_e in ("val_poc", "vah_break", "rsima") or (cand_strat_e.startswith("val_poc") or (cand_strat_e.startswith("rsima") and not cand_strat_e.startswith("rsima_short"))):
-                        cand_side = "LONG"
-                    elif cand_strat_e in ("vah_poc", "val_break", "rsima_short") or (cand_strat_e.startswith("vah_poc") or cand_strat_e.startswith("val_break") or cand_strat_e.startswith("rsima_short")):
-                        cand_side = "SHORT"
-                    else:
-                        discord.print_log(f"⚠️ [{sym}] 未知または方向不明の戦略 '{cand_strat_e}' のためスキップします。")
-                        continue
-
-                    # 許可戦略チェック (allowed_strategies が指定されている場合)
-                    gate_allowed = regime_info.get("allowed_strategies", []) if "regime_info" in locals() else []
-                    if gate_allowed and cand_strat_e not in gate_allowed:
-                        continue
-
-                    # 時間帯ロール適合性チェック (東京はレンジ逆張りのみ、欧州はブレイクアウトのみ、米国は両方許可)
-                    is_brk_strat = (cand_strat_e in ("vah_break", "val_break"))
-                    if is_tokyo_b3 and is_brk_strat:
-                        continue
-                    if is_london_b3 and not is_brk_strat:
-                        continue
-
-                    in_cooldown, rem_h = is_in_sl_cooldown(sym)
-                    if in_cooldown:
-                        continue
-
-                    # クールダウンチェック (直近20分以内の取引除外)
-                    if time.time() - last_trade_time.get(sym, 0) < 1200:
+                    # 既に同スペックの指値待機中かつ5m境界未到達なら注文キュー優先順位を維持
+                    if sym in pending_entry_orders and not is_candle_closed:
                         continue
 
                     # 確定足タイミングまたは未キャッシュ時はストアから取得
@@ -3124,7 +3348,12 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                     df_entry_eval = resample_candles(df_5m, cand_interval_e, drop_unclosed=True) if cand_interval_e > 5 else df_5m.copy()
                     try:
                         from bingx_oi_collector import enrich_candles_with_oi_fr
-                        df_entry_eval = enrich_candles_with_oi_fr(df_entry_eval, sym, auto_sync=False)
+                        df_entry_eval = enrich_candles_with_oi_fr(
+                            df_entry_eval,
+                            sym,
+                            auto_sync=True,
+                            timeframe=f"{cand_interval_e}m",
+                        )
                     except Exception:
                         pass
                     df_entry_eval = logic.make_logic(
@@ -3142,492 +3371,186 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                     val_e = float(df_entry_eval["VAL"].iloc[-1]) if "VAL" in df_entry_eval.columns else cur_px * 0.98
                     poc_e = float(df_entry_eval["POC"].iloc[-1]) if "POC" in df_entry_eval.columns else cur_px
 
-                    if cand_side == "SHORT":
-                        # --------------------------------------------------
-                        # 【SHORT戦略 新規エントリー判定】(単発1本固定)
-                        # --------------------------------------------------
-                        if cand_strat_e == "val_break":
-                            sig_entry = check_val_break_signals(
-                                df_5m=df_entry_eval,
-                                current_pos_qty=0.0,
-                                current_trades_count=0,
-                                avg_entry_price=0.0,
-                                last_entry_price=0.0,
-                                current_price=cur_px,
-                                vp_period=int(sym_params_e.get("mp", 200)),
-                                num_bins=int(sym_params_e.get("num_bins", 50)),
-                                value_area_pct=float(sym_params_e.get("value_area_pct", 0.70)),
-                                target_ratio=float(sym_params_e.get("target_ratio", 0.70)),
-                                is_cooldown_active=in_cooldown,
-                            )
-                        elif cand_strat_e.startswith("vah_poc"):
-                            use_ema_v = ("ema" in cand_strat_e)
-                            sig_entry = check_vah_poc_signals(
-                                df_5m=df_entry_eval,
-                                current_pos_qty=0.0,
-                                current_trades_count=0,
-                                avg_entry_price=0.0,
-                                last_entry_price=0.0,
-                                current_price=cur_px,
-                                vp_period=int(sym_params_e.get("mp", 200)),
-                                num_bins=int(sym_params_e.get("num_bins", 50)),
-                                value_area_pct=float(sym_params_e.get("value_area_pct", 0.70)),
-                                ma_type=str(sym_params_e.get("ma_type", "EMA" if use_ema_v else "NONE")),
-                                ma_condition=str(sym_params_e.get("ma_condition", "close_below" if use_ema_v else "none")),
-                                max_trades=1,
-                                target_ratio=float(sym_params_e.get("target_ratio", 0.70)),
-                                sl_pct=float(sym_params_e.get("sl_pct", 0.090)),
-                                is_cooldown_active=in_cooldown,
-                                use_ema_filter=use_ema_v,
-                            )
-                        elif cand_strat_e.startswith("rsima_short"):
-                            use_ema_r = ("ema" in cand_strat_e)
-                            sig_entry = check_rsima3_short_signals(
-                                df_5m=df_entry_eval,
-                                current_pos_qty=0.0,
-                                current_trades_count=0,
-                                avg_entry_price=0.0,
-                                current_price=cur_px,
-                                rsi_len=9,
-                                ema_len=7,
-                                s_ep=float(sym_params_e.get("s_ep", 60.0)),
-                                s_cp=float(sym_params_e.get("s_cp", 40.0)),
-                                sl_pct=float(sym_params_e.get("sl_pct", 0.090)),
-                                max_trades=1,
-                                last_entry_price=0.0,
-                                val_price=val_e,
-                                vah_price=vah_e,
-                                use_ema_filter=use_ema_r,
+                    sig_entry = _evaluate_strategy_signal(
+                        cand_strat=cand_strat_e,
+                        df_eval=df_entry_eval,
+                        current_pos_qty=0.0,
+                        current_trades_count=0,
+                        avg_entry_price=0.0,
+                        last_entry_price=0.0,
+                        current_price=cur_px,
+                        sym_params=sym_params_e,
+                        val_price=val_e,
+                        vah_price=vah_e,
+                        pos_mp=int(sym_params_e.get("mp", 200)),
+                        pos_tr=float(sym_params_e.get("target_ratio", 0.70)),
+                        pos_l_ep=float(sym_params_e.get("l_ep", 40.0)),
+                        pos_l_cp=float(sym_params_e.get("l_cp", 60.0)),
+                        pos_s_ep=float(sym_params_e.get("s_ep", 60.0)),
+                        pos_s_cp=float(sym_params_e.get("s_cp", 40.0)),
+                        is_cooldown_active=False,
+                    )
+
+                    is_short_e = (cand_side == "SHORT")
+                    expected_action = "INITIAL_ENTRY_SHORT" if is_short_e else "INITIAL_ENTRY"
+                    pos_qty_key = "sell" if is_short_e else "buy"
+                    pos_px_key = "sell_pos" if is_short_e else "buy_pos"
+                    sig_col_name = "short" if is_short_e else "long"
+                    book_label = "Best Ask" if is_short_e else "Best Bid"
+                    side_low = "short" if is_short_e else "long"
+
+                    entry_action = sig_entry.get("action", "NONE")
+                    entry_reason = sig_entry.get("reason", expected_action)
+                    sig_tf_close_ts = _extract_latest_close_ts_utc(df_entry_eval, cand_interval_e)
+
+                    # ケース 1: 同スペックの指値待機中 (5m=最大3回追随 / 15m=最大1本待機で終了)
+                    if sym in pending_entry_orders:
+                        if is_candle_closed:
+                            po = pending_entry_orders[sym]
+                            max_chase = 3 if cand_interval_e == 5 else 1
+                            chase_used = int(po.get("chase_count", 0)) + 1
+                            po["chase_count"] = chase_used
+                            if sig_tf_close_ts > 0:
+                                last_signal_tf_close_map[(sym, cand_strat_e, cand_interval_e)] = sig_tf_close_ts
+                            if chase_used >= max_chase:
+                                await _cancel_pending_order_for_symbol(
+                                    sym,
+                                    f"追随上限到達({chase_used}/{max_chase})",
+                                    pending_entry_orders,
+                                    symbol_apis,
+                                )
+                            elif entry_action != expected_action:
+                                await _cancel_pending_order_for_symbol(
+                                    sym,
+                                    f"{cand_side}サイン終了",
+                                    pending_entry_orders,
+                                    symbol_apis,
+                                )
+                            else:
+                                api = symbol_apis.get(sym)
+                                if api:
+                                    spec = api.bingx.instrument_spec or {}
+                                    lot_size = compute_lot_size(cur_px, BINGX_TARGET_POSITION_VALUE_USDT, spec)
+                                    df_re = df_entry_eval.copy()
+                                    df_re[sig_col_name] = True
+                                    entry_fn = api.short_entry if is_short_e else api.long_entry
+                                    entered_re = await entry_fn(df_re, {}, cycle_balance, lot_size, max_lot)
+                                    if entered_re:
+                                        new_pos = await api.get_positions()
+                                        if float(new_pos.get(pos_qty_key, 0.0)) > 0:
+                                            actual_fill_px = float(new_pos.get(pos_px_key, 0.0)) or cur_px
+                                            pending_entry_orders.pop(sym, None)
+                                            _build_and_store_live_fill_state(
+                                                sym=sym,
+                                                side=side_low,
+                                                actual_fill_px=actual_fill_px,
+                                                lot_size=lot_size,
+                                                df_eval=df_entry_eval,
+                                                sym_params_e=sym_params_e,
+                                                cand_interval_e=cand_interval_e,
+                                                cand_strat_e=cand_strat_e,
+                                                entry_reason=entry_reason,
+                                                vah_e=vah_e,
+                                                val_e=val_e,
+                                                poc_e=poc_e,
+                                                scale_in_states=scale_in_states,
+                                                trade_counts=trade_counts,
+                                                last_trade_time=last_trade_time,
+                                                last_nanpin_time=last_nanpin_time,
+                                                tracked_active_positions=tracked_active_positions,
+                                                pending_info=sym_params_e,
+                                                spawn_reporting=True,
+                                            )
+                                        else:
+                                            pending_entry_orders[sym]["price"] = cur_px
+                                            discord.print_log(
+                                                f"📌 [{sym}] {cand_side}指値追随 ({chase_used}/{max_chase - 1}, {book_label}: ~${cur_px:.4f})"
+                                            )
+                        continue
+
+                    # ケース 2: 新規指値発注 (保有+待機 <= MAX_ACTIVE_POSITIONS かつ 同一確定足重複除外)
+                    if (len(active_positions) + len(pending_entry_orders)) >= MAX_ACTIVE_POSITIONS:
+                        continue
+                    if entry_action != expected_action:
+                        continue
+                    if sig_tf_close_ts > 0 and last_signal_tf_close_map.get((sym, cand_strat_e, cand_interval_e)) == sig_tf_close_ts:
+                        continue
+
+                    api = symbol_apis.get(sym)
+                    if not api:
+                        api = api_bingx(symbol=sym, mode=mode)
+                        spec = fetch_instrument_spec_bingx(sym, mode)
+                        if spec:
+                            api.update_instrument_spec(spec)
+                        symbol_apis[sym] = api
+
+                    spec = api.bingx.instrument_spec or {}
+                    lot_size = compute_lot_size(cur_px, BINGX_TARGET_POSITION_VALUE_USDT, spec)
+                    if lot_size <= 0:
+                        continue
+
+                    pos = await api.get_positions()
+                    if float(pos.get(pos_qty_key, 0.0)) > 0:
+                        continue
+
+                    api.entry_val = val_e
+                    api.entry_vah = vah_e
+
+                    discord.print_log(f"⚡ [{sym}] [{cand_strat_e.upper()} 初期{cand_side}エントリー>>] {entry_reason}")
+                    df_entry_send = df_entry_eval.copy()
+                    df_entry_send[sig_col_name] = True
+                    entry_fn = api.short_entry if is_short_e else api.long_entry
+                    entered = await entry_fn(df_entry_send, pos, cycle_balance, lot_size, max_lot)
+
+                    if entered:
+                        if sig_tf_close_ts > 0:
+                            last_signal_tf_close_map[(sym, cand_strat_e, cand_interval_e)] = sig_tf_close_ts
+                        new_pos = await api.get_positions()
+                        if float(new_pos.get(pos_qty_key, 0.0)) > 0:
+                            actual_fill_px = float(new_pos.get(pos_px_key, 0.0)) or cur_px
+                            _build_and_store_live_fill_state(
+                                sym=sym,
+                                side=side_low,
+                                actual_fill_px=actual_fill_px,
+                                lot_size=lot_size,
+                                df_eval=df_entry_eval,
+                                sym_params_e=sym_params_e,
+                                cand_interval_e=cand_interval_e,
+                                cand_strat_e=cand_strat_e,
+                                entry_reason=entry_reason,
+                                vah_e=vah_e,
+                                val_e=val_e,
+                                poc_e=poc_e,
+                                scale_in_states=scale_in_states,
+                                trade_counts=trade_counts,
+                                last_trade_time=last_trade_time,
+                                last_nanpin_time=last_nanpin_time,
+                                tracked_active_positions=tracked_active_positions,
+                                pending_info=sym_params_e,
+                                spawn_reporting=True,
                             )
                         else:
-                            discord.print_log(f"⚠️ [{sym}] SHORTブロック内で非SHORT戦略 '{cand_strat_e}' が検出されたためスキップします。")
-                            continue
-
-                        entry_action = sig_entry.get("action", "NONE")
-                        entry_reason = sig_entry.get("reason", "INITIAL_ENTRY_SHORT")
-
-                        # ケース 1: すでにショート指値待機中
-                        if sym in pending_entry_orders:
-                            if pending_entry_orders[sym].get("side") != "short":
-                                # 方向不一致の古いロング指値が残っていれば安全キャンセル
-                                p_api = symbol_apis.get(sym)
-                                if p_api:
-                                    try:
-                                        await p_api.active_order_cancel()
-                                        discord.print_log(f"🛡️ [{sym}] 旧ロング指値を安全キャンセルしショート指値待機へ切り替えます。")
-                                    except Exception:
-                                        pass
-                                pending_entry_orders.pop(sym, None)
-                            if is_candle_closed:
-                                if entry_action == "INITIAL_ENTRY_SHORT":
-                                    api = symbol_apis.get(sym)
-                                    if api:
-                                        spec = api.bingx.instrument_spec or {}
-                                        lot_size = compute_lot_size(cur_px, BINGX_TARGET_POSITION_VALUE_USDT, spec)
-                                        df_re = df_entry_eval.copy()
-                                        df_re["short"] = True
-                                        entered_re = await api.short_entry(df_re, {}, cycle_balance, lot_size, max_lot)
-                                        if entered_re:
-                                            new_pos = await api.get_positions()
-                                            if float(new_pos.get("sell", 0.0)) > 0:
-                                                actual_fill_px = float(new_pos.get("sell_pos", 0.0)) or cur_px
-                                                pending_entry_orders.pop(sym, None)
-                                                trade_counts[sym] = 1
-                                                last_trade_time[sym] = time.time()
-                                                last_nanpin_time[sym] = time.time()
-                                                tracked_active_positions.add(sym)
-                                                h_eval = df_entry_eval["high"].astype(float) if "high" in df_entry_eval.columns else df_entry_eval["close"].astype(float)
-                                                rec_h_val = float(h_eval.iloc[-10:].max()) if len(h_eval) >= 10 else float(h_eval.max())
-                                                dyn_sl_pct_e = float(sym_params_e.get("dynamic_mae_stop", -0.030))
-                                                dyn_to_bars_e = int(sym_params_e.get("dynamic_timeout_bars", max(3, 240 // max(1, cand_interval_e))))
-                                                sl_px_val = min(max(rec_h_val, actual_fill_px * 1.0020), actual_fill_px * (1.0 + abs(dyn_sl_pct_e)))
-                                                from lake_live_bridge import record_live_entry_to_lake, interval_to_timeframe
-                                                lake_entry_meta = record_live_entry_to_lake(sym, "short", actual_fill_px, lot_size, params=sym_params_e)
-                                                scale_in_states[sym] = {
-                                                    "nanpin_count": 0,
-                                                    "last_entry_price": actual_fill_px,
-                                                    "avg_price": actual_fill_px,
-                                                    "initial_entry_time": time.time(),
-                                                    "entry_ts_utc": int(time.time()),
-                                                    "qty": float(lot_size),
-                                                    "side": "short",
-                                                    "interval": cand_interval_e,
-                                                    "timeframe": interval_to_timeframe(cand_interval_e),
-                                                    "strategy": cand_strat_e,
-                                                    "dynamic_mae_stop": dyn_sl_pct_e,
-                                                    "dynamic_timeout_bars": dyn_to_bars_e,
-                                                    "mp": int(sym_params_e.get("mp", 200)),
-                                                    "target_ratio": float(sym_params_e.get("target_ratio", 0.70)),
-                                                    "s_ep": float(sym_params_e.get("s_ep", 60.0)),
-                                                    "s_cp": float(sym_params_e.get("s_cp", 40.0)),
-                                                    "recent_high": rec_h_val,
-                                                    "sl_price": sl_px_val,
-                                                    **lake_entry_meta,
-                                                }
-                                                save_scale_in_states(scale_in_states)
-                                                inv_label_e = f"{cand_interval_e}m" if cand_interval_e < 60 else f"{cand_interval_e // 60}h"
-                                                strat_desc = f"SHORT {cand_strat_e.upper()} ({inv_label_e}足 / MP={sym_params_e.get('mp', '-')})"
-                                                asyncio.create_task(_async_post_entry_reporting(
-                                                    sym=sym, entry_px=actual_fill_px, lot_size=lot_size, entry_full_reason=entry_reason,
-                                                    df_chart=df_entry_eval, vah_val=vah_e, val_val=val_e, poc_val=poc_e,
-                                                    strat_desc=strat_desc, interval_label=inv_label_e, side="SHORT"
-                                                ))
-                                            else:
-                                                pending_entry_orders[sym]["price"] = cur_px
-                                                discord.print_log(f"📌 [{sym}] 新しいショート指値に更新完了 (Best Ask 待機継続: 約 ${cur_px:.4f})")
-                                else:
-                                    api = symbol_apis.get(sym)
-                                    if api:
-                                        try:
-                                            await api.active_order_cancel()
-                                        except Exception:
-                                            pass
-                                    pending_entry_orders.pop(sym, None)
-                                    discord.print_log(f"🛡️ [{sym}] 5分足SHORTサインが終了したため、未約定指値を安全にキャンセルしました。")
-                            continue
-
-                        # ケース 2: 新規ショート指値発注 (Maker Best Ask)
-                        if total_active_count >= MAX_ACTIVE_POSITIONS:
-                            continue
-                        if entry_action != "INITIAL_ENTRY_SHORT":
-                            continue
-
-                        api = symbol_apis.get(sym)
-                        if not api:
-                            api = api_bingx(symbol=sym, mode=mode)
-                            spec = fetch_instrument_spec_bingx(sym, mode)
-                            if spec:
-                                api.update_instrument_spec(spec)
-                            symbol_apis[sym] = api
-
-                        spec = api.bingx.instrument_spec or {}
-                        lot_size = compute_lot_size(cur_px, BINGX_TARGET_POSITION_VALUE_USDT, spec)
-                        if lot_size <= 0:
-                            continue
-
-                        pos = await api.get_positions()
-                        if float(pos.get("sell", 0.0)) > 0:
-                            continue
-
-                        api.entry_val = val_e
-                        api.entry_vah = vah_e
-
-                        discord.print_log(f"⚡ [{sym}] [{cand_strat_e.upper()} 初期ショートエントリー>>] {entry_reason}")
-                        df_entry_send = df_entry_eval.copy()
-                        df_entry_send["short"] = True
-                        entered = await api.short_entry(df_entry_send, pos, cycle_balance, lot_size, max_lot)
-
-                        if entered:
-                            new_pos = await api.get_positions()
-                            if float(new_pos.get("sell", 0.0)) > 0:
-                                actual_fill_px = float(new_pos.get("sell_pos", 0.0)) or cur_px
-                                last_trade_time[sym] = time.time()
-                                trade_counts[sym] = 1
-                                last_nanpin_time[sym] = time.time()
-                                tracked_active_positions.add(sym)
-
-                                # ショート直近高値(Swing High) & 確定足SL基準価格の算出
-                                h_eval = df_entry_eval["high"].astype(float) if "high" in df_entry_eval.columns else df_entry_eval["close"].astype(float)
-                                rec_h_val = float(h_eval.iloc[-10:].max()) if len(h_eval) >= 10 else float(h_eval.max())
-                                dyn_sl_pct_e = float(sym_params_e.get("dynamic_mae_stop", -0.030))
-                                dyn_to_bars_e = int(sym_params_e.get("dynamic_timeout_bars", max(3, 240 // max(1, cand_interval_e))))
-                                sl_px_val = min(max(rec_h_val, actual_fill_px * 1.0020), actual_fill_px * (1.0 + abs(dyn_sl_pct_e)))
-
-                                from lake_live_bridge import record_live_entry_to_lake, interval_to_timeframe
-                                lake_entry_meta = record_live_entry_to_lake(sym, "short", actual_fill_px, lot_size, params=sym_params_e)
-                                scale_state_new = {
-                                    "nanpin_count": 0,
-                                    "last_entry_price": actual_fill_px,
-                                    "avg_price": actual_fill_px,
-                                    "initial_entry_time": time.time(),
-                                    "entry_ts_utc": int(time.time()),
-                                    "qty": float(lot_size),
-                                    "side": "short",
-                                    "interval": cand_interval_e,
-                                    "timeframe": interval_to_timeframe(cand_interval_e),
-                                    "strategy": cand_strat_e,
-                                    "dynamic_mae_stop": dyn_sl_pct_e,
-                                    "dynamic_timeout_bars": dyn_to_bars_e,
-                                    "mp": int(sym_params_e.get("mp", 200)),
-                                    "target_ratio": float(sym_params_e.get("target_ratio", 0.70)),
-                                    "s_ep": float(sym_params_e.get("s_ep", 60.0)),
-                                    "s_cp": float(sym_params_e.get("s_cp", 40.0)),
-                                    "recent_high": rec_h_val,
-                                    "sl_price": sl_px_val,
-                                    **lake_entry_meta,
-                                }
-                                scale_in_states[sym] = scale_state_new
-                                save_scale_in_states(scale_in_states)
-                                total_active_count += 1
-                                inv_label_e = f"{cand_interval_e}m" if cand_interval_e < 60 else f"{cand_interval_e // 60}h"
-                                strat_desc = f"SHORT {cand_strat_e.upper()} ({inv_label_e}足 / MP={sym_params_e.get('mp', '-')})"
-                                asyncio.create_task(_async_post_entry_reporting(
-                                    sym=sym, entry_px=actual_fill_px, lot_size=lot_size, entry_full_reason=entry_reason,
-                                    df_chart=df_entry_eval, vah_val=vah_e, val_val=val_e, poc_val=poc_e,
-                                    strat_desc=strat_desc, interval_label=inv_label_e, side="SHORT"
-                                ))
-                            else:
-                                pending_entry_orders[sym] = {
-                                    "placed_at": time.time(),
-                                    "price": cur_px,
-                                    "lot": lot_size,
-                                    "reason": entry_reason,
-                                    "interval": cand_interval_e,
-                                    "strategy": cand_strat_e,
-                                    "dynamic_mae_stop": float(sym_params_e.get("dynamic_mae_stop", -0.030)),
-                                    "dynamic_timeout_bars": int(sym_params_e.get("dynamic_timeout_bars", max(3, 240 // max(1, cand_interval_e)))),
-                                    "mp": int(sym_params_e.get("mp", 200)),
-                                    "target_ratio": float(sym_params_e.get("target_ratio", 0.70)),
-                                    "s_ep": float(sym_params_e.get("s_ep", 60.0)),
-                                    "s_cp": float(sym_params_e.get("s_cp", 40.0)),
-                                    "side": "short",
-                                    "lake_selection_id": sym_params_e.get("lake_selection_id"),
-                                    "lake_run_id": sym_params_e.get("lake_run_id"),
-                                }
-                                total_active_count += 1
-                                discord.print_log(f"📌 [{sym}] Best Ask ショート指値を配置し待機中 (数量={lot_size}, 価格=~${cur_px:.4f})")
-
-                    elif cand_side == "LONG":
-                        # --------------------------------------------------
-                        # 【LONG戦略 新規エントリー判定】(単発1本固定)
-                        # --------------------------------------------------
-                        if cand_strat_e == "vah_break":
-                            sig_entry = check_vah_break_signals(
-                                df_5m=df_entry_eval,
-                                current_pos_qty=0.0,
-                                current_trades_count=0,
-                                avg_entry_price=0.0,
-                                last_entry_price=0.0,
-                                current_price=cur_px,
-                                vp_period=int(sym_params_e.get("mp", 200)),
-                                num_bins=int(sym_params_e.get("num_bins", 50)),
-                                value_area_pct=float(sym_params_e.get("value_area_pct", 0.70)),
-                                target_ratio=float(sym_params_e.get("target_ratio", 0.70)),
-                                is_cooldown_active=in_cooldown,
-                            )
-                        elif cand_strat_e.startswith("val_poc"):
-                            use_ema_v = ("ema" in cand_strat_e)
-                            sig_entry = check_val_poc_signals(
-                                df_5m=df_entry_eval,
-                                current_pos_qty=0.0,
-                                current_trades_count=0,
-                                avg_entry_price=0.0,
-                                last_entry_price=0.0,
-                                current_price=cur_px,
-                                vp_period=int(sym_params_e.get("mp", 200)),
-                                num_bins=int(sym_params_e.get("num_bins", 50)),
-                                value_area_pct=float(sym_params_e.get("value_area_pct", 0.70)),
-                                ma_type=str(sym_params_e.get("ma_type", "EMA" if use_ema_v else "NONE")),
-                                ma_condition=str(sym_params_e.get("ma_condition", "close_above" if use_ema_v else "none")),
-                                max_trades=MAX_TRADES_COUNT,
-                                target_ratio=float(sym_params_e.get("target_ratio", 0.70)),
-                                sl_pct=float(sym_params_e.get("sl_pct", 0.090)),
-                                is_cooldown_active=in_cooldown,
-                                use_ema_filter=use_ema_v,
-                            )
-                        elif cand_strat_e.startswith("rsima") and not cand_strat_e.startswith("rsima_short"):
-                            use_ema_r = ("ema" in cand_strat_e)
-                            sig_entry = check_rsima3_signals(
-                                df_5m=df_entry_eval,
-                                current_pos_qty=0.0,
-                                current_trades_count=0,
-                                avg_entry_price=0.0,
-                                current_price=cur_px,
-                                rsi_len=9,
-                                ema_len=7,
-                                l_ep=float(sym_params_e.get("l_ep", 40.0)),
-                                l_cp=float(sym_params_e.get("l_cp", 60.0)),
-                                sl_pct=float(sym_params_e.get("sl_pct", 0.090)),
-                                max_trades=MAX_TRADES_COUNT,
-                                last_entry_price=0.0,
-                                val_price=val_e,
-                                vah_price=vah_e,
-                                use_ema_filter=use_ema_r,
-                            )
-                        else:
-                            discord.print_log(f"⚠️ [{sym}] LONGブロック内で非LONG戦略 '{cand_strat_e}' が検出されたためスキップします。")
-                            continue
-
-                        entry_action = sig_entry.get("action", "NONE")
-                        entry_reason = sig_entry.get("reason", "INITIAL_ENTRY")
-
-                        # ケース 1: すでにロング指値待機中
-                        if sym in pending_entry_orders:
-                            if pending_entry_orders[sym].get("side") != "long":
-                                # 方向不一致の古いショート指値が残っていれば安全キャンセル
-                                p_api = symbol_apis.get(sym)
-                                if p_api:
-                                    try:
-                                        await p_api.active_order_cancel()
-                                        discord.print_log(f"🛡️ [{sym}] 旧ショート指値を安全キャンセルしロング指値待機へ切り替えます。")
-                                    except Exception:
-                                        pass
-                                pending_entry_orders.pop(sym, None)
-                            if is_candle_closed:
-                                if entry_action == "INITIAL_ENTRY":
-                                    api = symbol_apis.get(sym)
-                                    if api:
-                                        spec = api.bingx.instrument_spec or {}
-                                        lot_size = compute_lot_size(cur_px, BINGX_TARGET_POSITION_VALUE_USDT, spec)
-                                        df_re = df_entry_eval.copy()
-                                        df_re["long"] = True
-                                        entered_re = await api.long_entry(df_re, {}, cycle_balance, lot_size, max_lot)
-                                        if entered_re:
-                                            new_pos = await api.get_positions()
-                                            if float(new_pos.get("buy", 0.0)) > 0:
-                                                actual_fill_px = float(new_pos.get("buy_pos", 0.0)) or cur_px
-                                                pending_entry_orders.pop(sym, None)
-                                                trade_counts[sym] = 1
-                                                last_trade_time[sym] = time.time()
-                                                last_nanpin_time[sym] = time.time()
-                                                tracked_active_positions.add(sym)
-                                                l_eval = df_entry_eval["low"].astype(float) if "low" in df_entry_eval.columns else df_entry_eval["close"].astype(float)
-                                                rec_l_val = float(l_eval.iloc[-10:].min()) if len(l_eval) >= 10 else float(l_eval.min())
-                                                dyn_sl_pct_e = float(sym_params_e.get("dynamic_mae_stop", -0.030))
-                                                dyn_to_bars_e = int(sym_params_e.get("dynamic_timeout_bars", max(3, 240 // max(1, cand_interval_e))))
-                                                sl_px_val = max(min(rec_l_val, actual_fill_px * 0.9980), actual_fill_px * (1.0 - abs(dyn_sl_pct_e)))
-                                                from lake_live_bridge import record_live_entry_to_lake, interval_to_timeframe
-                                                lake_entry_meta = record_live_entry_to_lake(sym, "long", actual_fill_px, lot_size, params=sym_params_e)
-                                                scale_in_states[sym] = {
-                                                    "nanpin_count": 0,
-                                                    "last_entry_price": actual_fill_px,
-                                                    "avg_price": actual_fill_px,
-                                                    "initial_entry_time": time.time(),
-                                                    "entry_ts_utc": int(time.time()),
-                                                    "qty": float(lot_size),
-                                                    "side": "long",
-                                                    "interval": cand_interval_e,
-                                                    "timeframe": interval_to_timeframe(cand_interval_e),
-                                                    "strategy": cand_strat_e,
-                                                    "dynamic_mae_stop": dyn_sl_pct_e,
-                                                    "dynamic_timeout_bars": dyn_to_bars_e,
-                                                    "mp": int(sym_params_e.get("mp", 200)),
-                                                    "target_ratio": float(sym_params_e.get("target_ratio", 0.70)),
-                                                    "l_ep": float(sym_params_e.get("l_ep", 40.0)),
-                                                    "l_cp": float(sym_params_e.get("l_cp", 60.0)),
-                                                    "recent_low": rec_l_val,
-                                                    "sl_price": sl_px_val,
-                                                    **lake_entry_meta,
-                                                }
-                                                save_scale_in_states(scale_in_states)
-                                                inv_label_e = f"{cand_interval_e}m" if cand_interval_e < 60 else f"{cand_interval_e // 60}h"
-                                                strat_desc = f"{cand_strat_e.upper()} ({inv_label_e}足 / MP={sym_params_e.get('mp', '-')})"
-                                                asyncio.create_task(_async_post_entry_reporting(
-                                                    sym=sym, entry_px=actual_fill_px, lot_size=lot_size, entry_full_reason=entry_reason,
-                                                    df_chart=df_entry_eval, vah_val=vah_e, val_val=val_e, poc_val=poc_e,
-                                                    strat_desc=strat_desc, interval_label=inv_label_e, side="LONG"
-                                                ))
-                                            else:
-                                                pending_entry_orders[sym]["price"] = cur_px
-                                                discord.print_log(f"📌 [{sym}] 新しい指値に更新完了 (Best Bid 待機継続: 約 ${cur_px:.4f})")
-                                else:
-                                    api = symbol_apis.get(sym)
-                                    if api:
-                                        try:
-                                            await api.active_order_cancel()
-                                        except Exception:
-                                            pass
-                                    pending_entry_orders.pop(sym, None)
-                                    discord.print_log(f"🛡️ [{sym}] 5分足LONGサインが終了したため、未約定指値を安全にキャンセルしました (下落ナイフ防止)。")
-                            continue
-
-                        # ケース 2: 新規ロング指値発注 (Maker Best Bid)
-                        if total_active_count >= MAX_ACTIVE_POSITIONS:
-                            continue
-                        if entry_action != "INITIAL_ENTRY":
-                            continue
-
-                        api = symbol_apis.get(sym)
-                        if not api:
-                            api = api_bingx(symbol=sym, mode=mode)
-                            spec = fetch_instrument_spec_bingx(sym, mode)
-                            if spec:
-                                api.update_instrument_spec(spec)
-                            symbol_apis[sym] = api
-
-                        spec = api.bingx.instrument_spec or {}
-                        lot_size = compute_lot_size(cur_px, BINGX_TARGET_POSITION_VALUE_USDT, spec)
-                        if lot_size <= 0:
-                            continue
-
-                        pos = await api.get_positions()
-                        if float(pos.get("buy", 0.0)) > 0:
-                            continue
-
-                        api.entry_val = val_e
-                        api.entry_vah = vah_e
-
-                        discord.print_log(f"⚡ [{sym}] [{cand_strat_e.upper()} 初期エントリー>>] {entry_reason}")
-                        df_entry_send = df_entry_eval.copy()
-                        df_entry_send["long"] = True
-                        entered = await api.long_entry(df_entry_send, pos, cycle_balance, lot_size, max_lot)
-
-                        if entered:
-                            new_pos = await api.get_positions()
-                            if float(new_pos.get("buy", 0.0)) > 0:
-                                actual_fill_px = float(new_pos.get("buy_pos", 0.0)) or cur_px
-                                last_trade_time[sym] = time.time()
-                                trade_counts[sym] = 1
-                                last_nanpin_time[sym] = time.time()
-                                tracked_active_positions.add(sym)
-                                l_eval = df_entry_eval["low"].astype(float) if "low" in df_entry_eval.columns else df_entry_eval["close"].astype(float)
-                                rec_l_val = float(l_eval.iloc[-10:].min()) if len(l_eval) >= 10 else float(l_eval.min())
-                                dyn_sl_pct_e = float(sym_params_e.get("dynamic_mae_stop", -0.030))
-                                dyn_to_bars_e = int(sym_params_e.get("dynamic_timeout_bars", max(3, 240 // max(1, cand_interval_e))))
-                                sl_px_val = max(min(rec_l_val, actual_fill_px * 0.9980), actual_fill_px * (1.0 - abs(dyn_sl_pct_e)))
-                                from lake_live_bridge import record_live_entry_to_lake, interval_to_timeframe
-                                lake_entry_meta = record_live_entry_to_lake(sym, "long", actual_fill_px, lot_size, params=sym_params_e)
-                                scale_state_new = {
-                                    "nanpin_count": 0,
-                                    "last_entry_price": actual_fill_px,
-                                    "avg_price": actual_fill_px,
-                                    "initial_entry_time": time.time(),
-                                    "entry_ts_utc": int(time.time()),
-                                    "qty": float(lot_size),
-                                    "side": "long",
-                                    "interval": cand_interval_e,
-                                    "timeframe": interval_to_timeframe(cand_interval_e),
-                                    "strategy": cand_strat_e,
-                                    "dynamic_mae_stop": dyn_sl_pct_e,
-                                    "dynamic_timeout_bars": dyn_to_bars_e,
-                                    "mp": int(sym_params_e.get("mp", 200)),
-                                    "target_ratio": float(sym_params_e.get("target_ratio", 0.70)),
-                                    "l_ep": float(sym_params_e.get("l_ep", 40.0)),
-                                    "l_cp": float(sym_params_e.get("l_cp", 60.0)),
-                                    "recent_low": rec_l_val,
-                                    "sl_price": sl_px_val,
-                                    **lake_entry_meta,
-                                }
-                                scale_in_states[sym] = scale_state_new
-                                save_scale_in_states(scale_in_states)
-                                total_active_count += 1
-                                inv_label_e = f"{cand_interval_e}m" if cand_interval_e < 60 else f"{cand_interval_e // 60}h"
-                                strat_desc = f"{cand_strat_e.upper()} ({inv_label_e}足 / MP={sym_params_e.get('mp', '-')})"
-                                asyncio.create_task(_async_post_entry_reporting(
-                                    sym=sym, entry_px=actual_fill_px, lot_size=lot_size, entry_full_reason=entry_reason,
-                                    df_chart=df_entry_eval, vah_val=vah_e, val_val=val_e, poc_val=poc_e,
-                                    strat_desc=strat_desc, interval_label=inv_label_e, side="LONG"
-                                ))
-                            else:
-                                pending_entry_orders[sym] = {
-                                    "placed_at": time.time(),
-                                    "price": cur_px,
-                                    "lot": lot_size,
-                                    "reason": entry_reason,
-                                    "interval": cand_interval_e,
-                                    "strategy": cand_strat_e,
-                                    "dynamic_mae_stop": float(sym_params_e.get("dynamic_mae_stop", -0.030)),
-                                    "dynamic_timeout_bars": int(sym_params_e.get("dynamic_timeout_bars", max(3, 240 // max(1, cand_interval_e)))),
-                                    "mp": int(sym_params_e.get("mp", 200)),
-                                    "target_ratio": float(sym_params_e.get("target_ratio", 0.70)),
-                                    "l_ep": float(sym_params_e.get("l_ep", 40.0)),
-                                    "l_cp": float(sym_params_e.get("l_cp", 60.0)),
-                                    "side": "long",
-                                    "lake_selection_id": sym_params_e.get("lake_selection_id"),
-                                    "lake_run_id": sym_params_e.get("lake_run_id"),
-                                }
-                                total_active_count += 1
-                                discord.print_log(f"📌 [{sym}] Best Bid 指値を配置し待機中 (数量={lot_size}, 価格=~${cur_px:.4f})")
+                            pending_entry_orders[sym] = {
+                                "placed_at": time.time(),
+                                "price": cur_px,
+                                "lot": lot_size,
+                                "reason": entry_reason,
+                                "interval": cand_interval_e,
+                                "strategy": cand_strat_e,
+                                "chase_count": 0,
+                                "dynamic_mae_stop": float(sym_params_e.get("dynamic_mae_stop", -0.030)),
+                                "dynamic_timeout_bars": int(sym_params_e.get("dynamic_timeout_bars", max(3, 240 // max(1, cand_interval_e)))),
+                                "mp": int(sym_params_e.get("mp", 200)),
+                                "target_ratio": float(sym_params_e.get("target_ratio", 0.70)),
+                                "s_ep": float(sym_params_e.get("s_ep", 60.0)),
+                                "s_cp": float(sym_params_e.get("s_cp", 40.0)),
+                                "l_ep": float(sym_params_e.get("l_ep", 40.0)),
+                                "l_cp": float(sym_params_e.get("l_cp", 60.0)),
+                                "side": side_low,
+                                "lake_selection_id": sym_params_e.get("lake_selection_id"),
+                                "lake_run_id": sym_params_e.get("lake_run_id"),
+                            }
+                            discord.print_log(f"📌 [{sym}] {book_label} {cand_side}指値を配置し待機中 (数量={lot_size}, 価格=~${cur_px:.4f})")
                 except Exception as ent_err:
                     discord.print_log(f"⚠️ [{sym}] 新規エントリー判定例外: {ent_err}", level="warning")
 

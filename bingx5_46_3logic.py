@@ -95,7 +95,7 @@ class logicinstance:
         最新・標準仕様に準拠した高精度マーケットプロファイル（ボリュームプロファイル）生成関数
         - 入出力は完全互換 (POC, VAH, VAL を付加して返す)
         - 実体とヒゲの出来高密度配分、サブビン重心補正、CBOT/TradingView標準Value Area探索を実装
-        - デフォルトで直近重視・指数減衰型（EMA型）ボリュームプロファイルが有効 (use_decay=True)
+        - バックテスト SSoT と同一単一算出コア (`compute_mp_levels_at_bar`) を共有
         """
         df = df.copy()
         n = len(df)
@@ -104,7 +104,7 @@ class logicinstance:
             df['VAH'] = np.nan
             df['VAL'] = np.nan
             return df
-            
+
         try:
             period = max(10, int(period or 100))
         except Exception:
@@ -113,157 +113,42 @@ class logicinstance:
         poc_arr = np.full(n, np.nan)
         vah_arr = np.full(n, np.nan)
         val_arr = np.full(n, np.nan)
-        
+
         min_required = min(5, period)
         start_loop = max(min_required, n - int(tail_only)) if (tail_only is not None and tail_only > 0) else min_required
-        
+
         highs = df['high'].astype(float).values
         lows = df['low'].astype(float).values
         closes = df['close'].astype(float).values
         opens = df['open'].astype(float).values if 'open' in df.columns else closes
         volumes = df['volume'].astype(float).values if 'volume' in df.columns else np.ones(n)
-        
+
         if np.all(volumes <= 0):
             volumes = np.ones(n)
-            
+
         half_life = float(decay_half_life) if decay_half_life is not None else max(5.0, period / 2.0)
         decay_factor = 0.5 ** (1.0 / half_life) if use_decay else 1.0
-            
+        full_weights = (decay_factor ** np.arange(period - 1, -1, -1)) if use_decay else np.ones(period)
+
         for i in range(start_loop, n):
-            # CPU負荷抑制のためのジェントルスリープ (50足ごとに2ミリ秒休止)
-            if (i - start_loop) > 0 and (i - start_loop) % 50 == 0:
-                time.sleep(0.002)
+            poc_p, val_p, vah_p, _, _ = compute_mp_levels_at_bar(
+                opens, highs, lows, closes, volumes,
+                end_idx=i, period=period, num_bins=num_bins,
+                value_area_pct=value_area_pct, full_weights=full_weights,
+                compute_80=False,
+            )
+            poc_arr[i] = poc_p
+            val_arr[i] = val_p
+            vah_arr[i] = vah_p
 
-            start_idx = max(0, i - period + 1)
-            win_len = i - start_idx + 1
-            
-            w_highs = highs[start_idx:i+1]
-            w_lows = lows[start_idx:i+1]
-            w_closes = closes[start_idx:i+1]
-            w_opens = opens[start_idx:i+1]
-            w_volumes = volumes[start_idx:i+1].copy()
-            
-            # 指数減衰の適用（直近足 age=0 が 1.0、古い足ほど減衰）
-            if use_decay:
-                ages = np.arange(win_len - 1, -1, -1)
-                weights = decay_factor ** ages
-                w_volumes = w_volumes * weights
-            
-            if len(w_highs) == 0 or len(w_lows) == 0:
-                curr_c = closes[i] if i < len(closes) else 0.0
-                poc_arr[i] = curr_c
-                vah_arr[i] = curr_c
-                val_arr[i] = curr_c
-                continue
-
-            p_max = w_highs.max()
-            p_min = w_lows.min()
-            
-            if p_max <= p_min or np.isnan(p_max) or np.isnan(p_min):
-                curr_c = closes[i]
-                poc_arr[i] = curr_c
-                vah_arr[i] = curr_c
-                val_arr[i] = curr_c
-                continue
-            
-            price_bins = np.linspace(p_min, p_max, num_bins + 1)
-            bin_centers = (price_bins[:-1] + price_bins[1:]) / 2
-            
-            body_lows = np.minimum(w_opens, w_closes)
-            body_highs = np.maximum(w_opens, w_closes)
-            
-            w_h_2d = w_highs[:, np.newaxis]
-            w_l_2d = w_lows[:, np.newaxis]
-            w_bh_2d = body_highs[:, np.newaxis]
-            w_bl_2d = body_lows[:, np.newaxis]
-            w_v_2d = w_volumes[:, np.newaxis]
-            
-            bin_lows_2d = price_bins[:-1][np.newaxis, :]
-            bin_highs_2d = price_bins[1:][np.newaxis, :]
-            
-            full_overlap = np.maximum(0.0, np.minimum(w_h_2d, bin_highs_2d) - np.maximum(w_l_2d, bin_lows_2d))
-            full_range = np.maximum(w_h_2d - w_l_2d, 1e-12)
-            full_ratio = full_overlap / full_range
-            
-            body_overlap = np.maximum(0.0, np.minimum(w_bh_2d, bin_highs_2d) - np.maximum(w_bl_2d, bin_lows_2d))
-            body_range = np.maximum(w_bh_2d - w_bl_2d, 1e-12)
-            body_ratio = body_overlap / body_range
-            
-            has_body = (body_highs - body_lows) > 1e-12
-            has_body_2d = has_body[:, np.newaxis]
-            
-            eff_ratio = np.where(has_body_2d, 0.60 * body_ratio + 0.40 * full_ratio, full_ratio)
-            
-            vol_profile = (w_v_2d * eff_ratio).sum(axis=0)
-            
-            total_vol = vol_profile.sum()
-            if total_vol <= 0:
-                curr_c = closes[i]
-                poc_arr[i] = curr_c
-                vah_arr[i] = curr_c
-                val_arr[i] = curr_c
-                continue
-                
-            poc_idx = int(np.argmax(vol_profile))
-            
-            idx_start = max(0, poc_idx - 1)
-            idx_end = min(num_bins, poc_idx + 2)
-            local_vols = vol_profile[idx_start:idx_end]
-            local_centers = bin_centers[idx_start:idx_end]
-            local_sum = local_vols.sum()
-            poc_price = (local_vols * local_centers).sum() / local_sum if local_sum > 0 else bin_centers[poc_idx]
-            
-            target_vol = total_vol * value_area_pct
-            current_va_vol = vol_profile[poc_idx]
-            
-            upper_idx = poc_idx
-            lower_idx = poc_idx
-            
-            while current_va_vol < target_vol:
-                can_up = upper_idx < num_bins - 1
-                can_down = lower_idx > 0
-                
-                if not can_up and not can_down:
-                    break
-                    
-                up_vol = vol_profile[upper_idx + 1] if can_up else -1.0
-                down_vol = vol_profile[lower_idx - 1] if can_down else -1.0
-                
-                if can_up and can_down:
-                    if up_vol > down_vol:
-                        upper_idx += 1
-                        current_va_vol += vol_profile[upper_idx]
-                    elif down_vol > up_vol:
-                        lower_idx -= 1
-                        current_va_vol += vol_profile[lower_idx]
-                    else:
-                        upper_idx += 1
-                        current_va_vol += vol_profile[upper_idx]
-                        if current_va_vol < target_vol and lower_idx > 0:
-                            lower_idx -= 1
-                            current_va_vol += vol_profile[lower_idx]
-                elif can_up:
-                    upper_idx += 1
-                    current_va_vol += vol_profile[upper_idx]
-                elif can_down:
-                    lower_idx -= 1
-                    current_va_vol += vol_profile[lower_idx]
-            
-            vah_price = price_bins[upper_idx + 1]
-            val_price = price_bins[lower_idx]
-            
-            poc_arr[i] = poc_price
-            vah_arr[i] = vah_price
-            val_arr[i] = val_price
-            
         df['POC'] = poc_arr
         df['VAH'] = vah_arr
         df['VAL'] = val_arr
-        
+
         df['POC'] = df['POC'].ffill().bfill()
         df['VAH'] = df['VAH'].ffill().bfill()
         df['VAL'] = df['VAL'].ffill().bfill()
-        
+
         return df
 
     def make_logic(self, df, market_profile_period=720, strategy_type="range", use_decay=True, decay_half_life=None, vol_surge_mult=1.2, fr_threshold=0.00002, **kwargs):
@@ -1617,15 +1502,138 @@ def compute_dynamic_center_margin(df: pd.DataFrame, strategy_type: str = "breako
 
 
 
+def compute_mp_levels_at_bar(
+    opens: np.ndarray,
+    highs: np.ndarray,
+    lows: np.ndarray,
+    closes: np.ndarray,
+    volumes: np.ndarray,
+    end_idx: int,
+    period: int = 150,
+    num_bins: int = 50,
+    value_area_pct: float = 0.70,
+    full_weights: Optional[np.ndarray] = None,
+    compute_80: bool = True,
+) -> Tuple[float, float, float, float, float]:
+    """単一確定足インデックス `end_idx` における厳密 causal Market Profile (POC, VAL_70, VAH_70, VAL_80, VAH_80) を算出する単一正本コア。"""
+    start_idx = max(0, end_idx - period + 1)
+    win_len = end_idx - start_idx + 1
+    w_highs = highs[start_idx:end_idx + 1]
+    w_lows = lows[start_idx:end_idx + 1]
+    w_closes = closes[start_idx:end_idx + 1]
+    w_opens = opens[start_idx:end_idx + 1]
+    curr_c = float(closes[end_idx]) if end_idx < len(closes) else 0.0
+
+    if len(w_highs) == 0 or len(w_lows) == 0:
+        return curr_c, curr_c, curr_c, curr_c, curr_c
+
+    if full_weights is not None:
+        w_volumes = volumes[start_idx:end_idx + 1] * full_weights[-win_len:]
+    else:
+        w_volumes = volumes[start_idx:end_idx + 1]
+
+    p_max = float(w_highs.max())
+    p_min = float(w_lows.min())
+    if p_max <= p_min or np.isnan(p_max) or np.isnan(p_min):
+        return curr_c, curr_c, curr_c, curr_c, curr_c
+
+    price_bins = np.linspace(p_min, p_max, num_bins + 1)
+    bin_centers = (price_bins[:-1] + price_bins[1:]) * 0.5
+    bin_lows_2d = price_bins[:-1][np.newaxis, :]
+    bin_highs_2d = price_bins[1:][np.newaxis, :]
+
+    body_lows = np.minimum(w_opens, w_closes)
+    body_highs = np.maximum(w_opens, w_closes)
+    w_h_2d = w_highs[:, np.newaxis]
+    w_l_2d = w_lows[:, np.newaxis]
+    w_bh_2d = body_highs[:, np.newaxis]
+    w_bl_2d = body_lows[:, np.newaxis]
+    w_v_2d = w_volumes[:, np.newaxis]
+
+    full_overlap = np.maximum(0.0, np.minimum(w_h_2d, bin_highs_2d) - np.maximum(w_l_2d, bin_lows_2d))
+    full_range = np.maximum(w_h_2d - w_l_2d, 1e-12)
+    full_ratio = full_overlap / full_range
+
+    body_overlap = np.maximum(0.0, np.minimum(w_bh_2d, bin_highs_2d) - np.maximum(w_bl_2d, bin_lows_2d))
+    body_range = np.maximum(w_bh_2d - w_bl_2d, 1e-12)
+    body_ratio = body_overlap / body_range
+
+    has_body_2d = ((body_highs - body_lows) > 1e-12)[:, np.newaxis]
+    eff_ratio = np.where(has_body_2d, 0.60 * body_ratio + 0.40 * full_ratio, full_ratio)
+    vol_profile = (w_v_2d * eff_ratio).sum(axis=0)
+
+    total_vol = float(vol_profile.sum())
+    if total_vol <= 0.0:
+        return curr_c, curr_c, curr_c, curr_c, curr_c
+
+    poc_idx = int(np.argmax(vol_profile))
+    idx_start = max(0, poc_idx - 1)
+    idx_end = min(num_bins, poc_idx + 2)
+    local_vols = vol_profile[idx_start:idx_end]
+    local_centers = bin_centers[idx_start:idx_end]
+    local_sum = float(local_vols.sum())
+    poc_price = float((local_vols * local_centers).sum() / local_sum) if local_sum > 0 else float(bin_centers[poc_idx])
+
+    target_vol_va = total_vol * value_area_pct
+    target_vol_stop = total_vol * (0.80 if compute_80 else value_area_pct)
+    curr_va_vol = float(vol_profile[poc_idx])
+    upper_idx = poc_idx
+    lower_idx = poc_idx
+    val_va = float(price_bins[lower_idx])
+    vah_va = float(price_bins[upper_idx + 1])
+    found_va = (curr_va_vol >= target_vol_va)
+
+    while (upper_idx < num_bins - 1 or lower_idx > 0):
+        if not found_va and curr_va_vol >= target_vol_va:
+            val_va = float(price_bins[lower_idx])
+            vah_va = float(price_bins[upper_idx + 1])
+            found_va = True
+        if curr_va_vol >= target_vol_stop:
+            break
+
+        can_up = upper_idx < num_bins - 1
+        can_down = lower_idx > 0
+        up_vol = float(vol_profile[upper_idx + 1]) if can_up else -1.0
+        down_vol = float(vol_profile[lower_idx - 1]) if can_down else -1.0
+
+        if can_up and can_down:
+            if up_vol > down_vol:
+                upper_idx += 1
+                curr_va_vol += float(vol_profile[upper_idx])
+            elif down_vol > up_vol:
+                lower_idx -= 1
+                curr_va_vol += float(vol_profile[lower_idx])
+            else:
+                upper_idx += 1
+                curr_va_vol += float(vol_profile[upper_idx])
+                if curr_va_vol < target_vol_stop and lower_idx > 0:
+                    lower_idx -= 1
+                    curr_va_vol += float(vol_profile[lower_idx])
+        elif can_up:
+            upper_idx += 1
+            curr_va_vol += float(vol_profile[upper_idx])
+        elif can_down:
+            lower_idx -= 1
+            curr_va_vol += float(vol_profile[lower_idx])
+
+    if not found_va:
+        val_va = float(price_bins[lower_idx])
+        vah_va = float(price_bins[upper_idx + 1])
+    val_80 = float(price_bins[lower_idx])
+    vah_80 = float(price_bins[upper_idx + 1])
+    return poc_price, val_va, vah_va, val_80, vah_80
+
+
 def make_market_profile_dual_va(
     df: pd.DataFrame,
     period: int = 100,
     num_bins: int = 100,
     step: int = 1,
     use_decay: bool = True,
-    decay_half_life: Optional[float] = None
+    decay_half_life: Optional[float] = None,
+    indices: Optional[Sequence[int]] = None,
 ) -> Dict[str, np.ndarray]:
-    """1パスの出来高ビン集計で VA 70% と VA 80% の両方の VAL/VAH を一挙算出する関数 (指数減衰・step間引き対応)"""
+    """1パスの出来高ビン集計で VA 70% と VA 80% の両方の VAL/VAH を一挙算出する関数 (単一算出コア利用・遅延インデックス計算対応)"""
     n = len(df)
     min_required = min(max(10, period // 2), period)
     highs = df['high'].astype(float).values
@@ -1646,15 +1654,34 @@ def make_market_profile_dual_va(
     vah_80 = np.full(n, np.nan)
     poc_arr = np.full(n, np.nan)
 
+    if indices is not None:
+        for i in indices:
+            idx = int(i)
+            if idx < 0 or idx >= n:
+                continue
+            poc_p, v70, vh70, v80, vh80 = compute_mp_levels_at_bar(
+                opens, highs, lows, closes, volumes,
+                end_idx=idx, period=period, num_bins=num_bins,
+                value_area_pct=0.70, full_weights=full_weights, compute_80=True,
+            )
+            poc_arr[idx] = poc_p
+            val_70[idx] = v70
+            vah_70[idx] = vh70
+            val_80[idx] = v80
+            vah_80[idx] = vh80
+        return {
+            'poc': poc_arr,
+            'val_70': val_70, 'vah_70': vah_70,
+            'val_80': val_80, 'vah_80': vah_80,
+        }
+
     last_poc = np.nan
     last_v70 = np.nan
     last_vh70 = np.nan
     last_v80 = np.nan
     last_vh80 = np.nan
-    calc_count = 0
 
     for i in range(min_required, n):
-        # step間引き: 直前計算値のフォワードフィル (計算量を1/stepに削減)
         if step > 1 and (i - min_required) % step != 0 and not np.isnan(last_poc):
             poc_arr[i] = last_poc
             val_70[i] = last_v70
@@ -1663,120 +1690,12 @@ def make_market_profile_dual_va(
             vah_80[i] = last_vh80
             continue
 
-        calc_count += 1
-        # CPU負荷を20〜30%以下に抑えるためのジェントルスリープ
-        if calc_count % 40 == 0:
-            time.sleep(0.015)
-
-        start_idx = max(0, i - period + 1)
-        win_len = i - start_idx + 1
-        w_highs = highs[start_idx:i+1]
-        w_lows = lows[start_idx:i+1]
-        w_closes = closes[start_idx:i+1]
-        w_opens = opens[start_idx:i+1]
-        w_volumes = volumes[start_idx:i+1] * full_weights[-win_len:]
-
-        if len(w_highs) == 0 or len(w_lows) == 0:
-            curr_c = closes[i] if i < len(closes) else 0.0
-            last_poc = last_v70 = last_vh70 = last_v80 = last_vh80 = curr_c
-            poc_arr[i] = val_70[i] = vah_70[i] = val_80[i] = vah_80[i] = curr_c
-            continue
-
-        p_max = w_highs.max()
-        p_min = w_lows.min()
-        curr_c = closes[i]
-
-        if p_max <= p_min or np.isnan(p_max) or np.isnan(p_min):
-            last_poc = last_v70 = last_vh70 = last_v80 = last_vh80 = curr_c
-            poc_arr[i] = val_70[i] = vah_70[i] = val_80[i] = vah_80[i] = curr_c
-            continue
-
-        price_bins = np.linspace(p_min, p_max, num_bins + 1)
-        bin_centers = (price_bins[:-1] + price_bins[1:]) / 2
-        bin_lows_2d = price_bins[:-1][np.newaxis, :]
-        bin_highs_2d = price_bins[1:][np.newaxis, :]
-
-        body_lows = np.minimum(w_opens, w_closes)
-        body_highs = np.maximum(w_opens, w_closes)
-        w_h_2d = w_highs[:, np.newaxis]
-        w_l_2d = w_lows[:, np.newaxis]
-        w_bh_2d = body_highs[:, np.newaxis]
-        w_bl_2d = body_lows[:, np.newaxis]
-        w_v_2d = w_volumes[:, np.newaxis]
-
-        full_overlap = np.maximum(0.0, np.minimum(w_h_2d, bin_highs_2d) - np.maximum(w_l_2d, bin_lows_2d))
-        full_range = np.maximum(w_h_2d - w_l_2d, 1e-12)
-        full_ratio = full_overlap / full_range
-
-        body_overlap = np.maximum(0.0, np.minimum(w_bh_2d, bin_highs_2d) - np.maximum(w_bl_2d, bin_lows_2d))
-        body_range = np.maximum(w_bh_2d - w_bl_2d, 1e-12)
-        body_ratio = body_overlap / body_range
-
-        has_body_2d = ((body_highs - body_lows) > 1e-12)[:, np.newaxis]
-        eff_ratio = np.where(has_body_2d, 0.60 * body_ratio + 0.40 * full_ratio, full_ratio)
-        vol_profile = (w_v_2d * eff_ratio).sum(axis=0)
-
-        total_vol = vol_profile.sum()
-        if total_vol <= 0:
-            last_poc = last_v70 = last_vh70 = last_v80 = last_vh80 = curr_c
-            poc_arr[i] = val_70[i] = vah_70[i] = val_80[i] = vah_80[i] = curr_c
-            continue
-
-        poc_idx = int(np.argmax(vol_profile))
-        idx_start = max(0, poc_idx - 1)
-        idx_end = min(num_bins, poc_idx + 2)
-        local_vols = vol_profile[idx_start:idx_end]
-        local_centers = bin_centers[idx_start:idx_end]
-        local_sum = local_vols.sum()
-        last_poc = (local_vols * local_centers).sum() / local_sum if local_sum > 0 else bin_centers[poc_idx]
+        last_poc, last_v70, last_vh70, last_v80, last_vh80 = compute_mp_levels_at_bar(
+            opens, highs, lows, closes, volumes,
+            end_idx=i, period=period, num_bins=num_bins,
+            value_area_pct=0.70, full_weights=full_weights, compute_80=True,
+        )
         poc_arr[i] = last_poc
-
-        target_vol_70 = total_vol * 0.70
-        target_vol_80 = total_vol * 0.80
-        curr_va_vol = vol_profile[poc_idx]
-        upper_idx = poc_idx
-        lower_idx = poc_idx
-        found_70 = False
-
-        while upper_idx < num_bins - 1 or lower_idx > 0:
-            if not found_70 and curr_va_vol >= target_vol_70:
-                last_v70 = price_bins[lower_idx]
-                last_vh70 = price_bins[upper_idx + 1]
-                found_70 = True
-            if curr_va_vol >= target_vol_80:
-                break
-
-            can_up = upper_idx < num_bins - 1
-            can_down = lower_idx > 0
-            up_vol = vol_profile[upper_idx + 1] if can_up else -1.0
-            down_vol = vol_profile[lower_idx - 1] if can_down else -1.0
-
-            if can_up and can_down:
-                if up_vol > down_vol:
-                    upper_idx += 1
-                    curr_va_vol += vol_profile[upper_idx]
-                elif down_vol > up_vol:
-                    lower_idx -= 1
-                    curr_va_vol += vol_profile[lower_idx]
-                else:
-                    upper_idx += 1
-                    curr_va_vol += vol_profile[upper_idx]
-                    if curr_va_vol < target_vol_80 and lower_idx > 0:
-                        lower_idx -= 1
-                        curr_va_vol += vol_profile[lower_idx]
-            elif can_up:
-                upper_idx += 1
-                curr_va_vol += vol_profile[upper_idx]
-            elif can_down:
-                lower_idx -= 1
-                curr_va_vol += vol_profile[lower_idx]
-
-        if not found_70:
-            last_v70 = price_bins[lower_idx]
-            last_vh70 = price_bins[upper_idx + 1]
-        last_v80 = price_bins[lower_idx]
-        last_vh80 = price_bins[upper_idx + 1]
-
         val_70[i] = last_v70
         vah_70[i] = last_vh70
         val_80[i] = last_v80
@@ -5509,6 +5428,204 @@ def calc_rsi_ema(
     return rsi, lrsi_ma
 
 
+def _prior_10_swing_level(df: Optional[pd.DataFrame], is_short: bool, fallback_px: float) -> float:
+    """現在評価中の最新確定足自身を除外し、直前10本確定足 (shift(1)) の高値/安値を算出する。"""
+    if df is None or df.empty:
+        return float(fallback_px)
+    col = "high" if is_short else "low"
+    ser = df[col].astype(float) if col in df.columns else df["close"].astype(float)
+    prior = ser.iloc[-11:-1] if len(ser) >= 2 else ser
+    if prior.empty:
+        prior = ser
+    val = float(prior.max() if is_short else prior.min())
+    return val if (val > 0 and np.isfinite(val)) else float(fallback_px)
+
+
+def compute_dynamic_exit_levels(
+    strategy: str,
+    avg_entry_px: float,
+    val: float,
+    vah: float,
+    poc: float,
+    prev10_swing_px: Optional[float],
+    target_ratio: float = 0.70,
+    eff_hard_sl_pct: float = 0.030,
+    min_sl_pct: float = 0.0020,
+) -> Dict[str, Any]:
+    """全6戦略の毎足動的更新 TP / 確定足防衛SL / ハードSL 水準を算出する単一正本 (BT & 実運用共通)。"""
+    strat = str(strategy).lower()
+    if strat.startswith("val_poc"):
+        base_strat = "val_poc"
+    elif strat.startswith("vah_poc"):
+        base_strat = "vah_poc"
+    elif strat == "vah_break":
+        base_strat = "vah_break"
+    elif strat == "val_break":
+        base_strat = "val_break"
+    elif strat.startswith("rsima_short"):
+        base_strat = "rsima_short"
+    else:
+        base_strat = "rsima"
+
+    is_short = base_strat in ("vah_poc", "val_break", "rsima_short")
+    is_brk = base_strat in ("vah_break", "val_break")
+    eff_sl = abs(float(eff_hard_sl_pct)) if eff_hard_sl_pct else 0.030
+    e_px = float(avg_entry_px)
+    valid_va = (vah > val > 0) and np.isfinite(vah) and np.isfinite(val)
+    poc_safe = float(poc) if (poc and np.isfinite(poc) and poc > 0) else e_px
+
+    target_tp: Optional[float] = None
+    if base_strat == "val_poc":
+        tp_cand = (val + (vah - val) * float(target_ratio)) if valid_va else poc_safe
+        target_tp = max(tp_cand, e_px * 1.0040)
+        rec_l = float(prev10_swing_px) if (prev10_swing_px and prev10_swing_px > 0) else e_px * (1.0 - eff_sl)
+        sl_confirm_px = min(rec_l, e_px * (1.0 - min_sl_pct))
+        hard_sl_px = e_px * (1.0 - eff_sl)
+    elif base_strat == "vah_poc":
+        tp_cand = (vah - (vah - val) * float(target_ratio)) if valid_va else poc_safe
+        target_tp = min(tp_cand, e_px * 0.9960)
+        rec_h = float(prev10_swing_px) if (prev10_swing_px and prev10_swing_px > 0) else e_px * (1.0 + eff_sl)
+        sl_confirm_px = max(rec_h, e_px * (1.0 + min_sl_pct))
+        hard_sl_px = e_px * (1.0 + eff_sl)
+    elif base_strat == "vah_break":
+        tp_cand = (vah + (vah - val) * float(target_ratio)) if valid_va else e_px * 1.0080
+        target_tp = max(tp_cand, e_px * 1.0080)
+        tp_dist = max(target_tp - e_px, e_px * 0.0080)
+        poc_sl = min(poc_safe, e_px * 0.9950)
+        sl_confirm_px = max(poc_sl, e_px - tp_dist * 0.5)
+        hard_sl_px = max(sl_confirm_px, e_px * (1.0 - eff_sl))
+    elif base_strat == "val_break":
+        tp_cand = (val - (vah - val) * float(target_ratio)) if valid_va else e_px * 0.9920
+        target_tp = min(tp_cand, e_px * 0.9920)
+        tp_dist = max(e_px - target_tp, e_px * 0.0080)
+        poc_sl = max(poc_safe, e_px * 1.0050)
+        sl_confirm_px = min(poc_sl, e_px + tp_dist * 0.5)
+        hard_sl_px = min(sl_confirm_px, e_px * (1.0 + eff_sl))
+    elif base_strat == "rsima":
+        rec_l = float(prev10_swing_px) if (prev10_swing_px and prev10_swing_px > 0) else e_px * (1.0 - eff_sl)
+        sl_confirm_px = min(rec_l, e_px * (1.0 - min_sl_pct))
+        hard_sl_px = e_px * (1.0 - eff_sl)
+    else:  # rsima_short
+        rec_h = float(prev10_swing_px) if (prev10_swing_px and prev10_swing_px > 0) else e_px * (1.0 + eff_sl)
+        sl_confirm_px = max(rec_h, e_px * (1.0 + min_sl_pct))
+        hard_sl_px = e_px * (1.0 + eff_sl)
+
+    effective_sl = min(sl_confirm_px, hard_sl_px) if is_short else max(sl_confirm_px, hard_sl_px)
+    return {
+        "base_strategy": base_strat,
+        "is_short": is_short,
+        "is_breakout": is_brk,
+        "target_tp": target_tp,
+        "sl_confirm_px": float(sl_confirm_px),
+        "hard_sl_px": float(hard_sl_px),
+        "sl_price": float(effective_sl),
+    }
+
+
+def evaluate_dynamic_exit_decision(
+    strategy: str,
+    avg_entry_px: float,
+    levels: Dict[str, Any],
+    is_fill_bar: bool,
+    can_check_close_exit: bool,
+    is_emergency_breakeven: bool,
+    elapsed_minutes: float,
+    low_px: float,
+    high_px: float,
+    close_check_px: float,
+    live_px: float,
+    cur_rsi: float = 50.0,
+    rsi_exit_thresh: float = 60.0,
+    timeout_minutes: float = 240.0,
+    max_hold_minutes: float = 480.0,
+    prefer_limit_fill_px: bool = False,
+) -> Dict[str, Any]:
+    """
+    全6戦略のエグジット優先順位を完全統一する単一判定コア (BT & 実運用共通)。
+    優先順位:
+      1. HARD_SL / POC_RR_SL (約定当足含め常時有効)
+      --- 以下 is_fill_bar=False 時のみ ---
+      2. SWING_SL_CLOSE / POC_SL_CLOSE (約定後初の確定足以降、採用足確定終値で評価)
+      3. EMERGENCY_BREAKEVEN_TP (±0.20%, 地合い非合致時)
+      4. TARGET_TP / RSI_TP (Target到達 または RSI到達+建値±0.40%)
+      5. TIMEOUT_EXIT (timeout_minutes=240m 経過 かつ 含み損)
+      6. MAX_HOLD_CLOSE (max_hold_minutes=480m 到達時は損益不問強制決済)
+    """
+    is_short = bool(levels["is_short"])
+    is_brk = bool(levels["is_breakout"])
+    sl_confirm_px = float(levels["sl_confirm_px"])
+    hard_sl_px = float(levels["hard_sl_px"])
+    target_tp = levels["target_tp"]
+
+    # 1. ハードSL / ブレイクアウトPOC-RR SL (約定当足から常時有効)
+    if not is_short and low_px <= hard_sl_px:
+        px_out = hard_sl_px if prefer_limit_fill_px else live_px
+        code = "POC_RR_SL" if is_brk else "HARD_SL"
+        return {"action": "STOP_LOSS", "code": code, "exit_px": float(px_out), "detail": f"${px_out:.4f} <= ${hard_sl_px:.4f}"}
+    if is_short and high_px >= hard_sl_px:
+        px_out = hard_sl_px if prefer_limit_fill_px else live_px
+        code = "POC_RR_SL" if is_brk else "HARD_SL"
+        return {"action": "STOP_LOSS", "code": code, "exit_px": float(px_out), "detail": f"${px_out:.4f} >= ${hard_sl_px:.4f}"}
+
+    if is_fill_bar:
+        return {"action": "HOLD", "code": "HOLD", "exit_px": 0.0, "detail": ""}
+
+    # 2. 確定足終値ストップ (約定後初の採用足確定後のみ)
+    if can_check_close_exit:
+        if not is_short and close_check_px < sl_confirm_px:
+            code = "POC_SL_CLOSE" if is_brk else "SWING_SL_CLOSE"
+            return {"action": "STOP_LOSS", "code": code, "exit_px": float(close_check_px), "detail": f"確定終値(${close_check_px:.4f}) < SL(${sl_confirm_px:.4f})"}
+        if is_short and close_check_px > sl_confirm_px:
+            code = "POC_SL_CLOSE" if is_brk else "SWING_SL_CLOSE"
+            return {"action": "STOP_LOSS", "code": code, "exit_px": float(close_check_px), "detail": f"確定終値(${close_check_px:.4f}) > SL(${sl_confirm_px:.4f})"}
+
+    # 3. 地合い転換時の緊急建値撤退 (±0.20%)
+    if is_emergency_breakeven and avg_entry_px > 0:
+        if not is_short:
+            be_px = avg_entry_px * 1.0020
+            if high_px >= be_px:
+                px_out = be_px if prefer_limit_fill_px else live_px
+                return {"action": "CLOSE_ALL", "code": "EMERGENCY_BREAKEVEN_TP", "exit_px": float(px_out), "detail": f"目標: ${be_px:.4f}"}
+        else:
+            be_px = avg_entry_px * 0.9980
+            if low_px <= be_px:
+                px_out = be_px if prefer_limit_fill_px else live_px
+                return {"action": "CLOSE_ALL", "code": "EMERGENCY_BREAKEVEN_TP", "exit_px": float(px_out), "detail": f"目標: ${be_px:.4f}"}
+
+    # 4. 利確 (TARGET_TP または RSI_TP)
+    if target_tp is not None:
+        if not is_short and high_px >= target_tp:
+            px_out = float(target_tp) if prefer_limit_fill_px else float(live_px)
+            return {"action": "CLOSE_ALL", "code": "TARGET_TP", "exit_px": px_out, "detail": f"目標(${target_tp:.4f})到達"}
+        if is_short and low_px <= target_tp:
+            px_out = float(target_tp) if prefer_limit_fill_px else float(live_px)
+            return {"action": "CLOSE_ALL", "code": "TARGET_TP", "exit_px": px_out, "detail": f"目標(${target_tp:.4f})到達"}
+    elif can_check_close_exit and avg_entry_px > 0:
+        if not is_short and cur_rsi > rsi_exit_thresh and close_check_px >= avg_entry_px * 1.0040:
+            return {"action": "CLOSE_ALL", "code": "RSI_TP", "exit_px": float(close_check_px), "detail": f"RSI({cur_rsi:.1f} > {rsi_exit_thresh:.0f}) & 建値+0.40%"}
+        if is_short and cur_rsi < rsi_exit_thresh and close_check_px <= avg_entry_px * 0.9960:
+            return {"action": "CLOSE_ALL", "code": "RSI_TP", "exit_px": float(close_check_px), "detail": f"RSI({cur_rsi:.1f} < {rsi_exit_thresh:.0f}) & 建値-0.40%"}
+
+    # 5. タイムアウト撤退 (240分以上経過 かつ 含み損)
+    if elapsed_minutes >= timeout_minutes and avg_entry_px > 0:
+        in_loss = (live_px <= avg_entry_px) if not is_short else (live_px >= avg_entry_px)
+        if in_loss:
+            return {"action": "TIMEOUT_EXIT", "code": "TIMEOUT_LOSS", "exit_px": float(live_px), "detail": f"経過{elapsed_minutes:.0f}m >= {timeout_minutes:.0f}m & 含み損"}
+
+    # 6. 最大保有時間強制決済 (480分 = 8時間到達)
+    if max_hold_minutes > 0 and elapsed_minutes >= max_hold_minutes:
+        return {"action": "CLOSE_ALL", "code": "MAX_HOLD_CLOSE", "exit_px": float(live_px), "detail": f"最大保有{elapsed_minutes:.0f}m >= {max_hold_minutes:.0f}m 強制決済"}
+
+    return {"action": "HOLD", "code": "HOLD", "exit_px": 0.0, "detail": ""}
+
+
+def _resolve_elapsed_minutes(elapsed_minutes: Optional[float], bars_held: int, timeout_bars: int, timeout_minutes: float) -> float:
+    if elapsed_minutes is not None and elapsed_minutes >= 0:
+        return float(elapsed_minutes)
+    step_min = float(timeout_minutes) / max(1, int(timeout_bars))
+    return float(bars_held) * step_min
+
+
 def check_rsima3_signals(
     df_5m: pd.DataFrame,
     current_pos_qty: float,
@@ -5532,13 +5649,12 @@ def check_rsima3_signals(
     timeout_bars: int = 48,
     recent_low: Optional[float] = None,
     is_fill_bar: bool = False,
+    elapsed_minutes: Optional[float] = None,
+    timeout_minutes: float = 240.0,
+    max_hold_minutes: float = 480.0,
+    has_new_tf_bar_after_fill: bool = True,
 ) -> Dict[str, Any]:
-    """RSIMA ロング判定 (`lake_backtest_engine.py` 完全統一 SSoT)
-    1. エントリー: 1本ゴールデンクロス (prev_rsi <= prev_ma & curr_rsi > curr_ma) かつ curr_ma < l_ep
-    2. 利確: curr_rsi > l_cp かつ 平均建値 +0.40% 以上利益
-    3. 損切り: 直近10本安値確定足SL、ハードSL (-3.0%)、またはタイムアウト撤退
-    4. 緊急建値撤退: 全体地合い非BUY時、平均建値 +0.20% で早期撤退
-    """
+    """RSIMA ロング判定 (BT・実運用 100% 統一 SSoT コア使用)"""
     if df_5m is None or df_5m.empty or len(df_5m) < rsi_len + ema_len + 5:
         return {"action": "NONE", "reason": "5M_DATA_INSUFFICIENT", "lot_multiplier": 1.0, "metrics": {}}
 
@@ -5553,29 +5669,18 @@ def check_rsima3_signals(
     curr_close_val = float(c.iloc[-1])
     prev_close = float(c.iloc[-2]) if len(c) >= 2 else current_price
 
-    # 1. 確定足1本ゴールデンクロス判定 (lake_backtest_engine.py と完全一致)
     LE = (curr_rsi > curr_ma) and (prev_rsi <= prev_ma)
-
-    # 2. 水準判定: rsi_ma < l_ep
     LC = (curr_ma < l_ep) and (current_trades_count < max_trades)
 
     lpo = (current_pos_qty > 0)
     poz = (current_pos_qty <= 0)
-
-    tp_add_pct = 0.0040
-    LRS = (curr_rsi > l_cp)
-    base_long_exit = (
-        LRS
-        and (avg_entry_price > 0)
-        and (current_price >= avg_entry_price * (1.0 + tp_add_pct))
-    )
 
     metrics = {
         "curr_price": current_price,
         "prev_close": prev_close,
         "avg_entry_price": avg_entry_price,
         "last_entry_price": last_entry_price if (last_entry_price is not None and last_entry_price > 0) else avg_entry_price,
-        "tp_add_pct": tp_add_pct,
+        "tp_add_pct": 0.0040,
         "rsi": curr_rsi,
         "lrsi_ma": curr_ma,
         "prev_rsi": prev_rsi,
@@ -5583,65 +5688,59 @@ def check_rsima3_signals(
         "LE": LE,
         "LC": LC,
         "opentrades": current_trades_count,
-        "LRS": LRS,
+        "LRS": (curr_rsi > l_cp),
         "is_emergency_breakeven": is_emergency_breakeven,
     }
 
-    # === [0] ロング ハードSL & 直近10本安値（Swing Low）確定足ストップロス ===
     if lpo and avg_entry_price > 0:
         eff_sl_pct = abs(dynamic_sl_pct) if dynamic_sl_pct != 0 else 0.030
-        if recent_low is not None and recent_low > 0:
-            rec_l = float(recent_low)
-        else:
-            l_s = df_5m["low"].astype(float) if "low" in df_5m.columns else c
-            rec_l = float(l_s.iloc[-10:].min()) if len(l_s) >= 10 else float(l_s.min())
-        sl_confirm_px = min(rec_l, avg_entry_price * 0.9980)
-        hard_sl_px = avg_entry_price * (1.0 - eff_sl_pct)
-        metrics["sl_price"] = max(sl_confirm_px, hard_sl_px)
+        prev10_l = float(recent_low) if (recent_low is not None and recent_low > 0) else _prior_10_swing_level(df_5m, is_short=False, fallback_px=avg_entry_price)
+        levels = compute_dynamic_exit_levels(
+            "rsima", avg_entry_price,
+            val=float(val_price or 0.0), vah=float(vah_price or 0.0), poc=avg_entry_price,
+            prev10_swing_px=prev10_l, eff_hard_sl_pct=eff_sl_pct,
+        )
+        metrics["sl_price"] = levels["sl_price"]
+        el_min = _resolve_elapsed_minutes(elapsed_minutes, bars_held, timeout_bars, timeout_minutes)
+        dec = evaluate_dynamic_exit_decision(
+            strategy="rsima",
+            avg_entry_px=avg_entry_price,
+            levels=levels,
+            is_fill_bar=is_fill_bar,
+            can_check_close_exit=has_new_tf_bar_after_fill,
+            is_emergency_breakeven=is_emergency_breakeven,
+            elapsed_minutes=el_min,
+            low_px=current_price,
+            high_px=current_price,
+            close_check_px=curr_close_val,
+            live_px=current_price,
+            cur_rsi=curr_rsi,
+            rsi_exit_thresh=l_cp,
+            timeout_minutes=timeout_minutes,
+            max_hold_minutes=max_hold_minutes,
+            prefer_limit_fill_px=False,
+        )
+        if dec["action"] != "HOLD":
+            code = dec["code"]
+            if dec["action"] == "STOP_LOSS":
+                pct_val = ((dec["exit_px"] - avg_entry_price) / avg_entry_price)
+                reason = f"RSIMA3_{code}: {dec['detail']} (損失{pct_val:.2%})"
+            elif dec["action"] == "TIMEOUT_EXIT":
+                loss_pct = (current_price - avg_entry_price) / avg_entry_price
+                reason = f"RSIMA3_TIMEOUT_EXIT: {dec['detail']} ({loss_pct:.2%}) ➔ タイムアウト撤退"
+            else:
+                pnl_pct = (dec["exit_px"] - avg_entry_price) / avg_entry_price
+                reason = f"RSIMA3_{code}: {dec['detail']} (PnL={pnl_pct:+.2%})"
+            return {"action": dec["action"], "reason": reason, "lot_multiplier": 1.0, "metrics": metrics}
 
-        # 0-A. 突発急落リアルタイム成行フェイルセーフ (約定当足から有効)
-        if current_price <= hard_sl_px:
-            loss_pct = (current_price - avg_entry_price) / avg_entry_price
-            reason = f"RSIMA3_HARD_SL: リアルタイム急落(${current_price:.4f} <= ${hard_sl_px:.4f}, 損失{loss_pct:.2%})"
-            return {"action": "STOP_LOSS", "reason": reason, "lot_multiplier": 1.0, "metrics": metrics}
-
-        # 0-B. 確定足終値での直近10本安値下抜け損切り判定 (約定次足以降に判定)
-        if (not is_fill_bar) and (curr_close_val < sl_confirm_px):
-            loss_pct = (curr_close_val - avg_entry_price) / avg_entry_price
-            reason = f"RSIMA3_SWING_LOW_SL: 確定終値(${curr_close_val:.4f}) < 直近安値SL(${sl_confirm_px:.4f}, 損失{loss_pct:.2%})"
-            return {"action": "STOP_LOSS", "reason": reason, "lot_multiplier": 1.0, "metrics": metrics}
-
-    # === [0-1] 動的タイムアウト微損撤退判定 ===
-    if (not is_fill_bar) and lpo and bars_held >= timeout_bars and avg_entry_price > 0 and current_price <= avg_entry_price:
-        loss_pct = (current_price - avg_entry_price) / avg_entry_price
-        reason = f"RSIMA3_TIMEOUT_EXIT: 保有タイムアウト({bars_held}本>={timeout_bars}本) & 含み損({loss_pct:.2%}) ➔ 動的タイムアウト撤退"
-        return {"action": "TIMEOUT_EXIT", "reason": reason, "lot_multiplier": 1.0, "metrics": metrics}
-
-    # === [1-0] 地合い悪化時の緊急建値撤退判定 (非BUY時: 平均建値 +0.20%) ===
-    if lpo and is_emergency_breakeven and avg_entry_price > 0:
-        breakeven_target = avg_entry_price * 1.0020
-        if current_price >= breakeven_target:
-            pnl_pct = (current_price - avg_entry_price) / avg_entry_price
-            reason = f"RSIMA3_EMERGENCY_BREAKEVEN_TP: 地合い変化に伴う緊急建値撤退 (目標: ${breakeven_target:.4f}, PnL: {pnl_pct:+.2%})"
-            return {"action": "CLOSE_ALL", "reason": reason, "lot_multiplier": 1.0, "metrics": metrics}
-
-    # === [1] エグジット判定 (RSI > l_cp かつ 平均建値 +0.40% 以上利益) ===
-    if (not is_fill_bar) and lpo and base_long_exit:
-        pnl_pct = (current_price - avg_entry_price) / avg_entry_price
-        reason = f"RSIMA3_NORMAL_TP: RSI({curr_rsi:.1f} > {l_cp:.0f}) & PnL({pnl_pct:+.2%} >= +{tp_add_pct:.2%})"
-        return {"action": "CLOSE_ALL", "reason": reason, "lot_multiplier": 1.0, "metrics": metrics}
-
-    # EMA 200 トレンドフィルター判定 (use_ema_filter=True 時のみ)
-    curr_c = curr_close_val
     if use_ema_filter:
         ema200 = calc_ema(c, 200)
-        curr_ema200 = float(ema200.iloc[-1]) if len(ema200) > 0 else curr_c
-        trend_ok = (curr_c >= curr_ema200)
+        curr_ema200 = float(ema200.iloc[-1]) if len(ema200) > 0 else curr_close_val
+        trend_ok = (curr_close_val >= curr_ema200)
     else:
         curr_ema200 = 0.0
         trend_ok = True
 
-    # === [2] 新規エントリー判定 ===
     if poz and not is_cooldown_active and LE and LC and trend_ok:
         prec_ok, prec_msg, prec_info = evaluate_entry_precision_gate(df_5m, side="long", is_vp=False, is_breakout=False)
         metrics.update(prec_info)
@@ -5650,8 +5749,7 @@ def check_rsima3_signals(
             strat_tag = "RSIMA_EMA" if use_ema_filter else "RSIMA"
             reason = f"{strat_tag}_INITIAL_ENTRY: GC(RSI={curr_rsi:.1f} > MA={curr_ma:.1f} < {l_ep:.0f}){ema_str} [{prec_msg}]"
             return {"action": "INITIAL_ENTRY", "reason": reason, "lot_multiplier": 1.0, "metrics": metrics}
-        else:
-            return {"action": "NONE", "reason": f"RSIMA3_PRECISION_FILTER_WAIT: {prec_msg}", "lot_multiplier": 1.0, "metrics": metrics}
+        return {"action": "NONE", "reason": f"RSIMA3_PRECISION_FILTER_WAIT: {prec_msg}", "lot_multiplier": 1.0, "metrics": metrics}
 
     if lpo:
         return {"action": "HOLD", "reason": "RSIMA3_HOLD", "lot_multiplier": 1.0, "metrics": metrics}
@@ -5659,21 +5757,18 @@ def check_rsima3_signals(
     return {"action": "NONE", "reason": "RSIMA3_WAIT", "lot_multiplier": 1.0, "metrics": metrics}
 
 
-# 後方互換性エイリアス
 def check_5m_rsi_scalp_entry(df_5m, rsi_period=9, ma_period=7, max_rsima_threshold=40.0):
     sig = check_rsima3_signals(df_5m, current_pos_qty=0.0, current_trades_count=0, avg_entry_price=0.0, current_price=float(df_5m["close"].iloc[-1]) if df_5m is not None and not df_5m.empty else 0.0, rsi_len=rsi_period, ema_len=ma_period, l_ep=max_rsima_threshold)
-    is_ok = sig["action"] == "INITIAL_ENTRY"
-    return is_ok, sig["reason"], sig["metrics"]
+    return sig["action"] == "INITIAL_ENTRY", sig["reason"], sig["metrics"]
 
 def check_5m_rsi_scalp_exit(df_5m, curr_price, entry_price, rsi_period=9, ma_period=7, min_rsi_exit=60.0):
-    sig = check_rsima3_signals(df_5m, current_pos_qty=1.0, current_trades_count=1, avg_entry_price=entry_price, current_price=curr_price, rsi_len=rsi_period, ema_len=ma_period, l_cp=min_rsi_exit)
-    is_exit = sig["action"] == "CLOSE_ALL"
-    return is_exit, sig["reason"], sig["metrics"]
+    df_use = df_5m
+    if df_5m is not None and not df_5m.empty and curr_price > 0:
+        df_use = df_5m.copy()
+        df_use.iloc[-1, df_use.columns.get_loc("close")] = float(curr_price)
+    sig = check_rsima3_signals(df_use, current_pos_qty=1.0, current_trades_count=1, avg_entry_price=entry_price, current_price=curr_price, rsi_len=rsi_period, ema_len=ma_period, l_cp=min_rsi_exit)
+    return sig["action"] == "CLOSE_ALL", sig["reason"], sig["metrics"]
 
-
-# ==============================================================================
-# 【BingX実証黄金最適化】ボリュームプロファイル VAL_POC ＋ EMA 200 戦略
-# ==============================================================================
 
 def _extract_latest_mp_levels(df: pd.DataFrame, vp_period: int, num_bins: int, value_area_pct: float) -> Tuple[float, float, float, float, float]:
     """直近確定足と1本前確定足の Market Profile (VAL, prev_VAL, VAH, prev_VAH, POC) を統一算出する。"""
@@ -5717,19 +5812,21 @@ def check_val_poc_signals(
     timeout_bars: int = 48,
     recent_low: Optional[float] = None,
     is_fill_bar: bool = False,
+    elapsed_minutes: Optional[float] = None,
+    timeout_minutes: float = 240.0,
+    max_hold_minutes: float = 480.0,
+    has_new_tf_bar_after_fill: bool = True,
 ) -> Dict[str, Any]:
-    """VAL_POC ロング戦略 リアルタイム判定 (`lake_backtest_engine.py` 完全統一 SSoT)"""
+    """VAL_POC ロング戦略 リアルタイム判定 (BT・実運用 100% 統一 SSoT コア使用)"""
     if df_5m is None or df_5m.empty or len(df_5m) < 20:
         return {"action": "NONE", "reason": "5M_DATA_INSUFFICIENT", "lot_multiplier": 1.0, "metrics": {}}
 
     c = df_5m["close"].astype(float)
     curr_val, prev_val, curr_vah, _, curr_poc = _extract_latest_mp_levels(df_5m, vp_period, num_bins, value_area_pct)
-
     curr_c = float(c.iloc[-1])
     prev_c = float(c.iloc[-2]) if len(c) >= 2 else curr_c
 
     valid_mp = (curr_val > 0) and (curr_vah > curr_val) and (curr_poc > 0)
-    # lake_backtest_engine.py L331: (c <= val * 1.001) & (c >= val * 0.970)
     val_gc = valid_mp and (curr_c <= curr_val * 1.001) and (curr_c >= curr_val * 0.970)
 
     cond = str(ma_condition).lower()
@@ -5750,9 +5847,13 @@ def check_val_poc_signals(
     lpo = (current_pos_qty > 0)
     poz = (current_pos_qty <= 0)
 
-    va_diff = (curr_vah - curr_val) if (curr_vah > curr_val and curr_val > 0) else 0.0
-    raw_target_tp = (curr_val + va_diff * target_ratio) if va_diff > 0 else curr_poc
-    target_tp = max(raw_target_tp, avg_entry_price * 1.0040) if (lpo and avg_entry_price > 0) else raw_target_tp
+    ref_e = avg_entry_price if (lpo and avg_entry_price > 0) else curr_c
+    eff_sl_pct = abs(dynamic_sl_pct) if dynamic_sl_pct != 0 else 0.030
+    prev10_l = float(recent_low) if (recent_low is not None and recent_low > 0) else _prior_10_swing_level(df_5m, is_short=False, fallback_px=ref_e)
+    levels = compute_dynamic_exit_levels(
+        "val_poc", ref_e, val=curr_val, vah=curr_vah, poc=curr_poc,
+        prev10_swing_px=prev10_l, target_ratio=target_ratio, eff_hard_sl_pct=eff_sl_pct,
+    )
 
     metrics = {
         "curr_price": current_price,
@@ -5765,65 +5866,52 @@ def check_val_poc_signals(
         "ma200": curr_ma200,
         "val_gc": val_gc,
         "trend_ok": trend_ok,
-        "target_tp": target_tp,
+        "target_tp": levels["target_tp"],
+        "sl_price": levels["sl_price"],
         "avg_entry_price": avg_entry_price,
         "last_entry_price": last_entry_price,
         "trades_count": current_trades_count,
         "is_emergency_breakeven": is_emergency_breakeven,
     }
 
-    # === [1] ロング ハードSL & 直近10本安値（Swing Low）確定足ストップロス ===
     if lpo and avg_entry_price > 0:
-        eff_sl_pct = abs(dynamic_sl_pct) if dynamic_sl_pct != 0 else 0.030
-        if recent_low is not None and recent_low > 0:
-            rec_l = float(recent_low)
-        else:
-            l_s = df_5m["low"].astype(float) if "low" in df_5m.columns else c
-            rec_l = float(l_s.iloc[-10:].min()) if len(l_s) >= 10 else float(l_s.min())
-        sl_confirm_px = min(rec_l, avg_entry_price * 0.9980)
-        hard_sl_px = avg_entry_price * (1.0 - eff_sl_pct)
-        metrics["sl_price"] = max(sl_confirm_px, hard_sl_px)
+        el_min = _resolve_elapsed_minutes(elapsed_minutes, bars_held, timeout_bars, timeout_minutes)
+        dec = evaluate_dynamic_exit_decision(
+            strategy="val_poc",
+            avg_entry_px=avg_entry_price,
+            levels=levels,
+            is_fill_bar=is_fill_bar,
+            can_check_close_exit=has_new_tf_bar_after_fill,
+            is_emergency_breakeven=is_emergency_breakeven,
+            elapsed_minutes=el_min,
+            low_px=current_price,
+            high_px=current_price,
+            close_check_px=curr_c,
+            live_px=current_price,
+            timeout_minutes=timeout_minutes,
+            max_hold_minutes=max_hold_minutes,
+            prefer_limit_fill_px=False,
+        )
+        if dec["action"] != "HOLD":
+            code = dec["code"]
+            if dec["action"] == "STOP_LOSS":
+                loss_pct = (dec["exit_px"] - avg_entry_price) / avg_entry_price
+                reason = f"VAL_POC_{code}: {dec['detail']} (損失{loss_pct:.2%})"
+            elif dec["action"] == "TIMEOUT_EXIT":
+                loss_pct = (current_price - avg_entry_price) / avg_entry_price
+                reason = f"VAL_POC_TIMEOUT_EXIT: {dec['detail']} ({loss_pct:.2%}) ➔ タイムアウト撤退"
+            else:
+                pnl_pct = (dec["exit_px"] - avg_entry_price) / avg_entry_price
+                reason = f"VAL_POC_{code} (TR={target_ratio:.2f}): {dec['detail']} (PnL={pnl_pct:+.2%})"
+            return {"action": dec["action"], "reason": reason, "lot_multiplier": 1.0, "metrics": metrics}
 
-        if current_price <= hard_sl_px:
-            loss_pct = (current_price - avg_entry_price) / avg_entry_price
-            reason = f"VAL_POC_HARD_SL: リアルタイム急落(${current_price:.4f} <= ${hard_sl_px:.4f}, 損失{loss_pct:.2%})"
-            return {"action": "STOP_LOSS", "reason": reason, "lot_multiplier": 1.0, "metrics": metrics}
-
-        if (not is_fill_bar) and (curr_c < sl_confirm_px):
-            loss_pct = (curr_c - avg_entry_price) / avg_entry_price
-            reason = f"VAL_POC_SWING_LOW_SL: 確定終値(${curr_c:.4f}) < 直近安値SL(${sl_confirm_px:.4f}, 損失{loss_pct:.2%})"
-            return {"action": "STOP_LOSS", "reason": reason, "lot_multiplier": 1.0, "metrics": metrics}
-
-    # === [1-1] 動的タイムアウト微損撤退判定 ===
-    if (not is_fill_bar) and lpo and bars_held >= timeout_bars and avg_entry_price > 0 and current_price <= avg_entry_price:
-        loss_pct = (current_price - avg_entry_price) / avg_entry_price
-        reason = f"VAL_POC_TIMEOUT_EXIT: 保有タイムアウト({bars_held}本>={timeout_bars}本) & 含み損({loss_pct:.2%}) ➔ 動的タイムアウト撤退"
-        return {"action": "TIMEOUT_EXIT", "reason": reason, "lot_multiplier": 1.0, "metrics": metrics}
-
-    # === [1-0] 地合い悪化時の緊急建値撤退判定 (非BUY時: 平均建値 +0.20%) ===
-    if lpo and is_emergency_breakeven and avg_entry_price > 0:
-        breakeven_target = avg_entry_price * 1.0020
-        if current_price >= breakeven_target:
-            pnl_pct = (current_price - avg_entry_price) / avg_entry_price
-            reason = f"VAL_POC_EMERGENCY_BREAKEVEN_TP: 地合い悪化に伴う緊急建値撤退 (目標: ${breakeven_target:.4f}, PnL: {pnl_pct:+.2%})"
-            return {"action": "CLOSE_ALL", "reason": reason, "lot_multiplier": 1.0, "metrics": metrics}
-
-    # === [2] 利確判定 (target_tp 到達かつ建値+0.40%フロア保証) ===
-    if (not is_fill_bar) and lpo and target_tp > 0 and avg_entry_price > 0:
-        if current_price >= target_tp:
-            pnl_pct = (current_price - avg_entry_price) / avg_entry_price
-            reason = f"VAL_POC_TP (TR={target_ratio:.2f}): 目標(${target_tp:.4f})到達 (PnL={pnl_pct:+.2%})"
-            return {"action": "CLOSE_ALL", "reason": reason, "lot_multiplier": 1.0, "metrics": metrics}
-
-    # === [3] 新規エントリー判定 ===
     if poz and not is_cooldown_active and val_gc and trend_ok:
         prec_ok, prec_msg, prec_info = evaluate_entry_precision_gate(df_5m, side="long", is_vp=True, is_breakout=False)
         metrics.update(prec_info)
         if prec_ok:
             reason = f"VAL_POC_INITIAL_ENTRY: VALゾーン(${curr_c:.4f} <= ${curr_val * 1.001:.4f}) [{prec_msg}]"
             return {"action": "INITIAL_ENTRY", "reason": reason, "lot_multiplier": 1.0, "metrics": metrics}
-        else:
-            return {"action": "NONE", "reason": f"VAL_POC_PRECISION_FILTER_WAIT: {prec_msg}", "lot_multiplier": 1.0, "metrics": metrics}
+        return {"action": "NONE", "reason": f"VAL_POC_PRECISION_FILTER_WAIT: {prec_msg}", "lot_multiplier": 1.0, "metrics": metrics}
 
     if lpo:
         return {"action": "HOLD", "reason": "VAL_POC_HOLD", "lot_multiplier": 1.0, "metrics": metrics}
@@ -5855,19 +5943,21 @@ def check_vah_poc_signals(
     use_ema_filter: bool = False,
     timeout_bars: int = 48,
     is_fill_bar: bool = False,
+    elapsed_minutes: Optional[float] = None,
+    timeout_minutes: float = 240.0,
+    max_hold_minutes: float = 480.0,
+    has_new_tf_bar_after_fill: bool = True,
 ) -> Dict[str, Any]:
-    """VAH_POC ショート戦略 リアルタイム判定 (`lake_backtest_engine.py` 完全統一 SSoT)"""
+    """VAH_POC ショート戦略 リアルタイム判定 (BT・実運用 100% 統一 SSoT コア使用)"""
     if df_5m is None or df_5m.empty or len(df_5m) < 20:
         return {"action": "NONE", "reason": "5M_DATA_INSUFFICIENT", "lot_multiplier": 1.0, "metrics": {}}
 
     c = df_5m["close"].astype(float)
     curr_val, _, curr_vah, prev_vah, curr_poc = _extract_latest_mp_levels(df_5m, vp_period, num_bins, value_area_pct)
-
     curr_c = float(c.iloc[-1])
     prev_c = float(c.iloc[-2]) if len(c) >= 2 else curr_c
 
     valid_mp = (curr_val > 0) and (curr_vah > curr_val) and (curr_poc > 0)
-    # lake_backtest_engine.py L334: (c >= vah * 0.999) & (c <= vah * 1.030)
     vah_dc = valid_mp and (curr_c >= curr_vah * 0.999) and (curr_c <= curr_vah * 1.030)
 
     cond = str(ma_condition).lower()
@@ -5888,9 +5978,13 @@ def check_vah_poc_signals(
     spo = (current_pos_qty < 0 or (current_pos_qty > 0 and current_trades_count > 0 and avg_entry_price > 0))
     poz = (current_pos_qty == 0 and current_trades_count == 0)
 
-    va_diff = (curr_vah - curr_val) if (curr_vah > curr_val and curr_val > 0) else 0.0
-    raw_target_tp = (curr_vah - va_diff * target_ratio) if va_diff > 0 else curr_poc
-    target_tp = min(raw_target_tp, avg_entry_price * 0.9960) if (spo and avg_entry_price > 0) else raw_target_tp
+    ref_e = avg_entry_price if (spo and avg_entry_price > 0) else curr_c
+    eff_sl_pct = abs(dynamic_sl_pct) if dynamic_sl_pct != 0 else 0.030
+    prev10_h = float(recent_high) if (recent_high is not None and recent_high > 0) else _prior_10_swing_level(df_5m, is_short=True, fallback_px=ref_e)
+    levels = compute_dynamic_exit_levels(
+        "vah_poc", ref_e, val=curr_val, vah=curr_vah, poc=curr_poc,
+        prev10_swing_px=prev10_h, target_ratio=target_ratio, eff_hard_sl_pct=eff_sl_pct,
+    )
 
     metrics = {
         "curr_price": current_price,
@@ -5903,65 +5997,52 @@ def check_vah_poc_signals(
         "ema200": curr_ma200,
         "vah_dc": vah_dc,
         "trend_ok": trend_ok,
-        "target_tp": target_tp,
+        "target_tp": levels["target_tp"],
+        "sl_price": levels["sl_price"],
         "avg_entry_price": avg_entry_price,
         "last_entry_price": last_entry_price,
         "trades_count": current_trades_count,
         "is_emergency_breakeven": is_emergency_breakeven,
     }
 
-    # === [1] ショート ハードSL & 直近10本高値（Swing High）確定足ストップロス ===
     if spo and avg_entry_price > 0:
-        eff_sl_pct = abs(dynamic_sl_pct) if dynamic_sl_pct != 0 else 0.030
-        if recent_high is not None and recent_high > 0:
-            rec_h = float(recent_high)
-        else:
-            h_s = df_5m["high"].astype(float) if "high" in df_5m.columns else c
-            rec_h = float(h_s.iloc[-10:].max()) if len(h_s) >= 10 else float(h_s.max())
-        sl_confirm_px = max(rec_h, avg_entry_price * 1.0020)
-        hard_sl_px = avg_entry_price * (1.0 + eff_sl_pct)
-        metrics["sl_price"] = min(sl_confirm_px, hard_sl_px)
+        el_min = _resolve_elapsed_minutes(elapsed_minutes, bars_held, timeout_bars, timeout_minutes)
+        dec = evaluate_dynamic_exit_decision(
+            strategy="vah_poc",
+            avg_entry_px=avg_entry_price,
+            levels=levels,
+            is_fill_bar=is_fill_bar,
+            can_check_close_exit=has_new_tf_bar_after_fill,
+            is_emergency_breakeven=is_emergency_breakeven,
+            elapsed_minutes=el_min,
+            low_px=current_price,
+            high_px=current_price,
+            close_check_px=curr_c,
+            live_px=current_price,
+            timeout_minutes=timeout_minutes,
+            max_hold_minutes=max_hold_minutes,
+            prefer_limit_fill_px=False,
+        )
+        if dec["action"] != "HOLD":
+            code = dec["code"]
+            if dec["action"] == "STOP_LOSS":
+                loss_pct = (avg_entry_price - dec["exit_px"]) / avg_entry_price
+                reason = f"VAH_POC_{code}: {dec['detail']} (損失{loss_pct:.2%})"
+            elif dec["action"] == "TIMEOUT_EXIT":
+                loss_pct = (avg_entry_price - current_price) / avg_entry_price
+                reason = f"VAH_POC_TIMEOUT_EXIT: {dec['detail']} ({loss_pct:.2%}) ➔ タイムアウト撤退"
+            else:
+                pnl_pct = (avg_entry_price - dec["exit_px"]) / avg_entry_price
+                reason = f"VAH_POC_{code} (TR={target_ratio:.2f}): {dec['detail']} (PnL={pnl_pct:+.2%})"
+            return {"action": dec["action"], "reason": reason, "lot_multiplier": 1.0, "metrics": metrics}
 
-        if current_price >= hard_sl_px:
-            loss_pct = (avg_entry_price - current_price) / avg_entry_price
-            reason = f"VAH_POC_HARD_SL: リアルタイム急騰(${current_price:.4f} >= ${hard_sl_px:.4f}, 損失{loss_pct:.2%})"
-            return {"action": "STOP_LOSS", "reason": reason, "lot_multiplier": 1.0, "metrics": metrics}
-
-        if (not is_fill_bar) and (curr_c > sl_confirm_px):
-            loss_pct = (avg_entry_price - curr_c) / avg_entry_price
-            reason = f"VAH_POC_SWING_HIGH_SL: 確定終値(${curr_c:.4f}) > 直近高値SL(${sl_confirm_px:.4f}, 損失{loss_pct:.2%})"
-            return {"action": "STOP_LOSS", "reason": reason, "lot_multiplier": 1.0, "metrics": metrics}
-
-    # === [1-1] 動的タイムアウト微損撤退判定 ===
-    if (not is_fill_bar) and spo and bars_held >= timeout_bars and avg_entry_price > 0 and current_price >= avg_entry_price:
-        loss_pct = (avg_entry_price - current_price) / avg_entry_price
-        reason = f"VAH_POC_TIMEOUT_EXIT: 保有タイムアウト({bars_held}本>={timeout_bars}本) & ショート含み損({loss_pct:.2%}) ➔ 動的タイムアウト撤退"
-        return {"action": "TIMEOUT_EXIT", "reason": reason, "lot_multiplier": 1.0, "metrics": metrics}
-
-    # === [1-0] 地合い非BEAR時の緊急建値撤退判定 (平均建値 -0.20%) ===
-    if spo and is_emergency_breakeven and avg_entry_price > 0:
-        breakeven_target = avg_entry_price * 0.9980
-        if current_price <= breakeven_target:
-            pnl_pct = (avg_entry_price - current_price) / avg_entry_price
-            reason = f"VAH_POC_EMERGENCY_BREAKEVEN_TP: 地合い変化に伴う緊急建値撤退 (目標: ${breakeven_target:.4f}, PnL: {pnl_pct:+.2%})"
-            return {"action": "CLOSE_ALL", "reason": reason, "lot_multiplier": 1.0, "metrics": metrics}
-
-    # === [2] ショート利確判定 (target_tp 到達かつ建値-0.40%フロア保証) ===
-    if (not is_fill_bar) and spo and target_tp > 0 and avg_entry_price > 0:
-        if current_price <= target_tp:
-            pnl_pct = (avg_entry_price - current_price) / avg_entry_price
-            reason = f"VAH_POC_TP (TR={target_ratio:.2f}): 目標(${target_tp:.4f})到達 (PnL={pnl_pct:+.2%})"
-            return {"action": "CLOSE_ALL", "reason": reason, "lot_multiplier": 1.0, "metrics": metrics}
-
-    # === [3] 新規ショートエントリー判定 ===
     if poz and not is_cooldown_active and vah_dc and trend_ok:
         prec_ok, prec_msg, prec_info = evaluate_entry_precision_gate(df_5m, side="short", is_vp=True, is_breakout=False)
         metrics.update(prec_info)
         if prec_ok:
             reason = f"VAH_POC_INITIAL_ENTRY_SHORT: VAHゾーン(${curr_c:.4f} >= ${curr_vah * 0.999:.4f}) [{prec_msg}]"
             return {"action": "INITIAL_ENTRY_SHORT", "reason": reason, "lot_multiplier": 1.0, "metrics": metrics}
-        else:
-            return {"action": "NONE", "reason": f"VAH_POC_PRECISION_FILTER_WAIT: {prec_msg}", "lot_multiplier": 1.0, "metrics": metrics}
+        return {"action": "NONE", "reason": f"VAH_POC_PRECISION_FILTER_WAIT: {prec_msg}", "lot_multiplier": 1.0, "metrics": metrics}
 
     if spo:
         return {"action": "HOLD", "reason": "VAH_POC_HOLD", "lot_multiplier": 1.0, "metrics": metrics}
@@ -5992,8 +6073,12 @@ def check_rsima3_short_signals(
     use_ema_filter: bool = False,
     timeout_bars: int = 48,
     is_fill_bar: bool = False,
+    elapsed_minutes: Optional[float] = None,
+    timeout_minutes: float = 240.0,
+    max_hold_minutes: float = 480.0,
+    has_new_tf_bar_after_fill: bool = True,
 ) -> Dict[str, Any]:
-    """RSIMA_SHORT ショート判定 (`lake_backtest_engine.py` 完全統一 SSoT)"""
+    """RSIMA_SHORT ショート判定 (BT・実運用 100% 統一 SSoT コア使用)"""
     if df_5m is None or df_5m.empty or len(df_5m) < rsi_len + ema_len + 5:
         return {"action": "NONE", "reason": "5M_DATA_INSUFFICIENT", "lot_multiplier": 1.0, "metrics": {}}
 
@@ -6004,14 +6089,11 @@ def check_rsima3_short_signals(
     prev_rsi = float(rsi.iloc[-2])
     curr_ma = float(lrsi_ma.iloc[-1])
     prev_ma = float(lrsi_ma.iloc[-2])
-
     curr_close = float(c.iloc[-1])
 
-    # 1. 確定足1本デッドクロス判定 & RSI-EMA > s_ep (lake_backtest_engine.py L370 完全一致)
     SE = (curr_rsi < curr_ma) and (prev_rsi >= prev_ma)
     SC = (curr_ma > s_ep) and (current_trades_count < max_trades)
 
-    # 2. EMA(200) トレンドフィルター
     if use_ema_filter:
         ema200 = calc_ema(c, 200)
         curr_ema200 = float(ema200.iloc[-1])
@@ -6040,50 +6122,47 @@ def check_rsima3_short_signals(
         "is_emergency_breakeven": is_emergency_breakeven,
     }
 
-    # === [1] ショート ハードSL & 直近10本高値（Swing High）確定足ストップロス ===
     if spo and avg_entry_price > 0:
         eff_sl_pct = abs(dynamic_sl_pct) if dynamic_sl_pct != 0 else 0.030
-        if recent_high is not None and recent_high > 0:
-            rec_h = float(recent_high)
-        else:
-            h_s = df_5m["high"].astype(float) if "high" in df_5m.columns else c
-            rec_h = float(h_s.iloc[-10:].max()) if len(h_s) >= 10 else float(h_s.max())
-        sl_confirm_px = max(rec_h, avg_entry_price * 1.0020)
-        hard_sl_px = avg_entry_price * (1.0 + eff_sl_pct)
-        metrics["sl_price"] = min(sl_confirm_px, hard_sl_px)
+        prev10_h = float(recent_high) if (recent_high is not None and recent_high > 0) else _prior_10_swing_level(df_5m, is_short=True, fallback_px=avg_entry_price)
+        levels = compute_dynamic_exit_levels(
+            "rsima_short", avg_entry_price,
+            val=float(val_price or 0.0), vah=float(vah_price or 0.0), poc=avg_entry_price,
+            prev10_swing_px=prev10_h, eff_hard_sl_pct=eff_sl_pct,
+        )
+        metrics["sl_price"] = levels["sl_price"]
+        el_min = _resolve_elapsed_minutes(elapsed_minutes, bars_held, timeout_bars, timeout_minutes)
+        dec = evaluate_dynamic_exit_decision(
+            strategy="rsima_short",
+            avg_entry_px=avg_entry_price,
+            levels=levels,
+            is_fill_bar=is_fill_bar,
+            can_check_close_exit=has_new_tf_bar_after_fill,
+            is_emergency_breakeven=is_emergency_breakeven,
+            elapsed_minutes=el_min,
+            low_px=current_price,
+            high_px=current_price,
+            close_check_px=curr_close,
+            live_px=current_price,
+            cur_rsi=curr_rsi,
+            rsi_exit_thresh=s_cp,
+            timeout_minutes=timeout_minutes,
+            max_hold_minutes=max_hold_minutes,
+            prefer_limit_fill_px=False,
+        )
+        if dec["action"] != "HOLD":
+            code = dec["code"]
+            if dec["action"] == "STOP_LOSS":
+                loss_pct = (avg_entry_price - dec["exit_px"]) / avg_entry_price
+                reason = f"RSIMA_SHORT_{code}: {dec['detail']} (損失{loss_pct:.2%})"
+            elif dec["action"] == "TIMEOUT_EXIT":
+                loss_pct = (avg_entry_price - current_price) / avg_entry_price
+                reason = f"RSIMA_SHORT_TIMEOUT_EXIT: {dec['detail']} ({loss_pct:.2%}) ➔ タイムアウト撤退"
+            else:
+                pnl_pct = (avg_entry_price - dec["exit_px"]) / avg_entry_price
+                reason = f"RSIMA_SHORT_{code}: {dec['detail']} (PnL={pnl_pct:+.2%})"
+            return {"action": dec["action"], "reason": reason, "lot_multiplier": 1.0, "metrics": metrics}
 
-        if current_price >= hard_sl_px:
-            loss_pct = (avg_entry_price - current_price) / avg_entry_price
-            reason = f"RSIMA_SHORT_HARD_SL: リアルタイム急騰(${current_price:.4f} >= ${hard_sl_px:.4f}, 損失{loss_pct:.2%})"
-            return {"action": "STOP_LOSS", "reason": reason, "lot_multiplier": 1.0, "metrics": metrics}
-
-        if (not is_fill_bar) and (curr_close > sl_confirm_px):
-            loss_pct = (avg_entry_price - curr_close) / avg_entry_price
-            reason = f"RSIMA_SHORT_SWING_HIGH_SL: 確定終値(${curr_close:.4f}) > 直近高値SL(${sl_confirm_px:.4f}, 損失{loss_pct:.2%})"
-            return {"action": "STOP_LOSS", "reason": reason, "lot_multiplier": 1.0, "metrics": metrics}
-
-    # === [1-1] 動的タイムアウト微損撤退判定 ===
-    if (not is_fill_bar) and spo and bars_held >= timeout_bars and avg_entry_price > 0 and current_price >= avg_entry_price:
-        loss_pct = (avg_entry_price - current_price) / avg_entry_price
-        reason = f"RSIMA_SHORT_TIMEOUT_EXIT: 保有タイムアウト({bars_held}本>={timeout_bars}本) & ショート含み損({loss_pct:.2%}) ➔ 動的タイムアウト撤退"
-        return {"action": "TIMEOUT_EXIT", "reason": reason, "lot_multiplier": 1.0, "metrics": metrics}
-
-    # === [1-0] 地合い非BEAR時の緊急建値撤退判定 ===
-    if spo and is_emergency_breakeven and avg_entry_price > 0:
-        breakeven_target = avg_entry_price * 0.9980
-        if current_price <= breakeven_target:
-            pnl_pct = (avg_entry_price - current_price) / avg_entry_price
-            reason = f"RSIMA_SHORT_EMERGENCY_BREAKEVEN_TP: 地合い変化に伴う緊急建値撤退 (目標: ${breakeven_target:.4f}, PnL: {pnl_pct:+.2%})"
-            return {"action": "CLOSE_ALL", "reason": reason, "lot_multiplier": 1.0, "metrics": metrics}
-
-    # === [2] ショート利確判定 (curr_rsi < s_cp かつ 平均建値 -0.40% 以下利益) ===
-    if (not is_fill_bar) and spo and avg_entry_price > 0:
-        if curr_rsi < s_cp and current_price <= avg_entry_price * 0.9960:
-            pnl_pct = (avg_entry_price - current_price) / avg_entry_price
-            reason = f"RSIMA_SHORT_TP: RSI({curr_rsi:.1f}) < s_cp({s_cp:.0f}) & 建値利益(PnL={pnl_pct:+.2%})"
-            return {"action": "CLOSE_ALL", "reason": reason, "lot_multiplier": 1.0, "metrics": metrics}
-
-    # === [3] 新規ショートエントリー判定 ===
     if poz and not is_cooldown_active and SE and SC and trend_ok:
         prec_ok, prec_msg, prec_info = evaluate_entry_precision_gate(df_5m, side="short", is_vp=False, is_breakout=False)
         metrics.update(prec_info)
@@ -6092,8 +6171,7 @@ def check_rsima3_short_signals(
             ema_str = f" & EMA200(${curr_ema200:.4f})条件OK" if use_ema_filter else ""
             reason = f"{strat_name}_INITIAL_ENTRY_SHORT: DC(RSI={curr_rsi:.1f} < MA={curr_ma:.1f} > {s_ep:.0f}){ema_str} [{prec_msg}]"
             return {"action": "INITIAL_ENTRY_SHORT", "reason": reason, "lot_multiplier": 1.0, "metrics": metrics}
-        else:
-            return {"action": "NONE", "reason": f"RSIMA_SHORT_PRECISION_FILTER_WAIT: {prec_msg}", "lot_multiplier": 1.0, "metrics": metrics}
+        return {"action": "NONE", "reason": f"RSIMA_SHORT_PRECISION_FILTER_WAIT: {prec_msg}", "lot_multiplier": 1.0, "metrics": metrics}
 
     if spo:
         return {"action": "HOLD", "reason": "RSIMA_SHORT_HOLD", "lot_multiplier": 1.0, "metrics": metrics}
@@ -6119,35 +6197,32 @@ def check_vah_break_signals(
     bars_held: int = 0,
     timeout_bars: int = 48,
     is_fill_bar: bool = False,
+    elapsed_minutes: Optional[float] = None,
+    timeout_minutes: float = 240.0,
+    max_hold_minutes: float = 480.0,
+    has_new_tf_bar_after_fill: bool = True,
 ) -> Dict[str, Any]:
-    """VAH_BREAK ロング上方ブレイクアウト戦略 (`lake_backtest_engine.py` 完全統一 SSoT)"""
+    """VAH_BREAK ロング上方ブレイクアウト戦略 (BT・実運用 100% 統一 SSoT コア使用)"""
     if df_5m is None or df_5m.empty or len(df_5m) < 20:
         return {"action": "NONE", "reason": "5M_DATA_INSUFFICIENT", "lot_multiplier": 1.0, "metrics": {}}
 
     c = df_5m["close"].astype(float)
-    h = df_5m["high"].astype(float) if "high" in df_5m.columns else c
     curr_val, _, curr_vah, prev_vah, curr_poc = _extract_latest_mp_levels(df_5m, vp_period, num_bins, value_area_pct)
-
     curr_c = float(c.iloc[-1])
     prev_c = float(c.iloc[-2]) if len(c) >= 2 else curr_c
-    curr_h = float(h.iloc[-1])
 
     valid_mp = (curr_val > 0) and (curr_vah > curr_val) and (curr_poc > 0)
-    # lake_backtest_engine.py L337: valid_mp & (prev_c <= prev_vah) & (c > vah) & (c < vah * 1.04)
     vah_brk_ok = valid_mp and (prev_c <= prev_vah) and (curr_c > curr_vah) and (curr_c < curr_vah * 1.04)
 
     lpo = (current_pos_qty > 0 and current_trades_count > 0)
     poz = (current_pos_qty == 0 and current_trades_count == 0)
     ref_entry_px = avg_entry_price if (lpo and avg_entry_price > 0) else curr_c
 
-    va_diff = (curr_vah - curr_val) if (curr_vah > curr_val and curr_val > 0) else 0.0
-    tp_cand = (curr_vah + va_diff * target_ratio) if va_diff > 0 else ref_entry_px * 1.0080
-    target_tp = max(tp_cand, ref_entry_px * 1.0080)
-    tp_dist = max(target_tp - ref_entry_px, ref_entry_px * 0.0080)
-    poc_sl = min(curr_poc, ref_entry_px * 0.9950) if curr_poc > 0 else ref_entry_px * 0.9950
-    sl_confirm_px = max(poc_sl, ref_entry_px - tp_dist * 0.5)
     eff_hard_sl_pct = abs(dynamic_sl_pct) if dynamic_sl_pct != 0 else 0.030
-    hard_sl_px = max(sl_confirm_px, ref_entry_px * (1.0 - eff_hard_sl_pct))
+    levels = compute_dynamic_exit_levels(
+        "vah_break", ref_entry_px, val=curr_val, vah=curr_vah, poc=curr_poc,
+        prev10_swing_px=None, target_ratio=target_ratio, eff_hard_sl_pct=eff_hard_sl_pct,
+    )
 
     metrics = {
         "curr_price": current_price,
@@ -6158,57 +6233,53 @@ def check_vah_break_signals(
         "prev_vah": prev_vah,
         "poc": curr_poc,
         "vah_brk_ok": vah_brk_ok,
-        "sl_confirm_px": sl_confirm_px,
-        "sl_price": hard_sl_px,
-        "target_tp": target_tp,
+        "sl_confirm_px": levels["sl_confirm_px"],
+        "sl_price": levels["sl_price"],
+        "target_tp": levels["target_tp"],
         "avg_entry_price": avg_entry_price,
         "last_entry_price": last_entry_price,
         "trades_count": current_trades_count,
         "is_emergency_breakeven": is_emergency_breakeven,
     }
 
-    # === [1] 損切り判定 (POC/RRハードSL & 確定終値POC/RR防衛SL) ===
     if lpo and avg_entry_price > 0:
-        if current_price <= hard_sl_px:
-            loss_pct = (current_price - avg_entry_price) / avg_entry_price
-            reason = f"VAH_BREAK_POC_RR_SL: リアルタイム(${current_price:.4f} <= ${hard_sl_px:.4f}, 損失{loss_pct:.2%})"
-            return {"action": "STOP_LOSS", "reason": reason, "lot_multiplier": 1.0, "metrics": metrics}
+        el_min = _resolve_elapsed_minutes(elapsed_minutes, bars_held, timeout_bars, timeout_minutes)
+        dec = evaluate_dynamic_exit_decision(
+            strategy="vah_break",
+            avg_entry_px=avg_entry_price,
+            levels=levels,
+            is_fill_bar=is_fill_bar,
+            can_check_close_exit=has_new_tf_bar_after_fill,
+            is_emergency_breakeven=is_emergency_breakeven,
+            elapsed_minutes=el_min,
+            low_px=current_price,
+            high_px=current_price,
+            close_check_px=curr_c,
+            live_px=current_price,
+            timeout_minutes=timeout_minutes,
+            max_hold_minutes=max_hold_minutes,
+            prefer_limit_fill_px=False,
+        )
+        if dec["action"] != "HOLD":
+            code = dec["code"]
+            if dec["action"] == "STOP_LOSS":
+                loss_pct = (dec["exit_px"] - avg_entry_price) / avg_entry_price
+                reason = f"VAH_BREAK_{code}: {dec['detail']} (損失{loss_pct:.2%})"
+            elif dec["action"] == "TIMEOUT_EXIT":
+                loss_pct = (current_price - avg_entry_price) / avg_entry_price
+                reason = f"VAH_BREAK_TIMEOUT_EXIT: {dec['detail']} ({loss_pct:.2%}) ➔ タイムアウト撤退"
+            else:
+                pnl_pct = (dec["exit_px"] - avg_entry_price) / avg_entry_price
+                reason = f"VAH_BREAK_{code} (TR={target_ratio:.2f}): {dec['detail']} (PnL={pnl_pct:+.2%})"
+            return {"action": dec["action"], "reason": reason, "lot_multiplier": 1.0, "metrics": metrics}
 
-        if (not is_fill_bar) and (curr_c < sl_confirm_px):
-            loss_pct = (curr_c - avg_entry_price) / avg_entry_price
-            reason = f"VAH_BREAK_POC_SL_CLOSE: 確定終値(${curr_c:.4f}) < 防衛SL(${sl_confirm_px:.4f}, 損失{loss_pct:.2%})"
-            return {"action": "STOP_LOSS", "reason": reason, "lot_multiplier": 1.0, "metrics": metrics}
-
-    # === [1-1] 動的タイムアウト微損撤退判定 ===
-    if (not is_fill_bar) and lpo and bars_held >= timeout_bars and avg_entry_price > 0 and current_price <= avg_entry_price:
-        loss_pct = (current_price - avg_entry_price) / avg_entry_price
-        reason = f"VAH_BREAK_TIMEOUT_EXIT: 保有タイムアウト({bars_held}本>={timeout_bars}本) & 含み損({loss_pct:.2%}) ➔ 動的タイムアウト撤退"
-        return {"action": "TIMEOUT_EXIT", "reason": reason, "lot_multiplier": 1.0, "metrics": metrics}
-
-    # === [1-0] 地合い非BULL時の緊急建値撤退判定 (+0.20%) ===
-    if lpo and is_emergency_breakeven and avg_entry_price > 0:
-        breakeven_target = avg_entry_price * 1.0020
-        if current_price >= breakeven_target:
-            pnl_pct = (current_price - avg_entry_price) / avg_entry_price
-            reason = f"VAH_BREAK_EMERGENCY_BREAKEVEN_TP: 地合い変化に伴う緊急建値撤退 (目標: ${breakeven_target:.4f}, PnL: {pnl_pct:+.2%})"
-            return {"action": "CLOSE_ALL", "reason": reason, "lot_multiplier": 1.0, "metrics": metrics}
-
-    # === [2] 利確判定 (target_ratio 拡張TP到達) ===
-    if (not is_fill_bar) and lpo and target_tp > 0 and avg_entry_price > 0:
-        if (current_price >= target_tp) or (curr_h >= target_tp and current_price >= avg_entry_price * 1.0040):
-            pnl_pct = (current_price - avg_entry_price) / avg_entry_price
-            reason = f"VAH_BREAK_TP (TR={target_ratio:.2f}): 目標(${target_tp:.4f})到達 (PnL={pnl_pct:+.2%})"
-            return {"action": "CLOSE_ALL", "reason": reason, "lot_multiplier": 1.0, "metrics": metrics}
-
-    # === [3] 新規ロングブレイクアウトエントリー判定 ===
     if poz and not is_cooldown_active and vah_brk_ok:
         prec_ok, prec_msg, prec_info = evaluate_entry_precision_gate(df_5m, side="long", is_vp=True, is_breakout=True)
         metrics.update(prec_info)
         if prec_ok:
             reason = f"VAH_BREAK_INITIAL_ENTRY: VAH上方ブレイク(${curr_c:.4f} > VAH ${curr_vah:.4f}) [{prec_msg}]"
             return {"action": "INITIAL_ENTRY", "reason": reason, "lot_multiplier": 1.0, "metrics": metrics}
-        else:
-            return {"action": "NONE", "reason": f"VAH_BREAK_PRECISION_FILTER_WAIT: {prec_msg}", "lot_multiplier": 1.0, "metrics": metrics}
+        return {"action": "NONE", "reason": f"VAH_BREAK_PRECISION_FILTER_WAIT: {prec_msg}", "lot_multiplier": 1.0, "metrics": metrics}
 
     if lpo:
         return {"action": "HOLD", "reason": "VAH_BREAK_HOLD", "lot_multiplier": 1.0, "metrics": metrics}
@@ -6235,35 +6306,32 @@ def check_val_break_signals(
     bars_held: int = 0,
     timeout_bars: int = 48,
     is_fill_bar: bool = False,
+    elapsed_minutes: Optional[float] = None,
+    timeout_minutes: float = 240.0,
+    max_hold_minutes: float = 480.0,
+    has_new_tf_bar_after_fill: bool = True,
 ) -> Dict[str, Any]:
-    """VAL_BREAK ショート下方ブレイクダウン戦略 (`lake_backtest_engine.py` 完全統一 SSoT)"""
+    """VAL_BREAK ショート下方ブレイクダウン戦略 (BT・実運用 100% 統一 SSoT コア使用)"""
     if df_5m is None or df_5m.empty or len(df_5m) < 20:
         return {"action": "NONE", "reason": "5M_DATA_INSUFFICIENT", "lot_multiplier": 1.0, "metrics": {}}
 
     c = df_5m["close"].astype(float)
-    l = df_5m["low"].astype(float) if "low" in df_5m.columns else c
     curr_val, prev_val, curr_vah, _, curr_poc = _extract_latest_mp_levels(df_5m, vp_period, num_bins, value_area_pct)
-
     curr_c = float(c.iloc[-1])
     prev_c = float(c.iloc[-2]) if len(c) >= 2 else curr_c
-    curr_l = float(l.iloc[-1])
 
     valid_mp = (curr_val > 0) and (curr_vah > curr_val) and (curr_poc > 0)
-    # lake_backtest_engine.py L340: valid_mp & (prev_c >= prev_val) & (c < val) & (c > val * 0.96)
     val_brk_ok = valid_mp and (prev_c >= prev_val) and (curr_c < curr_val) and (curr_c > curr_val * 0.96)
 
     spo = (current_pos_qty < 0 or (current_pos_qty > 0 and current_trades_count > 0 and avg_entry_price > 0))
     poz = (current_pos_qty == 0 and current_trades_count == 0)
     ref_entry_px = avg_entry_price if (spo and avg_entry_price > 0) else curr_c
 
-    va_diff = (curr_vah - curr_val) if (curr_vah > curr_val and curr_val > 0) else 0.0
-    tp_cand = (curr_val - va_diff * target_ratio) if va_diff > 0 else ref_entry_px * 0.9920
-    target_tp = min(tp_cand, ref_entry_px * 0.9920)
-    tp_dist = max(ref_entry_px - target_tp, ref_entry_px * 0.0080)
-    poc_sl = max(curr_poc, ref_entry_px * 1.0050) if curr_poc > 0 else ref_entry_px * 1.0050
-    sl_confirm_px = min(poc_sl, ref_entry_px + tp_dist * 0.5)
     eff_hard_sl_pct = abs(dynamic_sl_pct) if dynamic_sl_pct != 0 else 0.030
-    hard_sl_px = min(sl_confirm_px, ref_entry_px * (1.0 + eff_hard_sl_pct))
+    levels = compute_dynamic_exit_levels(
+        "val_break", ref_entry_px, val=curr_val, vah=curr_vah, poc=curr_poc,
+        prev10_swing_px=None, target_ratio=target_ratio, eff_hard_sl_pct=eff_hard_sl_pct,
+    )
 
     metrics = {
         "curr_price": current_price,
@@ -6274,57 +6342,53 @@ def check_val_break_signals(
         "vah": curr_vah,
         "poc": curr_poc,
         "val_brk_ok": val_brk_ok,
-        "sl_confirm_px": sl_confirm_px,
-        "sl_price": hard_sl_px,
-        "target_tp": target_tp,
+        "sl_confirm_px": levels["sl_confirm_px"],
+        "sl_price": levels["sl_price"],
+        "target_tp": levels["target_tp"],
         "avg_entry_price": avg_entry_price,
         "last_entry_price": last_entry_price,
         "trades_count": current_trades_count,
         "is_emergency_breakeven": is_emergency_breakeven,
     }
 
-    # === [1] ショート損切り判定 (POC/RRハードSL & 確定終値POC/RR防衛SL) ===
     if spo and avg_entry_price > 0:
-        if current_price >= hard_sl_px:
-            loss_pct = (avg_entry_price - current_price) / avg_entry_price
-            reason = f"VAL_BREAK_POC_RR_SL: リアルタイム(${current_price:.4f} >= ${hard_sl_px:.4f}, 損失{loss_pct:.2%})"
-            return {"action": "STOP_LOSS", "reason": reason, "lot_multiplier": 1.0, "metrics": metrics}
+        el_min = _resolve_elapsed_minutes(elapsed_minutes, bars_held, timeout_bars, timeout_minutes)
+        dec = evaluate_dynamic_exit_decision(
+            strategy="val_break",
+            avg_entry_px=avg_entry_price,
+            levels=levels,
+            is_fill_bar=is_fill_bar,
+            can_check_close_exit=has_new_tf_bar_after_fill,
+            is_emergency_breakeven=is_emergency_breakeven,
+            elapsed_minutes=el_min,
+            low_px=current_price,
+            high_px=current_price,
+            close_check_px=curr_c,
+            live_px=current_price,
+            timeout_minutes=timeout_minutes,
+            max_hold_minutes=max_hold_minutes,
+            prefer_limit_fill_px=False,
+        )
+        if dec["action"] != "HOLD":
+            code = dec["code"]
+            if dec["action"] == "STOP_LOSS":
+                loss_pct = (avg_entry_price - dec["exit_px"]) / avg_entry_price
+                reason = f"VAL_BREAK_{code}: {dec['detail']} (損失{loss_pct:.2%})"
+            elif dec["action"] == "TIMEOUT_EXIT":
+                loss_pct = (avg_entry_price - current_price) / avg_entry_price
+                reason = f"VAL_BREAK_TIMEOUT_EXIT: {dec['detail']} ({loss_pct:.2%}) ➔ タイムアウト撤退"
+            else:
+                pnl_pct = (avg_entry_price - dec["exit_px"]) / avg_entry_price
+                reason = f"VAL_BREAK_{code} (TR={target_ratio:.2f}): {dec['detail']} (PnL={pnl_pct:+.2%})"
+            return {"action": dec["action"], "reason": reason, "lot_multiplier": 1.0, "metrics": metrics}
 
-        if (not is_fill_bar) and (curr_c > sl_confirm_px):
-            loss_pct = (avg_entry_price - curr_c) / avg_entry_price
-            reason = f"VAL_BREAK_POC_SL_CLOSE: 確定終値(${curr_c:.4f}) > 防衛SL(${sl_confirm_px:.4f}, 損失{loss_pct:.2%})"
-            return {"action": "STOP_LOSS", "reason": reason, "lot_multiplier": 1.0, "metrics": metrics}
-
-    # === [1-1] 動的タイムアウト微損撤退判定 ===
-    if (not is_fill_bar) and spo and bars_held >= timeout_bars and avg_entry_price > 0 and current_price >= avg_entry_price:
-        loss_pct = (avg_entry_price - current_price) / avg_entry_price
-        reason = f"VAL_BREAK_TIMEOUT_EXIT: 保有タイムアウト({bars_held}本>={timeout_bars}本) & ショート含み損({loss_pct:.2%}) ➔ 動的タイムアウト撤退"
-        return {"action": "TIMEOUT_EXIT", "reason": reason, "lot_multiplier": 1.0, "metrics": metrics}
-
-    # === [1-0] 地合い非BEAR時の緊急建値撤退判定 (-0.20%) ===
-    if spo and is_emergency_breakeven and avg_entry_price > 0:
-        breakeven_target = avg_entry_price * 0.9980
-        if current_price <= breakeven_target:
-            pnl_pct = (avg_entry_price - current_price) / avg_entry_price
-            reason = f"VAL_BREAK_EMERGENCY_BREAKEVEN_TP: 地合い変化に伴う緊急建値撤退 (目標: ${breakeven_target:.4f}, PnL: {pnl_pct:+.2%})"
-            return {"action": "CLOSE_ALL", "reason": reason, "lot_multiplier": 1.0, "metrics": metrics}
-
-    # === [2] ショート利確判定 (target_ratio 拡張TP到達) ===
-    if (not is_fill_bar) and spo and target_tp > 0 and avg_entry_price > 0:
-        if (current_price <= target_tp) or (curr_l <= target_tp and current_price <= avg_entry_price * 0.9960):
-            pnl_pct = (avg_entry_price - current_price) / avg_entry_price
-            reason = f"VAL_BREAK_TP (TR={target_ratio:.2f}): 目標(${target_tp:.4f})到達 (PnL={pnl_pct:+.2%})"
-            return {"action": "CLOSE_ALL", "reason": reason, "lot_multiplier": 1.0, "metrics": metrics}
-
-    # === [3] 新規ショートブレイクダウンエントリー判定 ===
     if poz and not is_cooldown_active and val_brk_ok:
         prec_ok, prec_msg, prec_info = evaluate_entry_precision_gate(df_5m, side="short", is_vp=True, is_breakout=True)
         metrics.update(prec_info)
         if prec_ok:
             reason = f"VAL_BREAK_INITIAL_ENTRY_SHORT: VAL下方ブレイク(${curr_c:.4f} < VAL ${curr_val:.4f}) [{prec_msg}]"
             return {"action": "INITIAL_ENTRY_SHORT", "reason": reason, "lot_multiplier": 1.0, "metrics": metrics}
-        else:
-            return {"action": "NONE", "reason": f"VAL_BREAK_PRECISION_FILTER_WAIT: {prec_msg}", "lot_multiplier": 1.0, "metrics": metrics}
+        return {"action": "NONE", "reason": f"VAL_BREAK_PRECISION_FILTER_WAIT: {prec_msg}", "lot_multiplier": 1.0, "metrics": metrics}
 
     if spo:
         return {"action": "HOLD", "reason": "VAL_BREAK_HOLD", "lot_multiplier": 1.0, "metrics": metrics}
@@ -6952,11 +7016,12 @@ def evaluate_market_regime_3window(
                 if m_trough_ratio < 0.50 and m_final >= m_half:
                     market_bottom_rev = True
 
-        # 判定基準: 半分以上 (11票以上 / 22票)
+        # 判定基準: 過半数 ((total_votes // 2) + 1: 23票時 12票)
+        majority = (total_votes // 2) + 1 if total_votes > 0 else 12
         state = "NEUTRAL"
-        if buy_votes >= 11:
+        if buy_votes >= majority:
             state = "BUY"
-        elif sell_votes >= 11:
+        elif sell_votes >= majority:
             state = "SELL"
 
         period_results[w_name] = {
@@ -7054,7 +7119,11 @@ def _finalize_regime_result(
 
     mean_b = (b_14d + b_7d + b_2d) / 3.0
     mean_sl = (sl_14d + sl_7d + sl_2d) / 3.0
-    net_score = (mean_b - mean_sl) / 22.0
+    t_14d = period_results.get("14d", {}).get("total_votes", 23)
+    t_7d = period_results.get("7d", {}).get("total_votes", 23)
+    t_2d = period_results.get("2d", {}).get("total_votes", 23)
+    mean_tot = max(1.0, (t_14d + t_7d + t_2d) / 3.0)
+    net_score = (mean_b - mean_sl) / mean_tot
     score_pct_str = f"{net_score * 100:+.1f}%"
 
     if buy_count == 3:
@@ -7234,10 +7303,11 @@ def evaluate_market_regime_3window_from_close_arrays(symbol_close_arrays: Dict[s
                     sell_votes += votes
                     sell_passed.add(sym)
 
+        majority = (total_votes // 2) + 1 if total_votes > 0 else 12
         state = "NEUTRAL"
-        if buy_votes >= 11:
+        if buy_votes >= majority:
             state = "BUY"
-        elif sell_votes >= 11:
+        elif sell_votes >= majority:
             state = "SELL"
 
         period_results[w_name] = {
@@ -7256,6 +7326,58 @@ def evaluate_market_regime_3window_from_close_arrays(symbol_close_arrays: Dict[s
         eligible_buy_by_window=eligible_buy_by_window,
         eligible_sell_by_window=eligible_sell_by_window,
     )
+
+
+def compute_normalized_exclusions_from_close_arrays(
+    symbol_close_arrays: Dict[str, np.ndarray],
+    overall_regime: str,
+) -> Dict[str, str]:
+    """
+    `check_normalized_peak_timing` / `check_normalized_trough_timing` と完全同一の
+    NumPy 高速配列版ノーマライズ除外判定（2d / 7d / 14d、BTC 除外）。
+    """
+    reg_upper = str(overall_regime).upper()
+    if reg_upper not in ("BUY", "SELL"):
+        return {}
+
+    use_peak = (reg_upper == "BUY")
+    windows = (("2d", 48), ("7d", 168), ("14d", 336))
+    excluded: Dict[str, str] = {}
+
+    for sym, arr in symbol_close_arrays.items():
+        ticker = str(sym).upper().replace("-USDT", "").replace("USDT", "")
+        if ticker == "BTC" or arr is None or len(arr) < 24:
+            continue
+        reasons: List[str] = []
+        for w_name, w_hours in windows:
+            sub = arr[-w_hours:] if len(arr) > w_hours else arr
+            n_sub = len(sub)
+            if n_sub < 24:
+                continue
+            base_c = float(sub[0])
+            if base_c <= 0.0:
+                continue
+            final_norm = float(sub[-1]) / base_c
+            c_min = float(sub.min()) / base_c
+            c_max = float(sub.max()) / base_c
+            half_level = c_min + (c_max - c_min) * 0.5
+            ext_idx = int(sub.argmax() if use_peak else sub.argmin())
+            ext_ratio = ext_idx / n_sub
+            if ext_ratio >= 0.50:
+                continue
+            if use_peak:
+                if final_norm < half_level:
+                    reasons.append(
+                        f"{w_name}前半ピーク半値割れ(peak={ext_ratio:.2f}, max={c_max:.2f}x, curr={final_norm:.2f}x < half={half_level:.2f}x)"
+                    )
+            else:
+                if final_norm > half_level:
+                    reasons.append(
+                        f"{w_name}前半ボトム半値超え(trough={ext_ratio:.2f}, min={c_min:.2f}x, curr={final_norm:.2f}x > half={half_level:.2f}x)"
+                    )
+        if reasons:
+            excluded[sym] = ", ".join(reasons)
+    return excluded
 
 
 def check_market_regime_safe(

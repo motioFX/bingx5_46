@@ -27,6 +27,10 @@ import pandas as pd
 
 from bingx5_46_3logic import (
     calc_rsi_ema,
+    compute_dynamic_exit_levels,
+    compute_mp_levels_at_bar,
+    compute_normalized_exclusions_from_close_arrays,
+    evaluate_dynamic_exit_decision,
     evaluate_market_regime_3window,
     evaluate_market_regime_3window_from_close_arrays,
     make_market_profile_dual_va,
@@ -38,7 +42,14 @@ from lake_store import (
     sec_to_iso,
     utc_now_sec,
 )
-from symbol_universe import BENCHMARK_SYMBOL, FIXED_TRADABLE_SYMBOLS, LAKE_UNIVERSE_SYMBOLS, normalize_symbol
+from symbol_universe import (
+    BENCHMARK_SYMBOL,
+    EXCLUDED_TRADE_MEGA_CAPS,
+    FIXED_TRADABLE_SYMBOLS,
+    LAKE_UNIVERSE_SYMBOLS,
+    TRADABLE_MID_CAP_SYMBOLS,
+    normalize_symbol,
+)
 
 JST = timezone(timedelta(hours=9))
 
@@ -57,7 +68,7 @@ class WalkForwardConfig:
     fee_maker: float = 0.0002
     fee_taker: float = 0.0006
     position_cost_usdt: float = 15.0
-    sl_cooldown_hours: float = 24.0
+    sl_cooldown_hours: float = 0.0
     hard_sl_pct: float = 0.030
     min_sl_pct: float = 0.0020
     timeout_minutes: int = 240
@@ -67,6 +78,11 @@ class WalkForwardConfig:
     enforce_oi_fr: bool = True
     oi_missing_policy: str = "when_available"  # "when_available" | "strict_zero_fill"
     enforce_session_mask: bool = True
+    allow_ny_session: bool = True
+    enable_emergency_breakeven: bool = True
+    mp_step: int = 1
+    max_active_positions: int = 2
+    daily_max_loss_usdt: float = 1.50
     use_point_in_time_regime: bool = True
     min_eval_trades_provisional: int = 10
     min_eval_trades_qualified: int = 30
@@ -158,7 +174,8 @@ def compute_regime_from_lake(
         }
 
     res = evaluate_market_regime_3window(symbol_1h_dfs)
-    res["excluded_symbols"] = {}
+    arr_map = {s: d["close"].to_numpy(dtype=np.float64) for s, d in symbol_1h_dfs.items()}
+    res["excluded_symbols"] = compute_normalized_exclusions_from_close_arrays(arr_map, res.get("overall_regime", "NEUTRAL"))
     res["whale_snapshot"] = {"source": "lake_offline_1h"}
     return res
 
@@ -190,6 +207,8 @@ def _snapshot_from_regime_dict(
     allowed_raw = [str(s) for s in reg.get("allowed_strategies", []) if str(s) in ALL_STRATEGIES]
     if not allowed_raw and fallback_all_strategies:
         allowed_raw = list(ALL_STRATEGIES)
+    raw_excl = reg.get("excluded_symbols", {})
+    excl_dict = raw_excl if isinstance(raw_excl, dict) else {str(s): "EXCLUDED" for s in raw_excl}
     return {
         "cutoff_utc": int(ts_hr),
         "cutoff_iso": sec_to_iso(ts_hr),
@@ -202,7 +221,8 @@ def _snapshot_from_regime_dict(
         "allowed_strategies": allowed_raw,
         "allowed_strategies_set": frozenset(allowed_raw),
         "recommended_symbols": list(reg.get("recommended_symbols", [])),
-        "excluded_symbols": reg.get("excluded_symbols", {}) if isinstance(reg.get("excluded_symbols"), dict) else {},
+        "excluded_symbols": excl_dict,
+        "excluded_symbols_set": frozenset(normalize_symbol(str(s)) for s in excl_dict.keys()),
         "whale_snapshot": {
             "source": source_label,
             "period_results": _compact_period_results(reg.get("period_results")),
@@ -287,12 +307,97 @@ def compute_hourly_regime_series_from_lake(
             hourly_map[t_hr] = _snapshot_from_regime_dict(t_hr, empty_reg, source_label="lake_hourly_warmup")
         else:
             reg_t = evaluate_market_regime_3window_from_close_arrays(hourly_arrays_at_t)
+            reg_t["excluded_symbols"] = compute_normalized_exclusions_from_close_arrays(
+                hourly_arrays_at_t, reg_t.get("overall_regime", "NEUTRAL")
+            )
             hourly_map[t_hr] = _snapshot_from_regime_dict(t_hr, reg_t, source_label="lake_hourly_1h")
 
         if gil_yield_sec > 0 and ((step_idx + 1) % 200) == 0:
             time.sleep(gil_yield_sec)
 
     return hourly_map, True
+
+
+class _LazyMPSeries:
+    """要求された確定足インデックスのみ厳密 `step=1` で Market Profile を算出しメモ化する遅延キャッシュ。"""
+
+    def __init__(
+        self,
+        o: np.ndarray,
+        h: np.ndarray,
+        l: np.ndarray,
+        c: np.ndarray,
+        v: np.ndarray,
+        period: int,
+        num_bins: int = 50,
+        value_area_pct: float = 0.70,
+        use_decay: bool = True,
+    ):
+        n = len(c)
+        self.o = o
+        self.h = h
+        self.l = l
+        self.c = c
+        self.v = v
+        self.period = max(10, int(period))
+        self.num_bins = int(num_bins)
+        self.value_area_pct = float(value_area_pct)
+        half_life = max(5.0, self.period / 2.0)
+        decay_factor = 0.5 ** (1.0 / half_life) if use_decay else 1.0
+        self.full_weights = (decay_factor ** np.arange(self.period - 1, -1, -1)) if use_decay else np.ones(self.period)
+        self.val = np.full(n, np.nan, dtype=np.float64)
+        self.vah = np.full(n, np.nan, dtype=np.float64)
+        self.poc = np.full(n, np.nan, dtype=np.float64)
+        self.done = np.zeros(n, dtype=bool)
+
+    def ensure_indices(self, indices: Sequence[int]) -> None:
+        n = len(self.done)
+        for i in indices:
+            idx = int(i)
+            if 0 <= idx < n and not self.done[idx]:
+                p, vl, vh, _, _ = compute_mp_levels_at_bar(
+                    self.o, self.h, self.l, self.c, self.v,
+                    end_idx=idx, period=self.period, num_bins=self.num_bins,
+                    value_area_pct=self.value_area_pct, full_weights=self.full_weights, compute_80=False,
+                )
+                self.poc[idx] = p
+                self.val[idx] = vl
+                self.vah[idx] = vh
+                self.done[idx] = True
+
+    def get_bar(self, idx: int) -> Tuple[float, float, float]:
+        i = int(idx)
+        if i < 0 or i >= len(self.done):
+            return 0.0, 0.0, 0.0
+        if not self.done[i]:
+            p, vl, vh, _, _ = compute_mp_levels_at_bar(
+                self.o, self.h, self.l, self.c, self.v,
+                end_idx=i, period=self.period, num_bins=self.num_bins,
+                value_area_pct=self.value_area_pct, full_weights=self.full_weights, compute_80=False,
+            )
+            self.poc[i] = p
+            self.val[i] = vl
+            self.vah[i] = vh
+            self.done[i] = True
+        return float(self.val[i]), float(self.vah[i]), float(self.poc[i])
+
+
+class _StaticMPSeries:
+    """旧互換 `mp_step > 1` 用ラッパー。"""
+
+    def __init__(self, val: np.ndarray, vah: np.ndarray, poc: np.ndarray):
+        self.val = val
+        self.vah = vah
+        self.poc = poc
+
+    def ensure_indices(self, indices: Sequence[int]) -> None:
+        return
+
+    def get_bar(self, idx: int) -> Tuple[float, float, float]:
+        i = int(idx)
+        if i < 0 or i >= len(self.val):
+            return 0.0, 0.0, 0.0
+        return float(self.val[i]), float(self.vah[i]), float(self.poc[i])
 
 
 def _compute_causal_features(
@@ -303,7 +408,7 @@ def _compute_causal_features(
 ) -> Dict[str, Any]:
     """
     指定足種 DataFrame (すでに `ts_utc + tf_sec <= end_cutoff` 済) に対して、
-    完全に因果的な配列（必要なMPのみ, RSI-EMA, ATR_14, range_high/low, swing10, precision, session）を事前計算する。
+    完全に因果的な配列（遅延/間引きMP, RSI-EMA, ATR_14, range_high/low, shift(1)直前10本高安, precision, session）を事前計算する。
     """
     n = len(df_tf)
     tf_sec = TIMEFRAME_SECONDS[timeframe]
@@ -314,6 +419,7 @@ def _compute_causal_features(
     l = df_tf["low"].to_numpy(dtype=np.float64)
     c = df_tf["close"].to_numpy(dtype=np.float64)
     v = df_tf["volume"].to_numpy(dtype=np.float64)
+    v_mp = np.ones(n, dtype=np.float64) if np.all(v <= 0) else v
 
     # ATR(14) - strictly causal
     prev_c = np.roll(c, 1)
@@ -321,15 +427,18 @@ def _compute_causal_features(
     tr = np.maximum(h - l, np.maximum(np.abs(h - prev_c), np.abs(l - prev_c)))
     atr_14 = pd.Series(tr).rolling(14, min_periods=1).mean().to_numpy(dtype=np.float64)
 
-    # 直近レンジ高安 (24本 = 5mなら2h, 15mなら6h, 1hなら24h, 4hなら4d) - 因果的
     s_h = pd.Series(h)
     s_l = pd.Series(l)
     range_high_24 = s_h.rolling(24, min_periods=1).max().to_numpy(dtype=np.float64)
     range_low_24 = s_l.rolling(24, min_periods=1).min().to_numpy(dtype=np.float64)
 
-    # 直近10本 スイング高安 (SL計算用)
-    swing_high_10 = s_h.rolling(10, min_periods=1).max().to_numpy(dtype=np.float64)
-    swing_low_10 = s_l.rolling(10, min_periods=1).min().to_numpy(dtype=np.float64)
+    # 当該確定足自身を含めない直前10本スイング高安 (`shift(1)` = 実運用の `iloc[-11:-1]` と完全一致)
+    if n > 0:
+        swing_high_10 = s_h.rolling(10, min_periods=1).max().shift(1).fillna(float(h[0])).to_numpy(dtype=np.float64)
+        swing_low_10 = s_l.rolling(10, min_periods=1).min().shift(1).fillna(float(l[0])).to_numpy(dtype=np.float64)
+    else:
+        swing_high_10 = np.empty(0, dtype=np.float64)
+        swing_low_10 = np.empty(0, dtype=np.float64)
 
     # Volume Ratio (直前20本移動平均は shift(1) で当足除外＝完全因果)
     v_ma20 = pd.Series(v).rolling(20, min_periods=5).mean().shift(1).to_numpy(dtype=np.float64)
@@ -340,27 +449,32 @@ def _compute_causal_features(
     oi_chg = df_tf["oi_chg_4h"].to_numpy(dtype=np.float64) if "oi_chg_4h" in df_tf.columns else np.full(n, np.nan)
     fr = df_tf["funding_rate"].to_numpy(dtype=np.float64) if "funding_rate" in df_tf.columns else np.full(n, np.nan)
 
-    # Session mask (JST時刻)
-    dt_jst = pd.to_datetime(ts_open, unit="s", utc=True).tz_convert(JST)
+    # Session mask (JST: 足確定時刻 `ts_close` 基準 = 実運用の `datetime.now(JST).hour` と完全一致)
+    dt_jst = pd.to_datetime(ts_close, unit="s", utc=True).tz_convert(JST)
     hrs_jst = dt_jst.hour.to_numpy(dtype=np.int32)
     tokyo_mask = (hrs_jst >= 9) & (hrs_jst < 16)
     london_mask = (hrs_jst >= 16) & (hrs_jst < 22)
+    ny_mask = (hrs_jst >= 22) | (hrs_jst < 9)
 
     # RSI(9) & RSI-EMA(7)
     rsi_s, rsi_ma_s = calc_rsi_ema(pd.Series(c), rsi_period=9, ma_period=7)
     rsi = rsi_s.to_numpy(dtype=np.float64)
     rsi_ma = rsi_ma_s.to_numpy(dtype=np.float64)
 
-    # Market Profile (必要な period のみ算出 / 5m=24ステップ(2h更新)等で高速因果算出)
-    mp_step = {"5m": 24, "15m": 8, "1h": 2, "4h": 1}.get(timeframe, 4)
-    mp_cache: Dict[int, Dict[str, np.ndarray]] = {}
+    # Market Profile Cache (`mp_step == 1` は要求足のみ遅延厳密計算で実運用と100%一致)
+    mp_cache: Dict[int, Any] = {}
+    eff_step = max(1, int(getattr(cfg, "mp_step", 1)))
     for mp_p in sorted(set(int(x) for x in needed_mps)):
-        mp_res = make_market_profile_dual_va(df_tf, period=mp_p, num_bins=50, step=mp_step, use_decay=True)
-        mp_cache[mp_p] = {
-            "val": np.asarray(mp_res["val_70"], dtype=np.float64),
-            "vah": np.asarray(mp_res["vah_70"], dtype=np.float64),
-            "poc": np.asarray(mp_res["poc"], dtype=np.float64),
-        }
+        if eff_step <= 1:
+            mp_cache[mp_p] = _LazyMPSeries(o, h, l, c, v_mp, period=mp_p, num_bins=50, value_area_pct=0.70, use_decay=True)
+        else:
+            step_val = eff_step if timeframe == "5m" else max(1, eff_step // 3)
+            mp_res = make_market_profile_dual_va(df_tf, period=mp_p, num_bins=50, step=step_val, use_decay=True)
+            mp_cache[mp_p] = _StaticMPSeries(
+                np.asarray(mp_res["val_70"], dtype=np.float64),
+                np.asarray(mp_res["vah_70"], dtype=np.float64),
+                np.asarray(mp_res["poc"], dtype=np.float64),
+            )
 
     # 精度フィルター事前マスク (戦略種別×方向別)
     def _precision_mask(side: str, is_brk: bool) -> np.ndarray:
@@ -377,7 +491,6 @@ def _compute_causal_features(
                 oi_ok = np.ones(n, dtype=bool)
                 fr_ok = np.ones(n, dtype=bool)
             else:
-                # 過去欠損期間 (collector開始前) は強制ゼロ埋めせず、観測値がある場合のみ厳格判定
                 oi_use = oi_chg
                 fr_use = fr
                 oi_ok = np.isfinite(oi_use)
@@ -422,6 +535,7 @@ def _compute_causal_features(
         "swing_low_10": swing_low_10,
         "tokyo_mask": tokyo_mask,
         "london_mask": london_mask,
+        "ny_mask": ny_mask,
         "rsi": rsi,
         "rsi_ma": rsi_ma,
         "mp_cache": mp_cache,
@@ -435,7 +549,7 @@ def _generate_signal_array(
     params: Dict[str, Any],
     cfg: WalkForwardConfig,
 ) -> Dict[str, Any]:
-    """事前計算済み因果特徴量から、シグナル発火配列と各足の基準TP/SL・伸び切り情報を生成する。"""
+    """事前計算済み因果特徴量から、シグナル発火配列と MP インスタンス・伸び切り基準情報を生成する。"""
     n = feat["n"]
     tf = feat["timeframe"]
     c = feat["close"]
@@ -446,37 +560,47 @@ def _generate_signal_array(
     p_mask = feat["precision_masks"][(side, is_brk)]
 
     if cfg.enforce_session_mask and tf in ("5m", "15m"):
-        sess_mask = feat["london_mask"] if is_brk else feat["tokyo_mask"]
+        if getattr(cfg, "allow_ny_session", True):
+            sess_mask = (feat["london_mask"] | feat["ny_mask"]) if is_brk else (feat["tokyo_mask"] | feat["ny_mask"])
+        else:
+            sess_mask = feat["london_mask"] if is_brk else feat["tokyo_mask"]
     else:
         sess_mask = np.ones(n, dtype=bool)
 
     base_mask = p_mask & sess_mask
-    # 最初の100本（またはMP期間）まではウォームアップ不足のため除外
     warmup_bars = int(params.get("mp", 30)) if "mp" in params else 30
+    mp_obj = None
 
     if strategy in ("val_poc", "vah_poc", "vah_break", "val_break"):
         mp_p = int(params["mp"])
-        mp = feat["mp_cache"][mp_p]
-        val = mp["val"]
-        vah = mp["vah"]
-        poc = mp["poc"]
+        mp_obj = feat["mp_cache"][mp_p]
+        cand_idxs = np.flatnonzero(base_mask)
+        cand_idxs = cand_idxs[cand_idxs >= warmup_bars]
+        if len(cand_idxs) > 0:
+            if is_brk:
+                need_idxs = np.unique(np.concatenate([cand_idxs, cand_idxs - 1]))
+                mp_obj.ensure_indices(need_idxs)
+            else:
+                mp_obj.ensure_indices(cand_idxs)
+
+        val = mp_obj.val
+        vah = mp_obj.vah
+        poc = mp_obj.poc
         valid_mp = (val > 0) & (vah > val) & (poc > 0)
-        prev_c = np.roll(c, 1)
-        prev_vah = np.roll(vah, 1)
-        prev_val = np.roll(val, 1)
-        prev_c[0] = c[0]
 
         if strategy == "val_poc":
-            # レンジ内回帰ロング: 確定足が VAL 以下へ押し込み、かつ極端な下抜け(-3%超)でない
             cond = valid_mp & (c <= val * 1.001) & (c >= val * 0.970)
         elif strategy == "vah_poc":
-            # レンジ内回帰ショート: 確定足が VAH 以上へ吹き上げ、かつ極端な上抜け(+3%超)でない
             cond = valid_mp & (c >= vah * 0.999) & (c <= vah * 1.030)
         elif strategy == "vah_break":
-            # VAH 上抜けブレイク (前足VAH以下 -> 今足VAH超)
+            prev_c = np.roll(c, 1)
+            prev_vah = np.roll(vah, 1)
+            prev_c[0] = c[0]
             cond = valid_mp & (prev_c <= prev_vah) & (c > vah) & (c < vah * 1.04)
         else:  # val_break
-            # VAL 下抜けブレイク (前足VAL以上 -> 今足VAL割れ)
+            prev_c = np.roll(c, 1)
+            prev_val = np.roll(val, 1)
+            prev_c[0] = c[0]
             cond = valid_mp & (prev_c >= prev_val) & (c < val) & (c > val * 0.96)
 
         sig = cond & base_mask
@@ -484,22 +608,8 @@ def _generate_signal_array(
         va_lower = val
         poc_arr = poc
     else:
-        # RSIMA / RSIMA_SHORT
         rsi = feat["rsi"]
         rsi_ma = feat["rsi_ma"]
-        mp_ref = feat["mp_cache"].get(150)
-        if mp_ref is None and feat["mp_cache"]:
-            mp_ref = next(iter(feat["mp_cache"].values()))
-        if mp_ref is not None:
-            va_upper = mp_ref["vah"]
-            va_lower = mp_ref["val"]
-            poc_arr = mp_ref["poc"]
-        else:
-            # VP 未計算時は直近24本レンジを VA フォールバックとし、計算コストをゼロにする
-            va_upper = feat["range_high_24"]
-            va_lower = feat["range_low_24"]
-            poc_arr = (va_upper + va_lower) * 0.5
-
         prev_rsi = np.roll(rsi, 1)
         prev_ma = np.roll(rsi_ma, 1)
         if strategy == "rsima":
@@ -509,6 +619,25 @@ def _generate_signal_array(
             ep = float(params["s_ep"])
             cond = (rsi < rsi_ma) & (prev_rsi >= prev_ma) & (rsi_ma > ep)
         sig = cond & base_mask
+        if n > warmup_bars:
+            sig[:warmup_bars] = False
+        else:
+            sig[:] = False
+
+        mp_ref = feat["mp_cache"].get(150)
+        if mp_ref is None and feat["mp_cache"]:
+            mp_ref = next(iter(feat["mp_cache"].values()))
+        if mp_ref is not None:
+            sig_idxs = np.flatnonzero(sig)
+            if len(sig_idxs) > 0:
+                mp_ref.ensure_indices(sig_idxs)
+            va_upper = mp_ref.vah
+            va_lower = mp_ref.val
+            poc_arr = mp_ref.poc
+        else:
+            va_upper = feat["range_high_24"]
+            va_lower = feat["range_low_24"]
+            poc_arr = (va_upper + va_lower) * 0.5
 
     if n > warmup_bars:
         sig[:warmup_bars] = False
@@ -520,6 +649,8 @@ def _generate_signal_array(
         "va_upper": va_upper,
         "va_lower": va_lower,
         "poc": poc_arr,
+        "mp_obj": mp_obj,
+        "sess_mask": sess_mask,
     }
 
 
@@ -612,6 +743,17 @@ def _compute_metrics(trades: List[Dict[str, Any]]) -> Dict[str, Any]:
     }
 
 
+def _session_allows_strategy(ts_utc: int, is_brk: bool, cfg: WalkForwardConfig) -> bool:
+    if not cfg.enforce_session_mask:
+        return True
+    hr_jst = datetime.fromtimestamp(int(ts_utc), tz=timezone.utc).astimezone(JST).hour
+    if 9 <= hr_jst < 16:
+        return not is_brk
+    if 16 <= hr_jst < 22:
+        return is_brk
+    return bool(getattr(cfg, "allow_ny_session", True))
+
+
 def _simulate_window(
     feat_tf: Dict[str, Any],
     sig_info: Dict[str, Any],
@@ -626,30 +768,31 @@ def _simulate_window(
     hourly_regime_map: Optional[Dict[int, Dict[str, Any]]] = None,
 ) -> List[Dict[str, Any]]:
     """
-    指定窓 `[win_start_utc, win_end_utc]` 上で 5m 足ベースの厳密 Maker 指値追随・
-    シグナル終了キャンセル・保守的 SL 先行決済・0.08% 手数料控除を実行する。
+    指定窓 `[win_start_utc, win_end_utc]` 上で実ボットと 1:1 同一シーケンスを実行する：
+    - 5m 足ベース非ブロッキング Maker 指値追随・シグナル終了/セッション転換キャンセル
+    - 保有中は確定足ごとに Market Profile (`VAH/VAL/POC`)・直前10本高安 (`shift(1)`) を動的再計算
+    - 地合い転換時緊急建値撤退 (`±0.20%`)・240m タイムアウト撤退・480m `MAX_HOLD_CLOSE`・往復 0.08% 手数料控除
     """
     if df_5m.empty or feat_tf["n"] == 0:
         return []
 
+    norm_sym = normalize_symbol(symbol)
     side = strategy_side(strategy)
     is_brk = is_breakout_strategy(strategy)
+    is_vp_strat = strategy in ("val_poc", "vah_poc", "vah_break", "val_break")
     tf = feat_tf["timeframe"]
-    tf_sec = feat_tf["tf_sec"]
 
     ts5 = df_5m["ts_utc"].to_numpy(dtype=np.int64)
-    o5 = df_5m["open"].to_numpy(dtype=np.float64)
     h5 = df_5m["high"].to_numpy(dtype=np.float64)
     l5 = df_5m["low"].to_numpy(dtype=np.float64)
     c5 = df_5m["close"].to_numpy(dtype=np.float64)
-    n5 = len(ts5)
 
-    # 窓上限以降の 5m 足は物理遮断
     valid_5m_end = int(np.searchsorted(ts5 + 300, win_end_utc, side="right"))
     if valid_5m_end <= 0:
         return []
 
     sig = sig_info["sig"]
+    mp_obj = sig_info.get("mp_obj")
     ts_close_tf = feat_tf["ts_close"]
     c_tf = feat_tf["close"]
     atr_tf = feat_tf["atr_14"]
@@ -660,21 +803,21 @@ def _simulate_window(
     vah_tf = sig_info["va_upper"]
     val_tf = sig_info["va_lower"]
     poc_tf = sig_info["poc"]
-
     rsi_tf = feat_tf["rsi"]
-    # 5m タイムスタンプ -> 最新確定済み strategy-tf インデックスの因果マップ (`ts_close_tf <= ts5 + 300`)
-    # 5m bar k の確定時点 (= ts5[k] + 300) 時点で参照可能な最新 strategy-tf バー:
+
     tf_at_5m_close = np.searchsorted(ts_close_tf, ts5[:valid_5m_end] + 300, side="right") - 1
 
-    cooldown_sec = int(cfg.sl_cooldown_hours * 3600)
+    cooldown_sec = int(cfg.sl_cooldown_hours * 3600) if cfg.sl_cooldown_hours > 0 else 0
     cooldown_until_utc = 0
     trades: List[Dict[str, Any]] = []
 
-    # 戦略足インデックス i のスキャン: `win_start_utc <= ts_close_tf[i] < win_end_utc`
     i_start = int(np.searchsorted(ts_close_tf, win_start_utc, side="left"))
     i_end = int(np.searchsorted(ts_close_tf, win_end_utc, side="left"))
     next_allowed_order_utc = win_start_utc
     seq_no = 0
+    tr_ratio = float(params.get("target_ratio", 0.70))
+    rsi_exit_thresh = float(params.get("s_cp" if side == "short" else "l_cp", 40.0 if side == "short" else 60.0))
+    enable_emerg_be = bool(getattr(cfg, "enable_emergency_breakeven", True))
 
     for i in range(i_start, i_end):
         if not sig[i]:
@@ -693,7 +836,11 @@ def _simulate_window(
         if hourly_regime_map is not None:
             t_hr = (sig_close_utc // 3600) * 3600
             snap = hourly_regime_map.get(t_hr)
-            if snap is None or strategy not in snap["allowed_strategies_set"]:
+            if (
+                snap is None
+                or strategy not in snap["allowed_strategies_set"]
+                or norm_sym in snap.get("excluded_symbols_set", frozenset())
+            ):
                 continue
             sig_regime_meta = {
                 "regime_at_signal": snap["overall_regime"],
@@ -703,18 +850,14 @@ def _simulate_window(
                 "sell_votes_at_signal": snap["mean_sell_votes"],
             }
 
-        # 次 5m 足 (t_order >= sig_close_utc) を検索
         m_start = int(np.searchsorted(ts5[:valid_5m_end], sig_close_utc, side="left"))
         if m_start >= valid_5m_end:
             break
 
-        # 実ボット (bingx5_46_2api) 準拠: シグナル後の 4〜5 分待機窓 (`5m` 1本分, またはシグナル継続時次足追随)
-        # 5m 戦略でシグナルが次足も継続なら最大 2 本追随、そうでなければ即 CANCEL_SIGNAL_END
         sig_px = float(c_tf[i])
         if sig_px <= 0:
             continue
 
-        # シグナル確定時点の因果的伸び切り指標 (base: VA境界 & 直近24本高安)
         atr_val = float(atr_tf[i]) if atr_tf[i] > 0 else (sig_px * 0.005)
         va_u = float(vah_tf[i]) if math.isfinite(vah_tf[i]) and vah_tf[i] > 0 else sig_px
         va_l = float(val_tf[i]) if math.isfinite(val_tf[i]) and val_tf[i] > 0 else sig_px
@@ -722,7 +865,6 @@ def _simulate_window(
         rl = float(rlow_tf[i]) if math.isfinite(rlow_tf[i]) and rlow_tf[i] > 0 else sig_px
 
         if side == "long":
-            # ロング時: 直近レンジ安値ベース (or VAHブレイク時はVAH超え) からの上昇伸び切り
             ref_base = va_u if is_brk else rl
             ext_pct = ((sig_px - ref_base) / ref_base * 100.0) if ref_base > 0 else 0.0
             ext_atr = (sig_px - ref_base) / atr_val if atr_val > 0 else 0.0
@@ -731,7 +873,6 @@ def _simulate_window(
             ext_pct = ((ref_base - sig_px) / ref_base * 100.0) if ref_base > 0 else 0.0
             ext_atr = (ref_base - sig_px) / atr_val if atr_val > 0 else 0.0
 
-        # Maker 指値配置 ＆ 追随ループ (成行約定なし)
         max_chase_bars = 3 if tf == "5m" else 1
         filled_bar = -1
         order_px = 0.0
@@ -751,10 +892,20 @@ def _simulate_window(
             if offset == 0:
                 order_px = first_order_px
             else:
-                # 次の確定足でもシグナルが継続している場合のみ最新気配に再配置 (追随)
+                bar_decision_ts = int(ts5[m])
+                if tf in ("5m", "15m") and not _session_allows_strategy(bar_decision_ts, is_brk, cfg):
+                    cancel_ts = bar_decision_ts
+                    cancel_reason = "CANCEL_SIGNAL_END"
+                    break
+                if hourly_regime_map is not None:
+                    snap_c = hourly_regime_map.get((bar_decision_ts // 3600) * 3600)
+                    if snap_c is None or strategy not in snap_c["allowed_strategies_set"] or norm_sym in snap_c.get("excluded_symbols_set", frozenset()):
+                        cancel_ts = bar_decision_ts
+                        cancel_reason = "CANCEL_SIGNAL_END"
+                        break
                 tf_idx_prev = int(tf_at_5m_close[m - 1])
                 if tf_idx_prev < 0 or not sig[tf_idx_prev]:
-                    cancel_ts = int(ts5[m])
+                    cancel_ts = bar_decision_ts
                     cancel_reason = "CANCEL_SIGNAL_END"
                     break
                 order_px = float(c5[m - 1]) * (1.0 - cfg.fee_maker if side == "long" else 1.0 + cfg.fee_maker)
@@ -814,134 +965,84 @@ def _simulate_window(
             next_allowed_order_utc = int(cancel_ts or (first_order_ts + 300))
             continue
 
-        # ===== 約定後の利確・損切り水準確定 =====
+        # ===== 約定後エグジット評価 (毎足動的TP/SL + 地合い転換建値 + 4hタイムアウト + 8h MAX_HOLD) =====
         fill_ts = int(ts5[filled_bar])
-        tr_ratio = float(params.get("target_ratio", 0.70))
-        poc_lvl = float(poc_tf[i]) if math.isfinite(poc_tf[i]) and poc_tf[i] > 0 else fill_px
-        swing_lo = float(sl10_tf[i]) if math.isfinite(sl10_tf[i]) and sl10_tf[i] > 0 else fill_px * (1.0 - cfg.hard_sl_pct)
-        swing_hi = float(sh10_tf[i]) if math.isfinite(sh10_tf[i]) and sh10_tf[i] > 0 else fill_px * (1.0 + cfg.hard_sl_pct)
-
-        tp_px: Optional[float] = None
-        if strategy == "val_poc":
-            tp_cand = va_l + (va_u - va_l) * tr_ratio
-            tp_px = max(tp_cand, fill_px * 1.004)
-            sl_confirm_px = min(swing_lo, fill_px * (1.0 - cfg.min_sl_pct))
-            hard_sl_px = fill_px * (1.0 - cfg.hard_sl_pct)
-        elif strategy == "vah_poc":
-            tp_cand = va_u - (va_u - va_l) * tr_ratio
-            tp_px = min(tp_cand, fill_px * 0.996)
-            sl_confirm_px = max(swing_hi, fill_px * (1.0 + cfg.min_sl_pct))
-            hard_sl_px = fill_px * (1.0 + cfg.hard_sl_pct)
-        elif strategy == "vah_break":
-            tp_cand = va_u + (va_u - va_l) * tr_ratio
-            tp_px = max(tp_cand, fill_px * 1.008)
-            tp_dist = max(tp_px - fill_px, fill_px * 0.008)
-            # RR 1:2 保証防衛SL (POC割れ または 1/2 TP幅の狭い方)
-            poc_sl = min(poc_lvl, fill_px * 0.995)
-            sl_confirm_px = max(poc_sl, fill_px - tp_dist * 0.5)
-            hard_sl_px = max(sl_confirm_px, fill_px * (1.0 - cfg.hard_sl_pct))
-        elif strategy == "val_break":
-            tp_cand = va_l - (va_u - va_l) * tr_ratio
-            tp_px = min(tp_cand, fill_px * 0.992)
-            tp_dist = max(fill_px - tp_px, fill_px * 0.008)
-            poc_sl = max(poc_lvl, fill_px * 1.005)
-            sl_confirm_px = min(poc_sl, fill_px + tp_dist * 0.5)
-            hard_sl_px = min(sl_confirm_px, fill_px * (1.0 + cfg.hard_sl_pct))
-        elif strategy == "rsima":
-            # RSI過熱利確は bars>=filled_bar+1 の確定足で判定。急変防止用に RR1:2 相当 TP上限も併用
-            sl_confirm_px = min(swing_lo, fill_px * (1.0 - cfg.min_sl_pct))
-            hard_sl_px = fill_px * (1.0 - cfg.hard_sl_pct)
-            l_cp = float(params["l_cp"])
-        else:  # rsima_short
-            sl_confirm_px = max(swing_hi, fill_px * (1.0 + cfg.min_sl_pct))
-            hard_sl_px = fill_px * (1.0 + cfg.hard_sl_pct)
-            s_cp = float(params["s_cp"])
-
         exit_bar = -1
         exit_px = 0.0
         exit_reason = ""
         exit_ts = 0
 
         max_hold_bars_5m = max(1, cfg.max_hold_minutes // 5)
-        timeout_bars_5m = max(1, cfg.timeout_minutes // 5)
-        k_limit = min(valid_5m_end, filled_bar + max_hold_bars_5m + 1)
+        k_limit = min(valid_5m_end, filled_bar + max_hold_bars_5m)
+        req_reg = "SELL" if side == "short" else "BUY"
 
         for k in range(filled_bar, k_limit):
             is_fill_bar = (k == filled_bar)
-            # 1. 保守的: ハードSL (またはブレイクアウトPOC/RRストップ) を利確より常に先行判定
-            if side == "long":
-                if l5[k] <= hard_sl_px:
-                    exit_bar = k
-                    exit_px = hard_sl_px
-                    exit_reason = "HARD_SL" if not is_brk else "POC_RR_SL"
-                    exit_ts = int(ts5[k]) + 300
-                    break
-            else:
-                if h5[k] >= hard_sl_px:
-                    exit_bar = k
-                    exit_px = hard_sl_px
-                    exit_reason = "HARD_SL" if not is_brk else "POC_RR_SL"
-                    exit_ts = int(ts5[k]) + 300
-                    break
+            cur_5m_close_utc = int(ts5[k]) + 300
+            tf_k = int(tf_at_5m_close[k])
+            can_check_close_exit = (
+                (not is_fill_bar)
+                and (tf_k >= 0)
+                and (int(ts_close_tf[tf_k]) > fill_ts)
+                and (tf == "5m" or cur_5m_close_utc == int(ts_close_tf[tf_k]))
+            )
 
-            # 約定当足では未知の足内順序による偽TP利確を禁止
-            if not is_fill_bar:
-                # 2. 確定足終値スイングSL判定
-                if side == "long" and c5[k] < sl_confirm_px:
-                    exit_bar = k
-                    exit_px = float(c5[k])
-                    exit_reason = "SWING_SL_CLOSE" if not is_brk else "POC_SL_CLOSE"
-                    exit_ts = int(ts5[k]) + 300
-                    break
-                if side == "short" and c5[k] > sl_confirm_px:
-                    exit_bar = k
-                    exit_px = float(c5[k])
-                    exit_reason = "SWING_SL_CLOSE" if not is_brk else "POC_SL_CLOSE"
-                    exit_ts = int(ts5[k]) + 300
-                    break
-
-                # 3. 目標 TP / RSI 利確判定
-                if tp_px is not None:
-                    if side == "long" and h5[k] >= tp_px:
-                        exit_bar = k
-                        exit_px = tp_px
-                        exit_reason = "TARGET_TP"
-                        exit_ts = int(ts5[k]) + 300
-                        break
-                    if side == "short" and l5[k] <= tp_px:
-                        exit_bar = k
-                        exit_px = tp_px
-                        exit_reason = "TARGET_TP"
-                        exit_ts = int(ts5[k]) + 300
-                        break
+            if tf_k >= 0:
+                if is_vp_strat and mp_obj is not None:
+                    v_l, v_u, v_p = mp_obj.get_bar(tf_k)
                 else:
-                    # RSIMA 利確: 採用足確定時 (または5m終値) のRSI到達＋手数料以上含み益
-                    tf_k = int(tf_at_5m_close[k])
-                    if tf_k >= 0 and (int(ts5[k]) + 300 == int(ts_close_tf[tf_k]) or tf == "5m"):
-                        cur_rsi = float(rsi_tf[tf_k])
-                        if side == "long" and cur_rsi > l_cp and c5[k] >= fill_px * 1.0040:
-                            exit_bar = k
-                            exit_px = float(c5[k])
-                            exit_reason = "RSI_TP"
-                            exit_ts = int(ts5[k]) + 300
-                            break
-                        if side == "short" and cur_rsi < s_cp and c5[k] <= fill_px * 0.9960:
-                            exit_bar = k
-                            exit_px = float(c5[k])
-                            exit_reason = "RSI_TP"
-                            exit_ts = int(ts5[k]) + 300
-                            break
+                    v_l = float(val_tf[tf_k]) if math.isfinite(val_tf[tf_k]) and val_tf[tf_k] > 0 else fill_px
+                    v_u = float(vah_tf[tf_k]) if math.isfinite(vah_tf[tf_k]) and vah_tf[tf_k] > 0 else fill_px
+                    v_p = float(poc_tf[tf_k]) if math.isfinite(poc_tf[tf_k]) and poc_tf[tf_k] > 0 else fill_px
+                prev10_sw = float(sh10_tf[tf_k] if side == "short" else sl10_tf[tf_k])
+                cur_rsi_k = float(rsi_tf[tf_k])
+            else:
+                v_l = v_u = v_p = prev10_sw = fill_px
+                cur_rsi_k = 50.0
 
-                # 4. 動的タイムアウト撤退 (4h経過時に含み損なら微損撤退)
-                bars_held = k - filled_bar
-                if bars_held == timeout_bars_5m:
-                    in_loss = (c5[k] <= fill_px) if side == "long" else (c5[k] >= fill_px)
-                    if in_loss:
-                        exit_bar = k
-                        exit_px = float(c5[k])
-                        exit_reason = "TIMEOUT_LOSS"
-                        exit_ts = int(ts5[k]) + 300
-                        break
+            levels = compute_dynamic_exit_levels(
+                strategy=strategy,
+                avg_entry_px=fill_px,
+                val=v_l,
+                vah=v_u,
+                poc=v_p,
+                prev10_swing_px=prev10_sw,
+                target_ratio=tr_ratio,
+                eff_hard_sl_pct=cfg.hard_sl_pct,
+                min_sl_pct=cfg.min_sl_pct,
+            )
+
+            is_emerg_be = False
+            if enable_emerg_be and hourly_regime_map is not None:
+                snap_k = hourly_regime_map.get((cur_5m_close_utc // 3600) * 3600)
+                if snap_k is not None:
+                    is_emerg_be = (snap_k["overall_regime"] != req_reg)
+
+            elapsed_min_k = float(cur_5m_close_utc - fill_ts) / 60.0
+            dec = evaluate_dynamic_exit_decision(
+                strategy=strategy,
+                avg_entry_px=fill_px,
+                levels=levels,
+                is_fill_bar=is_fill_bar,
+                can_check_close_exit=can_check_close_exit,
+                is_emergency_breakeven=is_emerg_be,
+                elapsed_minutes=elapsed_min_k,
+                low_px=float(l5[k]),
+                high_px=float(h5[k]),
+                close_check_px=float(c5[k]),
+                live_px=float(c5[k]),
+                cur_rsi=cur_rsi_k,
+                rsi_exit_thresh=rsi_exit_thresh,
+                timeout_minutes=float(cfg.timeout_minutes),
+                max_hold_minutes=float(cfg.max_hold_minutes),
+                prefer_limit_fill_px=True,
+            )
+            if dec["action"] != "HOLD":
+                exit_bar = k
+                exit_px = float(dec["exit_px"])
+                exit_reason = str(dec["code"])
+                exit_ts = cur_5m_close_utc
+                break
 
         if exit_bar < 0:
             last_k = min(k_limit - 1, valid_5m_end - 1)
@@ -950,7 +1051,6 @@ def _simulate_window(
             exit_ts = int(ts5[last_k]) + 300
             exit_reason = "WINDOW_END_FLATTEN" if last_k == valid_5m_end - 1 else "MAX_HOLD_CLOSE"
 
-        # 手数料計算: 往復 0.08% (Maker 0.02% + Taker 0.06%)
         entry_fee = cfg.position_cost_usdt * cfg.fee_maker
         exit_val = qty * exit_px
         exit_fee = exit_val * cfg.fee_taker
@@ -960,8 +1060,7 @@ def _simulate_window(
             gross_pnl = (fill_px - exit_px) * qty
         net_pnl = gross_pnl - entry_fee - exit_fee
 
-        is_sl_exit = ("SL" in exit_reason) or ("TIMEOUT" in exit_reason)
-        if is_sl_exit:
+        if cooldown_sec > 0 and (("SL" in exit_reason) or ("TIMEOUT" in exit_reason)):
             cooldown_until_utc = exit_ts + cooldown_sec
         next_allowed_order_utc = exit_ts
 
@@ -1115,7 +1214,7 @@ def run_walkforward_from_lake(
         if symbols is not None:
             target_symbols = [normalize_symbol(s) for s in symbols if normalize_symbol(s) != BENCHMARK_SYMBOL]
         else:
-            target_symbols = list(FIXED_TRADABLE_SYMBOLS)
+            target_symbols = list(TRADABLE_MID_CAP_SYMBOLS)
     else:
         if allowed_strategies_override is not None:
             eval_strategies = [str(s) for s in allowed_strategies_override if str(s) in ALL_STRATEGIES]
@@ -1130,7 +1229,7 @@ def run_walkforward_from_lake(
         elif rec_syms:
             target_symbols = [normalize_symbol(s) for s in rec_syms if normalize_symbol(s) != BENCHMARK_SYMBOL]
         else:
-            target_symbols = list(FIXED_TRADABLE_SYMBOLS)
+            target_symbols = list(TRADABLE_MID_CAP_SYMBOLS)
         target_symbols = [s for s in target_symbols if s not in cutoff_excluded]
 
     cutoff_rec_syms = regime_info.get("recommended_symbols")
@@ -1384,3 +1483,640 @@ def run_walkforward_from_lake(
         "pit_active": pit_active,
         "hourly_regime_count": len(hourly_regime_map) if pit_active else 0,
     }
+
+
+def _cell_rank_key_for_portfolio(c: Dict[str, Any]) -> Tuple[int, float, float, float, int, str]:
+    g = str(c.get("eval_grade", ""))
+    grade_rank = 2 if g == "QUALIFIED" else (1 if g == "PROVISIONAL" else (0 if g == "REJECTED_EV" else -1))
+    return (
+        grade_rank,
+        round(float(c.get("eval_ev", 0.0) or 0.0), 8),
+        round(float(c.get("eval_pf", 0.0) or 0.0), 6),
+        round(float(c.get("eval_net_pnl", 0.0) or 0.0), 6),
+        int(c.get("eval_trades", 0) or 0),
+        f"{c.get('symbol', '')}|{c.get('strategy', '')}|{c.get('timeframe', '')}",
+    )
+
+
+def _is_portfolio_cell_qualified(c: Optional[Dict[str, Any]]) -> bool:
+    if not c:
+        return False
+    return (
+        str(c.get("eval_grade", "")) in ("QUALIFIED", "PROVISIONAL")
+        and float(c.get("eval_ev", 0.0) or 0.0) > 0.0
+        and float(c.get("eval_net_pnl", 0.0) or 0.0) > 0.0
+    )
+
+
+def build_portfolio_params_map_from_cells(
+    cells: Sequence[Dict[str, Any]],
+    excluded_mega_caps: Sequence[str] = EXCLUDED_TRADE_MEGA_CAPS,
+) -> Tuple[List[str], Dict[str, Dict[str, Any]]]:
+    """OOS 評価済みセル集合から、実運用と同一のデュアルセッション用パラメータマップおよび監視順位を構築する。"""
+    mega_set = {normalize_symbol(str(s)) for s in excluded_mega_caps}
+    by_sym: Dict[str, List[Dict[str, Any]]] = {}
+    for c in cells:
+        sym = normalize_symbol(str(c["symbol"]))
+        if sym in mega_set:
+            continue
+        by_sym.setdefault(sym, []).append(c)
+
+    params_map: Dict[str, Dict[str, Any]] = {}
+    best_by_sym: Dict[str, Dict[str, Any]] = {}
+    ranked_syms: List[str] = []
+
+    def _to_spec(cell: Dict[str, Any], is_q: bool) -> Dict[str, Any]:
+        raw_p = json.loads(cell["params_json"])
+        tf = str(cell["timeframe"])
+        return {
+            "strategy": str(cell["strategy"]),
+            "side": str(cell["side"]),
+            "timeframe": tf,
+            "interval": {"5m": 5, "15m": 15, "1h": 60}.get(tf, 5),
+            "mp": int(raw_p.get("mp", 150)),
+            "target_ratio": float(raw_p.get("target_ratio", 0.70)),
+            "l_ep": float(raw_p.get("l_ep", 40.0)),
+            "l_cp": float(raw_p.get("l_cp", 60.0)),
+            "s_ep": float(raw_p.get("s_ep", 60.0)),
+            "s_cp": float(raw_p.get("s_cp", 40.0)),
+            "is_qualified": bool(is_q),
+            "eval_grade": str(cell["eval_grade"]),
+            "eval_ev": float(cell["eval_ev"]),
+        }
+
+    for sym, sym_cells in by_sym.items():
+        rng_cells = [c for c in sym_cells if not is_breakout_strategy(str(c["strategy"]))]
+        brk_cells = [c for c in sym_cells if is_breakout_strategy(str(c["strategy"]))]
+        best_rng = max(rng_cells, key=_cell_rank_key_for_portfolio) if rng_cells else None
+        best_brk = max(brk_cells, key=_cell_rank_key_for_portfolio) if brk_cells else None
+        best_all = max(sym_cells, key=_cell_rank_key_for_portfolio)
+
+        rng_q = _is_portfolio_cell_qualified(best_rng)
+        brk_q = _is_portfolio_cell_qualified(best_brk)
+        is_q = rng_q or brk_q
+
+        spec = _to_spec(best_all, is_q)
+        spec["is_range_qualified"] = rng_q
+        spec["is_breakout_qualified"] = brk_q
+        if best_rng is not None:
+            spec["range_params"] = _to_spec(best_rng, rng_q)
+        if best_brk is not None:
+            spec["breakout_params"] = _to_spec(best_brk, brk_q)
+        params_map[sym] = spec
+        best_by_sym[sym] = best_all
+        if is_q:
+            ranked_syms.append(sym)
+
+    ranked_syms.sort(key=lambda s: _cell_rank_key_for_portfolio(best_by_sym[s]), reverse=True)
+    return ranked_syms, params_map
+
+
+def simulate_portfolio_on_window(
+    lake: LakeStore,
+    symbol_params_map: Dict[str, Dict[str, Any]],
+    ranked_symbols: Sequence[str],
+    hourly_regime_map: Optional[Dict[int, Dict[str, Any]]],
+    win_start_utc: int,
+    win_end_utc: int,
+    cfg: WalkForwardConfig,
+) -> Dict[str, Any]:
+    """
+    実ボット (`bingx5_46_1futures_limit.py`) の全ポートフォリオ制約を 1:1 で再現する統合バックテスト:
+      - 同時保有＋待機指値上限 (`cfg.max_active_positions = 2`)
+      - セッション連動切替 (東京=`range_params`, 欧州=`breakout_params`, 米国=`best_overall`)
+      - 毎足動的 Market Profile / Swing 10 (`shift(1)`) 更新・緊急建値撤退 (`±0.20%`)・480分 `MAX_HOLD`
+      - 24時間SLクールダウンなし / 日次サーキットブレーカー (`cfg.daily_max_loss_usdt = 1.50`, 09:00 JST リセット)
+    """
+    syms = [normalize_symbol(s) for s in ranked_symbols if normalize_symbol(s) in symbol_params_map]
+    if not syms or win_end_utc <= win_start_utc:
+        empty_m = _compute_metrics([])
+        return {"metrics": empty_m, "sim_trades": [], "by_session": {}, "by_strategy": {}}
+
+    # 全選定銘柄の必要足種・特徴量・シグナル配列を一括構築 (すべて win_end_utc 以前のみ参照)
+    sym_5m: Dict[str, Dict[str, Any]] = {}
+    sym_feat: Dict[Tuple[str, str], Dict[str, Any]] = {}
+    sym_sig: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
+    all_ts_5m: set[int] = set()
+
+    for sym in syms:
+        df5 = lake.load_candles(sym, "5m", cutoff_utc=win_end_utc, start_utc=win_start_utc - max(2 * 86400, 220 * 300))
+        if df5.empty:
+            continue
+        ts5 = df5["ts_utc"].to_numpy(dtype=np.int64)
+        valid_end = int(np.searchsorted(ts5 + 300, win_end_utc, side="right"))
+        if valid_end <= 0:
+            continue
+        ts5_v = ts5[:valid_end]
+        ts_to_idx5 = {int(ts5_v[idx]): idx for idx in range(valid_end)}
+        sym_5m[sym] = {
+            "ts": ts5_v,
+            "o": df5["open"].to_numpy(dtype=np.float64)[:valid_end],
+            "h": df5["high"].to_numpy(dtype=np.float64)[:valid_end],
+            "l": df5["low"].to_numpy(dtype=np.float64)[:valid_end],
+            "c": df5["close"].to_numpy(dtype=np.float64)[:valid_end],
+            "idx_map": ts_to_idx5,
+        }
+        for t in ts5_v:
+            if win_start_utc <= int(t) < win_end_utc:
+                all_ts_5m.add(int(t))
+
+        sp = symbol_params_map[sym]
+        candidates: List[Dict[str, Any]] = [sp]
+        if "range_params" in sp:
+            candidates.append(sp["range_params"])
+        if "breakout_params" in sp:
+            candidates.append(sp["breakout_params"])
+
+        by_tf_mps: Dict[str, set[int]] = {}
+        for cand in candidates:
+            tf = str(cand.get("timeframe", "5m"))
+            by_tf_mps.setdefault(tf, set()).add(int(cand.get("mp", 150)))
+
+        df_oi = lake.load_oi_fr(sym, cutoff_utc=win_end_utc, start_utc=win_start_utc - 5 * 86400)
+        for tf, mps in by_tf_mps.items():
+            tf_sec = TIMEFRAME_SECONDS[tf]
+            df_tf = lake.load_candles(sym, tf, cutoff_utc=win_end_utc, start_utc=win_start_utc - max(2 * 86400, 220 * tf_sec))
+            if len(df_tf) < 30:
+                continue
+            df_tf = lake.attach_oi_fr_causal(df_tf, tf, df_oi, cutoff_utc=win_end_utc)
+            feat_tf = _compute_causal_features(df_tf, tf, cfg, needed_mps=sorted(mps))
+            sym_feat[(sym, tf)] = feat_tf
+
+        for cand in candidates:
+            strat = str(cand["strategy"])
+            tf = str(cand.get("timeframe", "5m"))
+            key = (sym, strat, tf)
+            if (sym, tf) in sym_feat and key not in sym_sig:
+                sym_sig[key] = _generate_signal_array(sym_feat[(sym, tf)], strat, cand, cfg)
+
+    timeline = sorted(all_ts_5m)
+    if not timeline:
+        empty_m = _compute_metrics([])
+        return {"metrics": empty_m, "sim_trades": [], "by_session": {}, "by_strategy": {}}
+
+    active_pos: Dict[str, Dict[str, Any]] = {}
+    pending_ord: Dict[str, Dict[str, Any]] = {}
+    last_signal_tf_close: Dict[Tuple[str, str, str], int] = {}
+    sim_trades: List[Dict[str, Any]] = []
+    seq_no = 0
+    enable_emerg_be = bool(getattr(cfg, "enable_emergency_breakeven", True))
+    max_pos_limit = max(1, int(getattr(cfg, "max_active_positions", 2)))
+    cb_limit = float(getattr(cfg, "daily_max_loss_usdt", 1.50))
+
+    cur_trade_day = ""
+    daily_realized_pnl = 0.0
+    cb_broken = False
+
+    def _pick_session_spec(sym_name: str, hr_jst: int) -> Optional[Dict[str, Any]]:
+        sp = symbol_params_map[sym_name]
+        if 9 <= hr_jst < 16:
+            cand = sp.get("range_params") or sp
+            if not sp.get("is_range_qualified") or is_breakout_strategy(str(cand["strategy"])):
+                return None
+            return cand
+        if 16 <= hr_jst < 22:
+            cand = sp.get("breakout_params") or sp
+            if not sp.get("is_breakout_qualified") or not is_breakout_strategy(str(cand["strategy"])):
+                return None
+            return cand
+        if not getattr(cfg, "allow_ny_session", True):
+            return None
+        if not sp.get("is_qualified"):
+            return None
+        return sp
+
+    def _session_label(hr_jst: int) -> str:
+        if 9 <= hr_jst < 16:
+            return "TOKYO"
+        if 16 <= hr_jst < 22:
+            return "LONDON"
+        return "NY"
+
+    def _latest_tf_idx(feat_tf: Dict[str, Any], close_utc: int) -> int:
+        ts_c = feat_tf["ts_close"]
+        return int(np.searchsorted(ts_c, close_utc, side="right")) - 1
+
+    for t5_open in timeline:
+        t5_close = int(t5_open) + 300
+        dt_utc = datetime.fromtimestamp(t5_close, tz=timezone.utc)
+        day_str = dt_utc.strftime("%Y-%m-%d")
+        if day_str != cur_trade_day:
+            cur_trade_day = day_str
+            daily_realized_pnl = 0.0
+            cb_broken = False
+        hr_jst = dt_utc.astimezone(JST).hour
+        sess_lbl = _session_label(hr_jst)
+        snap = hourly_regime_map.get((t5_close // 3600) * 3600) if hourly_regime_map else None
+
+        # 1. 保有前からの待機指値について、本 5m 足 [t5_open, t5_close) 内の約定判定
+        for sym in list(pending_ord.keys()):
+            po = pending_ord[sym]
+            s5 = sym_5m.get(sym)
+            if not s5 or t5_open not in s5["idx_map"]:
+                continue
+            m_idx = s5["idx_map"][t5_open]
+            o_px = float(po["order_px"])
+            hit = (float(s5["l"][m_idx]) <= o_px) if po["side"] == "long" else (float(s5["h"][m_idx]) >= o_px)
+            if hit:
+                pending_ord.pop(sym)
+                active_pos[sym] = {
+                    **po,
+                    "fill_ts": int(t5_open),
+                    "fill_px": o_px,
+                    "qty": cfg.position_cost_usdt / o_px,
+                }
+
+        # 2. 保有中ポジションの決済判定 (今約定したばかりのポジションは is_fill_bar=True 扱い)
+        for sym in list(active_pos.keys()):
+            ap = active_pos[sym]
+            s5 = sym_5m.get(sym)
+            if not s5 or t5_open not in s5["idx_map"]:
+                continue
+            m_idx = s5["idx_map"][t5_open]
+            strat = str(ap["strategy"])
+            tf = str(ap["timeframe"])
+            side = str(ap["side"])
+            fill_ts = int(ap["fill_ts"])
+            fill_px = float(ap["fill_px"])
+            is_fill_bar = (int(t5_open) == fill_ts)
+
+            feat_tf = sym_feat[(sym, tf)]
+            s_info = sym_sig[(sym, strat, tf)]
+            tf_k = _latest_tf_idx(feat_tf, t5_close)
+            can_check_close = (
+                (not is_fill_bar)
+                and (tf_k >= 0)
+                and (int(feat_tf["ts_close"][tf_k]) > fill_ts)
+                and (tf == "5m" or t5_close == int(feat_tf["ts_close"][tf_k]))
+            )
+
+            mp_obj = s_info.get("mp_obj")
+            if tf_k >= 0:
+                if mp_obj is not None and strat in ("val_poc", "vah_poc", "vah_break", "val_break"):
+                    v_l, v_u, v_p = mp_obj.get_bar(tf_k)
+                else:
+                    v_l = float(s_info["va_lower"][tf_k]) if math.isfinite(s_info["va_lower"][tf_k]) and s_info["va_lower"][tf_k] > 0 else fill_px
+                    v_u = float(s_info["va_upper"][tf_k]) if math.isfinite(s_info["va_upper"][tf_k]) and s_info["va_upper"][tf_k] > 0 else fill_px
+                    v_p = float(s_info["poc"][tf_k]) if math.isfinite(s_info["poc"][tf_k]) and s_info["poc"][tf_k] > 0 else fill_px
+                prev10_sw = float(feat_tf["swing_high_10"][tf_k] if side == "short" else feat_tf["swing_low_10"][tf_k])
+                cur_rsi_k = float(feat_tf["rsi"][tf_k])
+            else:
+                v_l = v_u = v_p = prev10_sw = fill_px
+                cur_rsi_k = 50.0
+
+            levels = compute_dynamic_exit_levels(
+                strategy=strat,
+                avg_entry_px=fill_px,
+                val=v_l,
+                vah=v_u,
+                poc=v_p,
+                prev10_swing_px=prev10_sw,
+                target_ratio=float(ap.get("target_ratio", 0.70)),
+                eff_hard_sl_pct=cfg.hard_sl_pct,
+                min_sl_pct=cfg.min_sl_pct,
+            )
+            is_emerg_be = False
+            if enable_emerg_be and snap is not None:
+                is_emerg_be = (snap["overall_regime"] != ("SELL" if side == "short" else "BUY"))
+
+            elapsed_min_k = float(t5_close - fill_ts) / 60.0
+            rsi_cp = float(ap.get("s_cp" if side == "short" else "l_cp", 40.0 if side == "short" else 60.0))
+            dec = evaluate_dynamic_exit_decision(
+                strategy=strat,
+                avg_entry_px=fill_px,
+                levels=levels,
+                is_fill_bar=is_fill_bar,
+                can_check_close_exit=can_check_close,
+                is_emergency_breakeven=is_emerg_be,
+                elapsed_minutes=elapsed_min_k,
+                low_px=float(s5["l"][m_idx]),
+                high_px=float(s5["h"][m_idx]),
+                close_check_px=float(s5["c"][m_idx]),
+                live_px=float(s5["c"][m_idx]),
+                cur_rsi=cur_rsi_k,
+                rsi_exit_thresh=rsi_cp,
+                timeout_minutes=float(cfg.timeout_minutes),
+                max_hold_minutes=float(cfg.max_hold_minutes),
+                prefer_limit_fill_px=True,
+            )
+            if dec["action"] != "HOLD":
+                exit_px = float(dec["exit_px"])
+                qty = float(ap["qty"])
+                entry_fee = cfg.position_cost_usdt * cfg.fee_maker
+                exit_fee = (qty * exit_px) * cfg.fee_taker
+                gross_pnl = ((exit_px - fill_px) * qty) if side == "long" else ((fill_px - exit_px) * qty)
+                net_pnl = gross_pnl - entry_fee - exit_fee
+                daily_realized_pnl += net_pnl
+                if cb_limit > 0 and daily_realized_pnl <= -cb_limit:
+                    cb_broken = True
+
+                seq_no += 1
+                sim_trades.append({
+                    "seq": seq_no,
+                    "window_type": "PORTFOLIO",
+                    "session_at_entry": ap.get("session_at_entry", sess_lbl),
+                    "symbol": sym,
+                    "strategy": strat,
+                    "side": side,
+                    "timeframe": tf,
+                    "signal_ts_utc": ap["signal_ts_utc"],
+                    "order_ts_utc": ap["order_ts_utc"],
+                    "order_px": round(float(ap["first_order_px"]), 8),
+                    "fill_ts_utc": fill_ts,
+                    "fill_px": round(fill_px, 8),
+                    "cancel_ts_utc": None,
+                    "cancel_reason": None,
+                    "exit_ts_utc": t5_close,
+                    "exit_px": round(exit_px, 8),
+                    "exit_reason": str(dec["code"]),
+                    "qty": qty,
+                    "pos_cost_usdt": cfg.position_cost_usdt,
+                    "gross_pnl": gross_pnl,
+                    "entry_fee_usdt": entry_fee,
+                    "exit_fee_usdt": exit_fee,
+                    "net_pnl": net_pnl,
+                    "ext_pct": ap.get("ext_pct"),
+                    "ext_atr": ap.get("ext_atr"),
+                })
+                active_pos.pop(sym)
+
+        # 3. CB 判定 (含み損考慮) & 地合い中立/CB時の待機指値全キャンセル
+        unrealized_now = 0.0
+        for sym, ap in active_pos.items():
+            s5 = sym_5m.get(sym)
+            if s5 and t5_open in s5["idx_map"]:
+                c_now = float(s5["c"][s5["idx_map"][t5_open]])
+                qty = float(ap["qty"])
+                unrealized_now += ((c_now - ap["fill_px"]) * qty) if ap["side"] == "long" else ((ap["fill_px"] - c_now) * qty)
+        cb_active_now = cb_broken or (cb_limit > 0 and (daily_realized_pnl + min(0.0, unrealized_now)) <= -cb_limit)
+        neutral_stop = (snap is not None and snap["overall_regime"] == "NEUTRAL" and not snap["allowed_strategies"])
+
+        if cb_active_now or neutral_stop:
+            for sym in list(pending_ord.keys()):
+                po = pending_ord.pop(sym)
+                seq_no += 1
+                sim_trades.append({
+                    "seq": seq_no, "window_type": "PORTFOLIO", "symbol": sym, "strategy": po["strategy"],
+                    "side": po["side"], "timeframe": po["timeframe"], "signal_ts_utc": po["signal_ts_utc"],
+                    "order_ts_utc": po["order_ts_utc"], "order_px": round(float(po["first_order_px"]), 8),
+                    "fill_ts_utc": None, "fill_px": None, "cancel_ts_utc": t5_close,
+                    "cancel_reason": "CANCEL_CB" if cb_active_now else "CANCEL_NEUTRAL",
+                    "exit_ts_utc": None, "exit_px": None, "exit_reason": None,
+                    "qty": cfg.position_cost_usdt / float(po["first_order_px"]),
+                    "pos_cost_usdt": cfg.position_cost_usdt, "gross_pnl": 0.0, "entry_fee_usdt": 0.0,
+                    "exit_fee_usdt": 0.0, "net_pnl": 0.0, "ext_pct": po.get("ext_pct"), "ext_atr": po.get("ext_atr"),
+                })
+            continue
+
+        # 4. 各候補銘柄の 待機指値更新 / 新規エントリー配置 (`t5_close` 確定後、次足 `[t5_close, t5_close+300)` 用)
+        if t5_close >= win_end_utc:
+            continue
+
+        for sym in syms:
+            if sym in active_pos:
+                continue
+            cand = _pick_session_spec(sym, hr_jst)
+            strat_e = str(cand["strategy"]) if cand else ""
+            tf_e = str(cand["timeframe"]) if cand else ""
+
+            valid_reg_sym = (
+                cand is not None
+                and (snap is None or (strat_e in snap["allowed_strategies_set"] and sym not in snap.get("excluded_symbols_set", frozenset())))
+            )
+
+            if sym in pending_ord:
+                po = pending_ord[sym]
+                same_spec = valid_reg_sym and (po["strategy"] == strat_e and po["timeframe"] == tf_e and po["side"] == strategy_side(strat_e))
+                max_chase = 3 if po["timeframe"] == "5m" else 1
+                po["chase_used"] += 1
+                keep_alive = False
+                if same_spec and po["chase_used"] < max_chase and (sym, strat_e, tf_e) in sym_sig:
+                    feat_tf = sym_feat[(sym, tf_e)]
+                    tf_k = _latest_tf_idx(feat_tf, t5_close)
+                    if tf_k >= 0 and sym_sig[(sym, strat_e, tf_e)]["sig"][tf_k]:
+                        s5 = sym_5m.get(sym)
+                        if s5 and t5_open in s5["idx_map"]:
+                            ref_c = float(s5["c"][s5["idx_map"][t5_open]])
+                            po["order_px"] = ref_c * (1.0 - cfg.fee_maker if po["side"] == "long" else 1.0 + cfg.fee_maker)
+                            keep_alive = True
+                if not keep_alive:
+                    pending_ord.pop(sym)
+                    seq_no += 1
+                    sim_trades.append({
+                        "seq": seq_no, "window_type": "PORTFOLIO", "symbol": sym, "strategy": po["strategy"],
+                        "side": po["side"], "timeframe": po["timeframe"], "signal_ts_utc": po["signal_ts_utc"],
+                        "order_ts_utc": po["order_ts_utc"], "order_px": round(float(po["first_order_px"]), 8),
+                        "fill_ts_utc": None, "fill_px": None, "cancel_ts_utc": t5_close,
+                        "cancel_reason": "CANCEL_SIGNAL_END",
+                        "exit_ts_utc": None, "exit_px": None, "exit_reason": None,
+                        "qty": cfg.position_cost_usdt / float(po["first_order_px"]),
+                        "pos_cost_usdt": cfg.position_cost_usdt, "gross_pnl": 0.0, "entry_fee_usdt": 0.0,
+                        "exit_fee_usdt": 0.0, "net_pnl": 0.0, "ext_pct": po.get("ext_pct"), "ext_atr": po.get("ext_atr"),
+                    })
+                continue
+
+            if not valid_reg_sym:
+                continue
+            if (len(active_pos) + len(pending_ord)) >= max_pos_limit:
+                continue
+            if (sym, strat_e, tf_e) not in sym_sig:
+                continue
+
+            feat_tf = sym_feat[(sym, tf_e)]
+            s_info = sym_sig[(sym, strat_e, tf_e)]
+            tf_k = _latest_tf_idx(feat_tf, t5_close)
+            if tf_k < 0 or not s_info["sig"][tf_k]:
+                continue
+            tf_close_ts = int(feat_tf["ts_close"][tf_k])
+            if last_signal_tf_close.get((sym, strat_e, tf_e)) == tf_close_ts:
+                continue
+
+            last_signal_tf_close[(sym, strat_e, tf_e)] = tf_close_ts
+            side_e = strategy_side(strat_e)
+            s5 = sym_5m.get(sym)
+            sig_px = float(s5["c"][s5["idx_map"][t5_open]]) if (s5 and t5_open in s5["idx_map"]) else float(feat_tf["close"][tf_k])
+            ord_px = sig_px * (1.0 - cfg.fee_maker if side_e == "long" else 1.0 + cfg.fee_maker)
+            atr_val_e = float(feat_tf["atr_14"][tf_k]) if feat_tf["atr_14"][tf_k] > 0 else (sig_px * 0.005)
+            mp_obj_e = s_info.get("mp_obj")
+            if mp_obj_e is not None and strat_e in ("val_poc", "vah_poc", "vah_break", "val_break"):
+                va_l_e, va_u_e, _ = mp_obj_e.get_bar(tf_k)
+            else:
+                va_u_e = float(s_info["va_upper"][tf_k]) if math.isfinite(s_info["va_upper"][tf_k]) and s_info["va_upper"][tf_k] > 0 else sig_px
+                va_l_e = float(s_info["va_lower"][tf_k]) if math.isfinite(s_info["va_lower"][tf_k]) and s_info["va_lower"][tf_k] > 0 else sig_px
+            rh_e = float(feat_tf["range_high_24"][tf_k]) if math.isfinite(feat_tf["range_high_24"][tf_k]) and feat_tf["range_high_24"][tf_k] > 0 else sig_px
+            rl_e = float(feat_tf["range_low_24"][tf_k]) if math.isfinite(feat_tf["range_low_24"][tf_k]) and feat_tf["range_low_24"][tf_k] > 0 else sig_px
+            is_brk_e = is_breakout_strategy(strat_e)
+            if side_e == "long":
+                ref_base_e = va_u_e if is_brk_e else rl_e
+                ext_pct_e = ((sig_px - ref_base_e) / ref_base_e * 100.0) if ref_base_e > 0 else 0.0
+                ext_atr_e = (sig_px - ref_base_e) / atr_val_e if atr_val_e > 0 else 0.0
+            else:
+                ref_base_e = va_l_e if is_brk_e else rh_e
+                ext_pct_e = ((ref_base_e - sig_px) / ref_base_e * 100.0) if ref_base_e > 0 else 0.0
+                ext_atr_e = (ref_base_e - sig_px) / atr_val_e if atr_val_e > 0 else 0.0
+            pending_ord[sym] = {
+                "symbol": sym,
+                "strategy": strat_e,
+                "side": side_e,
+                "timeframe": tf_e,
+                "target_ratio": float(cand.get("target_ratio", 0.70)),
+                "l_cp": float(cand.get("l_cp", 60.0)),
+                "s_cp": float(cand.get("s_cp", 40.0)),
+                "order_px": ord_px,
+                "first_order_px": ord_px,
+                "order_ts_utc": t5_close,
+                "signal_ts_utc": int(feat_tf["ts_open"][tf_k]),
+                "chase_used": 0,
+                "session_at_entry": sess_lbl,
+                "ext_pct": round(ext_pct_e, 4),
+                "ext_atr": round(ext_atr_e, 4),
+            }
+
+    # 窓終了時に未決済ポジションをクローズ
+    for sym, ap in list(active_pos.items()):
+        s5 = sym_5m.get(sym)
+        last_px = float(s5["c"][-1]) if (s5 and len(s5["c"]) > 0) else float(ap["fill_px"])
+        qty = float(ap["qty"])
+        side = str(ap["side"])
+        entry_fee = cfg.position_cost_usdt * cfg.fee_maker
+        exit_fee = (qty * last_px) * cfg.fee_taker
+        gross_pnl = ((last_px - ap["fill_px"]) * qty) if side == "long" else ((ap["fill_px"] - last_px) * qty)
+        net_pnl = gross_pnl - entry_fee - exit_fee
+        seq_no += 1
+        sim_trades.append({
+            "seq": seq_no, "window_type": "PORTFOLIO", "session_at_entry": ap.get("session_at_entry", ""),
+            "symbol": sym, "strategy": ap["strategy"], "side": side, "timeframe": ap["timeframe"],
+            "signal_ts_utc": ap["signal_ts_utc"], "order_ts_utc": ap["order_ts_utc"],
+            "order_px": round(float(ap["first_order_px"]), 8), "fill_ts_utc": ap["fill_ts"],
+            "fill_px": round(float(ap["fill_px"]), 8), "cancel_ts_utc": None, "cancel_reason": None,
+            "exit_ts_utc": win_end_utc, "exit_px": round(last_px, 8), "exit_reason": "WINDOW_END_FLATTEN",
+            "qty": qty, "pos_cost_usdt": cfg.position_cost_usdt, "gross_pnl": gross_pnl,
+            "entry_fee_usdt": entry_fee, "exit_fee_usdt": exit_fee, "net_pnl": net_pnl,
+            "ext_pct": ap.get("ext_pct"), "ext_atr": ap.get("ext_atr"),
+        })
+
+    metrics = _compute_metrics(sim_trades)
+    filled = [t for t in sim_trades if t.get("fill_ts_utc") is not None]
+    by_session: Dict[str, Dict[str, Any]] = {}
+    by_strategy: Dict[str, Dict[str, Any]] = {}
+    for s_key in ("TOKYO", "LONDON", "NY"):
+        sub = [t for t in filled if t.get("session_at_entry") == s_key]
+        by_session[s_key] = {"trades": len(sub), "net_pnl": round(sum(float(t["net_pnl"]) for t in sub), 4)}
+    for st_key in ALL_STRATEGIES:
+        sub = [t for t in filled if t.get("strategy") == st_key]
+        if sub:
+            by_strategy[st_key] = {"trades": len(sub), "net_pnl": round(sum(float(t["net_pnl"]) for t in sub), 4)}
+
+    return {
+        "metrics": metrics,
+        "sim_trades": sim_trades,
+        "by_session": by_session,
+        "by_strategy": by_strategy,
+    }
+
+
+def run_portfolio_backtest_from_lake(
+    lake: LakeStore,
+    data_cutoff_utc: Optional[int] = None,
+    forward_days: int = 30,
+    rebalance_days: int = 7,
+    cfg: Optional[WalkForwardConfig] = None,
+) -> Dict[str, Any]:
+    """
+    ローリング・ウォークフォワードで「各時点の因果 OOS 選定 → 次期間 (`rebalance_days`) の実運用ポートフォリオ再現」を
+    連鎖実行し、同時保有2枠・日次CB-$1.50・セッション切替・24hクールダウンなしの統合実力値を算出する。
+    """
+    cfg = cfg or WalkForwardConfig()
+    cutoff = int(data_cutoff_utc) if data_cutoff_utc is not None else utc_now_sec()
+    total_start = cutoff - (max(1, int(forward_days)) * 86400)
+    step_sec = max(1, int(rebalance_days)) * 86400
+
+    hourly_regime_map, pit_active = compute_hourly_regime_series_from_lake(
+        lake=lake,
+        start_utc=total_start,
+        end_utc=cutoff,
+        use_point_in_time_regime=cfg.use_point_in_time_regime,
+        gil_yield_sec=cfg.gil_yield_sec,
+    )
+
+    all_trades: List[Dict[str, Any]] = []
+    chunks: List[Dict[str, Any]] = []
+    cur_t = total_start
+
+    while cur_t < cutoff:
+        chunk_end = min(cutoff, cur_t + step_sec)
+        wf_res = run_walkforward_from_lake(
+            lake=lake,
+            data_cutoff_utc=cur_t,
+            cfg=cfg,
+            persist=False,
+        )
+        ranked_syms, sym_map = build_portfolio_params_map_from_cells(wf_res["cells"])
+        p_res = simulate_portfolio_on_window(
+            lake=lake,
+            symbol_params_map=sym_map,
+            ranked_symbols=ranked_syms,
+            hourly_regime_map=hourly_regime_map if pit_active else None,
+            win_start_utc=cur_t,
+            win_end_utc=chunk_end,
+            cfg=cfg,
+        )
+        all_trades.extend(p_res["sim_trades"])
+        chunks.append({
+            "start_iso": sec_to_iso(cur_t),
+            "end_iso": sec_to_iso(chunk_end),
+            "selected_symbols": ranked_syms,
+            "trades": p_res["metrics"]["trades"],
+            "net_pnl": round(p_res["metrics"]["net_pnl"], 4),
+        })
+        cur_t = chunk_end
+
+    agg = _compute_metrics(all_trades)
+    filled = [t for t in all_trades if t.get("fill_ts_utc") is not None]
+    by_session = {
+        s_k: {
+            "trades": sum(1 for t in filled if t.get("session_at_entry") == s_k),
+            "net_pnl": round(sum(float(t["net_pnl"]) for t in filled if t.get("session_at_entry") == s_k), 4),
+        }
+        for s_k in ("TOKYO", "LONDON", "NY")
+    }
+    by_strategy = {
+        st_k: {
+            "trades": sum(1 for t in filled if t.get("strategy") == st_k),
+            "net_pnl": round(sum(float(t["net_pnl"]) for t in filled if t.get("strategy") == st_k), 4),
+        }
+        for st_k in ALL_STRATEGIES
+        if any(t.get("strategy") == st_k for t in filled)
+    }
+    return {
+        "metrics": agg,
+        "sim_trades": all_trades,
+        "chunks": chunks,
+        "by_session": by_session,
+        "by_strategy": by_strategy,
+    }
+
+
+if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(description="BingX Data Lake Walk-Forward / Portfolio Backtest")
+    parser.add_argument("--portfolio", action="store_true", help="同時2ポジ・24h再現ポートフォリオBTを実行")
+    parser.add_argument("--days", type=int, default=30, help="ポートフォリオ前方検証日数 (既定: 30日)")
+    parser.add_argument("--rebalance-days", type=int, default=7, help="再選定周期日数 (既定: 7日)")
+    args = parser.parse_args()
+
+    lake_inst = LakeStore()
+    if args.portfolio:
+        res_p = run_portfolio_backtest_from_lake(lake_inst, forward_days=args.days, rebalance_days=args.rebalance_days)
+        m_p = res_p["metrics"]
+        print(
+            f"[Portfolio BT {args.days}d / reb={args.rebalance_days}d] "
+            f"Trades={m_p['trades']} | WR={m_p['win_rate']:.1f}% | Net=${m_p['net_pnl']:+.2f} | "
+            f"Fees=${m_p['total_fees']:.2f} | EV=${m_p['ev']:+.4f} | PF={m_p['pf']:.2f} | MaxDD=${m_p['max_dd']:.2f}"
+        )
+        print("  By Session :", res_p["by_session"])
+        print("  By Strategy:", res_p["by_strategy"])
+    else:
+        res_w = run_walkforward_from_lake(lake_inst, persist=False)
+        print(res_w["selection"]["reason_text"])

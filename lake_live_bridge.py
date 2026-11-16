@@ -31,7 +31,7 @@ from lake_backtest_engine import (
     strategy_side,
 )
 from lake_store import TIMEFRAME_SECONDS, LakeStore, sec_to_iso, utc_now_sec
-from symbol_universe import normalize_symbol
+from symbol_universe import EXCLUDED_TRADE_MEGA_CAPS, normalize_symbol
 
 JST = timezone(timedelta(hours=9))
 
@@ -224,7 +224,7 @@ def run_lake_screening_for_bot(
     db_path: Optional[Path] = None,
     wf_cfg: Optional[WalkForwardConfig] = None,
     max_selected_symbols: int = 20,
-    excluded_mega_caps: Sequence[str] = ("SOL-USDT", "DOGE-USDT", "XRP-USDT"),
+    excluded_mega_caps: Sequence[str] = EXCLUDED_TRADE_MEGA_CAPS,
 ) -> Dict[str, Any]:
     """
     `bingx5_46_1futures_limit.py` Phase A/C 毎時スクリーニング用のレイク勝者選定エントリポイント。

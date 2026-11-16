@@ -35,6 +35,10 @@ def reproduce_run(
     raw_cfg = json.loads(run_rec["config_json"])
     if "use_point_in_time_regime" not in raw_cfg:
         raw_cfg["use_point_in_time_regime"] = False
+    raw_cfg.setdefault("allow_ny_session", False)
+    raw_cfg.setdefault("enable_emergency_breakeven", False)
+    raw_cfg.setdefault("mp_step", 24)
+    raw_cfg.setdefault("sl_cooldown_hours", 24.0)
     cfg = WalkForwardConfig.from_dict(raw_cfg)
     allowed_strategies = json.loads(run_rec["allowed_strategies_json"])
     cutoff_utc = int(run_rec["data_cutoff_utc"])

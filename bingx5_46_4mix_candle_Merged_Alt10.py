@@ -394,14 +394,14 @@ async def main() -> None:
         state_label_map = {"BUY": "買い", "SELL": "売り", "NEUTRAL": "中立"}
         regime_summary_lines = [
             "📊 **【新・全体地合い判定サマリー（14日 / 7日 / 2日）】**",
-            "※判定基準: アルト20銘柄(各1票) + BTC-USDT(2票) = 計22票 / 11票以上で判定"
+            "※判定基準: アルト21銘柄(各1票) + BTC-USDT(2票) = 計23票 / 12票以上で判定"
         ]
         for win_label in ["14d", "7d", "2d"]:
             p_info = period_res.get(win_label, {})
             p_state = p_info.get("state", "NEUTRAL")
             b_votes = p_info.get("buy_votes", 0)
             s_votes = p_info.get("sell_votes", 0)
-            tot_v = p_info.get("total_votes", 22)
+            tot_v = p_info.get("total_votes", 23)
             s_label = state_label_map.get(p_state, p_state)
             icon = "🟢" if p_state == "BUY" else ("🔴" if p_state == "SELL" else "⚪")
             win_label_jp = {"14d": "14日分", "7d": "7日分", "2d": "2日分"}.get(win_label, win_label)

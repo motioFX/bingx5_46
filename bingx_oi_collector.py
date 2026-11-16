@@ -292,11 +292,11 @@ def _fetch_okx_historical_oi_fr(symbol: str, days: int = 35) -> pd.DataFrame:
         df_oi = pd.DataFrame(oi_rows, columns=["timestamp", "openInterest"]).drop_duplicates("timestamp").sort_values("timestamp").reset_index(drop=True)
         if fr_rows:
             df_fr = pd.DataFrame(fr_rows, columns=["timestamp", "fundingRate"]).drop_duplicates("timestamp").sort_values("timestamp").reset_index(drop=True)
-            df_merged = pd.merge_asof(df_oi, df_fr, on="timestamp", direction="backward")
-            df_merged["fundingRate"] = df_merged["fundingRate"].ffill().bfill().fillna(0.0001)
+            df_merged = pd.merge_asof(df_oi, df_fr, on="timestamp", direction="backward", tolerance=12 * 3600 * 1000)
+            df_merged["fundingRate"] = pd.to_numeric(df_merged["fundingRate"], errors="coerce")
         else:
             df_merged = df_oi
-            df_merged["fundingRate"] = 0.0001
+            df_merged["fundingRate"] = np.nan
         return df_merged
 
     # OKX に上場がない銘柄 (HYPEなど) のみ Bybit フォールバック試行
@@ -354,11 +354,11 @@ def _fetch_bybit_historical_oi_fr_fallback(symbol: str, days: int = 35) -> pd.Da
 
     if fr_rows:
         df_fr = pd.DataFrame(fr_rows, columns=["timestamp", "fundingRate"]).drop_duplicates("timestamp").sort_values("timestamp").reset_index(drop=True)
-        df_merged = pd.merge_asof(df_oi, df_fr, on="timestamp", direction="backward")
-        df_merged["fundingRate"] = df_merged["fundingRate"].ffill().bfill().fillna(0.0001)
+        df_merged = pd.merge_asof(df_oi, df_fr, on="timestamp", direction="backward", tolerance=12 * 3600 * 1000)
+        df_merged["fundingRate"] = pd.to_numeric(df_merged["fundingRate"], errors="coerce")
     else:
         df_merged = df_oi
-        df_merged["fundingRate"] = 0.0001
+        df_merged["fundingRate"] = np.nan
 
     return df_merged
 
@@ -438,7 +438,7 @@ def sync_oi_fr_history_for_symbol(symbol: str, target_days: int = 35) -> pd.Data
         return pd.DataFrame()
 
     df_out = df_bingx.sort_values("timestamp").reset_index(drop=True)
-    # 4時間前 (timestamp - 4h) の OI と比較して oi_chg_4h (%) を正確に算出 (時間間隔が不均一でも正確に4時間前を参照)
+    # 4時間前 (timestamp - 4h) の OI と比較して oi_chg_4h (%) を因果算出 (許容7200秒、欠損時はゼロ埋めせず NaN を維持)
     df_ref = df_out[["timestamp", "openInterest"]].copy().rename(columns={"timestamp": "ref_ts", "openInterest": "oi_4h_ago"})
     df_out["target_4h_ts"] = df_out["timestamp"] - (4 * 3600 * 1000)
     df_merged_4h = pd.merge_asof(
@@ -446,75 +446,137 @@ def sync_oi_fr_history_for_symbol(symbol: str, target_days: int = 35) -> pd.Data
         df_ref.sort_values("ref_ts"),
         left_on="target_4h_ts",
         right_on="ref_ts",
-        direction="backward"
+        direction="backward",
+        tolerance=7200 * 1000,
     ).sort_values("timestamp").reset_index(drop=True)
 
-    oi_now = df_merged_4h["openInterest"].astype(float)
-    oi_prev = df_merged_4h["oi_4h_ago"].astype(float)
-    df_merged_4h["oi_chg_4h"] = np.where(oi_prev > 0, (oi_now - oi_prev) / oi_prev * 100.0, 0.0)
-    df_merged_4h["fundingRate"] = pd.to_numeric(df_merged_4h["fundingRate"], errors="coerce").fillna(0.0001)
+    oi_now = pd.to_numeric(df_merged_4h["openInterest"], errors="coerce")
+    oi_prev = pd.to_numeric(df_merged_4h["oi_4h_ago"], errors="coerce")
+    df_merged_4h["oi_chg_4h"] = np.where((oi_prev > 0) & oi_now.notna(), (oi_now - oi_prev) / oi_prev * 100.0, np.nan)
+    df_merged_4h["fundingRate"] = pd.to_numeric(df_merged_4h["fundingRate"], errors="coerce")
 
     res_df = df_merged_4h[["timestamp", "openInterest", "oi_chg_4h", "fundingRate"]].copy()
     _OI_FR_MEM_CACHE[clean_sym] = (now_sec, res_df)
     return res_df
 
 
-def enrich_candles_with_oi_fr(df_candles: pd.DataFrame, symbol: str, auto_sync: bool = True) -> pd.DataFrame:
+def _infer_timeframe_sec(df_candles: pd.DataFrame, timeframe: Optional[str] = None) -> int:
+    tf_map = {"5m": 300, "15m": 900, "30m": 1800, "1h": 3600, "4h": 14400}
+    if timeframe and str(timeframe).lower() in tf_map:
+        return tf_map[str(timeframe).lower()]
+    if "timestamp" in df_candles.columns and len(df_candles) >= 2:
+        try:
+            ts_col = df_candles["timestamp"]
+            if pd.api.types.is_numeric_dtype(ts_col):
+                diffs = pd.Series(ts_col.astype(np.int64)).diff().dropna()
+                med = float(diffs.median()) if not diffs.empty else 300_000.0
+                sec = int(round(med / 1000.0)) if med > 1e5 else int(round(med))
+            else:
+                ts_s = pd.to_datetime(ts_col, utc=True)
+                sec = int(round(ts_s.diff().dt.total_seconds().dropna().median()))
+            if sec in (300, 900, 1800, 3600, 14400):
+                return sec
+        except Exception:
+            pass
+    return 300
+
+
+def enrich_candles_with_oi_fr(
+    df_candles: pd.DataFrame,
+    symbol: str,
+    auto_sync: bool = True,
+    timeframe: Optional[str] = None,
+) -> pd.DataFrame:
     """
-    任意のローソク足 DataFrame (5m, 15m, 30m, 60m) に timestamp 基準 (merge_asof backward) で
-    openInterest, oi_chg_4h (%), fundingRate (8h率) を結合して返す。
+    任意のローソク足 DataFrame (5m, 15m, 30m, 60m) に対し、`LakeStore.attach_oi_fr_causal` と完全同一の
+    足確定時刻 (`bar_close_ms`) 基準・許容 7200 秒で `openInterest`, `oi_chg_4h` (%), `fundingRate` を因果結合する。
+    欠損時はゼロ埋めせず `np.nan` を保持し、`when_available` ポリシーと一致させる。
     """
     if df_candles is None or df_candles.empty or not symbol:
         return df_candles
-    if "oi_chg_4h" in df_candles.columns and "fundingRate" in df_candles.columns:
+    if "oi_chg_4h" in df_candles.columns and ("fundingRate" in df_candles.columns or "funding_rate" in df_candles.columns):
         return df_candles
 
     try:
         clean_sym = normalize_sym(symbol)
         cached = _OI_FR_MEM_CACHE.get(clean_sym)
-        if not auto_sync and cached is not None and not cached[1].empty:
-            df_oifr = cached[1]
+        if not auto_sync:
+            if cached is not None and not cached[1].empty:
+                df_oifr = cached[1]
+            else:
+                df_local = load_bingx_oi_history(clean_sym)
+                if not df_local.empty:
+                    df_oifr = df_local[["timestamp", "openInterest", "fundingRate"]].copy()
+                else:
+                    df_oifr = pd.DataFrame()
         else:
             df_oifr = sync_oi_fr_history_for_symbol(symbol, target_days=35)
+
         if df_oifr.empty:
             out = df_candles.copy()
-            out["oi_chg_4h"] = 0.0
-            out["fundingRate"] = 0.0001
+            out["openInterest"] = np.nan
+            out["oi_chg_4h"] = np.nan
+            out["fundingRate"] = np.nan
             return out
 
+        tf_sec = _infer_timeframe_sec(df_candles, timeframe=timeframe)
         out = df_candles.copy()
         ts_col = out["timestamp"]
         if pd.api.types.is_numeric_dtype(ts_col):
-            out["_ts_ms"] = ts_col.astype(np.int64)
+            raw_num = ts_col.astype(np.int64)
+            out["_ts_ms"] = np.where(raw_num < 10**12, raw_num * 1000, raw_num)
         else:
             out["_ts_ms"] = pd.to_datetime(ts_col, utc=True).astype("int64") // 10**6
+        out["_bar_close_ms"] = out["_ts_ms"] + (tf_sec * 1000)
 
-        out = out.sort_values("_ts_ms").reset_index(drop=True)
-        oifr_sorted = df_oifr.sort_values("timestamp").reset_index(drop=True)
+        oifr_sorted = (
+            df_oifr[["timestamp", "openInterest", "fundingRate"]]
+            .drop_duplicates("timestamp", keep="last")
+            .sort_values("timestamp")
+            .reset_index(drop=True)
+        )
 
+        # 足確定時刻以前の最新 OI / FR (2時間以内のスナップショットのみ有効)
         merged = pd.merge_asof(
-            out,
+            out.sort_values("_bar_close_ms"),
             oifr_sorted,
-            left_on="_ts_ms",
+            left_on="_bar_close_ms",
             right_on="timestamp",
             direction="backward",
-            suffixes=("", "_oifr")
+            tolerance=7200 * 1000,
+            suffixes=("", "_oifr"),
         )
-        merged["oi_chg_4h"] = pd.to_numeric(merged["oi_chg_4h"], errors="coerce").fillna(0.0)
-        merged["fundingRate"] = pd.to_numeric(merged["fundingRate"], errors="coerce").fillna(0.0001)
-        if "openInterest" in merged.columns:
-            merged["openInterest"] = pd.to_numeric(merged["openInterest"], errors="coerce").ffill().fillna(0.0)
+        merged["_target_prev_ms"] = merged["_bar_close_ms"] - (4 * 3600 * 1000)
+        oi_prev_df = oifr_sorted[["timestamp", "openInterest"]].rename(
+            columns={"timestamp": "_oi_prev_ts", "openInterest": "_oi_4h_ago"}
+        )
+        merged = pd.merge_asof(
+            merged.sort_values("_target_prev_ms"),
+            oi_prev_df.sort_values("_oi_prev_ts"),
+            left_on="_target_prev_ms",
+            right_on="_oi_prev_ts",
+            direction="backward",
+            tolerance=7200 * 1000,
+        ).sort_values("_ts_ms").reset_index(drop=True)
 
-        drop_cols = [c for c in ("_ts_ms", "timestamp_oifr") if c in merged.columns]
+        oi_now = pd.to_numeric(merged["openInterest"], errors="coerce")
+        oi_ago = pd.to_numeric(merged["_oi_4h_ago"], errors="coerce")
+        merged["openInterest"] = oi_now
+        merged["oi_chg_4h"] = np.where((oi_ago > 0) & oi_now.notna(), (oi_now - oi_ago) / oi_ago * 100.0, np.nan)
+        merged["fundingRate"] = pd.to_numeric(merged["fundingRate"], errors="coerce")
+
+        drop_cols = [c for c in ("_ts_ms", "_bar_close_ms", "timestamp_oifr", "_target_prev_ms", "_oi_prev_ts", "_oi_4h_ago") if c in merged.columns]
         if drop_cols:
             merged = merged.drop(columns=drop_cols)
         return merged
     except Exception:
         out = df_candles.copy()
+        if "openInterest" not in out.columns:
+            out["openInterest"] = np.nan
         if "oi_chg_4h" not in out.columns:
-            out["oi_chg_4h"] = 0.0
+            out["oi_chg_4h"] = np.nan
         if "fundingRate" not in out.columns:
-            out["fundingRate"] = 0.0001
+            out["fundingRate"] = np.nan
         return out
 
 
