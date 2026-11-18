@@ -6,10 +6,13 @@ import json
 import sys
 import tempfile
 import unittest
+import warnings
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
 
+import matplotlib.image as mpimg
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
@@ -166,6 +169,7 @@ class TestDaily14dReportAndSideAwarePortfolio(unittest.TestCase):
 
             trades_json = tmp_path / "real_trades_history.json"
             state_json = tmp_path / "last_daily_14d_report_sent.json"
+            chart_png = tmp_path / "daily_14d_bt_vs_live.png"
             sample_real = [
                 {
                     "timestamp": "2026-11-17T05:11:53.151433+00:00",
@@ -205,6 +209,7 @@ class TestDaily14dReportAndSideAwarePortfolio(unittest.TestCase):
                 mock.patch.object(rtt, "DATA_DIR", tmp_path),
                 mock.patch.object(rtt, "TRADES_FILE", trades_json),
                 mock.patch.object(rtt, "DAILY_14D_REPORT_STATE_FILE", state_json),
+                mock.patch.object(rtt, "DAILY_14D_CHART_FILE", chart_png),
                 mock.patch("bingx5_46_3logic.discord", fake_discord),
             ):
                 rep = rtt.build_daily_14d_comparison_report(
@@ -216,29 +221,92 @@ class TestDaily14dReportAndSideAwarePortfolio(unittest.TestCase):
                 self.assertLess(len(rep["report_text"]), 1900)
                 self.assertIn("11/18", rep["report_text"])
 
-                # 09:00 JST 未満は送信しない
-                self.assertFalse(
-                    rtt.check_and_send_daily_14d_report(
-                        current_balance=99994.34, db_path=db_path, now_jst=before_9_jst
-                    )
-                )
-                self.assertEqual(fake_discord.print_log.call_count, 0)
+                # 白背景チャートPNG生成とFont/mathtext警告ゼロ検証
+                with warnings.catch_warnings(record=True) as caught:
+                    warnings.simplefilter("always")
+                    out_chart = rtt.plot_daily_14d_comparison_chart(rep, output_path=chart_png)
+                font_rm_warnings = [w for w in caught if "Font 'rm'" in str(w.message)]
+                self.assertEqual(font_rm_warnings, [])
+                self.assertFalse(bool(plt.rcParams["text.parse_math"]))
+                self.assertIsNotNone(out_chart)
+                self.assertTrue(chart_png.exists())
+                self.assertGreater(chart_png.stat().st_size, 1000)
+                img = mpimg.imread(str(chart_png))
+                self.assertGreaterEqual(float(img[0, 0, 0]), 0.99)
+                self.assertGreaterEqual(float(img[0, 0, 1]), 0.99)
+                self.assertGreaterEqual(float(img[0, 0, 2]), 0.99)
 
-                # 09:00 JST 以降は1回だけ送信
+                # 起動時送信: force=True, mark_daily_sent=False なら09:00枠を消費せずテキスト+画像送信
                 self.assertTrue(
                     rtt.check_and_send_daily_14d_report(
-                        current_balance=99994.34, db_path=db_path, now_jst=now_jst
+                        current_balance=99994.34,
+                        db_path=db_path,
+                        force=True,
+                        mark_daily_sent=False,
+                        label="起動時 14日間レポート",
+                        now_jst=before_9_jst,
+                        chart_output_path=chart_png,
                     )
                 )
                 self.assertEqual(fake_discord.print_log.call_count, 1)
+                self.assertIn("起動時 14日間レポート", fake_discord.print_log.call_args[0][0])
+                self.assertEqual(fake_discord.send_file.call_count, 1)
+                self.assertEqual(Path(fake_discord.send_file.call_args[0][0]), chart_png)
+                self.assertFalse(state_json.exists())
 
-                # 同日の2回目は二重送信防止でスキップ
+                # 09:00 JST 未満 (08:55) および 09:00 台以外 (10:00) は定時送信しない
                 self.assertFalse(
                     rtt.check_and_send_daily_14d_report(
-                        current_balance=99994.34, db_path=db_path, now_jst=now_jst + timedelta(hours=1)
+                        current_balance=99994.34,
+                        db_path=db_path,
+                        exact_hour=True,
+                        now_jst=before_9_jst,
+                        chart_output_path=chart_png,
+                    )
+                )
+                self.assertFalse(
+                    rtt.check_and_send_daily_14d_report(
+                        current_balance=99994.34,
+                        db_path=db_path,
+                        exact_hour=True,
+                        now_jst=datetime(2026, 11, 19, 10, 0, 0, tzinfo=JST),
+                        chart_output_path=chart_png,
                     )
                 )
                 self.assertEqual(fake_discord.print_log.call_count, 1)
+                self.assertEqual(fake_discord.send_file.call_count, 1)
+
+                # 09:00 台 (09:05) は起動時送信とは別に1日1回送信される
+                self.assertTrue(
+                    rtt.check_and_send_daily_14d_report(
+                        current_balance=99994.34,
+                        db_path=db_path,
+                        exact_hour=True,
+                        mark_daily_sent=True,
+                        label="日次 14日間レポート",
+                        now_jst=now_jst,
+                        chart_output_path=chart_png,
+                    )
+                )
+                self.assertEqual(fake_discord.print_log.call_count, 2)
+                self.assertIn("日次 14日間レポート", fake_discord.print_log.call_args[0][0])
+                self.assertEqual(fake_discord.send_file.call_count, 2)
+                self.assertTrue(state_json.exists())
+                saved_state = json.loads(state_json.read_text(encoding="utf-8"))
+                self.assertIn("2026-11-19", saved_state)
+
+                # 同日 09:30 の2回目は二重送信防止でスキップ
+                self.assertFalse(
+                    rtt.check_and_send_daily_14d_report(
+                        current_balance=99994.34,
+                        db_path=db_path,
+                        exact_hour=True,
+                        now_jst=now_jst + timedelta(minutes=25),
+                        chart_output_path=chart_png,
+                    )
+                )
+                self.assertEqual(fake_discord.print_log.call_count, 2)
+                self.assertEqual(fake_discord.send_file.call_count, 2)
 
 
 if __name__ == "__main__":

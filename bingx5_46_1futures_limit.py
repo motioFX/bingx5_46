@@ -1985,8 +1985,10 @@ async def send_periodic_performance_report(symbol_apis: Dict[str, Any], mode: st
         await asyncio.to_thread(send_periodic_pnl_report_discord, 10, current_balance)
         await asyncio.to_thread(check_and_send_monthly_report_on_first_day)
         discord.print_log(f"[Performance Report] {label} 送信完了 (残高: ${current_balance:.2f}, 累計損益: ${summary['net_pnl']:+.2f})")
+        return float(current_balance)
     except Exception as e:
         discord.print_log(f"[Performance Report Error] 実績レポート送信失敗: {e}")
+        return 0.0
 
 
 async def _async_post_entry_reporting(
@@ -2652,7 +2654,20 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
             symbol_params_map[sym]["strategy"] = FORCE_STRATEGY
 
     # 実運用トレード実績（直近PnLチャート画像 ＆ 現在の証拠金残高）をDiscordへ送信
-    await send_periodic_performance_report(symbol_apis, mode, label="起動時初期レポート")
+    startup_balance = await send_periodic_performance_report(symbol_apis, mode, label="起動時初期レポート")
+
+    # 起動時1回: 直近14日間 バックテスト vs 実運用 比較レポート＆白ベース推移グラフ送信（09:00日次枠は消費しない）
+    try:
+        from real_trade_tracker import check_and_send_daily_14d_report
+        await asyncio.to_thread(
+            check_and_send_daily_14d_report,
+            current_balance=(startup_balance if startup_balance and startup_balance > 0 else None),
+            force=True,
+            mark_daily_sent=False,
+            label="起動時 14日間レポート",
+        )
+    except Exception as d14_start_err:
+        discord.print_log(f"[Startup 14d Report Warning] 起動時14日比較レポート警告: {d14_start_err}", level="warning")
 
     # pybotters BingX WebSocket マネージャー初期化 & バックグラウンドストリーミング開始
     from bingx_ws_manager import BingXWSManager
@@ -2888,11 +2903,19 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                     summary_lines.append("```")
                     discord.print_log("\n".join(summary_lines), force_send=True)
 
-                # 1日1回（09:00 JST以降）直近14日間 バックテスト vs 実運用 日別比較レポート
-                if now_jst.hour >= 9:
+                # 1日1回（毎日09:00 JST）直近14日間 バックテスト vs 実運用 日別比較レポート＆白ベース推移グラフ
+                if now_jst.hour == 9:
                     try:
                         from real_trade_tracker import check_and_send_daily_14d_report
-                        await asyncio.to_thread(check_and_send_daily_14d_report, current_balance=h_balance)
+                        await asyncio.to_thread(
+                            check_and_send_daily_14d_report,
+                            current_balance=h_balance,
+                            send_hour_jst=9,
+                            exact_hour=True,
+                            mark_daily_sent=True,
+                            label="日次 14日間レポート",
+                            now_jst=now_jst,
+                        )
                     except Exception as d14_err:
                         discord.print_log(f"[Daily 14d Report Warning] 日次14日比較レポート警告: {d14_err}", level="warning")
             except Exception as hourly_err:

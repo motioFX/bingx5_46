@@ -42,6 +42,7 @@ CHART_FILE_CLEAN = DATA_DIR / "real_trading_performance_clean.png"
 CHART_FILE_DETAIL = DATA_DIR / "real_trading_performance_detail.png"
 MONTHLY_STATE_FILE = DATA_DIR / "last_monthly_report_sent.json"
 DAILY_14D_REPORT_STATE_FILE = DATA_DIR / "last_daily_14d_report_sent.json"
+DAILY_14D_CHART_FILE = DATA_DIR / "daily_14d_bt_vs_live.png"
 CHARTS_DIR = DATA_DIR / "charts"
 
 
@@ -980,6 +981,7 @@ def build_daily_14d_comparison_report(
     current_balance: Optional[float] = None,
     db_path: Optional[Path] = None,
     now_jst: Optional[datetime] = None,
+    label: str = "日次 14日間レポート",
 ) -> Dict[str, Any]:
     """直近 days 日間（デフォルト14日間）の理論バックテスト vs 実運用実績の日別比較レポートを生成する。"""
     jst_tz = timezone(timedelta(hours=9))
@@ -1096,6 +1098,7 @@ def build_daily_14d_comparison_report(
         reg_lbl = day_regime_label.get(ds, "-")
         daily_rows.append({
             "date": ds,
+            "mmdd": mmdd,
             "bt_trades": b["trades"],
             "bt_pnl": round(b["pnl"], 4),
             "bt_cum": round(bt_cum, 4),
@@ -1134,7 +1137,7 @@ def build_daily_14d_comparison_report(
 
     divider = "─────────────────────────────────────────────────────────"
     report_lines = [
-        f"📅 **【BingX 日次 {span_days}日間レポート (BT vs 実運用 / {end_str})】**",
+        f"📅 **【BingX {label} (BT vs 実運用 / {end_str})】**",
         f"{bal_line}対象: {start_date.strftime('%m/%d')}〜{end_date.strftime('%m/%d')} (JST)",
         bt_line,
         real_line,
@@ -1148,6 +1151,14 @@ def build_daily_14d_comparison_report(
     ]
     return {
         "date_str": end_str,
+        "label": label,
+        "span_days": span_days,
+        "start_date_str": start_str,
+        "end_date_str": end_str,
+        "start_mmdd": start_date.strftime("%m/%d"),
+        "end_mmdd": end_date.strftime("%m/%d"),
+        "current_balance": float(current_balance) if current_balance is not None else None,
+        "bt_note": bt_note,
         "report_text": "\n".join(report_lines),
         "bt_metrics": bt_metrics,
         "real_summary": {
@@ -1162,18 +1173,208 @@ def build_daily_14d_comparison_report(
     }
 
 
+def plot_daily_14d_comparison_chart(
+    report: Dict[str, Any],
+    output_path: Optional[Path] = None,
+) -> Optional[Path]:
+    """直近14日間の理論BT vs 実運用 日別・累積PnL比較チャートを白ベース(#ffffff)で生成する。"""
+    import gc
+
+    daily_rows = report.get("daily_rows") if isinstance(report, dict) else None
+    if not daily_rows:
+        return None
+
+    out_path = Path(output_path) if output_path is not None else DAILY_14D_CHART_FILE
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    n_days = len(daily_rows)
+    x = np.arange(n_days, dtype=float)
+    bt_cums = [float(r.get("bt_cum", 0.0)) for r in daily_rows]
+    real_cums = [float(r.get("real_cum", 0.0)) for r in daily_rows]
+    bt_pnls = [float(r.get("bt_pnl", 0.0)) for r in daily_rows]
+    real_pnls = [float(r.get("real_pnl", 0.0)) for r in daily_rows]
+
+    start_mmdd = str(report.get("start_mmdd") or daily_rows[0].get("mmdd") or str(daily_rows[0].get("date", ""))[5:].replace("-", "/"))
+    end_mmdd = str(report.get("end_mmdd") or daily_rows[-1].get("mmdd") or str(daily_rows[-1].get("date", ""))[5:].replace("-", "/"))
+    label = str(report.get("label") or "日次 14日間レポート")
+
+    bt_metrics = report.get("bt_metrics")
+    real_summary = report.get("real_summary") or {}
+    cur_bal = report.get("current_balance")
+    bt_note = str(report.get("bt_note") or "")
+
+    if isinstance(bt_metrics, dict):
+        bt_losses = int(bt_metrics.get("trades", 0)) - int(bt_metrics.get("wins", 0))
+        bt_sub = (
+            f"理論BT: {bt_metrics['trades']}回 ({bt_metrics['wins']}勝{bt_losses}敗/{bt_metrics['win_rate']:.1f}%) "
+            f"{bt_metrics['net_pnl']:+.2f} USDT (PF {bt_metrics['pf']:.2f} / DD {bt_metrics['max_dd']:.2f})"
+        )
+    else:
+        bt_sub = "理論BT: データなし"
+
+    real_sub = (
+        f"実運用: {real_summary.get('trades', 0)}回 "
+        f"({real_summary.get('wins', 0)}勝{real_summary.get('losses', 0)}敗/{real_summary.get('win_rate', 0.0):.1f}%) "
+        f"{real_summary.get('net_pnl', 0.0):+.2f} USDT (PF {real_summary.get('pf', 0.0):.2f})"
+    )
+    bal_sub = f"   |   残高: ${float(cur_bal):,.2f} USDT" if (cur_bal is not None and float(cur_bal) > 0) else ""
+    subtitle_str = f"{bt_sub}   |   {real_sub}{bal_sub}"
+
+    fig, (ax1, ax2) = plt.subplots(
+        2, 1, figsize=(12.5, 7.8),
+        gridspec_kw={"height_ratios": [1.35, 1.0]},
+        sharex=True,
+    )
+    try:
+        fig.patch.set_facecolor("#ffffff")
+        for ax in (ax1, ax2):
+            ax.set_facecolor("#ffffff")
+            ax.grid(True, axis="y", color="#e5e7eb", linestyle="--", linewidth=0.8, alpha=0.95)
+            ax.set_axisbelow(True)
+            ax.spines["top"].set_visible(False)
+            ax.spines["right"].set_visible(False)
+            ax.spines["left"].set_color("#cbd5e1")
+            ax.spines["bottom"].set_color("#cbd5e1")
+            ax.tick_params(colors="#374151", labelsize=9.0)
+            ax.axhline(0.0, color="#94a3b8", linewidth=1.0, linestyle="-", zorder=2)
+
+        fig.suptitle(
+            f"BingX {label} : 理論バックテスト vs 実運用 ({start_mmdd}〜{end_mmdd} JST)",
+            fontsize=13.5, fontweight="bold", color="#111827", y=0.975,
+        )
+        fig.text(0.5, 0.928, subtitle_str, ha="center", va="top", fontsize=9.6, color="#374151")
+
+        # 上段: 累積PnL推移
+        ax1.plot(
+            x, bt_cums, color="#2563eb", linewidth=2.4, marker="o", markersize=5.5,
+            markerfacecolor="#ffffff", markeredgewidth=1.8, label="理論BT 累計PnL (USDT)", zorder=4,
+        )
+        ax1.fill_between(x, 0.0, bt_cums, color="#3b82f6", alpha=0.08, zorder=1)
+        ax1.plot(
+            x, real_cums, color="#059669", linewidth=2.4, marker="s", markersize=5.2,
+            markerfacecolor="#ffffff", markeredgewidth=1.8, label="実運用 累計PnL (USDT)", zorder=5,
+        )
+        ax1.fill_between(x, 0.0, real_cums, color="#10b981", alpha=0.08, zorder=1)
+
+        cum_all = bt_cums + real_cums + [0.0]
+        cum_min, cum_max = min(cum_all), max(cum_all)
+        cum_span = max(0.2, cum_max - cum_min)
+        cum_pad = max(0.12, cum_span * 0.22)
+        ax1.set_ylim(cum_min - cum_pad * 0.6, cum_max + cum_pad)
+        ax1.set_xlim(-0.6, (n_days - 1) + 1.25)
+
+        bt_last = bt_cums[-1]
+        real_last = real_cums[-1]
+        if abs(bt_last - real_last) < cum_span * 0.14:
+            bt_dy, real_dy = (9, -9) if bt_last >= real_last else (-9, 9)
+        else:
+            bt_dy, real_dy = (0, 0)
+
+        ax1.annotate(
+            f"BT {bt_last:+.2f}", xy=(x[-1], bt_last), xytext=(8, bt_dy),
+            textcoords="offset points", ha="left", va="center", fontsize=8.8, fontweight="bold",
+            color="#1d4ed8",
+            bbox=dict(boxstyle="round,pad=0.22", facecolor="#eff6ff", edgecolor="#93c5fd", alpha=0.95),
+            zorder=6,
+        )
+        ax1.annotate(
+            f"実 {real_last:+.2f}", xy=(x[-1], real_last), xytext=(8, real_dy),
+            textcoords="offset points", ha="left", va="center", fontsize=8.8, fontweight="bold",
+            color="#047857",
+            bbox=dict(boxstyle="round,pad=0.22", facecolor="#ecfdf5", edgecolor="#6ee7b7", alpha=0.95),
+            zorder=6,
+        )
+        ax1.set_ylabel("累積損益 (USDT)", fontsize=10.0, color="#1f2937", fontweight="bold")
+        ax1.legend(loc="upper left", facecolor="#ffffff", edgecolor="#d1d5db", framealpha=0.95, fontsize=9.2)
+
+        # 下段: 日別PnL並列棒グラフ + 地合いラベル
+        bar_w = 0.35
+        bar_offset = 0.19
+        ax2.bar(
+            x - bar_offset, bt_pnls, width=bar_w, color="#2563eb", edgecolor="#1d4ed8",
+            linewidth=0.6, alpha=0.86, label="理論BT 日別PnL", zorder=3,
+        )
+        ax2.bar(
+            x + bar_offset, real_pnls, width=bar_w, color="#10b981", edgecolor="#047857",
+            linewidth=0.6, alpha=0.86, label="実運用 日別PnL", zorder=3,
+        )
+
+        bar_all = bt_pnls + real_pnls + [0.0]
+        b_min, b_max = min(bar_all), max(bar_all)
+        b_pad = max(0.08, (b_max - b_min) * 0.28)
+        y2_min = min(0.0, b_min) - b_pad
+        y2_max = max(0.0, b_max) + b_pad
+        ax2.set_ylim(y2_min, y2_max)
+        if y2_min < 0.0:
+            ax2.axhspan(y2_min, 0.0, color="#fef2f2", alpha=0.55, zorder=0)
+
+        for xi, bv, rv in zip(x, bt_pnls, real_pnls):
+            if abs(bv) >= 0.005:
+                ax2.annotate(
+                    f"{bv:+.2f}",
+                    xy=(xi - bar_offset, bv),
+                    xytext=(0, 3 if bv >= 0 else -3),
+                    textcoords="offset points",
+                    ha="center",
+                    va="bottom" if bv >= 0 else "top",
+                    fontsize=7.2,
+                    color="#1e40af",
+                    zorder=5,
+                )
+            if abs(rv) >= 0.005:
+                ax2.annotate(
+                    f"{rv:+.2f}",
+                    xy=(xi + bar_offset, rv),
+                    xytext=(0, 3 if rv >= 0 else -3),
+                    textcoords="offset points",
+                    ha="center",
+                    va="bottom" if rv >= 0 else "top",
+                    fontsize=7.2,
+                    color="#065f46",
+                    zorder=5,
+                )
+
+        tick_labels = []
+        for r in daily_rows:
+            mmdd_lbl = r.get("mmdd") or str(r.get("date", ""))[5:].replace("-", "/")
+            reg_lbl = str(r.get("regime", "-"))
+            tick_labels.append(f"{mmdd_lbl}\n{reg_lbl}")
+        ax2.set_xticks(x)
+        ax2.set_xticklabels(tick_labels, fontsize=8.0, color="#374151")
+        ax2.set_ylabel("日別損益 (USDT)", fontsize=10.0, color="#1f2937", fontweight="bold")
+        ax2.legend(loc="upper left", ncol=2, facecolor="#ffffff", edgecolor="#d1d5db", framealpha=0.95, fontsize=8.8)
+
+        fig.text(0.015, 0.012, bt_note, fontsize=8.0, color="#6b7280")
+        fig.subplots_adjust(left=0.075, right=0.975, top=0.875, bottom=0.115, hspace=0.14)
+        fig.savefig(str(out_path), dpi=150, facecolor="#ffffff", edgecolor="none")
+    finally:
+        plt.close(fig)
+        plt.close("all")
+        gc.collect()
+
+    return out_path if out_path.exists() else None
+
+
 def check_and_send_daily_14d_report(
     current_balance: Optional[float] = None,
     db_path: Optional[Path] = None,
     force: bool = False,
     send_hour_jst: int = 9,
+    exact_hour: bool = True,
+    mark_daily_sent: bool = True,
+    label: str = "日次 14日間レポート",
     now_jst: Optional[datetime] = None,
+    chart_output_path: Optional[Path] = None,
 ) -> bool:
-    """1日1回（デフォルト09:00 JST以降）直近14日間のBT vs 実運用比較レポートをDiscord＆ログへ送信する。"""
+    """直近14日間のBT vs 実運用比較レポート＆白ベースグラフをDiscord＆ログへ送信する（日次09:00 JST 1日1回＋起動時単発対応）。"""
     jst_tz = timezone(timedelta(hours=9))
     cur_jst = now_jst.astimezone(jst_tz) if now_jst is not None else datetime.now(jst_tz)
-    if not force and cur_jst.hour < int(send_hour_jst):
-        return False
+    if not force:
+        if exact_hour:
+            if cur_jst.hour != int(send_hour_jst):
+                return False
+        elif cur_jst.hour < int(send_hour_jst):
+            return False
 
     sent_key = cur_jst.strftime("%Y-%m-%d")
     sent_data: Dict[str, str] = {}
@@ -1190,9 +1391,15 @@ def check_and_send_daily_14d_report(
         return False
 
     report = build_daily_14d_comparison_report(
-        days=14, current_balance=current_balance, db_path=db_path, now_jst=cur_jst
+        days=14, current_balance=current_balance, db_path=db_path, now_jst=cur_jst, label=label
     )
     report_text = report["report_text"]
+
+    chart_path: Optional[Path] = None
+    try:
+        chart_path = plot_daily_14d_comparison_chart(report, output_path=chart_output_path)
+    except Exception as chart_err:
+        print(f"[Real Trade Tracker] 14日比較グラフ生成エラー: {chart_err}")
 
     try:
         from bingx5_46_3logic import discord
@@ -1201,19 +1408,29 @@ def check_and_send_daily_14d_report(
 
     if discord:
         discord.print_log(report_text, force_send=True)
+        if chart_path and chart_path.exists():
+            try:
+                caption = (
+                    f"📈 【BingX {label}】理論BT vs 実運用 14日間比較グラフ "
+                    f"({report['start_mmdd']}〜{report['end_mmdd']} JST)"
+                )
+                discord.send_file(chart_path, caption)
+            except Exception as send_err:
+                print(f"[Real Trade Tracker] 14日比較グラフ送信エラー: {send_err}")
     else:
         print(report_text)
 
-    sent_data[sent_key] = cur_jst.isoformat()
-    if len(sent_data) > 30:
-        for old_k in sorted(sent_data.keys())[:-30]:
-            sent_data.pop(old_k, None)
-    try:
-        DATA_DIR.mkdir(parents=True, exist_ok=True)
-        with open(DAILY_14D_REPORT_STATE_FILE, "w", encoding="utf-8") as f:
-            json.dump(sent_data, f, indent=2, ensure_ascii=False)
-    except Exception as e:
-        print(f"[Real Trade Tracker] 日次14日レポート状態保存エラー: {e}")
+    if mark_daily_sent:
+        sent_data[sent_key] = cur_jst.isoformat()
+        if len(sent_data) > 30:
+            for old_k in sorted(sent_data.keys())[:-30]:
+                sent_data.pop(old_k, None)
+        try:
+            DATA_DIR.mkdir(parents=True, exist_ok=True)
+            with open(DAILY_14D_REPORT_STATE_FILE, "w", encoding="utf-8") as f:
+                json.dump(sent_data, f, indent=2, ensure_ascii=False)
+        except Exception as e:
+            print(f"[Real Trade Tracker] 日次14日レポート状態保存エラー: {e}")
 
     return True
 
