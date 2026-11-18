@@ -134,6 +134,7 @@ BINGX_IS_LIVE = False
 #       False = リアル注文 (BingX VST デモ取引所へ実際に発注・約定・管理)
 #       True  = AIRモード (--air または --mock 引数指定時のみ仮想シミュレーション)
 BINGX_IS_AIR = ("--air" in sys.argv or "--mock" in sys.argv)
+ALLOW_NY_SESSION_LIVE: bool = True  # 本番口座(Live)でも米国セッション(22:00〜翌09:00 JST)をバックテストSSoT準拠で24時間稼働
 
 # [ 3 ] ポジション・ロット設定 (PROJECT_RULES.md 準拠)
 BINGX_TARGET_POSITION_VALUE_USDT = 15.0  # 目標投資額 $15.0 USDT (1枠基準)
@@ -2463,6 +2464,16 @@ def _build_and_store_live_fill_state(
     return scale_state_new
 
 
+def should_block_ny_session_entry(
+    is_live: bool,
+    is_ny: bool,
+    allow_ny_live: Optional[bool] = None,
+) -> bool:
+    """米国セッション(22:00〜翌09:00 JST)で新規エントリーを停止すべきか判定する。"""
+    allow = ALLOW_NY_SESSION_LIVE if allow_ny_live is None else bool(allow_ny_live)
+    return bool(is_ny and is_live and not allow)
+
+
 def select_session_entry_spec(
     raw_sym_params: Dict[str, Any],
     is_tokyo: bool,
@@ -3275,21 +3286,18 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
             is_ny_b3 = not (is_tokyo_b3 or is_london_b3)
 
             if is_ny_b3:
-                if BINGX_IS_LIVE:
-                    # 本番リアル運用規約:
-                    # 米国セッション(22:00〜翌09:00 JST)は新規エントリー停止 (待機指値も安全キャンセル)
+                mode_tag = "本番リアル運用" if BINGX_IS_LIVE else "デモアクティブ検証"
+                if should_block_ny_session_entry(BINGX_IS_LIVE, is_ny_b3):
                     if now_jst_b3.hour != last_ny_notice_hour:
                         last_ny_notice_hour = now_jst_b3.hour
-                        discord.print_log("🌙 [本番リアル運用] 米国セッション(22:00〜翌09:00 JST) 新規エントリー停止中 (既存ポジション標準出口監視のみ)", level="info")
-                    await _cancel_all_pending_orders("本番NYセッション停止", pending_entry_orders, symbol_apis)
+                        discord.print_log(f"🌙 [{mode_tag}] 米国セッション(22:00〜翌09:00 JST) 新規エントリー停止中 (既存ポジション標準出口監視のみ)", level="info")
+                    await _cancel_all_pending_orders("NYセッション停止", pending_entry_orders, symbol_apis)
                     continue
-                else:
-                    # デモアクティブ検証モード: 米国セッションもバックテストSSoT準拠で24時間監視
-                    if now_jst_b3.hour != last_ny_notice_hour:
-                        last_ny_notice_hour = now_jst_b3.hour
-                        discord.print_log(f"🌙 [デモアクティブ検証] 米国セッション(22:00〜翌09:00 JST) 24時間フル稼働中 (バックテストSSoT準拠監視)", level="info")
-                    elif cycle_count % 30 == 0:
-                        discord.print_log(f"🌙 [デモアクティブ検証] 米国セッション(22:00〜翌09:00 JST) 24時間フル稼働中 (バックテストSSoT準拠監視)", level="debug")
+                if now_jst_b3.hour != last_ny_notice_hour:
+                    last_ny_notice_hour = now_jst_b3.hour
+                    discord.print_log(f"🌙 [{mode_tag}] 米国セッション(22:00〜翌09:00 JST) 24時間フル稼働中 (バックテストSSoT準拠監視)", level="info")
+                elif cycle_count % 30 == 0:
+                    discord.print_log(f"🌙 [{mode_tag}] 米国セッション(22:00〜翌09:00 JST) 24時間フル稼働中 (バックテストSSoT準拠監視)", level="debug")
 
             # 🛡️ 日次リスクガードチェック (含み損考慮サーキットブレーカー / 回数制限解除済み)
             total_unrealized = sum(float(v[4]) for v in active_positions.values()) if active_positions else 0.0
