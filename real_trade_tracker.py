@@ -54,6 +54,66 @@ def load_real_trades():
         return []
 
 
+def _parse_utc_series(values) -> pd.Series:
+    """ISO8601(マイクロ秒あり/なし混在)や各種日時文字列を安全にUTCタイムスタンプ列へ変換する。"""
+    series = pd.Series(values) if not isinstance(values, pd.Series) else values
+    if series.empty:
+        return pd.to_datetime(series, utc=True, errors="coerce")
+    if pd.api.types.is_datetime64_any_dtype(series):
+        if getattr(series.dt, "tz", None) is None:
+            return series.dt.tz_localize("UTC")
+        return series.dt.tz_convert("UTC")
+    try:
+        parsed = pd.to_datetime(series, format="ISO8601", utc=True, errors="coerce")
+    except (ValueError, TypeError):
+        parsed = pd.to_datetime(series, format="mixed", utc=True, errors="coerce")
+    need_fb = parsed.isna() & series.notna() & (series.astype(str).str.strip() != "")
+    if need_fb.any():
+        try:
+            fb = pd.to_datetime(series[need_fb], format="mixed", utc=True, errors="coerce")
+        except (ValueError, TypeError):
+            fb = pd.to_datetime(series[need_fb], utc=True, errors="coerce")
+        parsed = parsed.copy()
+        parsed.loc[need_fb] = fb
+    return parsed
+
+
+def _parse_utc_timestamp(value: Any) -> Optional[pd.Timestamp]:
+    """単一の日時値(文字列/Timestamp等)を安全にUTC Timestampへ変換する。"""
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return None
+    if isinstance(value, pd.Timestamp):
+        return value.tz_localize("UTC") if value.tzinfo is None else value.tz_convert("UTC")
+    for kwargs in ({"format": "ISO8601", "utc": True}, {"utc": True, "errors": "coerce"}):
+        try:
+            ts = pd.to_datetime(value, **kwargs)
+            if not pd.isna(ts):
+                return ts
+        except Exception:
+            continue
+    return None
+
+
+def _parse_trade_jst_dt(trade: Optional[Dict[str, Any]]) -> Optional[pd.Timestamp]:
+    """トレードレコードからJSTタイムスタンプを安全に復元する（timestamp優先、dt_jstフォールバック）。"""
+    if not isinstance(trade, dict):
+        return None
+    ts_utc = _parse_utc_timestamp(trade.get("timestamp"))
+    if ts_utc is not None:
+        return ts_utc.tz_convert("Asia/Tokyo")
+    dt_jst_raw = trade.get("dt_jst")
+    if dt_jst_raw:
+        try:
+            ts_local = pd.to_datetime(dt_jst_raw, errors="coerce")
+            if not pd.isna(ts_local):
+                if ts_local.tzinfo is None:
+                    return ts_local.tz_localize("Asia/Tokyo")
+                return ts_local.tz_convert("Asia/Tokyo")
+        except Exception:
+            return None
+    return None
+
+
 def sync_trades_to_csv():
     """real_trades_history.json から trades_history.csv および daily_performance.csv を生成/同期する"""
     trades = load_real_trades()
@@ -64,7 +124,7 @@ def sync_trades_to_csv():
     try:
         df = pd.DataFrame(trades)
         if "timestamp" in df.columns:
-            dt_series = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
+            dt_series = _parse_utc_series(df["timestamp"])
             df["dt_jst"] = dt_series.dt.tz_convert("Asia/Tokyo").dt.strftime("%Y-%m-%d %H:%M:%S")
             df["date_jst"] = dt_series.dt.tz_convert("Asia/Tokyo").dt.strftime("%Y-%m-%d")
 
@@ -138,11 +198,8 @@ def get_real_trading_summary(days: Optional[int] = None, current_balance: Option
         for t in closes:
             ts_val = t.get("timestamp")
             if ts_val:
-                try:
-                    t_dt = pd.to_datetime(ts_val, utc=True)
-                    if t_dt >= cutoff_dt:
-                        filtered_closes.append(t)
-                except Exception:
+                t_dt = _parse_utc_timestamp(ts_val)
+                if t_dt is None or t_dt >= cutoff_dt:
                     filtered_closes.append(t)
             else:
                 filtered_closes.append(t)
@@ -183,7 +240,7 @@ def plot_real_trading_performance(days: int = 10, current_balance: Optional[floa
         return None, None
 
     df = pd.DataFrame(trades)
-    df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
+    df["timestamp"] = _parse_utc_series(df["timestamp"])
     df = df.dropna(subset=["timestamp"]).sort_values("timestamp").reset_index(drop=True)
     if df.empty:
         return None, None
@@ -334,7 +391,7 @@ def get_recent_performance_summary(days: int = 10) -> dict:
             "message": "トレード履歴に必要なカラムが存在しません。"
         }
 
-    df["timestamp_utc"] = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
+    df["timestamp_utc"] = _parse_utc_series(df["timestamp"])
     df = df.dropna(subset=["timestamp_utc"])
     df["dt_jst"] = df["timestamp_utc"].dt.tz_convert("Asia/Tokyo")
 
@@ -575,10 +632,8 @@ async def sync_real_trades_from_bingx_api(mode: str = 'demo') -> int:
         for idx, t in enumerate(trades):
             if t.get("action") == "CLOSE":
                 ts = t.get("timestamp")
-                try:
-                    sec = pd.to_datetime(ts, utc=True).timestamp()
-                except Exception:
-                    sec = 0.0
+                t_dt = _parse_utc_timestamp(ts)
+                sec = t_dt.timestamp() if t_dt is not None else 0.0
                 close_records.append((idx, t.get("symbol"), sec, float(t.get("pnl", 0.0))))
 
         new_count = 0
@@ -670,7 +725,7 @@ def get_monthly_performance_summary(target_year: int = None, target_month: int =
     target_prefix = f"{target_year:04d}-{target_month:02d}"
 
     df = pd.DataFrame(trades)
-    df["timestamp_utc"] = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
+    df["timestamp_utc"] = _parse_utc_series(df["timestamp"])
     df = df.dropna(subset=["timestamp_utc"])
     df["dt_jst"] = df["timestamp_utc"].dt.tz_convert("Asia/Tokyo")
     df["month_jst"] = df["dt_jst"].dt.strftime("%Y-%m")
@@ -753,7 +808,7 @@ def plot_monthly_performance(target_year: int = None, target_month: int = None) 
     target_prefix = f"{target_year:04d}-{target_month:02d}"
 
     df = pd.DataFrame(trades)
-    df["timestamp_utc"] = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
+    df["timestamp_utc"] = _parse_utc_series(df["timestamp"])
     df = df.dropna(subset=["timestamp_utc"])
     df["dt_jst"] = df["timestamp_utc"].dt.tz_convert("Asia/Tokyo")
     df["date_jst"] = df["dt_jst"].dt.strftime("%Y-%m-%d")
@@ -1109,9 +1164,9 @@ def plot_entry_chart(
         return None
 
     if "timestamp" in plot_df.columns:
-        plot_df["dt"] = pd.to_datetime(plot_df["timestamp"], utc=True)
+        plot_df["dt"] = _parse_utc_series(plot_df["timestamp"])
     elif "date" in plot_df.columns:
-        plot_df["dt"] = pd.to_datetime(plot_df["date"], utc=True)
+        plot_df["dt"] = _parse_utc_series(plot_df["date"])
     else:
         plot_df["dt"] = pd.date_range(end=pd.Timestamp.now(tz="UTC"), periods=len(plot_df), freq="5min")
 
@@ -1234,9 +1289,9 @@ def plot_exit_chart(
 
     # タイムスタンプの正規化（Asia/Tokyo）
     if "timestamp" in work_df.columns:
-        work_df["dt"] = pd.to_datetime(work_df["timestamp"], utc=True).dt.tz_convert("Asia/Tokyo")
+        work_df["dt"] = _parse_utc_series(work_df["timestamp"]).dt.tz_convert("Asia/Tokyo")
     elif "date" in work_df.columns:
-        work_df["dt"] = pd.to_datetime(work_df["date"], utc=True).dt.tz_convert("Asia/Tokyo")
+        work_df["dt"] = _parse_utc_series(work_df["date"]).dt.tz_convert("Asia/Tokyo")
     else:
         work_df["dt"] = pd.date_range(end=pd.Timestamp.now(tz="Asia/Tokyo"), periods=len(work_df), freq="5min")
 
@@ -1284,14 +1339,7 @@ def plot_exit_chart(
 
     # 決済時刻（Exit dt）の特定と未確定足の補完
     now_jst = pd.Timestamp.now(tz="Asia/Tokyo")
-    exit_dt = now_jst
-    if exit_trade:
-        ex_time_val = exit_trade.get("dt_jst") or exit_trade.get("timestamp")
-        if ex_time_val:
-            try:
-                exit_dt = pd.to_datetime(ex_time_val, utc=True).tz_convert("Asia/Tokyo")
-            except Exception:
-                pass
+    exit_dt = _parse_trade_jst_dt(exit_trade) or now_jst
 
     last_candle_start = work_df["dt"].iloc[-1]
     last_candle_end = last_candle_start + pd.Timedelta(minutes=gran_min)
@@ -1321,14 +1369,7 @@ def plot_exit_chart(
     work_df["rsi_ema"] = work_df["rsi"].ewm(span=7, adjust=False).mean()
 
     # エントリー足と表示バー数の動的決定（エントリーが見切れないように自動拡張）
-    entry_dt = None
-    if entry_trade:
-        en_time_val = entry_trade.get("dt_jst") or entry_trade.get("timestamp")
-        if en_time_val:
-            try:
-                entry_dt = pd.to_datetime(en_time_val, utc=True).tz_convert("Asia/Tokyo")
-            except Exception:
-                pass
+    entry_dt = _parse_trade_jst_dt(entry_trade)
 
     bars_needed = lookback_bars
     if entry_dt:
