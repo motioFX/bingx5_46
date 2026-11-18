@@ -41,6 +41,7 @@ CHART_FILE = DATA_DIR / "real_trading_performance.png"
 CHART_FILE_CLEAN = DATA_DIR / "real_trading_performance_clean.png"
 CHART_FILE_DETAIL = DATA_DIR / "real_trading_performance_detail.png"
 MONTHLY_STATE_FILE = DATA_DIR / "last_monthly_report_sent.json"
+DAILY_14D_REPORT_STATE_FILE = DATA_DIR / "last_daily_14d_report_sent.json"
 CHARTS_DIR = DATA_DIR / "charts"
 
 
@@ -964,6 +965,257 @@ def check_and_send_monthly_report_on_first_day() -> bool:
             print(f"[Real Trade Tracker] 月次送信状態保存エラー: {e}")
         return True
     return False
+
+
+def _compute_pf(pnls: list[float]) -> float:
+    gross_win = sum(x for x in pnls if x > 0)
+    gross_loss = abs(sum(x for x in pnls if x < 0))
+    if gross_loss > 0:
+        return gross_win / gross_loss
+    return 99.0 if gross_win > 0 else 0.0
+
+
+def build_daily_14d_comparison_report(
+    days: int = 14,
+    current_balance: Optional[float] = None,
+    db_path: Optional[Path] = None,
+    now_jst: Optional[datetime] = None,
+) -> Dict[str, Any]:
+    """直近 days 日間（デフォルト14日間）の理論バックテスト vs 実運用実績の日別比較レポートを生成する。"""
+    jst_tz = timezone(timedelta(hours=9))
+    cur_jst = now_jst.astimezone(jst_tz) if now_jst is not None else datetime.now(jst_tz)
+    span_days = max(1, int(days))
+    end_date = cur_jst.date()
+    start_date = end_date - timedelta(days=span_days - 1)
+    start_str = start_date.strftime("%Y-%m-%d")
+    end_str = end_date.strftime("%Y-%m-%d")
+
+    # 1. 実運用トレード集計 (JST日付別)
+    real_daily: Dict[str, Dict[str, Any]] = {}
+    real_pnls: list[float] = []
+    trades = load_real_trades()
+    if trades:
+        df_real = pd.DataFrame(trades)
+        if not df_real.empty and {"timestamp", "action", "pnl"}.issubset(df_real.columns):
+            if "note" in df_real.columns:
+                df_real = df_real[~df_real["note"].astype(str).str.contains("test_exit", case=False, na=False)]
+            df_real = df_real[df_real["action"] == "CLOSE"].copy()
+            if not df_real.empty:
+                ts_utc = _parse_utc_series(df_real["timestamp"])
+                df_real = df_real.loc[ts_utc.notna()].copy()
+                ts_jst = ts_utc.loc[ts_utc.notna()].dt.tz_convert("Asia/Tokyo")
+                df_real["date_jst"] = ts_jst.dt.strftime("%Y-%m-%d")
+                df_real = df_real[(df_real["date_jst"] >= start_str) & (df_real["date_jst"] <= end_str)]
+                for d_str, grp in df_real.groupby("date_jst", sort=True):
+                    p_list = [float(x) for x in grp["pnl"].tolist()]
+                    real_pnls.extend(p_list)
+                    real_daily[d_str] = {
+                        "trades": len(p_list),
+                        "wins": sum(1 for x in p_list if x > 0),
+                        "losses": sum(1 for x in p_list if x <= 0),
+                        "pnl": sum(p_list),
+                    }
+
+    # 2. バックテスト理論集計 (データレイク最新ランのOOS適格セルを方向別でポートフォリオ再現)
+    bt_daily: Dict[str, Dict[str, Any]] = {}
+    day_regime_label: Dict[str, str] = {}
+    bt_metrics: Optional[Dict[str, Any]] = None
+    bt_note = "※BT: 最新OOS適格セル14日ポートフォリオ再現(方向別/NY含/2枠/CB-$1.50/0.08%手数料)"
+    try:
+        from lake_store import LakeStore
+        from lake_backtest_engine import (
+            WalkForwardConfig,
+            build_portfolio_params_map_from_cells,
+            compute_hourly_regime_series_from_lake,
+            simulate_portfolio_on_window,
+        )
+        lake = LakeStore(db_path=db_path)
+        latest_run = None
+        with lake._conn(write=False) as conn:
+            row = conn.execute(
+                "SELECT run_id, data_cutoff_utc FROM backtest_runs ORDER BY rowid DESC LIMIT 1"
+            ).fetchone()
+            if row is not None:
+                latest_run = {"run_id": row["run_id"], "data_cutoff_utc": int(row["data_cutoff_utc"])}
+        if latest_run is not None:
+            cells = lake.get_cells_for_run(latest_run["run_id"])
+            if cells:
+                ranked_syms, sym_map = build_portfolio_params_map_from_cells(cells)
+                win_start_utc = int(datetime.combine(start_date, datetime.min.time(), tzinfo=jst_tz).timestamp())
+                win_end_utc = max(win_start_utc + 300, min(int(cur_jst.timestamp()), latest_run["data_cutoff_utc"]))
+                hourly_map, pit_ok = compute_hourly_regime_series_from_lake(
+                    lake, win_start_utc, win_end_utc, use_point_in_time_regime=True, gil_yield_sec=0.005
+                )
+                cfg = WalkForwardConfig(allow_ny_session=True, gil_yield_sec=0.005)
+                bt_res = simulate_portfolio_on_window(
+                    lake=lake,
+                    symbol_params_map=sym_map,
+                    ranked_symbols=ranked_syms,
+                    hourly_regime_map=hourly_map if pit_ok else None,
+                    win_start_utc=win_start_utc,
+                    win_end_utc=win_end_utc,
+                    cfg=cfg,
+                )
+                bt_metrics = bt_res["metrics"]
+                for tr in bt_res["sim_trades"]:
+                    if tr.get("fill_ts_utc") is None or tr.get("exit_ts_utc") is None:
+                        continue
+                    d_str = datetime.fromtimestamp(int(tr["exit_ts_utc"]), tz=timezone.utc).astimezone(jst_tz).strftime("%Y-%m-%d")
+                    rec = bt_daily.setdefault(d_str, {"trades": 0, "wins": 0, "losses": 0, "pnl": 0.0})
+                    pnl_v = float(tr["net_pnl"])
+                    rec["trades"] += 1
+                    if pnl_v > 0:
+                        rec["wins"] += 1
+                    else:
+                        rec["losses"] += 1
+                    rec["pnl"] += pnl_v
+                for ts_hr in sorted(hourly_map.keys()):
+                    dt_hr = datetime.fromtimestamp(int(ts_hr), tz=timezone.utc).astimezone(jst_tz)
+                    d_str = dt_hr.strftime("%Y-%m-%d")
+                    snap = hourly_map[ts_hr]
+                    reg_ch = str(snap.get("overall_regime", "?"))[:1]
+                    pat = str(snap.get("regime_pattern", ""))
+                    if dt_hr.hour == 12 or d_str not in day_regime_label:
+                        day_regime_label[d_str] = f"{reg_ch}{pat}"
+    except Exception as bt_err:
+        bt_note = f"※BT集計スキップ: {bt_err}"
+
+    # 3. テーブル整形
+    rows_text: list[str] = []
+    bt_cum = 0.0
+    real_cum = 0.0
+    cur_d = start_date
+    daily_rows: list[Dict[str, Any]] = []
+    while cur_d <= end_date:
+        ds = cur_d.strftime("%Y-%m-%d")
+        mmdd = cur_d.strftime("%m/%d")
+        b = bt_daily.get(ds, {"trades": 0, "wins": 0, "losses": 0, "pnl": 0.0})
+        r = real_daily.get(ds, {"trades": 0, "wins": 0, "losses": 0, "pnl": 0.0})
+        bt_cum += float(b["pnl"])
+        real_cum += float(r["pnl"])
+        reg_lbl = day_regime_label.get(ds, "-")
+        daily_rows.append({
+            "date": ds,
+            "bt_trades": b["trades"],
+            "bt_pnl": round(b["pnl"], 4),
+            "bt_cum": round(bt_cum, 4),
+            "real_trades": r["trades"],
+            "real_pnl": round(r["pnl"], 4),
+            "real_cum": round(real_cum, 4),
+            "regime": reg_lbl,
+        })
+        rows_text.append(
+            f"{mmdd} | {b['trades']:2d} {b['pnl']:+6.2f} {bt_cum:+6.2f} | "
+            f"{r['trades']:2d} {r['pnl']:+6.2f} {real_cum:+6.2f} | {reg_lbl}"
+        )
+        cur_d += timedelta(days=1)
+
+    r_cnt = len(real_pnls)
+    r_wins = sum(1 for x in real_pnls if x > 0)
+    r_losses = r_cnt - r_wins
+    r_wr = (r_wins / r_cnt * 100.0) if r_cnt > 0 else 0.0
+    r_net = sum(real_pnls)
+    r_pf = _compute_pf(real_pnls)
+
+    bal_line = f"💰 残高: ${float(current_balance):,.2f} | " if current_balance is not None else ""
+    if bt_metrics is not None:
+        bt_line = (
+            f"📊 理論BT({span_days}日): {bt_metrics['trades']}回 "
+            f"({bt_metrics['wins']}勝{bt_metrics['trades'] - bt_metrics['wins']}敗/{bt_metrics['win_rate']:.1f}%) "
+            f"| ${bt_metrics['net_pnl']:+.2f} | PF {bt_metrics['pf']:.2f} | DD ${bt_metrics['max_dd']:.2f}"
+        )
+    else:
+        bt_line = f"📊 理論BT({span_days}日): データなし"
+
+    real_line = (
+        f"🎯 実運用({span_days}日): {r_cnt}回 ({r_wins}勝{r_losses}敗/{r_wr:.1f}%) "
+        f"| ${r_net:+.2f} | PF {r_pf:.2f}"
+    )
+
+    divider = "─────────────────────────────────────────────────────────"
+    report_lines = [
+        f"📅 **【BingX 日次 {span_days}日間レポート (BT vs 実運用 / {end_str})】**",
+        f"{bal_line}対象: {start_date.strftime('%m/%d')}〜{end_date.strftime('%m/%d')} (JST)",
+        bt_line,
+        real_line,
+        "```text",
+        "日付  | BT 数   PnL   累計  | 実 数   PnL   累計  | 地合い",
+        divider,
+        *rows_text,
+        divider,
+        bt_note,
+        "```",
+    ]
+    return {
+        "date_str": end_str,
+        "report_text": "\n".join(report_lines),
+        "bt_metrics": bt_metrics,
+        "real_summary": {
+            "trades": r_cnt,
+            "wins": r_wins,
+            "losses": r_losses,
+            "win_rate": round(r_wr, 1),
+            "net_pnl": round(r_net, 4),
+            "pf": round(r_pf, 2),
+        },
+        "daily_rows": daily_rows,
+    }
+
+
+def check_and_send_daily_14d_report(
+    current_balance: Optional[float] = None,
+    db_path: Optional[Path] = None,
+    force: bool = False,
+    send_hour_jst: int = 9,
+    now_jst: Optional[datetime] = None,
+) -> bool:
+    """1日1回（デフォルト09:00 JST以降）直近14日間のBT vs 実運用比較レポートをDiscord＆ログへ送信する。"""
+    jst_tz = timezone(timedelta(hours=9))
+    cur_jst = now_jst.astimezone(jst_tz) if now_jst is not None else datetime.now(jst_tz)
+    if not force and cur_jst.hour < int(send_hour_jst):
+        return False
+
+    sent_key = cur_jst.strftime("%Y-%m-%d")
+    sent_data: Dict[str, str] = {}
+    if DAILY_14D_REPORT_STATE_FILE.exists():
+        try:
+            with open(DAILY_14D_REPORT_STATE_FILE, "r", encoding="utf-8") as f:
+                loaded = json.load(f)
+                if isinstance(loaded, dict):
+                    sent_data = loaded
+        except Exception:
+            sent_data = {}
+
+    if not force and sent_data.get(sent_key):
+        return False
+
+    report = build_daily_14d_comparison_report(
+        days=14, current_balance=current_balance, db_path=db_path, now_jst=cur_jst
+    )
+    report_text = report["report_text"]
+
+    try:
+        from bingx5_46_3logic import discord
+    except Exception:
+        discord = None
+
+    if discord:
+        discord.print_log(report_text, force_send=True)
+    else:
+        print(report_text)
+
+    sent_data[sent_key] = cur_jst.isoformat()
+    if len(sent_data) > 30:
+        for old_k in sorted(sent_data.keys())[:-30]:
+            sent_data.pop(old_k, None)
+    try:
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        with open(DAILY_14D_REPORT_STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(sent_data, f, indent=2, ensure_ascii=False)
+    except Exception as e:
+        print(f"[Real Trade Tracker] 日次14日レポート状態保存エラー: {e}")
+
+    return True
 
 
 def compute_volume_profile_bands(df: pd.DataFrame, period: int = 48, value_area_pct: float = 0.70, num_bins: int = 80) -> pd.DataFrame:

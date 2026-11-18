@@ -2887,6 +2887,14 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                     summary_lines.append(f"次回定期更新: {next_hour_jst} JST (1時間ごとに定期配信中)")
                     summary_lines.append("```")
                     discord.print_log("\n".join(summary_lines), force_send=True)
+
+                # 1日1回（09:00 JST以降）直近14日間 バックテスト vs 実運用 日別比較レポート
+                if now_jst.hour >= 9:
+                    try:
+                        from real_trade_tracker import check_and_send_daily_14d_report
+                        await asyncio.to_thread(check_and_send_daily_14d_report, current_balance=h_balance)
+                    except Exception as d14_err:
+                        discord.print_log(f"[Daily 14d Report Warning] 日次14日比較レポート警告: {d14_err}", level="warning")
             except Exception as hourly_err:
                 discord.print_log(f"[Hourly Update Error] 毎時タスクエラー: {hourly_err}", level="warning")
 

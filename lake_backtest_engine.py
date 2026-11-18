@@ -1544,27 +1544,42 @@ def build_portfolio_params_map_from_cells(
             "eval_ev": float(cell["eval_ev"]),
         }
 
-    for sym, sym_cells in by_sym.items():
-        rng_cells = [c for c in sym_cells if not is_breakout_strategy(str(c["strategy"]))]
-        brk_cells = [c for c in sym_cells if is_breakout_strategy(str(c["strategy"]))]
+    def _build_dual_spec(cell_group: Sequence[Dict[str, Any]]) -> Tuple[Dict[str, Any], Dict[str, Any], bool]:
+        rng_cells = [c for c in cell_group if not is_breakout_strategy(str(c["strategy"]))]
+        brk_cells = [c for c in cell_group if is_breakout_strategy(str(c["strategy"]))]
         best_rng = max(rng_cells, key=_cell_rank_key_for_portfolio) if rng_cells else None
         best_brk = max(brk_cells, key=_cell_rank_key_for_portfolio) if brk_cells else None
-        best_all = max(sym_cells, key=_cell_rank_key_for_portfolio)
+        best_all = max(cell_group, key=_cell_rank_key_for_portfolio)
 
         rng_q = _is_portfolio_cell_qualified(best_rng)
         brk_q = _is_portfolio_cell_qualified(best_brk)
         is_q = rng_q or brk_q
 
-        spec = _to_spec(best_all, is_q)
-        spec["is_range_qualified"] = rng_q
-        spec["is_breakout_qualified"] = brk_q
+        spec_obj = _to_spec(best_all, is_q)
+        spec_obj["is_range_qualified"] = rng_q
+        spec_obj["is_breakout_qualified"] = brk_q
         if best_rng is not None:
-            spec["range_params"] = _to_spec(best_rng, rng_q)
+            spec_obj["range_params"] = _to_spec(best_rng, rng_q)
         if best_brk is not None:
-            spec["breakout_params"] = _to_spec(best_brk, brk_q)
+            spec_obj["breakout_params"] = _to_spec(best_brk, brk_q)
+        return spec_obj, best_all, is_q
+
+    for sym, sym_cells in by_sym.items():
+        spec, best_all, is_q = _build_dual_spec(sym_cells)
+        side_specs: Dict[str, Dict[str, Any]] = {}
+        for side_key in ("long", "short"):
+            s_cells = [c for c in sym_cells if str(c.get("side", "")) == side_key]
+            if s_cells:
+                s_spec, _, s_q = _build_dual_spec(s_cells)
+                if s_q:
+                    side_specs[side_key] = s_spec
+        if side_specs:
+            spec["side_specs"] = side_specs
+        is_any_q = is_q or bool(side_specs)
+        spec["is_qualified"] = is_any_q
         params_map[sym] = spec
         best_by_sym[sym] = best_all
-        if is_q:
+        if is_any_q:
             ranked_syms.append(sym)
 
     ranked_syms.sort(key=lambda s: _cell_rank_key_for_portfolio(best_by_sym[s]), reverse=True)
@@ -1621,11 +1636,13 @@ def simulate_portfolio_on_window(
                 all_ts_5m.add(int(t))
 
         sp = symbol_params_map[sym]
-        candidates: List[Dict[str, Any]] = [sp]
-        if "range_params" in sp:
-            candidates.append(sp["range_params"])
-        if "breakout_params" in sp:
-            candidates.append(sp["breakout_params"])
+        candidates: List[Dict[str, Any]] = []
+        for base_sp in [sp, *list((sp.get("side_specs") or {}).values())]:
+            candidates.append(base_sp)
+            if "range_params" in base_sp:
+                candidates.append(base_sp["range_params"])
+            if "breakout_params" in base_sp:
+                candidates.append(base_sp["breakout_params"])
 
         by_tf_mps: Dict[str, set[int]] = {}
         for cand in candidates:
@@ -1667,23 +1684,37 @@ def simulate_portfolio_on_window(
     daily_realized_pnl = 0.0
     cb_broken = False
 
-    def _pick_session_spec(sym_name: str, hr_jst: int) -> Optional[Dict[str, Any]]:
-        sp = symbol_params_map[sym_name]
+    def _pick_from_spec_obj(spec_obj: Dict[str, Any], hr_jst: int) -> Optional[Dict[str, Any]]:
         if 9 <= hr_jst < 16:
-            cand = sp.get("range_params") or sp
-            if not sp.get("is_range_qualified") or is_breakout_strategy(str(cand["strategy"])):
+            cand = spec_obj.get("range_params") or spec_obj
+            if not spec_obj.get("is_range_qualified") or is_breakout_strategy(str(cand["strategy"])):
                 return None
             return cand
         if 16 <= hr_jst < 22:
-            cand = sp.get("breakout_params") or sp
-            if not sp.get("is_breakout_qualified") or not is_breakout_strategy(str(cand["strategy"])):
+            cand = spec_obj.get("breakout_params") or spec_obj
+            if not spec_obj.get("is_breakout_qualified") or not is_breakout_strategy(str(cand["strategy"])):
                 return None
             return cand
         if not getattr(cfg, "allow_ny_session", True):
             return None
-        if not sp.get("is_qualified"):
+        if not spec_obj.get("is_qualified"):
             return None
-        return sp
+        return spec_obj
+
+    def _pick_session_spec(sym_name: str, hr_jst: int, snap: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
+        sp = symbol_params_map[sym_name]
+        side_specs = sp.get("side_specs") or {}
+        if snap is not None and snap.get("allowed_strategies_set") and side_specs:
+            allowed_set = snap["allowed_strategies_set"]
+            matches = []
+            for side_sp in side_specs.values():
+                cand = _pick_from_spec_obj(side_sp, hr_jst)
+                if cand is not None and str(cand.get("strategy", "")) in allowed_set:
+                    matches.append(cand)
+            if matches:
+                return max(matches, key=lambda c: (float(c.get("eval_ev", 0.0) or 0.0), str(c.get("strategy", ""))))
+            return None
+        return _pick_from_spec_obj(sp, hr_jst)
 
     def _session_label(hr_jst: int) -> str:
         if 9 <= hr_jst < 16:
@@ -1875,7 +1906,7 @@ def simulate_portfolio_on_window(
         for sym in syms:
             if sym in active_pos:
                 continue
-            cand = _pick_session_spec(sym, hr_jst)
+            cand = _pick_session_spec(sym, hr_jst, snap=snap)
             strat_e = str(cand["strategy"]) if cand else ""
             tf_e = str(cand["timeframe"]) if cand else ""
 

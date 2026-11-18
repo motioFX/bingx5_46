@@ -748,6 +748,8 @@ BINGX_IS_AIR = ("--air" in sys.argv or "--mock" in sys.argv)
     ボット起動・再起動時に、取引所 API 実データと同期した最新の「直近10日間 実運用損益表（集計期間、取引回数、勝敗、勝率、確定損益、PF、平均利益/損失、銘柄別内訳）」をコンソールログ（`bot_output.log`）に整然とした固定幅テーブルで出力し、Discord へサマリーと累積PnLチャート（Clean版・Detail版）を即座に送信する。
 * **月初（毎月1日 09:00 JST）月次確定レポート**:
   * 前月1ヶ月間の確定実績（総損益、勝率、PF、銘柄ランキング）および月次チャート（`monthly_performance_YYYYMM.png`）を自動配信（二重送信防止管理付き）。
+* **日次（毎日 09:00 JST 以降 1日1回）直近14日間 バックテスト vs 実運用 日別比較レポート**:
+  * 毎日1回（09:00 JST の朝節目スクリーニング＆API同期完了後、または09:00以降の未送信時）、`Data/last_daily_14d_report_sent.json` による二重送信防止のもと、直近14日間（2週間分）の日別バックテスト理論PnL（方向別OOS適格セル準拠・時点1h地合い・2枠・NY稼働・CB-$1.50・往復0.08%手数料）と取引所API同期済み実運用PnLを並記した比較テーブルを Discord（`force_send=True`）およびログへ出力する。
 * **起動時・定期選定時 アスキーアートバナー即時送信規約 (`force_send=True`)**:
   * ボット起動・再起動時および定期選定時刻到達時、`AUTO TRADING SYSTEM START` および `PERIODIC SCREENING & OPTIMIZE` のアスキーアート・システム概要バナーを `force_send=True` で Discord へ即座に送信する。
   * バナー内の戦略表記は「3態勢地合い連動（BULL:買い / NEUTRAL:待機 / BEAR:売り）」および最新のポジション枠・ナンピン・動的MAE仕様を明記する。
