@@ -2061,33 +2061,80 @@ async def _async_post_exit_reporting(
     whale_sig: str = "",
     cycle_balance: float = 0.0,
     interval_label: str = "5m",
-    mp_period: int = 100
+    mp_period: int = 100,
+    mode: str = "demo",
 ):
-    """決済完了後のトレード記録・チャート生成・Discord画像送信をメインループから隔離して完全非同期実行する"""
+    """決済完了後のトレード記録・取引所実手数料同期(Net PnL)・チャート生成・Discord画像送信を完全非同期実行する"""
     try:
-        from real_trade_tracker import record_real_trade, plot_real_trading_performance, plot_exit_chart
+        from real_trade_tracker import (
+            record_real_trade,
+            plot_real_trading_performance,
+            plot_exit_chart,
+            sync_real_trades_from_bingx_api,
+            load_real_trades,
+        )
         side_upper = str(side).upper()
         side_icon = "🟢" if side_upper == "LONG" else "🔴"
         side_label_ja = "ロング" if side_upper == "LONG" else "ショート"
-        record_real_trade(sym, side_upper, "CLOSE", reported_exit_px, close_qty, pnl, f"実運用決済 ({exit_reason})")
-        discord.print_log(f"[{sym}] [CLOSE] {side_icon} {side_label_ja}ポジション決済完了 [{interval_label}足] (PnL: {pnl:+.2f} USDT, 理由: {exit_reason})")
+
+        est_fee = (
+            (entry_px * close_qty) * 0.0002 + (reported_exit_px * close_qty) * 0.0005
+            if (entry_px > 0 and close_qty > 0 and reported_exit_px > 0)
+            else 0.0
+        )
+        est_net_pnl = round(float(pnl) - est_fee, 4)
+        recorded_entry = record_real_trade(
+            sym, side_upper, "CLOSE", reported_exit_px, close_qty, est_net_pnl, f"実運用決済 ({exit_reason})"
+        )
+        recorded_ts = recorded_entry.get("timestamp") if isinstance(recorded_entry, dict) else None
+
+        display_pnl = est_net_pnl
+        if not BINGX_IS_AIR:
+            try:
+                await asyncio.sleep(2.0)
+                await sync_real_trades_from_bingx_api(mode=mode)
+                latest_trades = load_real_trades()
+                for t_rec in reversed(latest_trades):
+                    if t_rec.get("action") != "CLOSE" or t_rec.get("symbol") != sym:
+                        continue
+                    if not t_rec.get("fee_synced"):
+                        continue
+                    if recorded_ts and t_rec.get("timestamp") == recorded_ts:
+                        display_pnl = float(t_rec.get("pnl", est_net_pnl))
+                        break
+            except Exception as sync_ex_err:
+                print(f"[{sym}] 決済直後API純損益同期警告: {sync_ex_err}")
+
+        discord.print_log(
+            f"[{sym}] [CLOSE] {side_icon} {side_label_ja}ポジション決済完了 [{interval_label}足] "
+            f"(Net PnL: {display_pnl:+.2f} USDT, 理由: {exit_reason})"
+        )
 
         # 1. 決済トレードチャート画像の生成 & 送信
         exit_chart_file = await asyncio.to_thread(
             plot_exit_chart,
             symbol=sym, df=df_chart, exit_price=reported_exit_px, entry_price=entry_px,
-            pnl=pnl, exit_reason=exit_reason, side=side_upper,
+            pnl=display_pnl, exit_reason=exit_reason, side=side_upper,
             interval_label=interval_label, mp_period=mp_period
         )
         if exit_chart_file and Path(exit_chart_file).exists():
-            discord.send_file(exit_chart_file, f"📊 【決済チャート】{sym} {side_upper} 決済完了 [{interval_label}足] (PnL: {pnl:+.2f} USDT)")
+            discord.send_file(
+                exit_chart_file,
+                f"📊 【決済チャート】{sym} {side_upper} 決済完了 [{interval_label}足] (Net PnL: {display_pnl:+.2f} USDT)"
+            )
 
         # 2. スライディング10日間 累積 PnL パフォーマンスチャート (Clean版 & Detail版 2枚)
         clean_file, detail_file = await asyncio.to_thread(plot_real_trading_performance, 10, cycle_balance)
         if clean_file and Path(clean_file).exists():
-            discord.send_file(clean_file, f"📈 【実運用実績】累積損益パフォーマンス (直近10日 - Clean版 / 今回決済: {pnl:+.2f} USDT)")
+            discord.send_file(
+                clean_file,
+                f"📈 【実運用実績】累積損益パフォーマンス (直近10日 - Clean版 / 今回決済: {display_pnl:+.2f} USDT)"
+            )
         if detail_file and Path(detail_file).exists():
-            discord.send_file(detail_file, f"🔍 【実運用実績】累積損益パフォーマンス (直近10日 - Detail版 / 今回決済: {pnl:+.2f} USDT)")
+            discord.send_file(
+                detail_file,
+                f"🔍 【実運用実績】累積損益パフォーマンス (直近10日 - Detail版 / 今回決済: {display_pnl:+.2f} USDT)"
+            )
     except Exception as e:
         discord.print_log(f"⚠️ [{sym}] 決済レポート非同期タスクエラー: {e}", level="warning")
 
@@ -3251,11 +3298,17 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                     tracked_active_positions.discard(sym)
 
                     side_tag = "SHORT" if is_short_pos else "LONG"
-                    # 日次トレード実績および損失サーキットブレーカー用累計の記録
+                    est_fee_cb = (
+                        (entry_px * pos_qty) * 0.0002 + (cur_px * pos_qty) * 0.0005
+                        if (entry_px > 0 and pos_qty > 0 and cur_px > 0)
+                        else 0.0
+                    )
+                    est_net_cb = round(float(pnl_current) - est_fee_cb, 4)
+                    # 日次トレード実績および損失サーキットブレーカー用累計の記録 (推定手数料控除後)
                     record_daily_trade_completion(
                         symbol=sym,
                         side=side_tag,
-                        pnl=pnl_current,
+                        pnl=est_net_cb,
                         reason=exit_reason
                     )
                     try:
@@ -3276,7 +3329,7 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                         sym=sym, side=side_tag, close_qty=pos_qty, reported_exit_px=cur_px,
                         entry_px=entry_px, pnl=pnl_current, exit_reason=exit_reason,
                         df_chart=df_eval, cycle_balance=cycle_balance,
-                        interval_label=inv_label_p, mp_period=pos_mp
+                        interval_label=inv_label_p, mp_period=pos_mp, mode=mode
                     ))
             except Exception as pos_err:
                 discord.print_log(f"⚠️ [{sym}] ポジション監視例外: {pos_err}", level="warning")

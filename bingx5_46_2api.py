@@ -591,7 +591,7 @@ class api_bingx:
         stage_num: int = 1,
         is_nanpin: bool = False,
     ) -> bool:
-        """Long / Short 共通の非ブロッキング Maker 指値配置ヘルパー (`LIMIT GTC` 即時リターン)。"""
+        """Long / Short 共通の非ブロッキング Maker 指値配置ヘルパー (`LIMIT PostOnly` / Maker保証・最大3回ティック退避リトライ)。"""
         if lot_size == 0:
             raise ValueError("lot_size cannot be zero")
         is_short = (str(side).lower() == "short")
@@ -655,47 +655,86 @@ class api_bingx:
         await self.bingx.set_leverage(int(LEVERAGE_FACTOR))
         await self.active_order_cancel()
 
-        cur_bid, cur_ask = get_bingx_orderbook(self.symbol, self.bingx.base_url)
-        current_target, order_mode_label = determine_target_price(cur_bid, cur_ask, current_price)
-        attempt_price = self.bingx._quantize_price(current_target)
+        def _is_postonly_crossing_reject(res_obj: Any) -> bool:
+            if not isinstance(res_obj, dict):
+                return False
+            code_v = res_obj.get("code")
+            msg_low = str(res_obj.get("msg", "")).lower()
+            if code_v == 0:
+                data_obj = res_obj.get("data")
+                order_obj = data_obj.get("order") if isinstance(data_obj, dict) else None
+                status_up = str(order_obj.get("status", "")).upper() if isinstance(order_obj, dict) else ""
+                return status_up in ("CANCELLED", "CANCELED", "REJECTED", "EXPIRED")
+            if code_v in (101215, 109425, 101209):
+                return True
+            return any(k in msg_low for k in ("post only", "postonly", "post_only", "immediately", "maker"))
 
-        order_params = {
-            "symbol": self.symbol,
-            "side": "SELL" if is_short else "BUY",
-            "positionSide": "SHORT" if is_short else "LONG",
-            "type": "LIMIT",
-            "price": str(attempt_price),
-            "quantity": str(lot),
-            "timeInForce": "GTC",
-        }
-        try:
-            res = await _async_bingx_request(
-                "POST",
-                self.bingx.base_url,
-                "/openApi/swap/v2/trade/order",
-                self.bingx.api_key,
-                self.bingx.secret_key,
-                params=order_params,
-                timeout=10,
-            )
-            discord.print_log(
-                f"BingX {side_label} Limit ({order_mode_label}): price={attempt_price}, qty={lot}, result={res}",
-                level="debug",
-            )
-        except Exception as e:
-            discord.print_log(f"BingX {side_label} entry exception: {e}", level="warning")
-            return False
+        price_place = max(0, int(self.bingx._get_spec_value("price_place", 2.0)))
+        tick_size = 10.0 ** (-price_place)
 
-        if isinstance(res, dict):
-            code = res.get("code")
-            if code != 0:
-                msg = res.get("msg", "")
-                discord.print_log(f"⚠️ [{self.symbol}] BingX 注文拒絶 (code={code}): {msg}", level="warning")
+        for attempt_idx in range(3):
+            cur_bid, cur_ask = get_bingx_orderbook(self.symbol, self.bingx.base_url)
+            current_target, order_mode_label = determine_target_price(cur_bid, cur_ask, current_price)
+            if attempt_idx > 0:
+                raw_target = (
+                    current_target + (attempt_idx * tick_size)
+                    if is_short
+                    else max(tick_size, current_target - (attempt_idx * tick_size))
+                )
+            else:
+                raw_target = current_target
+            attempt_price = self.bingx._quantize_price(raw_target)
+
+            order_params = {
+                "symbol": self.symbol,
+                "side": "SELL" if is_short else "BUY",
+                "positionSide": "SHORT" if is_short else "LONG",
+                "type": "LIMIT",
+                "price": str(attempt_price),
+                "quantity": str(lot),
+                "timeInForce": "PostOnly",
+            }
+            try:
+                res = await _async_bingx_request(
+                    "POST",
+                    self.bingx.base_url,
+                    "/openApi/swap/v2/trade/order",
+                    self.bingx.api_key,
+                    self.bingx.secret_key,
+                    params=order_params,
+                    timeout=10,
+                )
+                discord.print_log(
+                    f"BingX {side_label} Limit ({order_mode_label} / PostOnly#{attempt_idx + 1}): "
+                    f"price={attempt_price}, qty={lot}, result={res}",
+                    level="debug",
+                )
+            except Exception as e:
+                discord.print_log(f"BingX {side_label} entry exception: {e}", level="warning")
                 return False
 
-        self.entry_val = float(df["VAL"].iloc[-1]) if "VAL" in df.columns else (current_price * 0.99)
-        self.entry_vah = float(df["VAH"].iloc[-1]) if "VAH" in df.columns else (current_price * 1.01)
-        return True
+            if isinstance(res, dict) and res.get("code") == 0 and not _is_postonly_crossing_reject(res):
+                self.entry_val = float(df["VAL"].iloc[-1]) if "VAL" in df.columns else (current_price * 0.99)
+                self.entry_vah = float(df["VAH"].iloc[-1]) if "VAH" in df.columns else (current_price * 1.01)
+                return True
+
+            if _is_postonly_crossing_reject(res):
+                discord.print_log(
+                    f"[{self.symbol}] PostOnly交差キャンセル (試行 {attempt_idx + 1}/3, price={attempt_price}) -> 次回{attempt_idx + 1}ティック外側へ退避",
+                    level="debug",
+                )
+                continue
+
+            code = res.get("code") if isinstance(res, dict) else None
+            msg = res.get("msg", "") if isinstance(res, dict) else str(res)
+            discord.print_log(f"⚠️ [{self.symbol}] BingX 注文拒絶 (code={code}): {msg}", level="warning")
+            return False
+
+        discord.print_log(
+            f"[{self.symbol}] PostOnly 3回試行すべて交差のため今回見送り（次サイクルで再試行）",
+            level="debug",
+        )
+        return False
 
     async def long_entry(self, df, position, usdt_onhand_amount, lot_size, max_lot, max_stage=1, is_scale_in=False, stage_num=1, is_nanpin=False):
         return await self._place_maker_entry_limit(

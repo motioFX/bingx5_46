@@ -75,8 +75,8 @@ flowchart TD
             PB4_2 -- "枠あり & CB未発動" --> PB4_3{"バックテスト厳格合格銘柄？"}
             PB4_3 -- "不合格/対象外" --> PB4_4["当該銘柄のエントリー見送り (トレード停止)"]
             PB4_3 -- "合格銘柄" --> PB4_5{"採用戦略シグナル判定"}
-            PB4_5 -- "LONGサイン" --> PB4_6["Best Bid 指値発注 (timeInForce: GTC / 単発1本固定 / 5分足スマート追随)"]
-            PB4_5 -- "SHORTサイン" --> PB4_7["Best Ask 指値発注 (timeInForce: GTC / 単発1本固定 / 5分足スマート追随)"]
+            PB4_5 -- "LONGサイン" --> PB4_6["Best Bid 指値発注 (timeInForce: PostOnly / 単発1本固定 / 5分足スマート追随)"]
+            PB4_5 -- "SHORTサイン" --> PB4_7["Best Ask 指値発注 (timeInForce: PostOnly / 単発1本固定 / 5分足スマート追随)"]
             PB4_6 --> PB4_8["足確定時: サイン終了なら指値キャンセル / 次足で再サインなら最新Best Bid/Askに再指値"]
             PB4_7 --> PB4_8
         end
@@ -569,7 +569,7 @@ USDCよりも圧倒的に出来高・流動性が厚い **USDT無期限先物ペ
 
 ### 🎯 Maker 指値優先発注（Best Bid / Best Ask）＆ 5分足確定ごとのライフサイクル
 * **VSTデモ口座でも本番と同一のAPI指値ロジックを実行**:
-  * BingXの公式VSTデモ取引所（`https://open-api-vst.bingx.com`）は豊富な流動性を持つUSDT板と連動しているため、デモ口座検証でも成行に逃げず、本番口座と全く同じ **Maker指値発注（`timeInForce: "GTC"`）** を実行し、実APIの約定挙動・未約定キャンセル・再配置を徹底検証する：
+  * BingXの公式VSTデモ取引所（`https://open-api-vst.bingx.com`）は豊富な流動性を持つUSDT板と連動しているため、デモ口座検証でも成行に逃げず、本番口座と全く同じ **Maker指値発注（`timeInForce: "PostOnly"` / Maker 保証・交差リジェクト時は `bookTicker` 再取得＋最大2ティック外側へ自動退避リトライで最大3回試行）** を実行し、実APIの約定挙動・未約定キャンセル・再配置を徹底検証する（実運用往復手数料 `0.02% + 0.05% = 0.07%` に対し、バックテストは保守的 `0.02% + 0.06% = 0.08%` を維持）：
     - **ロングエントリー**: **`order_price = best_bid`（買い気配最良値）** への指値発注（`side="BUY"`, `positionSide="LONG"`）。
     - **ショートエントリー**: **`order_price = best_ask`（売り気配最良値）** への指値発注（`side="SELL"`, `positionSide="SHORT"`）。
   * **相場板情報 (bookTicker) の本番 API 単一参照規約（デモ・本番共通）**:
@@ -577,7 +577,7 @@ USDCよりも圧倒的に出来高・流動性が厚い **USDT無期限先物ペ
     - デモ専用ドメイン（`open-api-vst.bingx.com`）の気配値は本番板と同期しておらずスプレッドが 0.3 ドル近く開いた孤立シミュレーション板であるため、**板気配値（`best_bid` / `best_ask`）の取得は、デモ口座運用時であっても常に本番公開 API（`https://open-api.bingx.com/openApi/swap/v2/quote/bookTicker`）を参照する**。
     - これにより、画面の取引板の最前列（ベストアスク・ベストビッド）に 100% 完全に一致した Maker 指値配置を実現する。発注・ポジション照会のみデモ用 API（`open-api-vst.bingx.com`）へルーティングする。
 * **5分足確定ごとの非ブロッキング指値ライフサイクル（Long / Short 完全対称仕様）**:
-  * **サイン点灯**: サイン（買い/売り）が出たら最良気配値（買いは `best_bid`、売りは `best_ask`）に単発指値（`LIMIT GTC`）を配置して即時リターンし、メイン監視ループ内の `pending_entry_orders` で一括追跡する（他銘柄のポジション・SL監視を阻害するブロッキング待機は禁止）。
+  * **サイン点灯**: サイン（買い/売り）が出たら最良気配値（買いは `best_bid`、売りは `best_ask`）に単発指値（`LIMIT PostOnly`）を配置して即時リターンし、メイン監視ループ内の `pending_entry_orders` で一括追跡する（他銘柄のポジション・SL監視を阻害するブロッキング待機は禁止）。
   * **確定足追随上限 (`max_chase_bars`)**: `5m` 足戦略は最大 **3 本（15分）**、`15m` 足戦略は **1 本（5分）** まで確定足追随を許可し、同一確定足バーでの重複再発注を禁止（`last_signal_bar_ts` 管理）。
   * **サイン終了・遷移キャンセル**: 足確定時のサイン消滅、追随上限到達、セッション切替（東京→欧州等）、地合い中立転落、日次CB発動のいずれかに該当した瞬間に未約定指値を `active_order_cancel` で即時キャンセルする。
 * **約定検知とクリーンアップ**:
@@ -741,7 +741,7 @@ BINGX_IS_AIR = ("--air" in sys.argv or "--mock" in sys.argv)
   * スライディング 10 日間の確定実績サマリー（有効勝率、PnL、PF、銘柄別ランキング）と、**Clean版（SNS共有用）** および **Detail版（千鳥配置アノテーション付き）** の 2 枚の累積損益チャートを生成・送信。
 * **実運用損益の取引所 API 直接取得・手動損切り完全同期規約 (API-Driven Realized PnL SSoT)**:
   * **取引所 API 直接取得**:
-    ボット内部の約定検知のみに依存せず、起動時・再起動時および定期実行時に BingX 先物 API（`/openApi/swap/v2/user/income?incomeType=REALIZED_PNL`）から実際の確定実現損益データを直接取得して同期する。`tranId` 未紐付けのボット決済レコード（`CLOSE`）は、同一銘柄・方向において時刻差 `900秒`（15分）以内かつ損益差 `±$0.50 USDT` 以内のうち時刻差最小の取引所 `REALIZED_PNL` と照合して `tranId`・確定 `pnl` を統合する（既に分離登録された重複APIレコードも自動統合・重複排除する）。
+    ボット内部の約定検知のみに依存せず、起動時・再起動時・決済直後および定期実行時に BingX 先物 API（`/openApi/swap/v2/user/income` を `incomeType` フィルタなしで一括取得）から `REALIZED_PNL`・`TRADING_FEE`（エントリー/決済双方）・`FUNDING_FEE` を取得・合算し、口座残高増減およびバックテスト / HYPE AIR 比較と 1:1 一致する **真の純損益（Net PnL = `gross_pnl + fee`）** を `gross_pnl`・`fee`・`fee_synced: true` とともに記録・同期する。`tranId` 未紐付けのボット決済レコード（`CLOSE`）は、同一銘柄・方向において時刻差 `900秒`（15分）以内かつ損益差 `±$0.50 USDT` 以内のうち時刻差最小の取引所 `REALIZED_PNL` と照合して `tranId`・確定 Net PnL を統合する（既に分離登録された重複APIレコードも自動統合・重複排除する）。
   * **手動損切り・外部決済の完全網羅**:
     ユーザーが手動スクリプトや取引所 UI から行った成行決済（Manual Flatten）、外部決済、清算イベントを自動検知し、未登録の決済を `Data/real_trades_history.json` および `Data/trades_history.csv` へ自動補完・反映する。
   * **起動・再起動時の実運用損益表出力**:

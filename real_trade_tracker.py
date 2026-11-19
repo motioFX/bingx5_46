@@ -133,7 +133,10 @@ def sync_trades_to_csv():
         if "price" in df.columns and "qty" in df.columns:
             df["notional_usd"] = (df["price"] * df["qty"]).round(2)
 
-        cols = ["timestamp", "dt_jst", "symbol", "action", "side", "price", "qty", "notional_usd", "pnl", "note"]
+        cols = [
+            "timestamp", "dt_jst", "symbol", "action", "side",
+            "price", "qty", "notional_usd", "pnl", "gross_pnl", "fee", "note",
+        ]
         cols = [c for c in cols if c in df.columns]
         df[cols].to_csv(TRADES_CSV, index=False, encoding="utf-8")
 
@@ -648,6 +651,9 @@ def deduplicate_api_synced_closes(
             copied[bot_idx]["tranId"] = api_t.get("tranId")
             copied[bot_idx]["tradeId"] = api_t.get("tradeId")
             copied[bot_idx]["pnl"] = float(api_t.get("pnl", 0.0) or 0.0)
+            for extra_k in ("gross_pnl", "fee", "fee_synced"):
+                if extra_k in api_t:
+                    copied[bot_idx][extra_k] = api_t[extra_k]
             paired_bots.add(bot_idx)
             removed_indices.add(api_idx)
 
@@ -655,11 +661,110 @@ def deduplicate_api_synced_closes(
     return deduped, len(removed_indices)
 
 
+def attach_bingx_income_fees(income_rows: list) -> list[Dict[str, Any]]:
+    """
+    BingX `/openApi/swap/v2/user/income` の全レコード群（`REALIZED_PNL` / `TRADING_FEE` / `FUNDING_FEE`）を
+    時系列に照合し、各 `REALIZED_PNL` 決済に対応するエントリー手数料・決済手数料・ファンディング料を紐付けた
+    純損益（`net_pnl = gross_pnl + fee`）リストを返す。
+    """
+    if not income_rows:
+        return []
+
+    valid_rows = [dict(r) for r in income_rows if isinstance(r, dict)]
+    valid_rows.sort(key=lambda r: (int(r.get("time", 0) or 0), str(r.get("tranId", ""))))
+
+    pnl_rows = [r for r in valid_rows if str(r.get("incomeType", "")).upper() == "REALIZED_PNL"]
+    fee_rows = [r for r in valid_rows if str(r.get("incomeType", "")).upper() == "TRADING_FEE"]
+    funding_rows = [r for r in valid_rows if str(r.get("incomeType", "")).upper() == "FUNDING_FEE"]
+
+    consumed_fee_indices: set[int] = set()
+    consumed_fund_indices: set[int] = set()
+    last_close_ms_by_sym: Dict[str, int] = {}
+    enriched: list[Dict[str, Any]] = []
+
+    max_hold_window_ms = 48 * 3600 * 1000
+
+    for pnl_row in pnl_rows:
+        sym = str(pnl_row.get("symbol", "")).strip()
+        t_ms = int(pnl_row.get("time", 0) or 0)
+        trade_id = pnl_row.get("tradeId")
+        gross_pnl = float(pnl_row.get("income", 0.0) or 0.0)
+        prev_close_ms = last_close_ms_by_sym.get(sym, 0)
+
+        # 1. 決済手数料: tradeId 完全一致を最優先、未一致時は ±5秒以内の Position closing fee で補完
+        close_fee = 0.0
+        matched_close_fee = False
+        if trade_id:
+            for fi, fr in enumerate(fee_rows):
+                if fi in consumed_fee_indices:
+                    continue
+                if fr.get("tradeId") == trade_id:
+                    close_fee += float(fr.get("income", 0.0) or 0.0)
+                    consumed_fee_indices.add(fi)
+                    matched_close_fee = True
+        if not matched_close_fee:
+            for fi, fr in enumerate(fee_rows):
+                if fi in consumed_fee_indices or str(fr.get("symbol", "")).strip() != sym:
+                    continue
+                f_info = str(fr.get("info", "")).lower()
+                f_ms = int(fr.get("time", 0) or 0)
+                if "closing" in f_info and abs(f_ms - t_ms) <= 5000:
+                    close_fee += float(fr.get("income", 0.0) or 0.0)
+                    consumed_fee_indices.add(fi)
+                    matched_close_fee = True
+                    break
+
+        # 2. エントリー手数料: 前回決済〜今回決済の間（48h以内）に発生した未消費の Position opening fee を合算
+        open_fee = 0.0
+        earliest_open_ms: Optional[int] = None
+        for fi, fr in enumerate(fee_rows):
+            if fi in consumed_fee_indices or str(fr.get("symbol", "")).strip() != sym:
+                continue
+            f_info = str(fr.get("info", "")).lower()
+            if "opening" not in f_info:
+                continue
+            f_ms = int(fr.get("time", 0) or 0)
+            if f_ms > t_ms or (t_ms - f_ms) > max_hold_window_ms:
+                continue
+            if prev_close_ms > 0 and f_ms < (prev_close_ms - 5000):
+                continue
+            open_fee += float(fr.get("income", 0.0) or 0.0)
+            consumed_fee_indices.add(fi)
+            if earliest_open_ms is None or f_ms < earliest_open_ms:
+                earliest_open_ms = f_ms
+
+        # 3. ファンディング手数料: 保有期間中の FUNDING_FEE を合算
+        funding_fee = 0.0
+        if earliest_open_ms is not None:
+            for fdi, fdr in enumerate(funding_rows):
+                if fdi in consumed_fund_indices or str(fdr.get("symbol", "")).strip() != sym:
+                    continue
+                fd_ms = int(fdr.get("time", 0) or 0)
+                if earliest_open_ms <= fd_ms <= t_ms:
+                    funding_fee += float(fdr.get("income", 0.0) or 0.0)
+                    consumed_fund_indices.add(fdi)
+
+        total_fee = round(open_fee + close_fee + funding_fee, 7)
+        net_pnl = round(gross_pnl + total_fee, 7)
+        last_close_ms_by_sym[sym] = max(prev_close_ms, t_ms)
+
+        out_row = dict(pnl_row)
+        out_row["gross_pnl"] = round(gross_pnl, 7)
+        out_row["open_fee"] = round(open_fee, 7)
+        out_row["close_fee"] = round(close_fee, 7)
+        out_row["funding_fee"] = round(funding_fee, 7)
+        out_row["fee"] = total_fee
+        out_row["net_pnl"] = net_pnl
+        enriched.append(out_row)
+
+    return enriched
+
+
 async def sync_real_trades_from_bingx_api(mode: str = 'demo') -> int:
     """
-    BingX 先物 API (/openApi/swap/v2/user/income?incomeType=REALIZED_PNL) から
-    取引所で確定した実現損益（REALIZED_PNL）履歴を直接取得し、
-    手動決済・外部決済・ボット決済の全レコードを real_trades_history.json と自動同期する。
+    BingX 先物 API (/openApi/swap/v2/user/income) から
+    実現損益（REALIZED_PNL）および売買手数料（TRADING_FEE）・ファンディング料（FUNDING_FEE）を直接取得し、
+    口座残高増減およびバックテストと一致する純損益（Net PnL）として real_trades_history.json へ自動同期する。
     戻り値: 新規追加・更新・重複統合された件数
     """
     try:
@@ -673,18 +778,33 @@ async def sync_real_trades_from_bingx_api(mode: str = 'demo') -> int:
             return 0
         base_url = RestAPI_url.get(cred_key, 'https://open-api-vst.bingx.com' if mode in ('paper', 'demo', 'testnet') else 'https://open-api.bingx.com')
 
+        has_fee_feed = False
         res = await _async_bingx_request(
             "GET", base_url, "/openApi/swap/v2/user/income",
             api_key, secret_key,
-            params={"incomeType": "REALIZED_PNL", "limit": 100},
+            params={"limit": 300},
             timeout=10
         )
-        if not res or res.get("code") != 0:
-            print(f"[PnL Sync] 取引所からの実現損益取得に失敗しました: {res}")
+        if res and res.get("code") == 0 and isinstance(res.get("data"), list):
+            has_fee_feed = True
+            raw_data = res.get("data", [])
+        else:
+            res_fb = await _async_bingx_request(
+                "GET", base_url, "/openApi/swap/v2/user/income",
+                api_key, secret_key,
+                params={"incomeType": "REALIZED_PNL", "limit": 100},
+                timeout=10
+            )
+            if not res_fb or res_fb.get("code") != 0:
+                print(f"[PnL Sync] 取引所からの実現損益取得に失敗しました: {res_fb or res}")
+                return 0
+            raw_data = res_fb.get("data", [])
+
+        if not raw_data:
             return 0
 
-        data = res.get("data", [])
-        if not data:
+        enriched_pnls = attach_bingx_income_fees(raw_data)
+        if not enriched_pnls:
             return 0
 
         DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -693,7 +813,11 @@ async def sync_real_trades_from_bingx_api(mode: str = 'demo') -> int:
             trades, max_time_diff_sec=900.0, max_pnl_diff_usd=0.50
         )
 
-        existing_tran_ids = {t.get("tranId") for t in trades if t.get("tranId")}
+        tran_id_to_idx: Dict[str, int] = {
+            str(t["tranId"]): idx
+            for idx, t in enumerate(trades)
+            if t.get("tranId")
+        }
 
         close_records = []
         for idx, t in enumerate(trades):
@@ -712,9 +836,11 @@ async def sync_real_trades_from_bingx_api(mode: str = 'demo') -> int:
         new_count = 0
         updated_count = 0
 
-        for item in reversed(data):
+        for item in enriched_pnls:
             sym = item.get("symbol")
-            inc = float(item.get("income", 0.0))
+            gross_inc = float(item.get("gross_pnl", item.get("income", 0.0)) or 0.0)
+            fee_val = float(item.get("fee", 0.0) or 0.0)
+            net_inc = float(item.get("net_pnl", gross_inc) or 0.0) if has_fee_feed else gross_inc
             t_ms = item.get("time", 0)
             tran_id = item.get("tranId")
             trade_id = item.get("tradeId")
@@ -723,7 +849,24 @@ async def sync_real_trades_from_bingx_api(mode: str = 'demo') -> int:
             t_sec = t_ms / 1000.0
             dt_iso = datetime.fromtimestamp(t_sec, timezone.utc).isoformat()
 
-            if tran_id and tran_id in existing_tran_ids:
+            if tran_id and str(tran_id) in tran_id_to_idx:
+                ex_idx = tran_id_to_idx[str(tran_id)]
+                ex_rec = trades[ex_idx]
+                if has_fee_feed:
+                    cur_pnl = float(ex_rec.get("pnl", 0.0) or 0.0)
+                    cur_fee = float(ex_rec.get("fee", 0.0) or 0.0)
+                    needs_backfill = (
+                        (not ex_rec.get("fee_synced"))
+                        or (ex_rec.get("gross_pnl") is None)
+                        or abs(cur_pnl - net_inc) > 1e-6
+                        or abs(cur_fee - fee_val) > 1e-6
+                    )
+                    if needs_backfill:
+                        ex_rec["gross_pnl"] = gross_inc
+                        ex_rec["fee"] = fee_val
+                        ex_rec["pnl"] = net_inc
+                        ex_rec["fee_synced"] = True
+                        updated_count += 1
                 continue
 
             info_low = str(info).lower()
@@ -738,7 +881,7 @@ async def sync_real_trades_from_bingx_api(mode: str = 'demo') -> int:
                 if side_detected and c_side and c_side != side_detected:
                     continue
                 dt_sec = abs(c_sec - t_sec)
-                if dt_sec <= 900.0 and abs(c_pnl - inc) <= 0.50:
+                if dt_sec <= 900.0 and min(abs(c_pnl - gross_inc), abs(c_pnl - net_inc)) <= 0.50:
                     if best_match is None or dt_sec < best_match[0]:
                         best_match = (dt_sec, idx)
 
@@ -746,29 +889,38 @@ async def sync_real_trades_from_bingx_api(mode: str = 'demo') -> int:
                 matched_idx = best_match[1]
                 trades[matched_idx]["tranId"] = tran_id
                 trades[matched_idx]["tradeId"] = trade_id
-                trades[matched_idx]["pnl"] = inc
+                trades[matched_idx]["pnl"] = net_inc
+                if has_fee_feed:
+                    trades[matched_idx]["gross_pnl"] = gross_inc
+                    trades[matched_idx]["fee"] = fee_val
+                    trades[matched_idx]["fee_synced"] = True
                 if tran_id:
-                    existing_tran_ids.add(tran_id)
+                    tran_id_to_idx[str(tran_id)] = matched_idx
                 updated_count += 1
             else:
                 new_side = side_detected or "LONG"
-                new_entry = {
+                new_entry: Dict[str, Any] = {
                     "timestamp": dt_iso,
                     "symbol": sym,
                     "side": new_side,
                     "action": "CLOSE",
                     "price": 0.0,
                     "qty": 0.0,
-                    "pnl": inc,
+                    "pnl": net_inc,
                     "tranId": tran_id,
                     "tradeId": trade_id,
-                    "note": f"取引所API直接取得決済 ({info}: 手動損切り/外部決済自動同期)"
+                    "note": f"取引所API直接取得決済 ({info}: 手動損切り/外部決済自動同期)",
                 }
+                if has_fee_feed:
+                    new_entry["gross_pnl"] = gross_inc
+                    new_entry["fee"] = fee_val
+                    new_entry["fee_synced"] = True
                 trades.append(new_entry)
+                new_idx = len(trades) - 1
                 if tran_id:
-                    existing_tran_ids.add(tran_id)
+                    tran_id_to_idx[str(tran_id)] = new_idx
                 new_count += 1
-                close_records.append((len(trades) - 1, sym, new_side, t_sec, inc))
+                close_records.append((new_idx, sym, new_side, t_sec, net_inc))
 
         if new_count > 0 or updated_count > 0 or dedup_count > 0:
             with open(TRADES_FILE, "w", encoding="utf-8") as f:
@@ -779,12 +931,12 @@ async def sync_real_trades_from_bingx_api(mode: str = 'demo') -> int:
             except Exception as pe:
                 print(f"[PnL Sync] チャート更新エラー: {pe}")
             print(
-                f"[PnL Sync] 取引所API直接同期完了: "
+                f"[PnL Sync] 取引所API直接同期完了 (Net PnL/手数料控除後): "
                 f"新規追加={new_count}件, 更新={updated_count}件, 重複統合={dedup_count}件 (総履歴: {len(trades)}件)"
             )
             return new_count + updated_count + dedup_count
         else:
-            print(f"[PnL Sync] 取引所API同期: 全{len(data)}件の実現損益レコードは既に完全同期済みです。")
+            print(f"[PnL Sync] 取引所API同期: 全{len(enriched_pnls)}件の実現損益レコード(Net PnL)は既に完全同期済みです。")
             return 0
     except Exception as e:
         print(f"[PnL Sync] 取引所API同期例外エラー: {e}")
