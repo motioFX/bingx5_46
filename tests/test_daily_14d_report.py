@@ -308,6 +308,12 @@ class TestDaily14dReportAndSideAwarePortfolio(unittest.TestCase):
                 self.assertEqual(fake_discord.print_log.call_count, 2)
                 self.assertEqual(fake_discord.send_file.call_count, 2)
 
+    def test_vp_param_grid_mp_values(self):
+        for strat in ("val_poc", "vah_poc", "vah_break", "val_break"):
+            grid = lbe.get_param_grid(strat)
+            self.assertEqual(len(grid), 9)
+            self.assertEqual({p["mp"] for p in grid}, {70, 100, 150})
+
 
 if __name__ == "__main__":
     unittest.main()

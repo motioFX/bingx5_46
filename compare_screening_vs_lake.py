@@ -55,7 +55,7 @@ def _run_legacy_insample_30d(
     win_start = cutoff_utc - (30 * 86400)
     out: Dict[tuple, Dict[str, Any]] = {}
     has_vp = any(s in ("val_poc", "vah_poc", "vah_break", "val_break") for s in strategies)
-    needed_mps = (100, 150, 200) if has_vp else ()
+    needed_mps = (70, 100, 150) if has_vp else ()
 
     for sym in FIXED_TRADABLE_SYMBOLS:
         df_5m = lake.load_candles(sym, "5m", cutoff_utc=cutoff_utc, start_utc=win_start - 2 * 86400)

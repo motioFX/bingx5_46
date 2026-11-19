@@ -115,13 +115,13 @@ def get_param_grid(strategy: str) -> List[Dict[str, Any]]:
     if strategy in ("val_poc", "vah_poc"):
         return [
             {"mp": mp, "target_ratio": tr}
-            for mp in (100, 150, 200)
+            for mp in (70, 100, 150)
             for tr in (0.55, 0.70, 0.85)
         ]
     if strategy in ("vah_break", "val_break"):
         return [
             {"mp": mp, "target_ratio": tr}
-            for mp in (100, 150, 200)
+            for mp in (70, 100, 150)
             for tr in (0.50, 0.70, 0.90)
         ]
     if strategy == "rsima":
@@ -404,7 +404,7 @@ def _compute_causal_features(
     df_tf: pd.DataFrame,
     timeframe: str,
     cfg: WalkForwardConfig,
-    needed_mps: Sequence[int] = (100, 150, 200),
+    needed_mps: Sequence[int] = (70, 100, 150),
 ) -> Dict[str, Any]:
     """
     指定足種 DataFrame (すでに `ts_utc + tf_sec <= end_cutoff` 済) に対して、
@@ -1280,7 +1280,7 @@ def run_walkforward_from_lake(
 
     # ウォームアップ用余白は個別最適化/評価ループ側で足種ごとに最小限 (max(2d, 220*tf)) を厳密切り出しする
     has_vp_strat = any(s in ("val_poc", "vah_poc", "vah_break", "val_break") for s in eval_strategies)
-    opt_mps: Tuple[int, ...] = (100, 150, 200) if has_vp_strat else ()
+    opt_mps: Tuple[int, ...] = (70, 100, 150) if has_vp_strat else ()
 
     cell_rows: List[Dict[str, Any]] = []
     sim_trade_rows: List[Dict[str, Any]] = []
