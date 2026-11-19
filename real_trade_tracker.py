@@ -593,12 +593,74 @@ def print_real_trading_table(days: int = 10, current_balance: Optional[float] = 
     return table_text
 
 
+def deduplicate_api_synced_closes(
+    trades: list,
+    max_time_diff_sec: float = 900.0,
+    max_pnl_diff_usd: float = 0.50,
+) -> Tuple[list, int]:
+    """`tranId` 未紐付けのボット決済レコードと、時刻ずれ・手数料差で別登録された API 直接同期決済レコードを統合する。"""
+    if not trades:
+        return [], 0
+
+    copied = [dict(t) for t in trades if isinstance(t, dict)]
+    bot_candidates = []
+    api_candidates = []
+
+    for idx, t in enumerate(copied):
+        if t.get("action") != "CLOSE":
+            continue
+        note = str(t.get("note", ""))
+        ts_dt = _parse_utc_timestamp(t.get("timestamp"))
+        if ts_dt is None:
+            continue
+        sec = ts_dt.timestamp()
+        sym = str(t.get("symbol", "")).strip()
+        side = str(t.get("side", "")).upper()
+        pnl = float(t.get("pnl", 0.0) or 0.0)
+        px = float(t.get("price", 0.0) or 0.0)
+
+        if not t.get("tranId") and "取引所API直接取得決済" not in note:
+            bot_candidates.append((idx, sym, side, sec, pnl))
+        elif t.get("tranId") and px == 0.0 and "取引所API直接取得決済" in note:
+            api_candidates.append((idx, sym, side, sec, pnl))
+
+    paired_bots = set()
+    removed_indices = set()
+
+    for api_idx, api_sym, api_side, api_sec, api_pnl in api_candidates:
+        best_match: Optional[Tuple[float, int]] = None
+        for bot_idx, bot_sym, bot_side, bot_sec, bot_pnl in bot_candidates:
+            if bot_idx in paired_bots or bot_sym != api_sym:
+                continue
+            if api_side and bot_side and api_side != bot_side:
+                continue
+            dt_sec = abs(bot_sec - api_sec)
+            if dt_sec > max_time_diff_sec:
+                continue
+            if abs(bot_pnl - api_pnl) > max_pnl_diff_usd:
+                continue
+            if best_match is None or dt_sec < best_match[0]:
+                best_match = (dt_sec, bot_idx)
+
+        if best_match is not None:
+            _, bot_idx = best_match
+            api_t = copied[api_idx]
+            copied[bot_idx]["tranId"] = api_t.get("tranId")
+            copied[bot_idx]["tradeId"] = api_t.get("tradeId")
+            copied[bot_idx]["pnl"] = float(api_t.get("pnl", 0.0) or 0.0)
+            paired_bots.add(bot_idx)
+            removed_indices.add(api_idx)
+
+    deduped = [t for idx, t in enumerate(copied) if idx not in removed_indices]
+    return deduped, len(removed_indices)
+
+
 async def sync_real_trades_from_bingx_api(mode: str = 'demo') -> int:
     """
     BingX 先物 API (/openApi/swap/v2/user/income?incomeType=REALIZED_PNL) から
     取引所で確定した実現損益（REALIZED_PNL）履歴を直接取得し、
     手動決済・外部決済・ボット決済の全レコードを real_trades_history.json と自動同期する。
-    戻り値: 新規追加または更新された件数
+    戻り値: 新規追加・更新・重複統合された件数
     """
     try:
         from bingx5_46_2api import RestAPI_url, apis_bingx, _async_bingx_request, is_air
@@ -627,6 +689,9 @@ async def sync_real_trades_from_bingx_api(mode: str = 'demo') -> int:
 
         DATA_DIR.mkdir(parents=True, exist_ok=True)
         trades = load_real_trades()
+        trades, dedup_count = deduplicate_api_synced_closes(
+            trades, max_time_diff_sec=900.0, max_pnl_diff_usd=0.50
+        )
 
         existing_tran_ids = {t.get("tranId") for t in trades if t.get("tranId")}
 
@@ -636,7 +701,13 @@ async def sync_real_trades_from_bingx_api(mode: str = 'demo') -> int:
                 ts = t.get("timestamp")
                 t_dt = _parse_utc_timestamp(ts)
                 sec = t_dt.timestamp() if t_dt is not None else 0.0
-                close_records.append((idx, t.get("symbol"), sec, float(t.get("pnl", 0.0))))
+                close_records.append((
+                    idx,
+                    t.get("symbol"),
+                    str(t.get("side", "")).upper(),
+                    sec,
+                    float(t.get("pnl", 0.0)),
+                ))
 
         new_count = 0
         updated_count = 0
@@ -655,13 +726,24 @@ async def sync_real_trades_from_bingx_api(mode: str = 'demo') -> int:
             if tran_id and tran_id in existing_tran_ids:
                 continue
 
-            matched_idx = None
-            for idx, c_sym, c_sec, c_pnl in close_records:
-                if c_sym == sym and abs(c_sec - t_sec) <= 180 and abs(c_pnl - inc) <= 0.05:
-                    matched_idx = idx
-                    break
+            info_low = str(info).lower()
+            side_detected = "SHORT" if "short" in info_low else ("LONG" if "long" in info_low else "")
 
-            if matched_idx is not None:
+            best_match: Optional[Tuple[float, int]] = None
+            for idx, c_sym, c_side, c_sec, c_pnl in close_records:
+                if trades[idx].get("tranId"):
+                    continue
+                if c_sym != sym:
+                    continue
+                if side_detected and c_side and c_side != side_detected:
+                    continue
+                dt_sec = abs(c_sec - t_sec)
+                if dt_sec <= 900.0 and abs(c_pnl - inc) <= 0.50:
+                    if best_match is None or dt_sec < best_match[0]:
+                        best_match = (dt_sec, idx)
+
+            if best_match is not None:
+                matched_idx = best_match[1]
                 trades[matched_idx]["tranId"] = tran_id
                 trades[matched_idx]["tradeId"] = trade_id
                 trades[matched_idx]["pnl"] = inc
@@ -669,11 +751,11 @@ async def sync_real_trades_from_bingx_api(mode: str = 'demo') -> int:
                     existing_tran_ids.add(tran_id)
                 updated_count += 1
             else:
-                side_detected = "SHORT" if ("short" in str(info).lower()) else "LONG"
+                new_side = side_detected or "LONG"
                 new_entry = {
                     "timestamp": dt_iso,
                     "symbol": sym,
-                    "side": side_detected,
+                    "side": new_side,
                     "action": "CLOSE",
                     "price": 0.0,
                     "qty": 0.0,
@@ -686,9 +768,9 @@ async def sync_real_trades_from_bingx_api(mode: str = 'demo') -> int:
                 if tran_id:
                     existing_tran_ids.add(tran_id)
                 new_count += 1
-                close_records.append((len(trades) - 1, sym, t_sec, inc))
+                close_records.append((len(trades) - 1, sym, new_side, t_sec, inc))
 
-        if new_count > 0 or updated_count > 0:
+        if new_count > 0 or updated_count > 0 or dedup_count > 0:
             with open(TRADES_FILE, "w", encoding="utf-8") as f:
                 json.dump(trades, f, indent=2, ensure_ascii=False)
             sync_trades_to_csv()
@@ -696,8 +778,11 @@ async def sync_real_trades_from_bingx_api(mode: str = 'demo') -> int:
                 plot_real_trading_performance(days=10)
             except Exception as pe:
                 print(f"[PnL Sync] チャート更新エラー: {pe}")
-            print(f"[PnL Sync] 取引所API直接同期完了: 新規追加={new_count}件, 更新={updated_count}件 (総履歴: {len(trades)}件)")
-            return new_count + updated_count
+            print(
+                f"[PnL Sync] 取引所API直接同期完了: "
+                f"新規追加={new_count}件, 更新={updated_count}件, 重複統合={dedup_count}件 (総履歴: {len(trades)}件)"
+            )
+            return new_count + updated_count + dedup_count
         else:
             print(f"[PnL Sync] 取引所API同期: 全{len(data)}件の実現損益レコードは既に完全同期済みです。")
             return 0

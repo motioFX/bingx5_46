@@ -98,6 +98,82 @@ class TestRealTradeTrackerTimestamps(unittest.TestCase):
         self.assertEqual(str(dt_from_naive.tzinfo), "Asia/Tokyo")
         self.assertEqual(dt_from_naive.strftime("%Y-%m-%d %H:%M:%S"), "2026-11-18 09:46:32")
 
+    def test_deduplicate_api_synced_closes_merges_clock_offset_and_fee_diff(self):
+        sample_trades = [
+            {
+                "timestamp": "2026-11-17T15:09:12.055736+00:00",
+                "symbol": "ENA-USDT",
+                "side": "SHORT",
+                "action": "CLOSE",
+                "price": 0.11569,
+                "qty": 128.16,
+                "pnl": 0.1009,
+                "note": "実運用決済 (VAH_POC_TARGET_TP (TR=0.55): 目標($0.1158)到達 (PnL=+1.11%))",
+            },
+            {
+                "timestamp": "2026-11-17T15:08:06+00:00",
+                "symbol": "ENA-USDT",
+                "side": "SHORT",
+                "action": "CLOSE",
+                "price": 0.0,
+                "qty": 0.0,
+                "pnl": -0.0012816,
+                "tranId": "1794553505100903883_513_1406976_PNL",
+                "tradeId": "1794553505100903883_513_1406975",
+                "note": "取引所API直接取得決済 (Close Short: 手動損切り/外部決済自動同期)",
+            },
+            {
+                "timestamp": "2026-11-18T00:46:32.453428+00:00",
+                "symbol": "ENA-USDT",
+                "side": "SHORT",
+                "action": "CLOSE",
+                "price": 0.11643,
+                "qty": 127.13,
+                "pnl": 0.2237488,
+                "tranId": "1794553505100903883_513_1560158_PNL",
+                "tradeId": "1794553505100903883_513_1560157",
+                "note": "実運用決済 (RSIMA_SHORT_RSI_TP)",
+            },
+            {
+                "timestamp": "2026-11-19T05:19:22.440689+00:00",
+                "symbol": "ENA-USDT",
+                "side": "SHORT",
+                "action": "CLOSE",
+                "price": 0.11159,
+                "qty": 132.39,
+                "pnl": 0.1638,
+                "note": "実運用決済 (VAH_POC_TARGET_TP (TR=0.55): 目標($0.1116)到達 (PnL=+1.33%))",
+            },
+            {
+                "timestamp": "2026-11-19T05:15:24+00:00",
+                "symbol": "ENA-USDT",
+                "side": "SHORT",
+                "action": "CLOSE",
+                "price": 0.0,
+                "qty": 0.0,
+                "pnl": 0.1431978,
+                "tranId": "1794553505100903883_513_2056985_PNL",
+                "tradeId": "1794553505100903883_513_2056984",
+                "note": "取引所API直接取得決済 (Close Short: 手動損切り/外部決済自動同期)",
+            },
+        ]
+
+        deduped, removed = rtt.deduplicate_api_synced_closes(sample_trades)
+        self.assertEqual(removed, 2)
+        self.assertEqual(len(deduped), 3)
+
+        self.assertAlmostEqual(deduped[0]["price"], 0.11569)
+        self.assertAlmostEqual(deduped[0]["pnl"], -0.0012816, places=7)
+        self.assertEqual(deduped[0]["tranId"], "1794553505100903883_513_1406976_PNL")
+        self.assertIn("VAH_POC_TARGET_TP", deduped[0]["note"])
+
+        self.assertAlmostEqual(deduped[1]["pnl"], 0.2237488, places=7)
+
+        self.assertAlmostEqual(deduped[2]["price"], 0.11159)
+        self.assertAlmostEqual(deduped[2]["pnl"], 0.1431978, places=7)
+        self.assertEqual(deduped[2]["tranId"], "1794553505100903883_513_2056985_PNL")
+        self.assertIn("VAH_POC_TARGET_TP", deduped[2]["note"])
+
 
 if __name__ == "__main__":
     unittest.main()

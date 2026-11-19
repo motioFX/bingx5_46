@@ -741,7 +741,7 @@ BINGX_IS_AIR = ("--air" in sys.argv or "--mock" in sys.argv)
   * スライディング 10 日間の確定実績サマリー（有効勝率、PnL、PF、銘柄別ランキング）と、**Clean版（SNS共有用）** および **Detail版（千鳥配置アノテーション付き）** の 2 枚の累積損益チャートを生成・送信。
 * **実運用損益の取引所 API 直接取得・手動損切り完全同期規約 (API-Driven Realized PnL SSoT)**:
   * **取引所 API 直接取得**:
-    ボット内部の約定検知のみに依存せず、起動時・再起動時および定期実行時に BingX 先物 API（`/openApi/swap/v2/user/income?incomeType=REALIZED_PNL`）から実際の確定実現損益データを直接取得して同期する。
+    ボット内部の約定検知のみに依存せず、起動時・再起動時および定期実行時に BingX 先物 API（`/openApi/swap/v2/user/income?incomeType=REALIZED_PNL`）から実際の確定実現損益データを直接取得して同期する。`tranId` 未紐付けのボット決済レコード（`CLOSE`）は、同一銘柄・方向において時刻差 `900秒`（15分）以内かつ損益差 `±$0.50 USDT` 以内のうち時刻差最小の取引所 `REALIZED_PNL` と照合して `tranId`・確定 `pnl` を統合する（既に分離登録された重複APIレコードも自動統合・重複排除する）。
   * **手動損切り・外部決済の完全網羅**:
     ユーザーが手動スクリプトや取引所 UI から行った成行決済（Manual Flatten）、外部決済、清算イベントを自動検知し、未登録の決済を `Data/real_trades_history.json` および `Data/trades_history.csv` へ自動補完・反映する。
   * **起動・再起動時の実運用損益表出力**:
