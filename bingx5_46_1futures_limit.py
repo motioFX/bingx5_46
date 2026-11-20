@@ -153,9 +153,9 @@ from symbol_universe import FIXED_TRADABLE_SYMBOLS, EXCLUDED_TRADE_MEGA_CAPS
 FIXED_SYMBOLS: List[str] = list(FIXED_TRADABLE_SYMBOLS)
 
 # [ 6 ] 定期銘柄選定・リセット時刻（JST時間: 0〜23時）
-#       デフォルト: [1, 9, 17] (01:00, 09:00, 17:00 JST / 8時間ごと・主要セッション＆FR節目)。
+#       デフォルト: [1, 5, 9, 13, 17, 21] (4時間ごと / 節目 01,09,17 JST + 中間監視 + 毎時軽量地合い反転検知)。
 #       CLI引数 (--analysis-hours / --reset-hours / --reset-hour) での上書き指定も可能。
-ANALYSIS_HOURS: List[int] = list(range(24))
+ANALYSIS_HOURS: List[int] = [1, 5, 9, 13, 17, 21]
 DAILY_ANALYSIS_MINUTE = 0
 
 # コマンドライン引数からのナンピン数オーバーライド
@@ -206,7 +206,7 @@ for _idx, _arg in enumerate(sys.argv):
 
 
 # コマンドライン引数からのステータス照会 (--status / --symbols)
-if any(arg in sys.argv for arg in ("--status", "--symbols", "-s")):
+if __name__ == "__main__" and any(arg in sys.argv for arg in ("--status", "--symbols", "-s")):
     try:
         from show_symbol_status import display_and_send_symbols_status
         send_d = "--discord" in sys.argv
@@ -1693,6 +1693,7 @@ async def run_screening_and_optimization(mode: str, send_charts: bool = False, s
     # 1. 銘柄スクリーニング実行
     print("\n[Phase A] 銘柄スクリーニング・パラメータ最適化を開始します (3-Regime Adaptive)...")
     mix_script = Path(__file__).resolve().parent / "bingx5_46_4mix_candle_Merged_Alt10.py"
+    mix_ok = False
     if mix_script.exists():
         try:
             cmd = [sys.executable, str(mix_script)]
@@ -1701,6 +1702,7 @@ async def run_screening_and_optimization(mode: str, send_charts: bool = False, s
             if skip_zip:
                 cmd.append("--skip-zip")
             subprocess.run(cmd, check=True)
+            mix_ok = True
         except Exception as sub_err:
             print(f"[Screening Error] 銘柄スクリーニング実行エラー: {sub_err}")
 
@@ -1729,11 +1731,12 @@ async def run_screening_and_optimization(mode: str, send_charts: bool = False, s
     print(f"[Market State] Regime: {overall_reg_mode} | Strategy Mode: {strat_mode_desc} | Whale Filter: OFF")
 
     # 3. データレイク 2段階ウォークフォワード評価による監視銘柄の選定 (OOS 判定)
-    try:
-        from candle_5m_store import sync_all_target_symbols_5m
-        sync_all_target_symbols_5m(lookback_days=2)
-    except Exception as sync_err:
-        print(f"[Lake Sync Warning] 差分5m足同期警告: {sync_err}")
+    if not mix_ok:
+        try:
+            from candle_5m_store import sync_all_target_symbols_5m
+            sync_all_target_symbols_5m(lookback_days=2)
+        except Exception as sync_err:
+            print(f"[Lake Sync Warning] 差分5m足同期警告: {sync_err}")
 
     # ノーマライズ前半高安監査の除外リストを辞書形式へ正規化 (クジラ除外は完全撤廃)
     ms_excl_raw = ms_data.get("excluded_symbols") or {}
@@ -2746,6 +2749,11 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
     last_neutral_notice_hour: Optional[int] = None
     last_ny_notice_hour: Optional[int] = None
     last_daily_limit_notice_hour: Optional[int] = None
+    regime_info = get_regime_gate_info("BTC-USDT")
+    overall_regime = regime_info.get("overall_regime", "NEUTRAL")
+    regime_strength = regime_info.get("regime_strength", {})
+    last_screened_overall_regime = str(overall_regime).upper()
+    force_regime_flip_screening = False
 
     # ========== フェーズB: MTFリアルタイム監視ループ (30秒サイクル省エネ運用) ==========
     while True:
@@ -2753,7 +2761,7 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
         now_jst = datetime.now(JST)
 
         # -------------------------------------------------------------
-        # [フェーズ C] 8時間ごと定期銘柄選定 & スロットリセット
+        # [フェーズ C] 定期銘柄選定 (4時間ごと) & 地合い反転時オフスケジュール再選定
         # -------------------------------------------------------------
         today_date = now_jst.date()
         current_slot = (today_date, now_jst.hour)
@@ -2762,9 +2770,11 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
             and now_jst.minute < 5
             and current_slot != last_screening_slot
         )
-        if is_periodic_reset_time:
-            # 8時間節目（01:00, 09:00, 17:00 JST）のみアスキーアートバナーおよびフルチャート画像を送信
-            is_major_slot = (now_jst.hour in [1, 9, 17])
+        if is_periodic_reset_time or force_regime_flip_screening:
+            trigger_reason = "定期" if is_periodic_reset_time else "地合い反転"
+            force_regime_flip_screening = False
+            # 8時間節目（01:00, 09:00, 17:00 JST）の定期枠のみアスキーアートバナーおよびフルチャート画像を送信
+            is_major_slot = bool(is_periodic_reset_time and now_jst.hour in [1, 9, 17])
             if is_major_slot:
                 periodic_banner = (
                     "```text\n"
@@ -2840,8 +2850,13 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
             await ws_mgr.update_symbols(list(symbol_apis.keys()))
             cached_5m_dfs.clear()
 
-            last_screening_slot = current_slot
-            discord.print_log(f"[Periodic Reset Complete] 新しい選定銘柄 ({trade_side.upper()}): {', '.join(selected_symbols)} | 現在の全監視対象: {', '.join(symbol_apis.keys())}")
+            if is_periodic_reset_time:
+                last_screening_slot = current_slot
+            regime_info = get_regime_gate_info("BTC-USDT")
+            overall_regime = regime_info.get("overall_regime", "NEUTRAL")
+            regime_strength = regime_info.get("regime_strength", {})
+            last_screened_overall_regime = str(overall_regime).upper()
+            discord.print_log(f"[Periodic Reset Complete ({trigger_reason})] 新しい選定銘柄 ({trade_side.upper()}): {', '.join(selected_symbols)} | 現在の全監視対象: {', '.join(symbol_apis.keys())}")
 
             # 8時間ごとの実運用トレード実績レポート
             # 8時間節目（01:00, 09:00, 17:00 JST）のみ実運用トレード実績レポート画像を送信
@@ -2861,6 +2876,29 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                     await asyncio.to_thread(collect_and_save_oi_snapshot)
                 except Exception as oi_err:
                     discord.print_log(f"[OI Collector Warning] 建玉スナップショット保存警告: {oi_err}", level="debug")
+
+                # 中間時間帯（定期 WF 非実行時）は軽量 1h 地合いのみ更新し、全体地合い反転時のみ Phase C を予約
+                if now_jst.hour not in ANALYSIS_HOURS:
+                    try:
+                        from lake_live_bridge import refresh_hourly_regime_for_bot
+                        reg_refresh = await asyncio.to_thread(refresh_hourly_regime_for_bot, sync_live=True)
+                        regime_info = get_regime_gate_info("BTC-USDT")
+                        overall_regime = regime_info.get("overall_regime", "NEUTRAL")
+                        regime_strength = regime_info.get("regime_strength", {})
+                        new_reg_up = str(reg_refresh.get("overall_regime", overall_regime)).upper()
+                        if (
+                            last_screened_overall_regime in ("BUY", "SELL", "NEUTRAL")
+                            and new_reg_up in ("BUY", "SELL", "NEUTRAL")
+                            and new_reg_up != last_screened_overall_regime
+                        ):
+                            force_regime_flip_screening = True
+                            discord.print_log(
+                                f"⚡ [Regime Flip] 毎時軽量判定で全体地合い反転を検知 "
+                                f"({last_screened_overall_regime} -> {new_reg_up})。再スクリーニングを即時実行します。",
+                                force_send=True,
+                            )
+                    except Exception as reg_err:
+                        discord.print_log(f"[Hourly Regime Check Warning] 毎時地合い監視警告: {reg_err}", level="debug")
 
                 # 月初（毎月1日）判定 & 月次確定レポート・先月高安(PMH/PML)自動更新
                 if now_jst.hour == 0:

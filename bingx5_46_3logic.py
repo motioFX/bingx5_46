@@ -197,7 +197,7 @@ class logicinstance:
         # 3. 建玉(OI)判定 (OI急増 / 投げ売り清算なし)
         oi_col = next((c for c in ['openInterest', 'open_interest', 'oi', 'openInterestCoins', 'open_interest_usd'] if c in df.columns), None)
         if oi_col and df[oi_col].nunique() > 1:
-            oi_pct = df[oi_col].pct_change(1).fillna(0.0)
+            oi_pct = df[oi_col].ffill().pct_change(1, fill_method=None).fillna(0.0)
             df['is_oi_surge'] = oi_pct >= -0.01  # OIが急減しておらず維持または増加
         else:
             df['is_oi_surge'] = True

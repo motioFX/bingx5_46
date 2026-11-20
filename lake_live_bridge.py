@@ -26,6 +26,7 @@ import pandas as pd
 from bingx5_46_3logic import make_market_profile_dual_va
 from lake_backtest_engine import (
     WalkForwardConfig,
+    compute_regime_from_lake,
     is_breakout_strategy,
     run_walkforward_from_lake,
     strategy_side,
@@ -219,6 +220,80 @@ def ensure_lake_ready_on_startup(history_days: int = 210) -> Dict[str, Any]:
     return {"status": "synced", "btc_5m_count": st["count"], "span_days": round(span_days, 1)}
 
 
+def refresh_hourly_regime_for_bot(
+    db_path: Optional[Path] = None,
+    sync_live: bool = True,
+    state_file_path: Optional[Path] = None,
+) -> Dict[str, Any]:
+    """毎時正時用の軽量地合い判定・反転検知。
+
+    WF 探索を実行せず直近 5m/1h 確定足のみで 3窓地合いを再評価し、
+    `Data/market_state.json` を最新化した上で前回地合いからの反転有無を返す。
+    """
+    lake = LakeStore(db_path=db_path)
+    now_sec = utc_now_sec()
+    if sync_live and db_path is None:
+        try:
+            from candle_5m_store import sync_all_target_symbols_5m
+            sync_all_target_symbols_5m(lookback_days=1)
+        except Exception:
+            pass
+
+    ms_file = Path(state_file_path) if state_file_path is not None else (Path(__file__).resolve().parent / "Data" / "market_state.json")
+    prev_regime = ""
+    if ms_file.exists():
+        try:
+            prev_data = json.loads(ms_file.read_text(encoding="utf-8"))
+            if isinstance(prev_data, dict):
+                prev_regime = str(prev_data.get("overall_regime", "")).upper()
+        except Exception:
+            pass
+
+    cutoff_1h = (now_sec // 3600) * 3600
+    reg_eval = compute_regime_from_lake(lake, data_cutoff_utc=cutoff_1h)
+    new_regime = str(reg_eval.get("overall_regime", "NEUTRAL")).upper()
+    regime_flipped = bool(prev_regime in ("BUY", "SELL", "NEUTRAL") and new_regime != prev_regime)
+
+    strength_obj = dict(reg_eval.get("regime_strength") or {})
+    if "strength_desc" not in strength_obj and strength_obj:
+        t_jp = str(strength_obj.get("tier_jp", strength_obj.get("tier", "")))
+        net_sc = float(strength_obj.get("net_score", 0.0) or 0.0)
+        strength_obj["strength_desc"] = f"【{t_jp} ({net_sc * 100:+.1f}%)】"
+
+    excl_raw = reg_eval.get("excluded_symbols") or {}
+    excl_list = list(excl_raw.keys()) if isinstance(excl_raw, dict) else list(excl_raw)
+    excl_reasons = excl_raw if isinstance(excl_raw, dict) else {}
+    now_iso = datetime.now(timezone.utc).isoformat()
+    ms_payload = {
+        "overall_regime": new_regime,
+        "regime_pattern": reg_eval.get("regime_pattern", ""),
+        "regime_strength": strength_obj,
+        "period_results": reg_eval.get("period_results", {}),
+        "allowed_strategies": reg_eval.get("allowed_strategies", []),
+        "recommended_symbols": reg_eval.get("recommended_symbols", []),
+        "excluded_symbols": excl_list,
+        "exclusion_reasons": excl_reasons,
+        "is_buy_regime": (new_regime == "BUY"),
+        "is_sell_regime": (new_regime == "SELL"),
+        "evaluated_at": now_iso,
+        "timestamp": now_iso,
+    }
+    try:
+        ms_file.parent.mkdir(parents=True, exist_ok=True)
+        ms_tmp = ms_file.with_suffix(".tmp")
+        ms_tmp.write_text(json.dumps(ms_payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        ms_tmp.replace(ms_file)
+    except Exception:
+        pass
+
+    return {
+        "prev_overall_regime": prev_regime,
+        "overall_regime": new_regime,
+        "regime_flipped": regime_flipped,
+        "regime_eval": reg_eval,
+    }
+
+
 def run_lake_screening_for_bot(
     override_regime_info: Dict[str, Any],
     db_path: Optional[Path] = None,
@@ -247,12 +322,15 @@ def run_lake_screening_for_bot(
         override_regime_info=override_regime_info,
         persist=True,
     )
-    lake.export_audit_csvs()
+    run_rec = wf_res["run"]
+    try:
+        lake.export_audit_csvs(latest_run_id=run_rec.get("run_id") if isinstance(run_rec, dict) else None)
+    except Exception:
+        pass
 
     winner = wf_res["winner"]
     selection = wf_res["selection"]
     cells = wf_res["cells"]
-    run_rec = wf_res["run"]
     cur_regime = wf_res.get("regime_info") or override_regime_info or {}
     cur_allowed = {str(s) for s in cur_regime.get("allowed_strategies", [])}
     raw_excl = cur_regime.get("excluded_symbols") or {}
@@ -468,6 +546,6 @@ def record_live_exit_to_lake(
                 "meta": {"exit_reason": exit_reason, "selection_id": sel_id, "run_id": run_id},
             }
         )
-        lake.export_audit_csvs()
+        lake.export_audit_csvs(tables=("daily_selections", "live_trades"))
     except Exception as e:
         print(f"[Lake LiveBridge] 決済書き戻し警告: {e}")

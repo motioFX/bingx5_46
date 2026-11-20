@@ -82,8 +82,8 @@ flowchart TD
         end
     end
 
-    subgraph PhaseC ["【Phase C】1時間定期スクリーニング (毎時 00:05 JST)"]
-        PB_Loop --> PC_1{"定期選定時刻？"}
+    subgraph PhaseC ["【Phase C】定期フル WF スクリーニング (4時間ごと) ＆ 地合い反転時即時再選定"]
+        PB_Loop --> PC_1{"定期時刻 (01/05/09/13/17/21 JST) または 毎時地合い反転？"}
         PC_1 -- "到達" --> PC_2["保有中ポジションは完全維持したまま Phase A 再実行 (完了後はcontinueせず当足の売買判定も直ちに実行)"]
         PC_2 --> PC_3["銘柄リスト・WebSocket購読更新 & 古い未約定指値クリーンアップ"]
     end
@@ -99,15 +99,15 @@ flowchart TD
   - **BEAR (売り)**: 売り推奨銘柄を対象にセッション連動個別バックテスト（東京レンジ逆張り5m/15m、ロンドンブレイクアウト5m: 全戦略 単発1本固定・計126通り）を実行。
   厳格基準（全体10回以上 ＆ 前半純利益>0 ＆ 後半純利益>前半純利益、後半利益最大選抜）クリア銘柄を選定し最優秀銘柄チャート1枚を送信、既存ポジション監査（`avgPrice` 基準・単発Graceful Exit引継ぎ）、直近10日間実損益レポート送信、pybotters WebSocket 5分足リアルタイム購読開始。
 * **【Phase B】リアルタイム MTF 監視ループ (15秒サイクル)**:
-  * **Phase B1 (毎時 00:05 JST)**: BingX OI/FR スナップショット自動蓄積、BTC地合い足更新、**Hype版と統一した毎時ステータス配信（`-USDT` 省略・3カラム整列）**、月初レポート送信。
+  * **Phase B1 (毎時 00:05 JST)**: BingX OI/FR スナップショット自動蓄積、BTC・対象銘柄 1H 地合い軽量更新（`overall_regime` が前回選定時と変化した場合は即座にオフスケジュール Phase C を発動）、**Hype版と統一した毎時ステータス配信（`-USDT` 省略・3カラム整列）**、月初レポート送信。
   * **Phase B2 (ポジション監視 & 決済判定)**: 保有銘柄の利確（毎足動的更新 Normal TP または 非合致時の建値 ±0.20% 早期撤退、RR 1:2）・戦略別主軸損切り（レンジ逆張りは直前10本高安確定足SL［上限キャップ: -3.0%］、ブレイクアウトは毎足更新 POC直上/直下防衛SL）・タイムアウト撤退（4時間経過で含み損なら撤退）・**最大保有強制決済（`MAX_HOLD_CLOSE`: 8時間 = 480分経過で無条件決済）**。**24時間SLクールダウンは廃止し**、同一銘柄の不要な長期遮断を行わない。**全戦略単発1本固定（ナンピン完全撤廃・追加発注物理遮断）**。決済ロジックは24時間全セッションを通じて `lake_backtest_engine.py`（SSoT）と完全一致させる。決済時は必ず既存の未約定指値をすべてキャンセルしてから成行決済を実行する。
   * **Phase B3 (3セッション役割分担 ＆ 3態勢地合いディフェンス)**:
     - **東京セッション (09:00〜16:00 JST)**: レンジ逆張り専用（`VAL_POC` / `VAH_POC` / `RSIMA` / `RSIMA_SHORT`: 5m/15m）。地合い連動（BULLは買い、BEARは売り、BALANCEDは待機、LEANは選別取引）。
     - **ロンドンセッション (16:00〜22:00 JST)**: ブレイクアウト専用（`VAH_BREAK` / `VAL_BREAK`: 5m のみ）。地合い不問（上抜け買い / 下抜け売り）。
     - **NYセッション (22:00〜09:00 JST)**: 本番・デモ共通で24時間エントリー継続（`ALLOW_NY_SESSION_LIVE = True` / 各銘柄の OOS 最上位戦略 `best_overall` を評価し、`lake_backtest_engine.py` と完全1:1一致）。標準出口監視も24時間共通で執行。
   * **Phase B4 (新規エントリー判定)**: 最大2銘柄枠内で「バックテスト厳格合格銘柄」のみ採用戦略シグナルを判定し、BingX API（VSTデモまたは本番）へ Best Bid（買い）/ Best Ask（売り）指値発注 ＆ 足確定ごとのライフサイクル管理（Pending & Resubmit）。全戦略単発1本固定（目標額100%フルロット）。
-* **【Phase C】1時間定期スクリーニング (毎時 00:05 JST)**:
-  保有中ポジションは利確・損切りまで一切強制決済せず維持し、Phase A と同様に最新データで全体地合い判定・推奨銘柄最適化を再実行。**定期選定完了後、ループを `continue` して確定足をスキップすることを厳禁とし、直ちにその確定足の決済・エントリー判定を実行する。**
+* **【Phase C】定期フル WF スクリーニング (`ANALYSIS_HOURS = [1, 5, 9, 13, 17, 21]` 4時間ごと ＆ 地合い反転時即時実行)**:
+  保有中ポジションは利確・損切りまで一切強制決済せず維持し、Phase A と同様に最新データで全体地合い判定・推奨銘柄最適化を再実行（`4mix` 成功時は重複の `sync_all_target_symbols_5m` を省略し、チャート画像は節目 `01:00, 09:00, 17:00 JST` のみ送信）。**定期選定完了後、ループを `continue` して確定足をスキップすることを厳禁とし、直ちにその確定足の決済・エントリー判定を実行する。**
 
 ---
 
@@ -131,6 +131,8 @@ flowchart TD
   7. `backtest_simulated_trades`: 全擬似約定・未約定キャンセル・エントリー/決済手数料・伸び切り指標（`ext_pct`, `ext_atr`, `va_upper/lower`, `range_high/low`）およびシグナル時点地合い（`regime_at_signal`, `strength_tier_at_signal`, `net_score_at_signal`, `buy_votes_at_signal`, `sell_votes_at_signal`）の1件単位明細
   8. `daily_selections`: 選定結果（最上位勝者1件、または基準未達時 `NO_CANDIDATE`）および実行ステータス（`SELECTED` / `NO_CANDIDATE` / `EXECUTED` / `BLOCKED_RISK`）
   9. `live_trades`: VSTデモ実トレード約定・決済結果（`selection_id` で選定根拠と紐づけて自動書き戻し）
+* **軽量監査 CSV 出力規約 (`export_audit_csvs`)**:
+  * 1GB RAM 環境での定期選定・決済時 Swap スラッシング（100MB超全件CSV書出による10分超ブロッキング）を防止するため、`export_audit_csvs()` はデフォルト（`include_heavy_history=False`）で軽量テーブル（`universe_symbols`, `backtest_runs`, `daily_selections`, `live_trades`）、最新 Run のみ（`backtest_cells_latest.csv`, `backtest_simulated_trades_latest.csv`）、および直近14日分の地合い履歴（`regime_snapshots_recent.csv`）を出力する。決済書き戻し時は `tables=("daily_selections", "live_trades")` のみ更新し、全履歴 CSV 出力は `include_heavy_history=True` 指定時（SQL チャンク分割ストリーム書出）のみ実行する。
 
 ### 🧭 【ウォークフォワード評価 ＆ 日次勝者選定仕様】(`lake_backtest_engine.py`, `lake_reproduce.py`)
 * **アウトオブサンプル (OOS) 厳格分離（インサンプル選定の禁止）**:

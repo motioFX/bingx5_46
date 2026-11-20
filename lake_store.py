@@ -1147,11 +1147,21 @@ class LakeStore:
                     (str(sel_id),),
                 )
 
-    def export_audit_csvs(self, out_dir: Optional[Path] = None) -> Dict[str, str]:
-        """外部検収・可視化用の読み取り専用 CSV スナップショットを `Data/lake/exports/` へ出力する。"""
+    def export_audit_csvs(
+        self,
+        out_dir: Optional[Path] = None,
+        tables: Optional[Sequence[str]] = None,
+        include_heavy_history: bool = False,
+        latest_run_id: Optional[str] = None,
+    ) -> Dict[str, str]:
+        """外部検収・可視化用の読み取り専用 CSV スナップショットを `Data/lake/exports/` へ出力する。
+
+        1GB RAM VPS での毎時/決済時 Swap スラッシングを防ぐため、デフォルト
+        (`include_heavy_history=False`) では軽量テーブル・直近14日地合い・最新 Run 分のみ出力する。
+        """
         target = Path(out_dir) if out_dir is not None else LAKE_EXPORTS_DIR
         target.mkdir(parents=True, exist_ok=True)
-        tables = [
+        allowed_tables = {
             "universe_symbols",
             "regime_snapshots",
             "backtest_runs",
@@ -1159,12 +1169,74 @@ class LakeStore:
             "backtest_simulated_trades",
             "daily_selections",
             "live_trades",
-        ]
+        }
+        light_tables = ("universe_symbols", "backtest_runs", "daily_selections", "live_trades")
         written: Dict[str, str] = {}
+
+        def _stream_query_to_csv(conn: sqlite3.Connection, sql: str, params: Tuple[Any, ...], path: Path) -> None:
+            first = True
+            for chunk in pd.read_sql_query(sql, conn, params=params, chunksize=50_000):
+                chunk.to_csv(path, mode=("w" if first else "a"), header=first, index=False, encoding="utf-8")
+                first = False
+            if first:
+                empty_sql = sql.split(" WHERE ")[0].split(" ORDER ")[0] + " WHERE 0"
+                pd.read_sql_query(empty_sql, conn).to_csv(path, index=False, encoding="utf-8")
+
         with self._conn(write=False) as conn:
-            for tbl in tables:
+            if tables is not None:
+                for tbl in tables:
+                    if tbl not in allowed_tables:
+                        continue
+                    path = target / f"{tbl}.csv"
+                    _stream_query_to_csv(conn, f"SELECT * FROM {tbl}", (), path)
+                    written[tbl] = str(path)
+                return written
+
+            for tbl in light_tables:
                 df = pd.read_sql_query(f"SELECT * FROM {tbl}", conn)
                 path = target / f"{tbl}.csv"
                 df.to_csv(path, index=False, encoding="utf-8")
                 written[tbl] = str(path)
+
+            if include_heavy_history:
+                for tbl in ("regime_snapshots", "backtest_cells", "backtest_simulated_trades"):
+                    path = target / f"{tbl}.csv"
+                    _stream_query_to_csv(conn, f"SELECT * FROM {tbl}", (), path)
+                    written[tbl] = str(path)
+            else:
+                recent_cutoff = utc_now_sec() - 14 * 86400
+                df_reg = pd.read_sql_query(
+                    "SELECT * FROM regime_snapshots WHERE cutoff_utc >= ? ORDER BY cutoff_utc ASC",
+                    conn,
+                    params=(int(recent_cutoff),),
+                )
+                reg_path = target / "regime_snapshots_recent.csv"
+                df_reg.to_csv(reg_path, index=False, encoding="utf-8")
+                written["regime_snapshots_recent"] = str(reg_path)
+
+                eff_run_id = latest_run_id
+                if not eff_run_id:
+                    row = conn.execute(
+                        "SELECT run_id FROM backtest_runs ORDER BY run_at_utc DESC, rowid DESC LIMIT 1"
+                    ).fetchone()
+                    eff_run_id = str(row[0]) if row else None
+
+                if eff_run_id:
+                    df_cells_l = pd.read_sql_query(
+                        "SELECT * FROM backtest_cells WHERE run_id = ?",
+                        conn,
+                        params=(eff_run_id,),
+                    )
+                    cells_path = target / "backtest_cells_latest.csv"
+                    df_cells_l.to_csv(cells_path, index=False, encoding="utf-8")
+                    written["backtest_cells_latest"] = str(cells_path)
+
+                    trades_path = target / "backtest_simulated_trades_latest.csv"
+                    _stream_query_to_csv(
+                        conn,
+                        "SELECT * FROM backtest_simulated_trades WHERE run_id = ?",
+                        (eff_run_id,),
+                        trades_path,
+                    )
+                    written["backtest_simulated_trades_latest"] = str(trades_path)
         return written
