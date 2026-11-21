@@ -237,12 +237,13 @@ class logicinstance:
         df_cleaned = df.dropna(subset=required_cols) if required_cols else df.dropna()
         rows_after = len(df_cleaned)
         
-        if rows_after == 0 and rows_before > 0:
-            print("[WARNING] dropna removed all rows, using bfill/ffill instead")
-            df = df.bfill().ffill()
-        else:
-            df = df_cleaned
-            df = df.bfill()
+        with pd.option_context("future.no_silent_downcasting", True):
+            if rows_after == 0 and rows_before > 0:
+                print("[WARNING] dropna removed all rows, using bfill/ffill instead")
+                df = df.bfill().ffill().infer_objects(copy=False)
+            else:
+                df = df_cleaned
+                df = df.bfill().infer_objects(copy=False)
         return df
 
 
