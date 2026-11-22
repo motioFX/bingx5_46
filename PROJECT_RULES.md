@@ -27,7 +27,7 @@
 | `bitbank5_46_2api.py` | Bitbank Private/Public REST API ラッパー（Nonce 管理、`aiohttp` による都度セッション生成・クローズ） |
 | `bitbank5_46_3logic.py` | `send_discord` ロギング（ANSI バッファリング、プラットフォーム別 Webhook 振分）および既存補助ユーティリティ |
 | `config_loader.py` | `bitbank_credentials.json` 読み込み、Windows（`test4_test`）/ Linux（`real1_bitbank`）自動振り分け、`WEBHOOK_ALIASES` 管理 |
-| `polymarket_top20_chart.py` | Polymarket 24h出来高 Top 20 の直近1ヶ月ノーマライズ比較チャート生成（Top 1-10 / Top 11-20）＆ Discord 配信（VPS cron 1日3回実行） |
+| `polymarket_top20_chart.py` | Polymarket 相場センチメント 5 カテゴリ（`Crypto` / `Econ/Fin` / `Tech/AI` / `Geo` / `Politics`）24h出来高 Top 20 の直近1ヶ月ノーマライズ比較チャート生成（Top 1-10 / Top 11-20）＆ 24h急変Top 5付き Discord 配信（VPS cron 1日3回実行） |
 | `check_and_restart.sh` | VPS cron（5分間隔）からのプロセス死活監視・`flock` 多重起動防止・自動復旧スクリプト |
 | `master_data_collector.py` / `download_*.py` / `data_pipeline_utils.py` | 海外・国内取引所ヒストリカル収集関連モジュール（通常監視時は停止、`--enable-history` または単体手動実行用） |
 
@@ -81,22 +81,24 @@ flowchart TD
 
 ---
 
-## 3. Polymarket Top 20 日次チャート配信仕様 (`polymarket_top20_chart.py`)
+## 3. Polymarket 相場センチメント Top 20 日次チャート配信仕様 (`polymarket_top20_chart.py`)
 
-現在、Bitbank ボットの同居リポジトリ・VPS 環境を活用し、cron による独立ジョブとして以下を暫定運用中。
+現在、Bitbank ボットの同居リポジトリ・VPS 環境を活用し、相場センチメント監視ツールとして cron による独立ジョブを以下で運用中。
 
 ### 3.1 取得・選定ロジック
-* **対象取得**: Polymarket Gamma API（`https://gamma-api.polymarket.com/events`）から `active=true`, `closed=false`, `order=volume24hr`, `ascending=false` で上位イベントを取得。
-* **フィルタ条件**:
+* **対象取得**: Polymarket Gamma API（`https://gamma-api.polymarket.com/events`）から `active=true`, `closed=false`, `order=volume24hr`, `ascending=false`, `limit=150`（`fetch_top_active_events(limit=150)`）で上位イベントを取得。
+* **相場センチメント・フィルタ条件**:
+  * スポーツ・eスポーツ・ゲーム/エンタメ・ツイート数賭け・数学/科学系ノイズ市場をタグ（`slug`）ベースで除外し、相場センチメント関連 **5 カテゴリ**（`Crypto` / `Econ/Fin` / `Tech/AI` / `Geo` / `Politics`）のホワイトリストに一致するイベントのみを選別。
   * プレースホルダー（`Other`, `Candidate X`, `Team X`, `Company X`, `Player X`, `Country X` 等）および非アクティブ・出来高ゼロ市場を除外。
   * 決着張り付き市場（現在確率 `1% 未満` または `99% 超`）を除外し、各イベント内で最も現在確率が高いアクティブ本命候補（同率時は取引量順）を 1 つ代表として選出。
   * Polymarket CLOB API（`https://clob.polymarket.com/prices-history?interval=1m&fidelity=60`）から直近 30 日分の 1 時間足相当データを取得し、履歴が `1.0 日未満` または `12 点未満` の超短期市場を除外した **上位 20 銘柄** を確定。
+  * 各銘柄の直近 24 時間確率変化（`delta_24h_pt`、パーセントポイント差）を算出し、全 20 銘柄中の変化幅上位 5 件を急変ピックアップとして抽出。
 
 ### 3.2 チャート描画・配信スケジュール
-* **ノーマライズ方式**: 各銘柄のデータ開始時点価格を **`100%`** とした比率ノーマライズ指数で描画（10 銘柄 × 2 枚：`Top 1-10` / `Top 11-20`）。
+* **ノーマライズ方式**: 各銘柄のデータ開始時点価格を **`100%`** とした比率ノーマライズ指数で描画（10 銘柄 × 2 枚：`Top 1-10` / `Top 11-20`）。凡例には `#順位 [Category] イベント名 [本命候補]` を表示。
 * **日本語フォント・数式誤爆防止**: Linux VPS 上の `NotoSansCJK-Regular.ttc` / `ipam.ttf` を明示登録し、`text.parse_math = False`（非対応環境では `\$` エスケープ）によりラベル内 `$` 記号の数式解釈を防止。
 * **実行スケジュール（VPS cron / JST）**:
-  * **毎日 3 回（`01:00 / 09:00 / 17:00 JST`）** に実行し、`real1_bitbank` へ 24h 出来高・現在確率・変化率サマリー付きで送信。
+  * **毎日 3 回（`01:00 / 09:00 / 17:00 JST`）** に実行し、`real1_bitbank` へカテゴリ・24h 出来高・現在確率・変化率サマリー付きで送信（1枚目のキャプションに **⚡ 直近24時間 確率急変ピックアップ (全20銘柄中 Top 5)** を含め、Discord 2000 文字制限に対し 1950 文字以内に収める）。
   * ログ出力: `Data/polymarket_chart.log`（毎回上書き `>` で肥大化防止）。
   * 画像保持: `Data/plots/polymarket_top*_1m_*.png` は 72 時間経過後に自動削除（最新 4 枚を保護）。
 

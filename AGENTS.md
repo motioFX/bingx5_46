@@ -60,4 +60,4 @@
 - ALWAYS write the Implementation Plan and Walkthrough artifacts entirely in Japanese.
 
 ## 9. Polymarket Top 20 Daily Normalized Chart
-- `polymarket_top20_chart.py` fetches top 20 active non-closed Polymarket events by 24h volume (excluding placeholders, <1d short-lived events, and settled extremes), plots 1-month normalized probability charts (Base = 100%, split into Top 1-10 & Top 11-20), and posts to Discord (`real1_bitbank`) 3 times daily at 01:00, 09:00, and 17:00 JST via VPS cron.
+- `polymarket_top20_chart.py` monitors market sentiment by filtering top active non-closed Polymarket events (`fetch_top_active_events(limit=150)`) to 5 categories (`Crypto`, `Econ/Fin`, `Tech/AI`, `Geo`, `Politics` — excluding sports, esports, gaming/entertainment, tweet-count, and math/science markets, plus placeholders, <1d short-lived events, and settled extremes), plots 1-month normalized probability charts with `[Category]` labels (Base = 100%, split into Top 1-10 & Top 11-20), includes a Top 5 24-hour probability shock summary (`delta_24h_pt`), and posts to Discord (`real1_bitbank`) 3 times daily at 01:00, 09:00, and 17:00 JST via VPS cron.

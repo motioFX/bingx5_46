@@ -1,12 +1,14 @@
-"""Polymarket 24h出来高 Top 20 銘柄 1ヶ月ノーマライズ推移チャート生成＆Discord通知スクリプト
+"""Polymarket 相場センチメント 24h出来高 Top 20 1ヶ月ノーマライズ推移チャート＆24h急変ピックアップ
 
 仕様:
 1. Polymarket Gamma API から現在アクティブかつ未終了のイベントを 24時間出来高順に取得。
-2. プレースホルダー市場や決着張り付き（1%未満 / 99%超）、履歴1日未満の超短期イベントを除外し、
-   各イベントの本命候補（現在確率最大のアクティブ選択肢）を Top 20 まで選出。
-3. Polymarket CLOB API (/prices-history) から直近1ヶ月（interval=1m, fidelity=60）の推移を取得。
-4. 各銘柄の開始時点価格を 100% として比率ノーマライズし、見やすさ重視で 10銘柄×2枚（Top 1-10 / Top 11-20）のチャート画像を生成。
-5. Discord Webhook（VPSでは real1_bitbank、Windowsテスト時や --test 指定時は test4_test）へ送信。
+2. スポーツ・eスポーツ・エンタメ・ツイート数カウント等のノイズを除外し、
+   相場センチメント関連カテゴリ（Crypto / Econ/Fin / Tech/AI / Geo / Politics）のみを抽出。
+3. プレースホルダー・決着張り付き（1%未満 / 99%超）・履歴1日未満の超短期を除外し、
+   各イベントの本命候補を Top 20 まで選出。
+4. CLOB API (/prices-history) から直近1ヶ月の推移と「直近24時間の確率変化（pt）」を算出。
+5. 開始時点=100%の比率ノーマライズチャートを 10銘柄×2枚（Top 1-10 / Top 11-20）で生成し、
+   24時間確率急変ピックアップ Top 5 とともに Discord へ送信。
 """
 from __future__ import annotations
 
@@ -42,6 +44,34 @@ GAMMA_EVENTS_URL = "https://gamma-api.polymarket.com/events"
 CLOB_HISTORY_URL = "https://clob.polymarket.com/prices-history"
 
 PLACEHOLDER_PREFIXES = ("Candidate ", "Team ", "Company ", "Player ", "Country ")
+
+# 相場センチメントと無関係なスポーツ・エンタメ・ツイート数カウント等を最優先除外
+EXCLUDED_TAG_SLUGS = {
+    "sports", "esports", "games", "nba", "nba-finals", "nfl", "nfl-all", "football",
+    "basketball", "soccer", "tennis", "baseball", "mlb", "nhl", "hockey", "mma", "ufc",
+    "boxing", "golf", "f1", "formula-1", "grand-prix", "cricket", "cbb", "cfb", "ncaa",
+    "dota-2", "cs2", "counter-strike-2", "league-of-legends", "valorant",
+    "champions-league", "ucl", "epl", "laliga", "la-liga", "mls",
+    "tweet-markets", "music", "movies", "tv", "gaming", "video-games", "gta-vi",
+    "awards", "weather", "chess", "poker", "math", "science",
+}
+
+# 相場センチメント5カテゴリの優先順ルール (pop-culture併記のTech案件を拾うためホワイトリスト併用)
+CATEGORY_TAG_RULES: List[Tuple[str, set]] = [
+    ("Crypto", {"crypto", "crypto-prices", "bitcoin", "ethereum", "solana", "altcoins", "defi", "stablecoins"}),
+    ("Econ/Fin", {
+        "economy", "finance", "fed", "fomc", "fed-rates", "economic-policy", "inflation",
+        "recession", "macro", "commodities", "oil", "gold", "stocks", "ipo", "ipos",
+        "business", "central-banks", "interest-rates", "currencies", "forex", "tariffs", "trade-war",
+    }),
+    ("Tech/AI", {"big-tech", "tech", "ai", "openai", "anthropic", "nvidia", "nvda", "claude"}),
+    ("Geo", {"geopolitics", "middle-east", "military-strikes", "foreign-policy", "israel-x-iran", "blockade"}),
+    ("Politics", {
+        "politics", "us-election", "elections", "main-election", "world-elections",
+        "global-elections", "french-election", "israel-election", "senate", "midterms", "president",
+    }),
+]
+
 HIGH_CONTRAST_COLORS = [
     "#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd",
     "#8c564b", "#e377c2", "#17becf", "#bcbd22", "#34495e",
@@ -222,16 +252,47 @@ def fetch_monthly_history(
     return points
 
 
+def classify_market_sentiment_event(event: Dict[str, Any]) -> Optional[str]:
+    """相場センチメント対象イベントかを判定し、5カテゴリ名のいずれかを返す（対象外は None）"""
+    tags = event.get("tags") or []
+    slugs = {str(t.get("slug", "")).lower() for t in tags if isinstance(t, dict) and t.get("slug")}
+    title_lower = str(event.get("title") or "").lower()
+
+    if "tweets" in title_lower or (slugs & EXCLUDED_TAG_SLUGS):
+        return None
+
+    for cat_name, tag_set in CATEGORY_TAG_RULES:
+        if slugs & tag_set:
+            return cat_name
+    return None
+
+
+def compute_24h_prob_delta(history: List[Tuple[datetime, float]]) -> Tuple[Optional[float], Optional[float]]:
+    """直近24時間に最も近い点からの確率変化 (24h前確率%, 変化pt) を算出"""
+    if len(history) < 2:
+        return None, None
+    latest_dt, latest_p = history[-1]
+    target_dt = latest_dt - timedelta(hours=24)
+    ref_dt, ref_p = min(history[:-1], key=lambda item: abs((item[0] - target_dt).total_seconds()))
+    if (latest_dt - ref_dt).total_seconds() < 12 * 3600:
+        return None, None
+    return ref_p * 100.0, (latest_p - ref_p) * 100.0
+
+
 def collect_top_normalized_markets(
     top_n: int = 20,
     min_days: float = 1.0,
     lookback_days: int = 30,
 ) -> List[Dict[str, Any]]:
-    """24h出来高順でフィルタ条件を満たす上位 top_n 銘柄と1ヶ月推移を収集"""
-    events = fetch_top_active_events(limit=100)
+    """24h出来高順で相場センチメント条件を満たす上位 top_n 銘柄と1ヶ月推移を収集"""
+    events = fetch_top_active_events(limit=150)
     results: List[Dict[str, Any]] = []
 
     for ev in events:
+        category = classify_market_sentiment_event(ev)
+        if not category:
+            continue
+
         primary = select_primary_market(ev)
         if not primary:
             continue
@@ -255,9 +316,11 @@ def collect_top_normalized_markets(
         last_norm = norm_values[-1]
         diff_pct = last_norm - 100.0
         span_days = (times[-1] - times[0]).total_seconds() / 86400.0
+        prob_24h_ago_pct, delta_24h_pt = compute_24h_prob_delta(history)
 
         results.append({
             "rank": len(results) + 1,
+            "category": category,
             "title": str(ev.get("title") or "Unknown Event"),
             "slug": str(ev.get("slug") or ""),
             "volume24h": float(ev.get("volume24hr") or 0.0),
@@ -265,6 +328,8 @@ def collect_top_normalized_markets(
             "candidate": primary["candidate_label"],
             "base_prob_pct": base_price * 100.0,
             "curr_prob_pct": prices[-1] * 100.0,
+            "prob_24h_ago_pct": prob_24h_ago_pct,
+            "delta_24h_pt": delta_24h_pt,
             "norm_pct": last_norm,
             "diff_pct": diff_pct,
             "span_days": span_days,
@@ -301,10 +366,10 @@ def render_normalized_chart(
         linestyle = LINE_STYLES[(idx // len(HIGH_CONTRAST_COLORS)) % len(LINE_STYLES)]
 
         sign = "+" if item["diff_pct"] >= 0 else ""
-        ev_short = shorten_text(item["title"], 32)
-        cand_short = shorten_text(item["candidate"], 18)
+        ev_short = shorten_text(item["title"], 28)
+        cand_short = shorten_text(item["candidate"], 16)
         label = safe_mpl_label(
-            f"#{item['rank']:02d} {ev_short} [{cand_short}] "
+            f"#{item['rank']:02d} [{item['category']}] {ev_short} [{cand_short}] "
             f"({item['base_prob_pct']:.1f}%→{item['curr_prob_pct']:.1f}% | {sign}{item['diff_pct']:.1f}%)"
         )
         # matplotlib 側の naive 表示用に tz を除いた JST 時刻を使う
@@ -328,8 +393,8 @@ def render_normalized_chart(
 
     ax.axhline(100.0, color="#555555", linestyle="--", linewidth=1.2, alpha=0.75, label="基準ライン (100%)")
     ax.set_title(
-        f"Polymarket 24h出来高 {rank_label} — 直近1ヶ月 ノーマライズ推移 (開始=100%) [{generated_at_jst.strftime('%Y-%m-%d %H:%M JST')}]",
-        fontsize=13,
+        f"Polymarket 相場センチメント 24h出来高 {rank_label} — 直近1ヶ月推移 (開始=100%) [{generated_at_jst.strftime('%Y-%m-%d %H:%M JST')}]",
+        fontsize=12.5,
         fontweight="bold",
         pad=14,
     )
@@ -358,23 +423,53 @@ def render_normalized_chart(
     return out_path
 
 
-def build_discord_caption(items: List[Dict[str, Any]], rank_label: str, generated_at_jst: datetime) -> str:
+def _format_24h_delta(delta_pt: Optional[float]) -> str:
+    if delta_pt is None:
+        return "24h:NA"
+    sign = "+" if delta_pt >= 0 else ""
+    return f"24h:{sign}{delta_pt:.1f}pt"
+
+
+def build_discord_caption(
+    items: List[Dict[str, Any]],
+    rank_label: str,
+    generated_at_jst: datetime,
+    shock_items: Optional[List[Dict[str, Any]]] = None,
+) -> str:
     """各チャート画像に添える Discord サマリーテキスト（2000文字以内）を作成"""
     header = (
-        f"📊 **【Polymarket 日次トレンド】 24h出来高 {rank_label} (1ヶ月ノーマライズ推移)**\n"
-        f"取得時刻: `{generated_at_jst.strftime('%Y-%m-%d %H:%M JST')}` | 基準: 各銘柄の開始時点=100%"
+        f"📊 **【Polymarket 相場センチメント】 24h出来高 {rank_label} (1ヶ月ノーマライズ推移)**\n"
+        f"取得時刻: `{generated_at_jst.strftime('%Y-%m-%d %H:%M JST')}` | "
+        f"対象: `Crypto / 経済金融 / Tech・AI / 地政学 / 政治`"
     )
     lines = [header, "```text"]
     for item in items:
-        sign = "+" if item["diff_pct"] >= 0 else ""
-        ev_s = shorten_text(item["title"], 30)
-        cand_s = shorten_text(item["candidate"], 15)
+        ev_s = shorten_text(item["title"], 24)
+        cand_s = shorten_text(item["candidate"], 13)
+        d24_str = _format_24h_delta(item.get("delta_24h_pt"))
         lines.append(
-            f"#{item['rank']:02d} {ev_s:<30} [{cand_s:<15}] "
-            f"{item['base_prob_pct']:4.1f}%->{item['curr_prob_pct']:4.1f}% ({sign}{item['diff_pct']:5.1f}%) "
-            f"| 24h:${item['volume24h']:,.0f}"
+            f"#{item['rank']:02d} [{item['category']:<8}] {ev_s:<24} [{cand_s:<13}] "
+            f"{item['curr_prob_pct']:4.1f}% ({d24_str}) | ${item['volume24h']:,.0f}"
         )
     lines.append("```")
+
+    if shock_items:
+        lines.append("⚡ **直近24時間 確率急変ピックアップ (全20銘柄中 Top 5)**")
+        lines.append("```text")
+        for s_item in shock_items:
+            delta_pt = float(s_item["delta_24h_pt"])
+            icon = "🔥" if delta_pt >= 0 else "🧊"
+            sign = "+" if delta_pt >= 0 else ""
+            ev_s = shorten_text(s_item["title"], 24)
+            cand_s = shorten_text(s_item["candidate"], 13)
+            p_24h = float(s_item["prob_24h_ago_pct"])
+            p_now = float(s_item["curr_prob_pct"])
+            lines.append(
+                f"{icon} #{s_item['rank']:02d} [{s_item['category']:<8}] {ev_s:<24} [{cand_s:<13}] "
+                f"{p_24h:4.1f}%->{p_now:4.1f}% ({sign}{delta_pt:.1f}pt)"
+            )
+        lines.append("```")
+
     text = "\n".join(lines)
     if len(text) > 1950:
         text = text[:1940] + "\n```"
@@ -433,7 +528,7 @@ def main() -> int:
     date_tag = now_jst.strftime("%Y%m%d_%H%M%S")
     plots_dir = BASE_DIR / "Data" / "plots"
 
-    print(f"[{now_jst.strftime('%Y-%m-%d %H:%M:%S JST')}] Polymarket 24h出来高 Top {args.top_n} のデータを取得中...")
+    print(f"[{now_jst.strftime('%Y-%m-%d %H:%M:%S JST')}] Polymarket 相場センチメント 24h出来高 Top {args.top_n} を取得中...")
     items = collect_top_normalized_markets(
         top_n=args.top_n,
         min_days=args.min_days,
@@ -443,14 +538,32 @@ def main() -> int:
         print("❌ 有効なマーケットデータを取得できませんでした。")
         return 1
 
+    shock_items = sorted(
+        [it for it in items if it.get("delta_24h_pt") is not None],
+        key=lambda it: abs(float(it["delta_24h_pt"])),
+        reverse=True,
+    )[:5]
+
     print(f"✅ 取得完了: {len(items)} 銘柄")
     for item in items:
         sign = "+" if item["diff_pct"] >= 0 else ""
+        d24 = _format_24h_delta(item.get("delta_24h_pt"))
         print(
-            f"  #{item['rank']:02d} 24h=${item['volume24h']:>10,.0f} ({item['span_days']:4.1f}d) | "
-            f"{item['base_prob_pct']:5.1f}%->{item['curr_prob_pct']:5.1f}% ({sign}{item['diff_pct']:6.1f}%) | "
+            f"  #{item['rank']:02d} [{item['category']:<8}] 24h=${item['volume24h']:>10,.0f} ({item['span_days']:4.1f}d) | "
+            f"{item['base_prob_pct']:5.1f}%->{item['curr_prob_pct']:5.1f}% ({sign}{item['diff_pct']:6.1f}% | {d24}) | "
             f"{item['title']} [{item['candidate']}]"
         )
+
+    if shock_items:
+        print("\n⚡ 直近24時間 確率急変ピックアップ (Top 5):")
+        for s_item in shock_items:
+            dp = float(s_item["delta_24h_pt"])
+            sign = "+" if dp >= 0 else ""
+            print(
+                f"  #{s_item['rank']:02d} [{s_item['category']:<8}] "
+                f"{s_item['prob_24h_ago_pct']:5.1f}%->{s_item['curr_prob_pct']:5.1f}% ({sign}{dp:.1f}pt) | "
+                f"{s_item['title']} [{s_item['candidate']}]"
+            )
 
     # 10銘柄ずつ 2分割してチャート生成 (Top 1-10 / Top 11-20)
     groups = [
@@ -468,6 +581,9 @@ def main() -> int:
             generated.append((rank_label, sub_items, rendered))
 
     if args.dry_run:
+        for idx, (rank_label, sub_items, _) in enumerate(generated):
+            cap = build_discord_caption(sub_items, rank_label, now_jst, shock_items=shock_items if idx == 0 else None)
+            print(f"📝 [{rank_label}] キャプション文字数: {len(cap)} 文字")
         print("📌 [--dry-run] Discord 送信をスキップしました。")
         cleanup_old_charts(plots_dir)
         return 0
@@ -480,7 +596,12 @@ def main() -> int:
 
     all_ok = True
     for idx, (rank_label, sub_items, chart_path) in enumerate(generated):
-        caption = build_discord_caption(sub_items, rank_label, now_jst)
+        caption = build_discord_caption(
+            sub_items,
+            rank_label,
+            now_jst,
+            shock_items=shock_items if idx == 0 else None,
+        )
         ok = send_chart_to_discord(webhook_url, chart_path, caption)
         if ok:
             print(f"✅ Discord 送信成功 ({rank_label}): {chart_path.name}")
