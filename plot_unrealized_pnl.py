@@ -579,7 +579,13 @@ def plot_value_vs_cost_dashboard(
         ax.fill_between(dts, costs, vals, where=(vals >= costs), interpolate=True, color="#10b981", alpha=0.22, label="含み益")
         ax.fill_between(dts, costs, vals, where=(vals < costs), interpolate=True, color="#ef4444", alpha=0.25, label="含み損")
 
-        _apply_y_padding(ax, list(vals) + list(costs), include_zero=False)
+        # 初回買付途中 (最初の14時間) の急増ステップで Y 軸が下方に引っ張られるのを防ぐ
+        scale_mask = dts >= (dts.iloc[0] + pd.Timedelta(hours=14))
+        if int(scale_mask.sum()) >= 5:
+            scale_vals = list(vals[scale_mask.values]) + list(costs[scale_mask.values])
+        else:
+            scale_vals = list(vals) + list(costs)
+        _apply_y_padding(ax, scale_vals, include_zero=False)
         ax.legend(loc="lower left", fontsize=8.5, facecolor="#1e293b", edgecolor="#475569", labelcolor="#f8fafc")
 
         last_row = df.iloc[-1]
