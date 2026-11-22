@@ -23,6 +23,7 @@
 | `portfolio_tracker.py` | Bitbank ＆ Binance Japan の全現物残高・移動加重平均建値・評価額・含み損益・未約定指値注文を取得し、縦揃えレポートを生成・Discord 配信 |
 | `long_term_btc_tracker.py` | 長期保有現物 BTC（保護数量 `0.1434 BTC` / 既知簿価 `12,794,387 円`）の保護・損益算出ユーティリティ |
 | `active_orders_tracker.py` | Bitbank 主要ペアの未約定アクティブ指値注文（拘束 JPY・乖離率）の取得・集計 |
+| `plot_unrealized_pnl.py` | BTC（1年分）・RENDER・NEAR（購入当初〜現在）の含み損益推移 ＆ 評価額vs元本 2×2 チャート生成 ＆ Discord 送信（起動時・毎日 09:06 JST） |
 | `bitbank5_46_2api.py` | Bitbank Private/Public REST API ラッパー（Nonce 管理、`aiohttp` による都度セッション生成・クローズ） |
 | `bitbank5_46_3logic.py` | `send_discord` ロギング（ANSI バッファリング、プラットフォーム別 Webhook 振分）および既存補助ユーティリティ |
 | `config_loader.py` | `bitbank_credentials.json` 読み込み、Windows（`test4_test`）/ Linux（`real1_bitbank`）自動振り分け、`WEBHOOK_ALIASES` 管理 |
@@ -40,13 +41,14 @@ flowchart TD
     Lock --> LogInit["TeeLogger 初期化 (端末 + Data/bot_output.log 15MB上限)"]
     LogInit --> Banner["起動バナー表示 & Discord 送信 (real1_bitbank)"]
     Banner --> InitAudit["起動時 総合ポジション監査: report_all_positions()"]
-    InitAudit --> HistCheck{"--enable-history 指定あり？"}
+    InitAudit --> InitPnlChart["起動時 含み損益チャート 2枚生成 & Discord 送信 (plot_unrealized_pnl.py)"]
+    InitPnlChart --> HistCheck{"--enable-history 指定あり？"}
     HistCheck -- "No (標準運用)" --> LoopWait["毎時 06分00秒 JST まで非同期スリープ待機"]
     HistCheck -- "Yes (手動時のみ)" --> SyncBg["非同期バックグラウンド収集タスク起動"]
     SyncBg --> LoopWait
 
     LoopWait --> SlotCheck{"時刻は 01 / 09 / 17 時台 (8時間節目)？"}
-    SlotCheck -- "Yes" --> PeriodicAudit["定期監査レポート送信 (01:00 / 09:00 / 17:00 JST 節目) + gc.collect()"]
+    SlotCheck -- "Yes" --> PeriodicAudit["定期監査レポート送信 (01/09/17時台) + 09時台は日次含み損チャート送信 + gc.collect()"]
     SlotCheck -- "No" --> HourlyAudit["毎時ポジション監査レポート送信 (Cycle #N / HH:06 JST) + gc.collect()"]
     PeriodicAudit --> LoopWait
     HourlyAudit --> LoopWait

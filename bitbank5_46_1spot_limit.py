@@ -1230,6 +1230,38 @@ async def sync_historical_and_charts(
 
 
 
+async def run_unrealized_pnl_chart_upload() -> None:
+    """含み損益推移・評価額比較チャートを別プロセスで生成し Discord へアップロード"""
+    chart_script = BASE_DIR / "plot_unrealized_pnl.py"
+    if not chart_script.exists():
+        return
+
+    cmd = [sys.executable, str(chart_script), "--discord"]
+    for idx, arg in enumerate(sys.argv):
+        if arg in ("--channel", "--webhook") and idx + 1 < len(sys.argv):
+            cmd.extend(["--channel", sys.argv[idx + 1]])
+            break
+
+    try:
+        proc_res = await asyncio.to_thread(
+            subprocess.run,
+            cmd,
+            cwd=str(BASE_DIR),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=120,
+        )
+        if proc_res.returncode == 0:
+            print("[PnL Chart] 含み損益推移チャート (2枚) を Discord へアップロードしました。")
+        else:
+            err_tail = (proc_res.stderr or proc_res.stdout or "").strip()[-300:]
+            discord.print_log(f"⚠️ [PnL Chart] チャート送信警告 (code={proc_res.returncode}): {err_tail}")
+    except Exception as exc:
+        discord.print_log(f"⚠️ [PnL Chart] チャート生成/送信エラー: {exc}")
+
+
 async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60'):
     enable_history = (
         ("--enable-history" in sys.argv or "--with-history" in sys.argv)
@@ -1281,6 +1313,11 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
         await report_all_positions(mode=mode, to_discord=True, header_title="🏦 【ボット起動時 初期状態: 全保有暗号資産 総合ポジション監査】")
     except Exception as port_err:
         discord.print_log(f"⚠️ 起動時 総合ポジション監査エラー: {port_err}")
+
+    # 📈 【起動時 含み損益推移チャート】: 購入当初(BTC 1年分)〜現在までのチャートを Discord へ送信
+    if "--skip-pnl-chart" not in sys.argv:
+        await run_unrealized_pnl_chart_upload()
+    last_pnl_chart_date = datetime.now(JST).date()
 
     # ========== 【起動時 ステップ2】: 全銘柄ヒストリカルデータ同期 (--enable-history 指定時のみ実行) ==========
     if enable_history:
@@ -1342,6 +1379,11 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
 
             last_screening_slot = current_slot
             gc.collect()
+
+            # 毎日 09:06 JST の定期監査時は1日1回、含み損益推移チャートを自動更新送信
+            if now_jst.hour == 9 and today_date != last_pnl_chart_date and "--skip-pnl-chart" not in sys.argv:
+                await run_unrealized_pnl_chart_upload()
+                last_pnl_chart_date = today_date
 
             # 2. 海外取引所（Hyperliquid & BingX 3カテゴリー別）全銘柄データ同期をバックグラウンド非同期実行 (--enable-history 指定時のみ)
             if enable_history:

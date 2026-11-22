@@ -699,7 +699,23 @@ async def run(send_discord_flag: bool = False, channel: Optional[str] = None) ->
             )
             send_to_discord(webhook_url, [pnl_path, val_path], summary)
 
+    cleanup_old_pnl_charts(plots_dir)
     return pnl_path, val_path
+
+
+def cleanup_old_pnl_charts(plots_dir: Path, max_age_hours: float = 72.0, keep_latest: int = 2) -> None:
+    """古い含み損推移チャートを削除（各パターン最新 keep_latest 枚は保護）"""
+    if not plots_dir.exists():
+        return
+    cutoff_ts = time.time() - (max_age_hours * 3600.0)
+    for pat in ("unrealized_pnl_history_*.png", "portfolio_value_vs_cost_*.png"):
+        matched = sorted(plots_dir.glob(pat), key=lambda p: p.stat().st_mtime, reverse=True)
+        for old_file in matched[keep_latest:]:
+            try:
+                if old_file.stat().st_mtime < cutoff_ts:
+                    old_file.unlink()
+            except Exception:
+                pass
 
 
 if __name__ == "__main__":
