@@ -1,193 +1,143 @@
-# bitbank5_46 プロジェクト運用ルール & 開発規約
+# bitbank5_46 プロジェクト運用ルール & 開発アーキテクチャ規約 (PROJECT_RULES)
 
-## 1. 全銘柄データダウンロード規約（4取引所マルチ時間足 ＆ 8時間ごとDiscord配信）
-
-### 【規約】全取引所・全時間足データ取得 ＆ 8時間に1回Discord送信（4取引所対応）
-* **対象スクリプト**: 
-  - 統合オーケストレーター: master_data_collector.py
-  - Bitbank: download_historical_candles.py
-  - Binance Japan: download_binance_candles.py
-  - Hyperliquid: download_hyperliquid_candles.py
-  - BingX: download_bingx_candles.py
-  - クリプト主要21銘柄5分足データセット: download_crypto21_5m_history.py
-* **対象取引所 ＆ 銘柄規模**:
-  1. **Bitbank**: 現物 JPY 全47銘柄（tc_jpy, eth_jpy, xrp_jpy, sol_jpy, 
-ender_jpy ... 全ペア）
-  2. **Binance Japan**: 現物 JPY 全27銘柄（ADAJPY, BTCJPY, ETHJPY, NEARJPY, SOLJPY ... 全現物JPYペア）
-  3. **Hyperliquid**: PERP 全230+銘柄（主要全無期限先物ペア）
-  4. **BingX**: USDT無期限先物 全1,100+銘柄（FX除外の暗号資産・コモディティ全ペア）
-  5. **BingX クリプト主要21銘柄データセット (crypto_top21)**:
-     - 全銘柄（crypto）とは完全に独立した厳選データセット
-     - 対象銘柄: HYPE-USDT, SOL-USDT, DOGE-USDT, XRP-USDT, SUI-USDT, AVAX-USDT, LINK-USDT, APT-USDT, NEAR-USDT, ARB-USDT, UNI-USDT, OP-USDT, TIA-USDT, RENDER-USDT, INJ-USDT, FET-USDT, TAO-USDT, AAVE-USDT, ENA-USDT, ZEC-USDT, BTC-USDT (計21銘柄)
-* **対応時間足 ＆ 取得・蓄積期間**:
-  - **1d (日足)**: 過去4年分 (設立・メインネット以降全期間、差分キャッシュ更新)
-  - **1h (1時間足)**: 過去4年分 (Bitbank丸4年 / Binance Japan全期間 / Hyperliquid約3年半 / BingX直近、差分キャッシュ更新)
-  - **15m (15分足)**: 直近180日分 (約半年間、差分キャッシュ更新)
-  - **5m (5分足 - クリプト主要21銘柄ヒストリー蓄積)**:
-    - **2ヶ月分（60日分）蓄積運用**: 初回はBingX API上限（約44日分）から取得を開始し、定期実行（毎時/8時間スロット）により最新差分をアペンド蓄積。
-    - **データセット生成**: 21銘柄包含マスターグリッド（欠損NaN補完）を構築し、全期間一括 1本（単一ZIPアーカイブ、約5.2MB / Discord 25MB制限内に安全収容）およびマスターCSV（Data/bingx_crypto21_5m_merged.csv）を出力・Discord配信。
-    - **キャッシュ保持規約**: キャッシュファイル（Data/historical_candles_bingx/{symbol}_5m.csv）は75日（約2.5ヶ月分）を上限として安全にトリミングし、常に直近2ヶ月分（60日分）のヒストリーを欠落なく保持。
-  - **5m (5分足 - 一般全銘柄)**: 直近90日分 (約3ヶ月間、差分キャッシュ更新)
-  - **1m (1分足)**: 直近30日分 (約1ヶ月間、差分キャッシュ更新)
-* **【8時間に1回 厳格送信規約】(8H Sync Guard)**:
-  - **全収集データ（4取引所ZIPアーカイブ ＆ ノーマライズ比較チャート）のDiscord送信は、厳格に「8時間に1回（定期選定時刻: 01:06, 09:06, 17:06 JST）」のみ実施する**。
-  - **スロット管理と送信ガード (`Data/last_full_sync_slot.json`)**:
-    - 直近の定期選定スロット（01:06, 09:06, 17:06 JST）で既に送信完了している場合、ボット再起動時であってもローカル差分同期のみ行い、Discordアップロードは自動スキップ（`📌 [8H Sync Guard]` が作動）。
-    - 最後の送信から8時間以上経過した未送信スロットに到達した時のみDiscord送信を実行。
-  - **スクリーニング処理（Phase A）での二重送信完全防止**:
-    - 定期選定直後のスクリーニング実行（`download_historical_candles.py`）時は、必ず `--skip-upload --skip-charts` を付与し、定期送信直後の不要な重複ZIP送信を恒久的に根絶する。
-* **【Discord送信先一元化規約】(Bitbankチャンネル集約)**:
-  - **全取引所（Bitbank, Binance Japan, Hyperliquid, BingX）のデータZIPアーカイブ、比較チャート、毎時監査、シグナル通知の送信先はすべて `real1_bitbank`（Bitbank専用チャンネル）へ一元化・集約する**。
-  - `config_loader.py` のエイリアスマップ（`WEBHOOK_ALIASES`）にて `real2_hype`, `real3_bngx`, `hype`, `bingx` 等の識別子もすべて `real1_bitbank` に自動リダイレクトする二重防護を適用。
-  - Windows（win32環境）テスト実行時は `test4_test` チャンネルへ自動出力。
-* **全銘柄網羅グリッド ＆ 時間軸N分割アーカイブ生成**:
-  - 全銘柄を同一タイムスタンプ軸で統合し、上場前や欠損期間は NaN で補完したマスターテーブルを生成。
-  - Discord制限（25MB）内に安全に収まるよう時間軸に沿って動的N分割し、必ず Part 1（最古データ）から順次アップロードする。
-* **レートリミット対策 ＆ CPU負荷極小化設計**:
-  - データ取得時は銘柄間ウェイト（0.3秒）およびページネーション間ウェイト（0.05秒）を挿入し、逐次（シングルスレッド）で丁寧に取得。
-  - ZIP圧縮は最軽量レベルを採用し、VPSのCPUクレジット消費やCPUスパイクを恒久的に防ぐ。
-* **データファイルの最新保持・自動クリーンアップ規約**:
-  - 生成されたZIPファイルおよびチャート画像は**「常に最新のものだけを維持する」**ことを厳守。
-  - 送信完了後の保管期間は **直近24時間（最大1日分）** とし、24時間を超過した古いZIPアーカイブおよび画像ファイルは自動削除。
-  - 最新の1セット分（past/recent各1本等）は経過時間に関わらず常時保護する。
-
+**Single Source of Truth (`PROJECT_RULES.md`)**
+本ドキュメントは、`d:\python_bitcoin\motiobtc\bitbank\bitbank5_46`（Bitbank & Binance Japan 現物ポートフォリオ監査ボット ＋ Polymarket トレンドチャート配信）における設計思想、システム動作シーケンス、実保有資産・含み損監査、サーバー運用、および Git デプロイに関する公式仕様原本です。
+すべてのコード変更・テスト・デプロイは本仕様に準拠して実施します。
 
 ---
 
-## 2. アーキテクチャ特性（1時間足確定足 ＆ 毎時06分実行 ＆ REST APIのみ）
+## 0. システム全体像 ＆ 安全ロック (`ALLOW_LIVE_TRADING = False`)
 
-* **毎時06分00秒確定足ループ（6分シフト運用）**:
-  - 5分ごとのループや5分足の監視・シグナル判定は行わない。
-  - ボットは完全に **「1時間足（1h）確定足」** で動作し、実行タイミングを **毎時06分00秒** にシフトして起動・評価を行う。
-  - **6分シフトの目的**: 正時（00分）の他ボットやシステム集中・取引所API過負荷を回避し、直前（00分）に確定した1時間足を完全に安定した状態で取得・評価するため。
-* **WebSocketの不採用（HTTP REST APIポーリング方式）**:
-  - WebSocket（WSS）常時接続は使用せず、すべての価格取得・残高照会・発注は標準の **HTTP REST API（GET / POST）** で完結させる。
-  - これにより、常時接続切断トラブルやPing/Pongタイムアウト、メモリリークのリスクを排除し、毎時06分に数十秒稼働した後は `sleep` 待機するため、VPSのCPUクレジット消費を極小化して長期間安定稼働させる。
+### 0.1 現行の運用方針（売買停止・保有銘柄監査専念）
+* **実売買・エアトレードの完全廃止**:
+  * 新規発注・決済発注・エアトレード（ペーパートレード）・戦略バックテスト最適化・WebSocket 常時接続はすべて廃止しています。
+  * `bitbank5_46_1spot_limit.py` および `bitbank5_46_2api.py` において `ALLOW_LIVE_TRADING = False` を設定し、本番口座への発注 API を物理的に遮断した上で、**「実保有暗号資産の含み損・評価額・未約定指値監査レポート」** に専念しています。
+* **海外取引所 5 分足収集のデフォルト停止（OOM 解消）**:
+  * Hyperliquid（235銘柄）＆ BingX（599銘柄）の 5 分足マスターグリッド一括生成は、VPS（物理 RAM 952 MiB + Swap 2.0 GiB）の上限（約 3.0 GB）を超過して OOM Killer による再起動ループを引き起こしていたため、**2026-11-17（コミット `9707e04`）よりデフォルト停止**としました（手動実行時のみ `--enable-history` / `--with-history` 指定で有効化可能）。
+  * これにより稼働メモリ（RSS）は約 200〜335 MB に抑制され、OOM・不要な再起動なしでの連続長期稼働を実現しています。
 
----
-
-## 3. オラクルNo.1 監視運用 ＆ エアモード（ペーパートレード）規約
-
-* **オラクルNo.1の運用方針**:
-  - オラクルNo.1ボットは相場監視・シグナル通知専用機として運用するため、実口座への本番発注は行わず、**エアトレード（`BITBANK_IS_AIR = True`）** として動作させる。
-* **本番データ接続 ＆ 仮想シミュレーション発注**:
-  - Live API（`BITBANK_IS_LIVE = True`）から本番リアルタイムレート・板情報・実残高を取得しつつ、発注処理はペーパートレードとして仮想執行する。
-* **シグナル通知 ＆ チャート配信**:
-  - 戦略ロジックがロングエントリーシグナルを判定した瞬間に、「🚀 **【シグナル通知: LONG ENTRY】**」（現在値、戦略名、クジラ判定等）をDiscordへ送信する。
-  - 利確・手仕舞い（クローズ）シグナル判定時には、「🎯 **【シグナル通知: LONG CLOSE】**」および決済トレードチャート画像をDiscordへ送信する。
-
----
-
-## 4. 全暗号資産 総合ポジション・指値監査規約（Cross-Exchange Portfolio Tracking）
-
-* **対象スクリプト**: `portfolio_tracker.py`
-* **実行タイミング**: 
-  - ボット起動時
-  - 毎時06分の確定足サイクル開始時（毎時間チェック）
-  - 定期選定時（8時間ごと: 01:06, 09:06, 17:06 JST）
-* **監査対象取引所・暗号資産**:
-  - **Bitbank**: 保有中の全暗号資産（現物 RENDER, BTC 等）の残高、約定履歴からの加重平均建値、現在価格、評価額、含み損益、未約定指値（拘束JPY）。
-  - **Binance Japan**: 保有中の全暗号資産（現物 NEAR 等）の残高、約定履歴からの加重平均建値、現在価格、評価額、含み損益、未約定指値（拘束JPY）。
-* **通知仕様**:
-  - 縦揃えの美しい箇条書きスタイル（緑色 / ANSI Green）で、各銘柄の保有数量、平均取得単価、現在価格、評価額、投資元本、含み損益を美しくフォーマットしてターミナルログおよびDiscord（`real1_bitbank`）へ自動報告する。
-* **現物長期保有BTCの隔離・保護**:
-  - 口座内の長期保有現物BTC（0.1434 BTC等、基準建値 1,279万円）は、ボットの売買から完全に隔離・保護する。
+### 0.2 コアモジュール構成
+| モジュール | 役割 |
+|---|---|
+| `bitbank5_46_1spot_limit.py` | メイン常駐プロセス（`--loop`）。起動バナー、起動時・毎時06分・8時間節目監査、シングルインスタンス排他ロック（`Data/bot.pid`）、`TeeLogger` ログ15MBローテーション管理 |
+| `portfolio_tracker.py` | Bitbank ＆ Binance Japan の全現物残高・移動加重平均建値・評価額・含み損益・未約定指値注文を取得し、縦揃えレポートを生成・Discord 配信 |
+| `long_term_btc_tracker.py` | 長期保有現物 BTC（保護数量 `0.1434 BTC` / 既知簿価 `12,794,387 円`）の保護・損益算出ユーティリティ |
+| `active_orders_tracker.py` | Bitbank 主要ペアの未約定アクティブ指値注文（拘束 JPY・乖離率）の取得・集計 |
+| `bitbank5_46_2api.py` | Bitbank Private/Public REST API ラッパー（Nonce 管理、`aiohttp` による都度セッション生成・クローズ） |
+| `bitbank5_46_3logic.py` | `send_discord` ロギング（ANSI バッファリング、プラットフォーム別 Webhook 振分）および既存補助ユーティリティ |
+| `config_loader.py` | `bitbank_credentials.json` 読み込み、Windows（`test4_test`）/ Linux（`real1_bitbank`）自動振り分け、`WEBHOOK_ALIASES` 管理 |
+| `polymarket_top20_chart.py` | Polymarket 24h出来高 Top 20 の直近1ヶ月ノーマライズ比較チャート生成（Top 1-10 / Top 11-20）＆ Discord 配信（VPS cron 1日3回実行） |
+| `check_and_restart.sh` | VPS cron（5分間隔）からのプロセス死活監視・`flock` 多重起動防止・自動復旧スクリプト |
+| `master_data_collector.py` / `download_*.py` / `data_pipeline_utils.py` | 海外・国内取引所ヒストリカル収集関連モジュール（通常監視時は停止、`--enable-history` または単体手動実行用） |
 
 ---
 
-## 5. Bitbank 取引所発注規約
+## 1. システム起動 ＆ 監視シーケンス (1時間足確定サイクル / 毎時06分)
 
-* **現物取引（Spot / JPY建て / LONG ONLY）**:
-  - Bitbank は現物取引のため、エッジ（金利・Funding Rate等）は加味せず純粋な現物売買とする。
-  - **買いエントリー（BUY）のみ（LONG ONLY）**。空売り（SHORT）は行わない。
-* **Maker指値優先**:
-  - Longエントリーは常に **`best_bid`（買い気配最良値）** または指値で発注する。
-  - 未約定リトライ時は、前回の指値を安全に全キャンセル（`cancel_order`）した上で最新気配値に再配置する。
-* **ロット・価格の丸め込み（Quantization）**:
-  - 各通貨ペアの最小発注数量（Bitbank 現物は基本 `0.0001` 等）および価格小数点桁数（`sz_decimals: 4.0`, 各ペアの `price_place`）を `BITBANK_SPECS` に基づき厳格に適用する。
-* **主要銘柄**:
-  - 対象銘柄例: `BTC`, `ETH`, `XRP`, `SOL`, `DOGE`, `BNB`, `ARB`, `SUI`, `AVAX`, `RNDR（render_jpy）`, `LINK`, `NEAR（Binance Japan現物連携）` 等
+```mermaid
+flowchart TD
+    Start["cron / 手動起動: python -u bitbank5_46_1spot_limit.py --loop"] --> Lock["排他ロック取得 (Data/bot.pid / fcntl.flock)"]
+    Lock --> LogInit["TeeLogger 初期化 (端末 + Data/bot_output.log 15MB上限)"]
+    LogInit --> Banner["起動バナー表示 & Discord 送信 (real1_bitbank)"]
+    Banner --> InitAudit["起動時 総合ポジション監査: report_all_positions()"]
+    InitAudit --> HistCheck{"--enable-history 指定あり？"}
+    HistCheck -- "No (標準運用)" --> LoopWait["毎時 06分00秒 JST まで非同期スリープ待機"]
+    HistCheck -- "Yes (手動時のみ)" --> SyncBg["非同期バックグラウンド収集タスク起動"]
+    SyncBg --> LoopWait
 
----
+    LoopWait --> SlotCheck{"時刻は 01 / 09 / 17 時台 (8時間節目)？"}
+    SlotCheck -- "Yes" --> PeriodicAudit["定期監査レポート送信 (01:00 / 09:00 / 17:00 JST 節目) + gc.collect()"]
+    SlotCheck -- "No" --> HourlyAudit["毎時ポジション監査レポート送信 (Cycle #N / HH:06 JST) + gc.collect()"]
+    PeriodicAudit --> LoopWait
+    HourlyAudit --> LoopWait
+```
 
-## 6. 資金管理・ポジション規約
-
-* **レバレッジ設定**:
-  - 現物取引のため、**レバレッジ1.0倍固定（`LEVERAGE_FACTOR = 1.0`）**。
-* **ポジションサイズ**:
-  - 目標投資額 15,000円（`BITBANK_TARGET_POSITION_VALUE_JPY = 15000.0`）に基づき動的にロット算出。
-* **必要資金チェック**:
-  - 発注前に `current_price * lot` を算出し、口座の利用可能 JPY 残高（`jpy_available`）を下回る場合は発注を安全にスキップする。
-* **最大同時保有数**:
-  - 最大2ポジション（`MAX_ACTIVE_POSITIONS = 2`）を厳守し、資金効率とリスク分散を両立する。
-
----
-
-## 7. 戦略ロジック ＆ バックテスト規約
-
-### 【2段階最適化プロセス】ベスト PnL 探索 ➔ トレーリングモード
-1. **第1段階（基礎戦略パラメータ最適化）**:
-   - **「Envelope戦略（戻りエントリー）」** と **「RSI戦略（RSIMA）」** のロジックを用いて、各銘柄におけるベスト PnL（最大利益・最適パラメータ）を探索・算出する。
-2. **第2段階（トレーリングモード適用・総合評価）**:
-   - ベスト PnL が得られた基礎設定に対し、**「ボリュームプロファイルトレーリング（VPトレーリング）」** を組み込み、利益の最大化とドローダウン抑制を検証・評価する。
-
-### 【ボリュームプロファイルトレーリング（VPトレーリング）】詳細仕様
-* 直近一定期間（例: 48時間）のローソク足から出来高プロファイル（VAH, VAL, POC）を算出。
-* **含み損時**: ストップライン = `VAL - α%`（サポート割れ損切り）
-* **POC 上抜け**: トレーリングライン = POC（最多出来高帯）へ引き上げ
-* **VAH 上抜け**: トレーリングライン = VAH（バリュー上限）へ引き上げ
-* **大相場ブレイクアウト**: `max(高値 × (1 - コールバック幅), VAH, 建値)` で利益追従
+### 1.1 毎時 06 分 00 秒 JST 実行（6分シフト運用）
+* **実行時刻**: `HOURLY_EXECUTION_MINUTE = 6`, `HOURLY_EXECUTION_SECOND = 0`（毎時 06 分 00 秒 JST）。
+* **6分シフトの目的**: 正時（00分）の他ボットや取引所 API アクセス集中を避け、HTTP REST API で安定して残高・ticker・約定履歴を取得するため。
+* **WebSocket 不採用（REST API のみ）**: 常時接続断・Ping/Pong タイムアウト・メモリリークを排除し、毎時 06 分の数秒のみ稼働して残りを `asyncio.sleep()` 待機することで CPU クレジット消費を極小化しています。
+* **バナー表示制限**: 起動時のアスキーアートバナーは初回起動時のみ送信し、毎時および 8 時間ごとの定期監査では送信しません。
 
 ---
 
-## 8. VPS常駐・接続・プロセス管理規約
+## 2. クロス取引所 総合ポジション・含み損監査規約 (`portfolio_tracker.py`)
 
-* **指定運用VPS（オラクルNo.1）接続情報**:
-  - **ホスト**: `141.147.160.15`
-  - **ユーザー**: `ubuntu`
-  - **秘密鍵**: `C:\Users\user\OneDrive\Desktop\OracleVPS\id_rsa.oracle`
-  - **SSH接続コマンド**:
-    ```bash
-    ssh -i "C:\Users\user\OneDrive\Desktop\OracleVPS\id_rsa.oracle" ubuntu@141.147.160.15
-    ```
-* **自動死活監視（Cron）**:
-  - `/etc/crontab` または `crontab -l` にて `check_and_restart.sh` を5分間隔（`*/5 * * * *`）で実行し、プロセスダウン時は自動再起動する。
-  - 監視対象プロセス名: `bitbank5_46_1spot_limit.py`
-* **Python実行時アンバッファ**:
-  - ログがリアルタイムに出力されるよう、必ず `python3 -u` オプションで起動する。
+### 2.1 監査対象取引所・保護資産
+1. **Bitbank（現物 JPY 口座）**:
+   * `GET /v1/user/assets` により JPY 残高（保有・利用可能・指値拘束）および保有暗号資産（評価額 10 円未満の端数は除外）を抽出。
+   * **長期保有 BTC の保護**: `BTC` については `long_term_btc_tracker.KNOWN_ENTRY_PRICE`（`12,794,387 円` / 保護枠 `0.1434 BTC`）を基準簿価として監査表示し、ボットの売買対象外として保護します。
+   * **その他現物銘柄（`RENDER` 等）**: `GET /v1/user/spot/trade_history` から移動加重平均建値を算出（API 取得失敗時は `Data/last_known_entry_prices.json` ➔ `DEFAULT_KNOWN_ENTRY_PRICES` にフォールバック）。
+   * **未約定指値**: `active_orders_tracker.fetch_active_orders()` により保有・主要ペアの未約定指値と拘束 JPY を集計。
+2. **Binance Japan（現物 JPY 口座）**:
+   * `ccxt.binance`（Spot）を用いて `JPY` 残高および保有暗号資産（`NEAR` 等）の現在価格・約定履歴に基づく平均取得単価（同キャッシュフォールバックあり）・評価額・含み損益・未約定指値（`fetch_open_orders`）を取得。
 
----
-
-## 9. コードデプロイ・同期運用規約（Git Push ➔ VPS Git Pull 方式）
-
-* **SCP直接アップロードの禁止**:
-  - Windowsローカル環境から VPS へプログラムコード（`.py` ファイル等）を SCP で直接上書きアップロードしてはならない（Git競合防止）。
-* **標準デプロイワークフロー**:
-  1. **ローカル**: コード修正 ➔ 構文・動作確認 ➔ `git add` ➔ `git commit` ➔ `git push origin bitbank`
-  2. **VPS側**: SSH接続 ➔ `cd /home/ubuntu/bitbank5_46 && git pull origin bitbank` で同期
-  3. **再起動**: VPS側でボットプロセスを安全に再起動（`python3 bitbank5_46_1spot_limit.py --loop`）
-* **データファイル（ログ・CSV等）の取得**:
-  - VPSからローカルへログファイルやCSV・画像をダウンロードする目的の SCP は許可される。
+### 2.2 出力項目・通知仕様
+* **出力フォーマット**: 取引所別の保有数量、平均取得単価、現在価格、評価額、投資元本、含み損益（円 / %）、未約定指値、全口座合算の暗号資産評価総額・含み損益・純資産総額を縦揃えテキストで出力。
+* **送信先チャンネル**:
+  * **Linux（VPS 本番）**: `real1_bitbank`
+  * **Windows（ローカル検証）**: `test4_test`（`config_loader.get_webhook_url()` による環境自動判定）
 
 ---
 
-## 10. Windows / クロスプラットフォーム動作保証規約
+## 3. Polymarket Top 20 日次チャート配信仕様 (`polymarket_top20_chart.py`)
 
-* **コマンドプロンプト / PowerShell 実行互換性**:
-  - Windows側のコマンドプロンプト（cmd.exe）および PowerShell からスクリプトを実行した場合でも、未捕捉例外やエンコードエラー、パス差異等で異常終了しないようコードを設計・テストすること。
-* **例外のフェイルセーフ防護**:
-  - 外部API通信（Bitbank/Binance Public/Private REST、Discord等）でネットワーク障害やHTTPエラー（503, 502, 429等）が発生しても、`SystemExit` 等でメインプロセスが終了しないよう、`Exception` や `BaseException` レベルで安全に捕捉・隔離すること。
-* **文字コード・パスの標準化**:
-  - すべてのファイルIO操作は `encoding="utf-8"` を明示し、パス操作には `pathlib.Path` を使用すること。
+現在、Bitbank ボットの同居リポジトリ・VPS 環境を活用し、cron による独立ジョブとして以下を暫定運用中。
+
+### 3.1 取得・選定ロジック
+* **対象取得**: Polymarket Gamma API（`https://gamma-api.polymarket.com/events`）から `active=true`, `closed=false`, `order=volume24hr`, `ascending=false` で上位イベントを取得。
+* **フィルタ条件**:
+  * プレースホルダー（`Other`, `Candidate X`, `Team X`, `Company X`, `Player X`, `Country X` 等）および非アクティブ・出来高ゼロ市場を除外。
+  * 決着張り付き市場（現在確率 `1% 未満` または `99% 超`）を除外し、各イベント内で最も現在確率が高いアクティブ本命候補（同率時は取引量順）を 1 つ代表として選出。
+  * Polymarket CLOB API（`https://clob.polymarket.com/prices-history?interval=1m&fidelity=60`）から直近 30 日分の 1 時間足相当データを取得し、履歴が `1.0 日未満` または `12 点未満` の超短期市場を除外した **上位 20 銘柄** を確定。
+
+### 3.2 チャート描画・配信スケジュール
+* **ノーマライズ方式**: 各銘柄のデータ開始時点価格を **`100%`** とした比率ノーマライズ指数で描画（10 銘柄 × 2 枚：`Top 1-10` / `Top 11-20`）。
+* **日本語フォント・数式誤爆防止**: Linux VPS 上の `NotoSansCJK-Regular.ttc` / `ipam.ttf` を明示登録し、`text.parse_math = False`（非対応環境では `\$` エスケープ）によりラベル内 `$` 記号の数式解釈を防止。
+* **実行スケジュール（VPS cron / JST）**:
+  * **毎日 3 回（`01:00 / 09:00 / 17:00 JST`）** に実行し、`real1_bitbank` へ 24h 出来高・現在確率・変化率サマリー付きで送信。
+  * ログ出力: `Data/polymarket_chart.log`（毎回上書き `>` で肥大化防止）。
+  * 画像保持: `Data/plots/polymarket_top*_1m_*.png` は 72 時間経過後に自動削除（最新 4 枚を保護）。
 
 ---
 
-## 11. データファイル最新保持・ディスク容量管理規約
+## 4. VPS 常駐・cron・ログ・ディスク管理規約
 
-* **保持期間と自動クリーンアップ**:
-  - **ZIPファイル（`Data/*.zip`）**: 直近24時間（1日分）のみ保持。24時間超過分は毎時および定期同期時に自動削除。
-  - **チャート画像（`Data/plots/*.png`）**: 最新セットのみ保持。24時間超過分は自動削除。
-  - **一時CSV（`Data/*_1h_*.csv`）**: 生成後24時間経過で自動削除。
-  - **保護対象**: キャッシュCSV（`historical_candles/`, `historical_candles_binance/`）、最新マスターCSV（`historical_all_symbols_merged.csv`, `binance_japan_all_symbols_merged.csv`）、送信台帳（`uploaded_files_registry.json`）は保護し、不要な重複ファイルを生成しない。
-* **常駐プロセスのログ管理**:
-  - `bot_output.log` 等のログファイルは、15MB上限の自動ローテーションを適用し、VPSのディスク容量を圧迫しないよう恒久的に監視・制御する。
+### 4.1 指定運用 VPS（Oracle No.1）環境
+* **ホスト / ユーザー**: `141.147.160.15` / `ubuntu`
+* **タイムゾーン**: `Asia/Tokyo (JST, +0900)`
+* **配置ディレクトリ**: `/home/ubuntu/bitbank5_46`
+* **Python 仮想環境**: `/home/ubuntu/pybot-env310/bin/python`（常に `-u` アンバッファ起動）
+* **SSH 接続コマンド**:
+  ```bash
+  ssh -i "C:\Users\user\OneDrive\Desktop\OracleVPS\id_rsa.oracle" ubuntu@141.147.160.15
+  ```
+
+### 4.2 crontab 設定（正本）
+```cron
+*/5 * * * * /home/ubuntu/bitbank5_46/check_and_restart.sh > /dev/null 2>&1
+0 1,9,17 * * * cd /home/ubuntu/bitbank5_46 && /home/ubuntu/pybot-env310/bin/python -u /home/ubuntu/bitbank5_46/polymarket_top20_chart.py --channel real1_bitbank > /home/ubuntu/bitbank5_46/Data/polymarket_chart.log 2>&1
+```
+
+### 4.3 ログ・ディスク容量保護
+* **`Data/bot_output.log`**: `TeeLogger` により `15 MB` 超過時に後半半分へ自動ローテーション。
+* **標準出力リダイレクトログ（`bot_output.log`）**: `check_and_restart.sh` による再起動時に `bot_output.log.old` へ退避。
+* **排他ロック**: `bitbank5_46_1spot_limit.py` 側は `Data/bot.pid`（`fcntl.flock` / Windows は `msvcrt.locking`）、`check_and_restart.sh` 側は `/tmp/bitbank_check_and_restart.lock` で二重起動を完全防止。
+
+---
+
+## 5. コードデプロイ・クロスプラットフォーム運用規約
+
+### 5.1 Git Push ➔ VPS Git Pull 方式（SCP 直接上書き厳禁）
+1. **ローカル（Windows）で修正・テスト**:
+   * `python -m py_compile <file>.py` および単体/ドライラン検証を実施。
+2. **GitHub（`origin bitbank`）へプッシュ**:
+   * `git add ...` ➔ `git commit -m "..."` ➔ `git push origin bitbank`
+3. **VPS 側で同期・検証**:
+   * `cd /home/ubuntu/bitbank5_46 && git pull origin bitbank`
+   * メイン監視ボットのコード更新時のみ安全に再起動（ドキュメント・独立 cron スクリプトのみの更新時は無停止継続）。
+* **ログ・画像の取得用 SCP**: VPS からローカルへのログ・画像・CSV ダウンロード目的の SCP は許可されます。
+
+### 5.2 クロスプラットフォーム互換・フェイルセーフ規約
+* ファイル I/O は必ず `encoding="utf-8"` を明示し、パス結合には `pathlib.Path` を使用します。
+* 外部 API 通信（Bitbank / Binance Japan / Polymarket / Discord）は `timeout` 指定および例外捕捉・リトライで保護し、ネットワーク一時障害でメインプロセスが停止しないように設計します。
+* Windows ローカル実行時は `config_loader.py` によりデフォルト送信先が `test4_test` に切り替わり、本番チャンネル `real1_bitbank` への誤通知を防止します。
