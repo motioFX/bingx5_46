@@ -35,11 +35,12 @@ DEFAULT_LAKE_DB_PATH = LAKE_DIR / "bingx_lake.db"
 TIMEFRAME_SECONDS: Dict[str, int] = {
     "5m": 300,
     "15m": 900,
+    "30m": 1800,
     "1h": 3600,
     "4h": 14400,
 }
 
-SUPPORTED_TIMEFRAMES: Tuple[str, ...] = ("5m", "15m", "1h", "4h")
+SUPPORTED_TIMEFRAMES: Tuple[str, ...] = ("5m", "15m", "30m", "1h", "4h")
 
 
 def utc_now_sec() -> int:
@@ -473,7 +474,7 @@ class LakeStore:
         symbol: str,
         cutoff_utc: Optional[int] = None,
         since_ts_utc: Optional[int] = None,
-        timeframes: Sequence[str] = ("15m", "1h", "4h"),
+        timeframes: Sequence[str] = ("15m", "30m", "1h", "4h"),
     ) -> Dict[str, int]:
         """確定済み 5m 足から上位足 (15m / 1h / 4h) を決定的に生成・格納する。"""
         norm_sym = normalize_symbol(symbol)

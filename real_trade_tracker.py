@@ -1255,13 +1255,14 @@ def build_daily_14d_comparison_report(
                         "pnl": sum(p_list),
                     }
 
-    # 2. バックテスト理論集計 (データレイク最新ランのOOS適格セルを方向別でポートフォリオ再現)
+    # 2. バックテスト理論集計 (データレイク最新仕様: 15銘柄以上時は F7 Two-Pillar、小規模DBは旧互換セル再現)
     bt_daily: Dict[str, Dict[str, Any]] = {}
     day_regime_label: Dict[str, str] = {}
     bt_metrics: Optional[Dict[str, Any]] = None
-    bt_note = "※BT: 最新OOS適格セル14日ポートフォリオ再現(方向別/NY含/2枠/CB-$1.50/0.08%手数料)"
+    bt_note = "※BT: F7 Two-Pillar 14日ポートフォリオ再現(2枠/CB-$1.50/0.08%手数料)"
     try:
         from lake_store import LakeStore
+        from symbol_universe import LAKE_UNIVERSE_SYMBOLS, BENCHMARK_SYMBOL, normalize_symbol
         from lake_backtest_engine import (
             WalkForwardConfig,
             build_portfolio_params_map_from_cells,
@@ -1269,53 +1270,110 @@ def build_daily_14d_comparison_report(
             simulate_portfolio_on_window,
         )
         lake = LakeStore(db_path=db_path)
-        latest_run = None
-        with lake._conn(write=False) as conn:
-            row = conn.execute(
-                "SELECT run_id, data_cutoff_utc FROM backtest_runs ORDER BY rowid DESC LIMIT 1"
-            ).fetchone()
-            if row is not None:
-                latest_run = {"run_id": row["run_id"], "data_cutoff_utc": int(row["data_cutoff_utc"])}
-        if latest_run is not None:
-            cells = lake.get_cells_for_run(latest_run["run_id"])
-            if cells:
-                ranked_syms, sym_map = build_portfolio_params_map_from_cells(cells)
-                win_start_utc = int(datetime.combine(start_date, datetime.min.time(), tzinfo=jst_tz).timestamp())
-                win_end_utc = max(win_start_utc + 300, min(int(cur_jst.timestamp()), latest_run["data_cutoff_utc"]))
-                hourly_map, pit_ok = compute_hourly_regime_series_from_lake(
-                    lake, win_start_utc, win_end_utc, use_point_in_time_regime=True, gil_yield_sec=0.005
-                )
-                cfg = WalkForwardConfig(allow_ny_session=True, gil_yield_sec=0.005)
-                bt_res = simulate_portfolio_on_window(
-                    lake=lake,
-                    symbol_params_map=sym_map,
-                    ranked_symbols=ranked_syms,
-                    hourly_regime_map=hourly_map if pit_ok else None,
-                    win_start_utc=win_start_utc,
-                    win_end_utc=win_end_utc,
-                    cfg=cfg,
-                )
-                bt_metrics = bt_res["metrics"]
-                for tr in bt_res["sim_trades"]:
-                    if tr.get("fill_ts_utc") is None or tr.get("exit_ts_utc") is None:
-                        continue
-                    d_str = datetime.fromtimestamp(int(tr["exit_ts_utc"]), tz=timezone.utc).astimezone(jst_tz).strftime("%Y-%m-%d")
-                    rec = bt_daily.setdefault(d_str, {"trades": 0, "wins": 0, "losses": 0, "pnl": 0.0})
-                    pnl_v = float(tr["net_pnl"])
-                    rec["trades"] += 1
-                    if pnl_v > 0:
-                        rec["wins"] += 1
-                    else:
-                        rec["losses"] += 1
-                    rec["pnl"] += pnl_v
-                for ts_hr in sorted(hourly_map.keys()):
-                    dt_hr = datetime.fromtimestamp(int(ts_hr), tz=timezone.utc).astimezone(jst_tz)
-                    d_str = dt_hr.strftime("%Y-%m-%d")
-                    snap = hourly_map[ts_hr]
-                    reg_ch = str(snap.get("overall_regime", "?"))[:1]
-                    pat = str(snap.get("regime_pattern", ""))
-                    if dt_hr.hour == 12 or d_str not in day_regime_label:
-                        day_regime_label[d_str] = f"{reg_ch}{pat}"
+        win_start_utc = int(datetime.combine(start_date, datetime.min.time(), tzinfo=jst_tz).timestamp())
+        btc_st = lake.get_candle_stats(normalize_symbol(BENCHMARK_SYMBOL), "5m")
+        btc_max_ts = int(btc_st.get("max_ts_utc") or 0)
+        f7_1h_syms = 0
+        for u_sym in LAKE_UNIVERSE_SYMBOLS:
+            df_u = lake.load_candles(normalize_symbol(u_sym), "1h", cutoff_utc=int(cur_jst.timestamp()), start_utc=win_start_utc - 20 * 86400, limit=30)
+            if not df_u.empty and len(df_u) >= 24:
+                f7_1h_syms += 1
+
+        if f7_1h_syms >= 15 and btc_max_ts > win_start_utc:
+            from lake_live_bridge import _ensure_30m_candles_in_lake
+            from strategy_f7_two_pillar import F7_MODE_NAME, simulate_f7_portfolio_from_lake
+            win_end_utc = max(win_start_utc + 300, min(int(cur_jst.timestamp()), btc_max_ts + 300))
+            _ensure_30m_candles_in_lake(lake, cutoff_utc=win_end_utc)
+            hourly_map, _ = compute_hourly_regime_series_from_lake(
+                lake, win_start_utc, win_end_utc, use_point_in_time_regime=True, gil_yield_sec=0.005
+            )
+            f7_res = simulate_f7_portfolio_from_lake(
+                lake=lake,
+                start_utc=win_start_utc,
+                end_utc=win_end_utc,
+                max_pos=2,
+                fee_rate=0.0008,
+                daily_cb_limit=1.50,
+                hourly_regime_map=hourly_map,
+                gil_yield_sec=0.005,
+            )
+            bt_note = f"※BT: {F7_MODE_NAME} 14日ポートフォリオ再現(2枠/CB-$1.50/0.08%手数料)"
+            tr_list = f7_res.get("trades") or []
+            bt_wins = sum(1 for t in tr_list if float(t.get("net_pnl", 0.0)) > 0.0)
+            bt_metrics = {
+                "trades": int(f7_res.get("n", len(tr_list))),
+                "wins": int(bt_wins),
+                "win_rate": float(f7_res.get("wr", 0.0)),
+                "net_pnl": float(f7_res.get("net_pnl", 0.0)),
+                "pf": float(f7_res.get("pf", 0.0)),
+                "max_dd": float(f7_res.get("max_dd", 0.0)),
+            }
+            for tr in tr_list:
+                d_str = datetime.fromtimestamp(int(tr["exit_ts"]), tz=timezone.utc).astimezone(jst_tz).strftime("%Y-%m-%d")
+                rec = bt_daily.setdefault(d_str, {"trades": 0, "wins": 0, "losses": 0, "pnl": 0.0})
+                pnl_v = float(tr["net_pnl"])
+                rec["trades"] += 1
+                if pnl_v > 0:
+                    rec["wins"] += 1
+                else:
+                    rec["losses"] += 1
+                rec["pnl"] += pnl_v
+            for ts_hr in sorted(hourly_map.keys()):
+                dt_hr = datetime.fromtimestamp(int(ts_hr), tz=timezone.utc).astimezone(jst_tz)
+                d_str = dt_hr.strftime("%Y-%m-%d")
+                snap = hourly_map[ts_hr]
+                reg_ch = str(snap.get("overall_regime", "?"))[:1]
+                pat = str(snap.get("regime_pattern", ""))
+                if dt_hr.hour == 12 or d_str not in day_regime_label:
+                    day_regime_label[d_str] = f"{reg_ch}{pat}"
+        else:
+            bt_note = "※BT: 最新OOS適格セル14日ポートフォリオ再現(方向別/NY含/2枠/CB-$1.50/0.08%手数料)"
+            latest_run = None
+            with lake._conn(write=False) as conn:
+                row = conn.execute(
+                    "SELECT run_id, data_cutoff_utc FROM backtest_runs ORDER BY rowid DESC LIMIT 1"
+                ).fetchone()
+                if row is not None:
+                    latest_run = {"run_id": row["run_id"], "data_cutoff_utc": int(row["data_cutoff_utc"])}
+            if latest_run is not None:
+                cells = lake.get_cells_for_run(latest_run["run_id"])
+                if cells:
+                    ranked_syms, sym_map = build_portfolio_params_map_from_cells(cells)
+                    win_end_utc = max(win_start_utc + 300, min(int(cur_jst.timestamp()), latest_run["data_cutoff_utc"]))
+                    hourly_map, pit_ok = compute_hourly_regime_series_from_lake(
+                        lake, win_start_utc, win_end_utc, use_point_in_time_regime=True, gil_yield_sec=0.005
+                    )
+                    cfg = WalkForwardConfig(allow_ny_session=True, gil_yield_sec=0.005)
+                    bt_res = simulate_portfolio_on_window(
+                        lake=lake,
+                        symbol_params_map=sym_map,
+                        ranked_symbols=ranked_syms,
+                        hourly_regime_map=hourly_map if pit_ok else None,
+                        win_start_utc=win_start_utc,
+                        win_end_utc=win_end_utc,
+                        cfg=cfg,
+                    )
+                    bt_metrics = bt_res["metrics"]
+                    for tr in bt_res["sim_trades"]:
+                        if tr.get("fill_ts_utc") is None or tr.get("exit_ts_utc") is None:
+                            continue
+                        d_str = datetime.fromtimestamp(int(tr["exit_ts_utc"]), tz=timezone.utc).astimezone(jst_tz).strftime("%Y-%m-%d")
+                        rec = bt_daily.setdefault(d_str, {"trades": 0, "wins": 0, "losses": 0, "pnl": 0.0})
+                        pnl_v = float(tr["net_pnl"])
+                        rec["trades"] += 1
+                        if pnl_v > 0:
+                            rec["wins"] += 1
+                        else:
+                            rec["losses"] += 1
+                        rec["pnl"] += pnl_v
+                    for ts_hr in sorted(hourly_map.keys()):
+                        dt_hr = datetime.fromtimestamp(int(ts_hr), tz=timezone.utc).astimezone(jst_tz)
+                        d_str = dt_hr.strftime("%Y-%m-%d")
+                        snap = hourly_map[ts_hr]
+                        reg_ch = str(snap.get("overall_regime", "?"))[:1]
+                        pat = str(snap.get("regime_pattern", ""))
+                        if dt_hr.hour == 12 or d_str not in day_regime_label:
+                            day_regime_label[d_str] = f"{reg_ch}{pat}"
     except Exception as bt_err:
         bt_note = f"※BT集計スキップ: {bt_err}"
 

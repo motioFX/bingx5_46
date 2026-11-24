@@ -1,7 +1,7 @@
 # bingx5_46 プロジェクト運用ルール & 開発アーキテクチャ規約 (PROJECT_RULES)
 
 本ドキュメントは、`bingx5_46`（BingX USDT無期限先物 自動売買ボット）プロジェクトの設計思想、システム起動シーケンス、データパイプライン、取引戦略、資金管理、およびサーバー運用に関する最高位の規約（Single Source of Truth）です。
-コアロジック（ノーマライズ3段階地合い判定・セッション連動個別最適化（126通り）・地合いディフェンス）は `hype5_45` と完全同一のアルゴリズムを維持しつつ、取引基盤として **BingX USDT無期限先物（豊富なUSDT流動性）** および **BingX公式 VSTデモ口座（実API発注検証）** に完全特化しています。
+コアロジック（**F7 Two-Pillar 戦略体系**: `val_poc_30m` [30分足・ULTRA_BUY・欧州除外] ＋ `h3b_squeeze_1h` [1時間足・SELL・S8bトレーリング・NoExh・WF90d]、3期間ノーマライズ全体地合い判定）は `hype5_45` と完全同一のアルゴリズム（`strategy_f7_two_pillar.py` SSoT）を維持しつつ、取引基盤として **BingX USDT無期限先物（豊富なUSDT流動性）** および **BingX公式 VSTデモ口座（実API発注検証）** に完全特化しています。
 
 ---
 
@@ -118,12 +118,12 @@ flowchart TD
   * 全市場600銘柄以上のダウンロードや巨大CSV/ZIP（`daily_*.csv`, `merged_*.csv`, `bingx_all_markets_1h_*.csv/.zip`）の生成・運用は廃止し、`symbol_universe.py` で単一定義された **実取引ユニバース 21銘柄＋`BTC-USDT`（計22銘柄）** のみを管理対象とする。
   * 唯一の正本（SSoT: Single Source of Truth）を **SQLite データレイク `Data/lake/bingx_lake.db`（WALモード・外部キー制約有効）** とし、既存の `Data/candles_5m/*.csv`、`Data/oi_store/*_oi.csv`、`Data/regime_history.csv`、`Data/trades_history.csv` を `migrate_to_lake.py` で無損失統合する（外部可視化用の読み取り専用CSVスナップショットは `Data/lake/exports/` に出力）。
 * **時系列蓄積・確定足専用原則 (`lake_store.py`, `candle_5m_store.py`)**:
-  * **65日切り捨て（`disk_max_bars`）の完全撤廃**: `market_candles` テーブルへ 5分足（`5m`）を最小粒度として無制限追記蓄積（180日超のバックフィル含む）し、確定済み `5m` 足から `15m` / `1h` / `4h` の全4時間軸を `closed='left', label='left'` で決定的生成・格納する（`PRIMARY KEY (symbol, timeframe, ts_utc)`）。
+  * **65日切り捨て（`disk_max_bars`）の完全撤廃**: `market_candles` テーブルへ 5分足（`5m`）を最小粒度として無制限追記蓄積（180日超のバックフィル含む）し、確定済み `5m` 足から `15m` / `30m` / `1h` / `4h` の全5時間軸を `closed='left', label='left'` で決定的生成・格納する（`PRIMARY KEY (symbol, timeframe, ts_utc)`）。
   * **未来情報混入（未確定足リーク）の構造的遮断**: すべてのローソク足は開始時刻 `ts_utc`（UTC秒）で格納し、基準時刻 `data_cutoff_utc = T` における参照時は常に `ts_utc + tf_sec <= T` を満たす確定足のみをSQLで抽出する。
   * **建玉 (OI)・ファンディングレート (FR) の因果結合 (`market_oi_fr`)**: `bingx_oi_collector.py` が収集する全銘柄 OI/FR を単一キー `{SYMBOL}`（`{SYM}-USDT` 統一）で追記保存し、`oi_chg_4h` 等は各足確定時刻 `bar_close_utc` 以前の最新観測値のみを後方 `merge_asof` で動的結合する（未来値の逆補間を厳禁）。
 * **テーブル構成（全9テーブル・蓄積ループ）**:
   1. `universe_symbols`: 対象22銘柄およびメガキャップ除外定義
-  2. `market_candles`: `5m` / `15m` / `1h` / `4h` の確定OHLCV
+  2. `market_candles`: `5m` / `15m` / `30m` / `1h` / `4h` の確定OHLCV
   3. `market_oi_fr`: 建玉・FR・マーク価格の時系列スナップショット
   4. `regime_snapshots`: 基準時刻ごとの3段階地合い・前半高安監査結果
   5. `backtest_runs`: 実行ID、`data_cutoff_utc`、`opt_start/end`、`eval_start/end`、手数料設定、Gitコミット識別子
@@ -314,9 +314,31 @@ USDCよりも圧倒的に出来高・流動性が厚い **USDT無期限先物ペ
 
 ---
 
-## 3. 基本戦略体系（Pure 3大戦略体系）＆ 個別最適化規約 (Triple Pure Strategy System & Individual Optimization)
+## 3. F7 Two-Pillar 戦略体系 ＆ エグジット統一仕様 (`strategy_f7_two_pillar.py` SSoT)
 
-### 🧩 3-1. セッション連動 Pure 3大戦略体系（各態勢 126通り / 単発1本固定）
+2021年〜2026年（約5.9年間 / 全6暦年・中堅17〜18アルト固定 `$15` 枠・往復コスト控除後）のデータ検証において全6暦年で黒字を達成した検証済み仕様として、以下の **F7 Two-Pillar（買い・売り独立2本柱）戦略体系** を本番・デモ共通の SSoT（`strategy_f7_two_pillar.py` / `USE_F7_TWO_PILLAR_MODE = True`）として採用する（後方互換テスト用に旧6戦略グリッド関連モジュールも保守維持する）。
+
+### 🧩 3-1. F7 Two-Pillar コア戦略対比マトリクス（単発1本固定 / ナンピン完全ゼロ）
+
+| 項目 | Pillar 1: ロング戦略 (`val_poc_30m` / `L1a_30m_VAL_TP`) | Pillar 2: ショート戦略 (`h3b_squeeze_1h` / `H3b_1h_Squeeze`) |
+| :--- | :--- | :--- |
+| **対象時間足** | **`30m`（30分確定足）** | **`1h`（1時間確定足）** |
+| **許可地合い (`Regime`)** | **`ULTRA_BUY` ティアのみ**（3窓全BUY一致 BBB） | **`overall_regime == "SELL"`**（売り優勢全体） |
+| **前半高安監査 (`NoNormExcl`)** | 対象銘柄が BUY ノーマライズ除外（前半ピーク半値割れ）でないこと | 対象銘柄が SELL ノーマライズ除外（前半ボトム半値超え）でないこと |
+| **時間帯フィルタ** | **欧州時間帯（16:00〜22:00 JST）新規禁止 (`NoEU`)** | 24時間許可 |
+| **追加前提フィルタ** | なし | **疲れ切り回避 (`NoExh`)**: `btc_ret14d >= -10.0%` かつ `sym_ret14d >= -20.0%`<br>**因果 WF90d ゲート**: `strategy_f7_two_pillar.evaluate_h3b_wf90d_gate_from_lake` によりポートフォリオ直近90日確定ペーパー台帳 (`n >= 10`) をヒステリシス判定（休止入り: `net90d < -3.00` かつ `pf90d < 0.85` / 休止解除: `pf90d >= 1.00` または `net90d >= 0.0`） |
+| **エントリー条件** | ・`warmup >= 155`<br>・Market Profile (`period=120, half_life=60.0, bins=50, va=0.70`, `vah > val > 0`, `poc > 0`)<br>・`val * 0.965 <= close <= val * 1.002`<br>・出来高倍率 `vr = volume / rolling(20, min_periods=5).mean().shift(1) >= 1.2` | ・`warmup >= 170`<br>・BB(20, `ddof=0`) 幅 `bw = 4*std/mid` について、直前確定足 `bw.shift(1) <= bw.rolling(168, min_periods=50).quantile(0.25).shift(1)`（ボラ圧縮スクイーズ）<br>・出来高倍率 `vr >= 1.5`<br>・`close < low.rolling(48, min_periods=48).min().shift(1)`（48時間安値下方ブレイク） |
+| **初期 SL / トレーリング** | `init_sl = epx - min(2.0 * entry_atr, epx * 0.040)`（`ATR14` 連動・最大4.0%キャップ） | **S8b 段階的防衛トレール**:<br>・`init_sl = epx + 2.0 * entry_atr`<br>・約定翌足以降: `eff_sl = min(init_sl, trough + 2.0 * prev_bar_atr)`<br>・到達利益が `(epx - min_trough) >= 1.5 * entry_atr` に達した瞬間 `be_locked = True` とし、`eff_sl = min(eff_sl, epx * 0.9980)` (`BE_LOCK_SL`) をロック |
+| **目標 TP** | `tp_base = val + (vah - val) * 0.70`（未達/低値時は `poc` または `epx * 1.006`）<br>`target_tp = max(tp_base, epx * 1.006)` | 目標TP上限を設けず `S8b` トレーリング＆FlipBEで利益伸長 |
+| **地合い反転建値撤退 (`FlipBE`)** | **`overall_regime == "SELL"` の時のみ** 建値 `+0.20%` 到達で早期撤退（`NEUTRAL` では決済しない） | **`overall_regime == "BUY"` の時のみ** 建値 `-0.20%` 到達で早期撤退（`NEUTRAL` では決済しない） |
+| **タイムアウト / 最大保有** | タイムアウト強制損切りなし / **最大保有 `1440分`（24時間）で強制決済 (`MAX_HOLD_CLOSE`)** | タイムアウト強制損切りなし / **最大保有 `7200分`（120時間 = 5日間）で強制決済 (`MAX_HOLD_CLOSE`)** |
+| **同時競合時の優先順位** | `(vol_ratio DESC, symbol ASC)` の決定論的ソートで空き枠（最大 `MAX_ACTIVE_POSITIONS = 2`）を配分 | `(vol_ratio DESC, symbol ASC)` の決定論的ソートで空き枠（最大 `MAX_ACTIVE_POSITIONS = 2`）を配分 |
+| **指値追随 (`pending_entry_orders`)** | `Best Bid` Post-Only 指値、最大3サイクル追随（`ULTRA_BUY` 喪失・16:00 JST突入・CB時は即時キャンセル） | `Best Ask` Post-Only 指値、最大3サイクル追随（`SELL` 喪失・`WF90d` 休止・CB時は即時キャンセル） |
+
+---
+
+### 🧩 3-2. 従来のセッション連動 Pure 3大戦略体系（後方互換・研究アーカイブ参照用 / 非推奨旧仕様）
+*(※ 以下は旧 `5m/15m` 6戦略セッションモデルの記録。ライブおよび日次14日BT比較の標準運用は §3-1 の F7 Two-Pillar 体系が優先適用される)*
 ボリュームプロファイル（レンジ回帰 ＆ バリューエリア・ブレイクアウト）と RSI-EMA（モメンタムスキャルピング）の3大コアロジックを軸とし、**トレード機会損失を引き起こしていた EMA200 フィルターを完全撤廃**。
 欧州時間帯（17:00〜01:00 JST）等で発生する強いトレンド・ボラティリティ拡大局面を収益化する **「ブレイクアウト戦略（`VAH_BREAK` / `VAL_BREAK`）」** を統合し、**買い（LONG / BULL時）3戦略 ＋ 売り（SHORT / BEAR時）3戦略 の完全対称な計6戦略体系（各態勢126通り）** を構成する：
 

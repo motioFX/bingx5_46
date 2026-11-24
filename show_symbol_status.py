@@ -46,13 +46,26 @@ def get_macro_gate_summary() -> Dict[str, Any]:
         "excluded_symbols": [],
         "exclusion_reasons": {},
         "recommended_symbols": [],
+        "strength_tier": "BALANCED",
+        "btc_ret14d": 0.0,
+        "sym_ret14d_map": {},
+        "h3b_wf90d": {},
     }
+    wf_file = DATA_DIR / "h3b_wf90d_state.json"
+    wf_fallback: Dict[str, Any] = {}
+    if wf_file.exists():
+        try:
+            wf_fallback = json.loads(wf_file.read_text(encoding="utf-8"))
+        except Exception:
+            wf_fallback = {}
     if not state_file.exists():
+        default_res["h3b_wf90d"] = wf_fallback
         return default_res
     try:
         with open(state_file, "r", encoding="utf-8") as f:
             data = json.load(f)
             overall = data.get("overall_regime", "NEUTRAL")
+            tier = str((data.get("regime_strength") or {}).get("tier", data.get("strength_tier", "BALANCED"))).upper()
             p_res = data.get("period_results", {})
             if any(k in p_res for k in ("14d", "7d", "2d")):
                 w14 = p_res.get("14d", {}).get("state", "NEUTRAL")
@@ -67,6 +80,7 @@ def get_macro_gate_summary() -> Dict[str, Any]:
             gate = "ALLOW" if overall in ("BUY", "SELL") else "STOP"
             return {
                 "overall_regime": overall,
+                "strength_tier": tier,
                 "regime_gate": gate,
                 "regime_desc": desc,
                 "w14": w14,
@@ -75,9 +89,13 @@ def get_macro_gate_summary() -> Dict[str, Any]:
                 "excluded_symbols": data.get("excluded_symbols", []),
                 "exclusion_reasons": data.get("exclusion_reasons", {}),
                 "recommended_symbols": data.get("recommended_symbols", []),
+                "btc_ret14d": float(data.get("btc_ret14d", 0.0) or 0.0),
+                "sym_ret14d_map": dict(data.get("sym_ret14d_map") or {}),
+                "h3b_wf90d": dict(data.get("h3b_wf90d") or wf_fallback or {}),
                 "timestamp": data.get("timestamp", datetime.now(timezone.utc).isoformat()),
             }
     except Exception:
+        default_res["h3b_wf90d"] = wf_fallback
         return default_res
 
 
@@ -144,47 +162,70 @@ def build_symbols_status_summary(
         detail_reason = ""
 
         if sym in selected_symbols:
-            badge = "🟢 【トレード選定・監視中】"
-            category = "SELECTED"
-            counts["SELECTED"] += 1
-            is_short_strat = ("SHORT" in strat or strat.startswith("VAH_POC") or strat == "VAL_BREAK" or is_sell_mode)
-            rng_p = opt_info.get("range_params")
-            brk_p = opt_info.get("breakout_params")
-            if isinstance(rng_p, dict) and isinstance(brk_p, dict) and rng_p and brk_p:
-                is_rq = bool(opt_info.get("is_range_qualified", rng_p.get("is_qualified", False)))
-                is_bq = bool(opt_info.get("is_breakout_qualified", brk_p.get("is_qualified", False)))
-                r_st = str(rng_p.get("strategy", "-")).upper()
-                r_iv = int(rng_p.get("interval", 5) or 5)
-                r_pnl = float(rng_p.get("pnl", 0.0))
-                r_cnt = int(rng_p.get("trade_count", 0))
-                r_mark = "🟢" if is_rq else "⚪"
-                b_st = str(brk_p.get("strategy", "-")).upper()
-                b_iv = int(brk_p.get("interval", 5) or 5)
-                b_pnl = float(brk_p.get("pnl", 0.0))
-                b_cnt = int(brk_p.get("trade_count", 0))
-                b_mark = "🟢" if is_bq else "⚪"
+            is_f7_row = bool(opt_info.get("f7_mode"))
+            if is_f7_row:
+                l_ok = bool(opt_info.get("f7_long_eligible_now"))
+                s_ok = bool(opt_info.get("f7_short_eligible_now"))
+                noexh_ok = bool(opt_info.get("noexh_ok", True))
+                wf_p = bool(opt_info.get("wf90d_paused", False))
+                sr14 = float(opt_info.get("sym_ret14d", (gate_info.get("sym_ret14d_map") or {}).get(sym, 0.0)) or 0.0)
+                if is_peak_dropped:
+                    badge = "🔴 【ノーマライズ除外】"
+                    category = "PEAK_DROP"
+                    counts["PEAK_DROP"] += 1
+                else:
+                    badge = "🟢 【F7 監視対象】"
+                    category = "SELECTED"
+                    counts["SELECTED"] += 1
+                s_state = "稼働可" if s_ok else ("WF休止" if wf_p else ("疲れ切除外" if not noexh_ok else "待機"))
+                l_state = "稼働可" if l_ok else "待機"
                 detail_reason = (
-                    f"🗼東京:{r_mark}{r_st}({r_iv}m/${r_pnl:+.1f}/{r_cnt}回) | "
-                    f"🏰欧州:{b_mark}{b_st}({b_iv}m/${b_pnl:+.1f}/{b_cnt}回)"
+                    f"F7 | L:val_poc_30m(30m/{l_state}) | S:h3b_squeeze_1h(1h/{s_state}) | "
+                    f"14d={sr14*100:+.1f}% | NoExh={'OK' if noexh_ok else 'BLOCK'}"
+                    f"{' [norm除外]' if is_peak_dropped else ''}"
                 )
             else:
-                dyn_sl = abs(float(opt_info.get("dynamic_mae_stop", opt_info.get("sl_pct", 0.025))))
-                dyn_to = int(opt_info.get("dynamic_timeout_bars", max(3, 240 // max(1, int(interval_val or 5)))))
-                if strat in ("VAH_BREAK", "VAL_BREAK") or strat.startswith("VAL_POC") or strat.startswith("VAH_POC") or strat == "VP_VAL_GC":
-                    mp_val = opt_info.get("mp", 200)
-                    bins_val = opt_info.get("num_bins", 50)
-                    va_pct = int(float(opt_info.get("value_area_pct", 0.70)) * 100)
-                    tr_pct = int(float(opt_info.get("target_ratio", 0.70)) * 100)
-                    ma_cond = f"{opt_info.get('ma_type', 'EMA' if 'EMA' in strat else 'NONE')}_{opt_info.get('ma_condition', 'close_below' if is_short_strat else 'close_above')}"
-                    sl_label = f"直近高値確定足SL(最大{dyn_sl:.2%})" if is_short_strat else f"直近安値確定足SL(最大{dyn_sl:.2%})"
-                    detail_reason = f"戦略={strat} ({interval_val}m / MP={mp_val}, Bins={bins_val}, VA={va_pct}%, TR={tr_pct}%, {ma_cond}, {sl_label}, TO={dyn_to}本)"
+                badge = "🟢 【トレード選定・監視中】"
+                category = "SELECTED"
+                counts["SELECTED"] += 1
+                is_short_strat = ("SHORT" in strat or strat.startswith("VAH_POC") or strat == "VAL_BREAK" or is_sell_mode)
+                rng_p = opt_info.get("range_params")
+                brk_p = opt_info.get("breakout_params")
+                if isinstance(rng_p, dict) and isinstance(brk_p, dict) and rng_p and brk_p:
+                    is_rq = bool(opt_info.get("is_range_qualified", rng_p.get("is_qualified", False)))
+                    is_bq = bool(opt_info.get("is_breakout_qualified", brk_p.get("is_qualified", False)))
+                    r_st = str(rng_p.get("strategy", "-")).upper()
+                    r_iv = int(rng_p.get("interval", 5) or 5)
+                    r_pnl = float(rng_p.get("pnl", 0.0))
+                    r_cnt = int(rng_p.get("trade_count", 0))
+                    r_mark = "🟢" if is_rq else "⚪"
+                    b_st = str(brk_p.get("strategy", "-")).upper()
+                    b_iv = int(brk_p.get("interval", 5) or 5)
+                    b_pnl = float(brk_p.get("pnl", 0.0))
+                    b_cnt = int(brk_p.get("trade_count", 0))
+                    b_mark = "🟢" if is_bq else "⚪"
+                    detail_reason = (
+                        f"🗼東京:{r_mark}{r_st}({r_iv}m/${r_pnl:+.1f}/{r_cnt}回) | "
+                        f"🏰欧州:{b_mark}{b_st}({b_iv}m/${b_pnl:+.1f}/{b_cnt}回)"
+                    )
                 else:
-                    ep_val = int(float(opt_info.get("s_ep" if is_short_strat else "l_ep", 60 if is_short_strat else 40)))
-                    cp_val = int(float(opt_info.get("s_cp" if is_short_strat else "l_cp", 40 if is_short_strat else 60)))
-                    sl_label = f"直近高値確定足SL(最大{dyn_sl:.2%})" if is_short_strat else f"直近安値確定足SL(最大{dyn_sl:.2%})"
-                    detail_reason = f"戦略={strat or 'RSIMA'} ({interval_val}m / R9, M7, EP={ep_val}, CP={cp_val}, {sl_label}, TO={dyn_to}本)"
-            if is_peak_dropped:
-                detail_reason += " [※3期間比較:前半高値警戒]"
+                    dyn_sl = abs(float(opt_info.get("dynamic_mae_stop", opt_info.get("sl_pct", 0.025))))
+                    dyn_to = int(opt_info.get("dynamic_timeout_bars", max(3, 240 // max(1, int(interval_val or 5)))))
+                    if strat in ("VAH_BREAK", "VAL_BREAK") or strat.startswith("VAL_POC") or strat.startswith("VAH_POC") or strat == "VP_VAL_GC":
+                        mp_val = opt_info.get("mp", 200)
+                        bins_val = opt_info.get("num_bins", 50)
+                        va_pct = int(float(opt_info.get("value_area_pct", 0.70)) * 100)
+                        tr_pct = int(float(opt_info.get("target_ratio", 0.70)) * 100)
+                        ma_cond = f"{opt_info.get('ma_type', 'EMA' if 'EMA' in strat else 'NONE')}_{opt_info.get('ma_condition', 'close_below' if is_short_strat else 'close_above')}"
+                        sl_label = f"直近高値確定足SL(最大{dyn_sl:.2%})" if is_short_strat else f"直近安値確定足SL(最大{dyn_sl:.2%})"
+                        detail_reason = f"戦略={strat} ({interval_val}m / MP={mp_val}, Bins={bins_val}, VA={va_pct}%, TR={tr_pct}%, {ma_cond}, {sl_label}, TO={dyn_to}本)"
+                    else:
+                        ep_val = int(float(opt_info.get("s_ep" if is_short_strat else "l_ep", 60 if is_short_strat else 40)))
+                        cp_val = int(float(opt_info.get("s_cp" if is_short_strat else "l_cp", 40 if is_short_strat else 60)))
+                        sl_label = f"直近高値確定足SL(最大{dyn_sl:.2%})" if is_short_strat else f"直近安値確定足SL(最大{dyn_sl:.2%})"
+                        detail_reason = f"戦略={strat or 'RSIMA'} ({interval_val}m / R9, M7, EP={ep_val}, CP={cp_val}, {sl_label}, TO={dyn_to}本)"
+                if is_peak_dropped:
+                    detail_reason += " [※3期間比較:前半高値警戒]"
         elif is_peak_dropped:
             if is_sell_mode:
                 badge = "🔴 【前半ボトム半値超え除外】"
@@ -274,10 +315,14 @@ def format_status_table_console(summary_data: Dict[str, Any]) -> str:
     gate_info = get_macro_gate_summary()
     g_icon = "🟢" if gate_info["regime_gate"] == "ALLOW" else "🛑"
 
+    wf_d = gate_info.get("h3b_wf90d") or {}
+    wf_lbl = "PAUSED" if wf_d.get("paused") else "ACTIVE"
+    btc14 = float(gate_info.get("btc_ret14d", 0.0) or 0.0) * 100.0
     lines = []
     lines.append("=" * 118)
     lines.append(f"📊 【主要アルト20銘柄 選定・除外ステータス完全一覧ダッシュボード】 (評価: {eval_time[:19]})")
     lines.append(f"🛡️  3期間全体地合いディフェンス: {g_icon} [{gate_info['regime_gate']}] {gate_info['regime_desc']}")
+    lines.append(f"🏛️  F7_30mNoEU_S8bNoExh_WF90d | Tier: {gate_info.get('strength_tier', 'BALANCED')} | BTC14d: {btc14:+.1f}% | H3b WF90d: {wf_lbl} (n={wf_d.get('window_trades', 0)}, Net=${float(wf_d.get('window_net', 0.0)):+.2f}, PF={float(wf_d.get('window_pf', 0.0)):.2f})")
     lines.append("※ Net PnL は往復0.08%（Maker 0.02% + Taker 0.06%）手数料を100%控除した実質純利益です")
     lines.append("=" * 118)
     lines.append(
@@ -359,9 +404,13 @@ def format_status_table_discord(summary_data: Dict[str, Any]) -> str:
     gate_info = get_macro_gate_summary()
     g_icon = "🟢" if gate_info["regime_gate"] == "ALLOW" else "🛑"
 
+    wf_d = gate_info.get("h3b_wf90d") or {}
+    wf_lbl = "PAUSED" if wf_d.get("paused") else "ACTIVE"
+    btc14 = float(gate_info.get("btc_ret14d", 0.0) or 0.0) * 100.0
     lines = []
     lines.append(f"📊 **【主要20銘柄 選定・除外ステータス】** (`{eval_time} UTC`)")
     lines.append(f"🛡️ **3期間地合い判定**: {g_icon}`{gate_info['regime_gate']}` ({gate_info['regime_desc']})")
+    lines.append(f"🏛️ **F7**: `Tier {gate_info.get('strength_tier', 'BALANCED')}` | `BTC14d {btc14:+.1f}%` | `WF90d {wf_lbl}` (n={wf_d.get('window_trades', 0)}, `${float(wf_d.get('window_net', 0.0)):+.2f}`, PF={float(wf_d.get('window_pf', 0.0)):.2f})")
     lines.append(
         f"💡 **内訳**: 監視: `{counts.get('SELECTED', 0)}` | ピーク割れ除外: `{counts.get('PEAK_DROP', 0)}` | "
         f"最適化不合格: `{counts.get('OPT_REJECTED', 0)}` | 上限枠外: `{counts.get('OVER_LIMIT', 0)}`"

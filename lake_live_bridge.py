@@ -32,12 +32,34 @@ from lake_backtest_engine import (
     strategy_side,
 )
 from lake_store import TIMEFRAME_SECONDS, LakeStore, sec_to_iso, utc_now_sec
-from symbol_universe import EXCLUDED_TRADE_MEGA_CAPS, normalize_symbol
+from strategy_f7_two_pillar import (
+    F7_LONG_MP_PERIOD,
+    F7_LONG_STRATEGY,
+    F7_LONG_TARGET_RATIO,
+    F7_LONG_TIMEFRAME,
+    F7_MODE_NAME,
+    F7_SHORT_STRATEGY,
+    F7_SHORT_TIMEFRAME,
+    check_f7_no_exhaustion,
+    compute_ret14d_from_1h_close,
+    evaluate_h3b_wf90d_gate_from_lake,
+    is_eu_session_jst,
+)
+from symbol_universe import (
+    BENCHMARK_SYMBOL,
+    EXCLUDED_TRADE_MEGA_CAPS,
+    LAKE_UNIVERSE_SYMBOLS,
+    TRADABLE_MID_CAP_SYMBOLS,
+    normalize_symbol,
+)
 
 JST = timezone(timedelta(hours=9))
 
-_TF_TO_INTERVAL_MIN = {"5m": 5, "15m": 15, "1h": 60, "4h": 240}
-_INTERVAL_TO_TF = {5: "5m", 15: "15m", 60: "1h", 240: "4h", "5": "5m", "15": "15m", "60": "1h", "240": "4h"}
+_TF_TO_INTERVAL_MIN = {"5m": 5, "15m": 15, "30m": 30, "1h": 60, "4h": 240}
+_INTERVAL_TO_TF = {
+    5: "5m", 15: "15m", 30: "30m", 60: "1h", 240: "4h",
+    "5": "5m", "15": "15m", "30": "30m", "60": "1h", "240": "4h",
+}
 
 
 def interval_to_timeframe(interval: Any) -> str:
@@ -197,6 +219,48 @@ def build_live_params_from_winner(winner: Dict[str, Any], selection: Dict[str, A
     return build_symbol_params_from_cells([winner], selection, regime_info)
 
 
+def _ensure_30m_candles_in_lake(lake: LakeStore, cutoff_utc: int) -> int:
+    """F7 `val_poc_30m` 用に既存の 5m 足から未生成の 30m 足を決定論的に補完生成する."""
+    rebuilt = 0
+    for sym in LAKE_UNIVERSE_SYMBOLS:
+        try:
+            st_5m = lake.get_candle_stats(sym, "5m")
+            st_30m = lake.get_candle_stats(sym, "30m")
+            cnt_5m = int(st_5m.get("count", 0) or 0)
+            cnt_30m = int(st_30m.get("count", 0) or 0)
+            if cnt_5m >= 24 and (cnt_30m == 0 or (cnt_5m >= 600 and cnt_30m < max(50, (cnt_5m // 6) - 200))):
+                res = lake.rebuild_higher_timeframes_from_5m(sym, cutoff_utc=cutoff_utc, timeframes=("30m",))
+                rebuilt += int(res.get("30m", 0) or 0)
+        except Exception:
+            pass
+    return rebuilt
+
+
+def _compute_f7_ret14d_context(
+    lake: LakeStore,
+    cutoff_1h: int,
+) -> Tuple[float, Dict[str, float]]:
+    """BTC および中堅アルト各銘柄の直近14日 (336h) リターンを Lake 確定 1h 足から因果算出する."""
+    btc_df = lake.load_candles(normalize_symbol(BENCHMARK_SYMBOL), "1h", cutoff_utc=cutoff_1h, limit=400)
+    btc_ret14d = compute_ret14d_from_1h_close(btc_df["close"].to_numpy(dtype=np.float64)) if not btc_df.empty else 0.0
+    sym_ret14d_map: Dict[str, float] = {}
+    for sym in TRADABLE_MID_CAP_SYMBOLS:
+        ns = normalize_symbol(sym)
+        df_s = lake.load_candles(ns, "1h", cutoff_utc=cutoff_1h, limit=400)
+        sym_ret14d_map[ns] = compute_ret14d_from_1h_close(df_s["close"].to_numpy(dtype=np.float64)) if not df_s.empty else 0.0
+    return float(btc_ret14d), sym_ret14d_map
+
+
+def _count_1h_symbols_in_lake(lake: LakeStore, cutoff_1h: int) -> int:
+    start_1h = int(cutoff_1h) - 20 * 86400
+    cnt = 0
+    for sym in LAKE_UNIVERSE_SYMBOLS:
+        df_s = lake.load_candles(normalize_symbol(sym), "1h", cutoff_utc=cutoff_1h, start_utc=start_1h, limit=30)
+        if not df_s.empty and len(df_s) >= 24:
+            cnt += 1
+    return cnt
+
+
 def ensure_lake_ready_on_startup(history_days: int = 210) -> Dict[str, Any]:
     """
     ボット起動時に Data/lake/bingx_lake.db の存在および過去履歴深度を確認し、
@@ -207,13 +271,15 @@ def ensure_lake_ready_on_startup(history_days: int = 210) -> Dict[str, Any]:
     span_days = ((st["max_ts_utc"] - st["min_ts_utc"]) / 86400.0) if (st["min_ts_utc"] and st["max_ts_utc"]) else 0.0
     if st["count"] == 0 or span_days < 120.0:
         from migrate_to_lake import run_migration
-        return run_migration(history_days=history_days, sync_live=True)
+        res = run_migration(history_days=history_days, sync_live=True)
+        _ensure_30m_candles_in_lake(lake, cutoff_utc=utc_now_sec())
+        return res
 
     from candle_5m_store import sync_all_target_symbols_5m
     sync_all_target_symbols_5m(lookback_days=2)
+    _ensure_30m_candles_in_lake(lake, cutoff_utc=utc_now_sec())
     try:
         from bingx_oi_collector import collect_and_save_oi_snapshot
-        from symbol_universe import LAKE_UNIVERSE_SYMBOLS
         collect_and_save_oi_snapshot(symbols=LAKE_UNIVERSE_SYMBOLS)
     except Exception:
         pass
@@ -225,7 +291,7 @@ def refresh_hourly_regime_for_bot(
     sync_live: bool = True,
     state_file_path: Optional[Path] = None,
 ) -> Dict[str, Any]:
-    """毎時正時用の軽量地合い判定・反転検知。
+    """毎時正時用の軽量地合い判定・反転検知・F7 14d疲れ切り/WF90d更新。
 
     WF 探索を実行せず直近 5m/1h 確定足のみで 3窓地合いを再評価し、
     `Data/market_state.json` を最新化した上で前回地合いからの反転有無を返す。
@@ -241,11 +307,15 @@ def refresh_hourly_regime_for_bot(
 
     ms_file = Path(state_file_path) if state_file_path is not None else (Path(__file__).resolve().parent / "Data" / "market_state.json")
     prev_regime = ""
+    prev_tier = ""
     if ms_file.exists():
         try:
             prev_data = json.loads(ms_file.read_text(encoding="utf-8"))
             if isinstance(prev_data, dict):
                 prev_regime = str(prev_data.get("overall_regime", "")).upper()
+                prev_tier = str(
+                    (prev_data.get("regime_strength") or {}).get("tier", prev_data.get("strength_tier", ""))
+                ).upper()
         except Exception:
             pass
 
@@ -255,10 +325,26 @@ def refresh_hourly_regime_for_bot(
     regime_flipped = bool(prev_regime in ("BUY", "SELL", "NEUTRAL") and new_regime != prev_regime)
 
     strength_obj = dict(reg_eval.get("regime_strength") or {})
+    new_tier = str(strength_obj.get("tier", "BALANCED")).upper()
+    tier_changed_ultra_buy = bool(prev_tier and ((prev_tier == "ULTRA_BUY") != (new_tier == "ULTRA_BUY")))
     if "strength_desc" not in strength_obj and strength_obj:
         t_jp = str(strength_obj.get("tier_jp", strength_obj.get("tier", "")))
         net_sc = float(strength_obj.get("net_score", 0.0) or 0.0)
         strength_obj["strength_desc"] = f"【{t_jp} ({net_sc * 100:+.1f}%)】"
+
+    btc_ret14d, sym_ret14d_map = _compute_f7_ret14d_context(lake, cutoff_1h)
+    h3b_wf90d = {"paused": False, "window_days": 90, "window_trades": 0, "window_net": 0.0, "window_pf": 0.0, "total_paper_trades": 0}
+    if db_path is None and _count_1h_symbols_in_lake(lake, cutoff_1h) >= 15:
+        try:
+            raw_wf = evaluate_h3b_wf90d_gate_from_lake(lake, cutoff_utc=cutoff_1h)
+            h3b_wf90d = {k: v for k, v in raw_wf.items() if not str(k).startswith("_")}
+            wf_file = Path(__file__).resolve().parent / "Data" / "h3b_wf90d_state.json"
+            wf_file.parent.mkdir(parents=True, exist_ok=True)
+            wf_tmp = wf_file.with_suffix(".tmp")
+            wf_tmp.write_text(json.dumps(h3b_wf90d, ensure_ascii=False, indent=2), encoding="utf-8")
+            wf_tmp.replace(wf_file)
+        except Exception:
+            pass
 
     excl_raw = reg_eval.get("excluded_symbols") or {}
     excl_list = list(excl_raw.keys()) if isinstance(excl_raw, dict) else list(excl_raw)
@@ -266,6 +352,7 @@ def refresh_hourly_regime_for_bot(
     now_iso = datetime.now(timezone.utc).isoformat()
     ms_payload = {
         "overall_regime": new_regime,
+        "strength_tier": new_tier,
         "regime_pattern": reg_eval.get("regime_pattern", ""),
         "regime_strength": strength_obj,
         "period_results": reg_eval.get("period_results", {}),
@@ -273,6 +360,9 @@ def refresh_hourly_regime_for_bot(
         "recommended_symbols": reg_eval.get("recommended_symbols", []),
         "excluded_symbols": excl_list,
         "exclusion_reasons": excl_reasons,
+        "btc_ret14d": btc_ret14d,
+        "sym_ret14d_map": sym_ret14d_map,
+        "h3b_wf90d": h3b_wf90d,
         "is_buy_regime": (new_regime == "BUY"),
         "is_sell_regime": (new_regime == "SELL"),
         "evaluated_at": now_iso,
@@ -289,8 +379,14 @@ def refresh_hourly_regime_for_bot(
     return {
         "prev_overall_regime": prev_regime,
         "overall_regime": new_regime,
+        "prev_strength_tier": prev_tier,
+        "strength_tier": new_tier,
+        "tier_changed_ultra_buy": tier_changed_ultra_buy,
         "regime_flipped": regime_flipped,
         "regime_eval": reg_eval,
+        "btc_ret14d": btc_ret14d,
+        "sym_ret14d_map": sym_ret14d_map,
+        "h3b_wf90d": h3b_wf90d,
     }
 
 
@@ -420,6 +516,179 @@ def run_lake_screening_for_bot(
         "winner": winner,
         "selection": selection,
         "wf_res": wf_res,
+        "summary_log": summary_log,
+    }
+
+
+def run_f7_screening_for_bot(
+    override_regime_info: Optional[Dict[str, Any]] = None,
+    db_path: Optional[Path] = None,
+    max_selected_symbols: int = 20,
+    excluded_mega_caps: Sequence[str] = EXCLUDED_TRADE_MEGA_CAPS,
+    wf90d_state_path: Optional[Path] = None,
+    gil_yield_sec: float = 0.0,
+) -> Dict[str, Any]:
+    """F7 Two-Pillar 体系用のスクリーニング・WF90d ゲート評価・全18中堅アルトマップ構築."""
+    lake = LakeStore(db_path=db_path)
+    now_sec = utc_now_sec()
+    cutoff_1h = (now_sec // 3600) * 3600
+    _ensure_30m_candles_in_lake(lake, cutoff_utc=now_sec)
+
+    cur_regime = dict(override_regime_info) if override_regime_info else compute_regime_from_lake(lake, data_cutoff_utc=cutoff_1h)
+    overall = str(cur_regime.get("overall_regime", "NEUTRAL")).upper()
+    strength_obj = dict(cur_regime.get("regime_strength") or {})
+    tier = str(strength_obj.get("tier", "BALANCED")).upper()
+    raw_excl = cur_regime.get("excluded_symbols") or {}
+    cur_excluded = {
+        normalize_symbol(str(s))
+        for s in (raw_excl.keys() if isinstance(raw_excl, dict) else raw_excl)
+    }
+
+    btc_ret14d, sym_ret14d_map = _compute_f7_ret14d_context(lake, cutoff_1h)
+    raw_wf90d = evaluate_h3b_wf90d_gate_from_lake(lake, cutoff_utc=cutoff_1h, gil_yield_sec=gil_yield_sec)
+    h3b_wf90d = {k: v for k, v in raw_wf90d.items() if not str(k).startswith("_")}
+
+    wf_out_file = (
+        Path(wf90d_state_path)
+        if wf90d_state_path is not None
+        else (Path(__file__).resolve().parent / "Data" / "h3b_wf90d_state.json" if db_path is None else None)
+    )
+    if wf_out_file is not None:
+        try:
+            wf_out_file.parent.mkdir(parents=True, exist_ok=True)
+            tmp_p = wf_out_file.with_suffix(".tmp")
+            tmp_p.write_text(json.dumps(h3b_wf90d, ensure_ascii=False, indent=2), encoding="utf-8")
+            tmp_p.replace(wf_out_file)
+        except Exception:
+            pass
+
+    if db_path is None:
+        try:
+            ms_file = Path(__file__).resolve().parent / "Data" / "market_state.json"
+            existing_ms: Dict[str, Any] = {}
+            if ms_file.exists():
+                loaded_ms = json.loads(ms_file.read_text(encoding="utf-8"))
+                if isinstance(loaded_ms, dict):
+                    existing_ms = loaded_ms
+            excl_raw_ms = cur_regime.get("excluded_symbols") or existing_ms.get("excluded_symbols") or {}
+            excl_list_ms = list(excl_raw_ms.keys()) if isinstance(excl_raw_ms, dict) else list(excl_raw_ms)
+            excl_reasons_ms = excl_raw_ms if isinstance(excl_raw_ms, dict) else dict(existing_ms.get("exclusion_reasons") or {})
+            now_iso_ms = datetime.now(timezone.utc).isoformat()
+            merged_ms = {
+                **existing_ms,
+                "overall_regime": overall,
+                "strength_tier": tier,
+                "regime_pattern": cur_regime.get("regime_pattern", existing_ms.get("regime_pattern", "")),
+                "regime_strength": strength_obj or existing_ms.get("regime_strength", {}),
+                "period_results": cur_regime.get("period_results", existing_ms.get("period_results", {})),
+                "allowed_strategies": cur_regime.get("allowed_strategies", existing_ms.get("allowed_strategies", [])),
+                "recommended_symbols": cur_regime.get("recommended_symbols", existing_ms.get("recommended_symbols", [])),
+                "excluded_symbols": excl_list_ms,
+                "exclusion_reasons": excl_reasons_ms,
+                "btc_ret14d": btc_ret14d,
+                "sym_ret14d_map": sym_ret14d_map,
+                "h3b_wf90d": h3b_wf90d,
+                "is_buy_regime": (overall == "BUY"),
+                "is_sell_regime": (overall == "SELL"),
+                "evaluated_at": now_iso_ms,
+                "timestamp": now_iso_ms,
+            }
+            ms_file.parent.mkdir(parents=True, exist_ok=True)
+            ms_tmp = ms_file.with_suffix(".tmp")
+            ms_tmp.write_text(json.dumps(merged_ms, ensure_ascii=False, indent=2), encoding="utf-8")
+            ms_tmp.replace(ms_file)
+        except Exception:
+            pass
+
+    wf90d_paused = bool(h3b_wf90d.get("paused", False))
+    eu_now = is_eu_session_jst(now_sec)
+    mega_cap_set = {normalize_symbol(s) for s in excluded_mega_caps}
+    symbol_params_map: Dict[str, Dict[str, Any]] = {}
+    selected_symbols: List[str] = []
+
+    for sym in TRADABLE_MID_CAP_SYMBOLS:
+        ns = normalize_symbol(sym)
+        if ns in mega_cap_set:
+            continue
+        is_norm_excl = ns in cur_excluded
+        sym_ret14d = float(sym_ret14d_map.get(ns, 0.0))
+        noexh_ok, noexh_reason = check_f7_no_exhaustion(btc_ret14d, sym_ret14d)
+
+        long_eligible = (tier == "ULTRA_BUY") and (not is_norm_excl) and (not eu_now)
+        short_eligible = (overall == "SELL") and (not is_norm_excl) and noexh_ok and (not wf90d_paused)
+
+        active_strat = F7_LONG_STRATEGY if overall == "BUY" else (F7_SHORT_STRATEGY if overall == "SELL" else F7_LONG_STRATEGY)
+        active_side = "long" if active_strat == F7_LONG_STRATEGY else "short"
+        active_tf = F7_LONG_TIMEFRAME if active_strat == F7_LONG_STRATEGY else F7_SHORT_TIMEFRAME
+        active_int = 30 if active_strat == F7_LONG_STRATEGY else 60
+
+        long_spec = {
+            "strategy": F7_LONG_STRATEGY,
+            "side": "long",
+            "interval": 30,
+            "timeframe": F7_LONG_TIMEFRAME,
+            "mp": F7_LONG_MP_PERIOD,
+            "tr": F7_LONG_TARGET_RATIO,
+            "is_qualified": True,
+            "eval_grade": "F7_SSOT",
+            "eligible_now": long_eligible,
+        }
+        short_spec = {
+            "strategy": F7_SHORT_STRATEGY,
+            "side": "short",
+            "interval": 60,
+            "timeframe": F7_SHORT_TIMEFRAME,
+            "is_qualified": True,
+            "eval_grade": "F7_SSOT",
+            "eligible_now": short_eligible,
+            "wf90d_paused": wf90d_paused,
+            "noexh_ok": noexh_ok,
+        }
+        active_spec = dict(long_spec if active_strat == F7_LONG_STRATEGY else short_spec)
+
+        symbol_params_map[ns] = {
+            **active_spec,
+            "f7_mode": True,
+            "f7_mode_name": F7_MODE_NAME,
+            "is_range_qualified": True,
+            "is_breakout_qualified": True,
+            "range_params": long_spec,
+            "breakout_params": short_spec,
+            "best_overall": active_spec,
+            "is_norm_excluded": is_norm_excl,
+            "btc_ret14d": btc_ret14d,
+            "sym_ret14d": sym_ret14d,
+            "noexh_ok": noexh_ok,
+            "noexh_reason": noexh_reason,
+            "wf90d_paused": wf90d_paused,
+            "f7_long_eligible_now": long_eligible,
+            "f7_short_eligible_now": short_eligible,
+        }
+        selected_symbols.append(ns)
+
+    selected_symbols = selected_symbols[: max(1, int(max_selected_symbols))]
+    default_best_params = dict(symbol_params_map[selected_symbols[0]]) if selected_symbols else None
+    long_elig_cnt = sum(1 for s in selected_symbols if symbol_params_map[s].get("f7_long_eligible_now"))
+    short_elig_cnt = sum(1 for s in selected_symbols if symbol_params_map[s].get("f7_short_eligible_now"))
+    wf_status_lbl = "PAUSED" if wf90d_paused else "ACTIVE"
+
+    summary_log = (
+        f"🏛️ **【{F7_MODE_NAME} スクリーニング結果】**\n"
+        f"   ├ 地合い/強度: `{overall}` / `{tier}` (EU除外: {'YES(16-22JST)' if eu_now else 'NO'}) | BTC14d: `{btc_ret14d * 100:+.1f}%`\n"
+        f"   ├ H3b WF90dゲート: **`{wf_status_lbl}`** (90d: n={h3b_wf90d['window_trades']}, Net=${h3b_wf90d['window_net']:+.2f}, PF={h3b_wf90d['window_pf']:.2f})\n"
+        f"   └ 監視対象: **{len(selected_symbols)}中堅アルト** | 現時点稼働可: `val_poc_30m`={long_elig_cnt}銘柄 / `h3b_squeeze_1h`={short_elig_cnt}銘柄"
+    )
+    return {
+        "f7_mode": True,
+        "selected_symbols": selected_symbols,
+        "symbol_params_map": symbol_params_map,
+        "default_best_params": default_best_params,
+        "winner": None,
+        "selection": {"selection_id": f"f7_{cutoff_1h}", "reason_text": F7_MODE_NAME},
+        "regime_eval": cur_regime,
+        "btc_ret14d": btc_ret14d,
+        "sym_ret14d_map": sym_ret14d_map,
+        "h3b_wf90d": h3b_wf90d,
         "summary_log": summary_log,
     }
 
