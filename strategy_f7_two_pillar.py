@@ -89,6 +89,11 @@ F7_WF90D_PAUSE_PF_LT: float = 0.85
 F7_WF90D_RESUME_PF_GTE: float = 1.00
 F7_WF90D_RESUME_NET_GTE: float = 0.0
 
+# 取引所ネイティブ保険逆指値（ソフト SL の外側クッション設定）
+F7_INSURANCE_SL_BUFFER_PCT: float = 0.0035
+F7_INSURANCE_SL_MIN_GAP_PCT: float = 0.0020
+F7_INSURANCE_SL_MIN_STEP_PCT: float = 0.0005
+
 JST_TZ = timezone(timedelta(hours=9))
 _DECAY_WEIGHTS_120_HL60: np.ndarray = (0.5 ** (1.0 / F7_LONG_MP_HALF_LIFE)) ** np.arange(
     F7_LONG_MP_PERIOD - 1, -1, -1, dtype=np.float64
@@ -1304,3 +1309,103 @@ def simulate_f7_portfolio_from_lake(
     sim["wf90d_diag"] = wf_diag
     sim["pit_active"] = len(reg_map) > 0
     return sim
+
+
+# ---------------------------------------------------------------------------
+# 取引所ネイティブ保険SL・毎時F7ステータス表示用 共通純粋関数
+# ---------------------------------------------------------------------------
+def compute_insurance_stop_price(
+    side: str,
+    eff_sl: float,
+    current_price: float,
+    buffer_pct: float = F7_INSURANCE_SL_BUFFER_PCT,
+    min_gap_pct: float = F7_INSURANCE_SL_MIN_GAP_PCT,
+) -> float:
+    """F7 ソフト SL (`eff_sl`) の外側クッションへ取引所側ネイティブ保険逆指値水準を算出する."""
+    eff = float(eff_sl or 0.0)
+    cur = float(current_price or 0.0)
+    if not (eff > 0.0 and cur > 0.0 and np.isfinite(eff) and np.isfinite(cur)):
+        return 0.0
+    if str(side or "").lower() == "short":
+        raw = eff * (1.0 + float(buffer_pct))
+        floor_px = cur * (1.0 + float(min_gap_pct))
+        return float(max(raw, floor_px))
+    raw = eff * (1.0 - float(buffer_pct))
+    cap_px = cur * (1.0 - float(min_gap_pct))
+    return float(max(0.0, min(raw, cap_px)))
+
+
+def should_update_insurance_stop(
+    side: str,
+    current_stop_px: Optional[float],
+    candidate_stop_px: float,
+    min_step_pct: float = F7_INSURANCE_SL_MIN_STEP_PCT,
+) -> bool:
+    """既存保険SLから有利方向へ `min_step_pct` 以上詰まった場合のみ True を返す（ラチェット更新専用）."""
+    cand = float(candidate_stop_px or 0.0)
+    if not (cand > 0.0 and np.isfinite(cand)):
+        return False
+    if current_stop_px is None or not np.isfinite(float(current_stop_px)) or float(current_stop_px) <= 0.0:
+        return True
+    cur = float(current_stop_px)
+    if str(side or "").lower() == "short":
+        return cand < cur * (1.0 - float(min_step_pct))
+    return cand > cur * (1.0 + float(min_step_pct))
+
+
+def format_f7_hourly_status_line(
+    overall_regime: str,
+    strength_tier: str,
+    btc_ret14d: float,
+    sym_ret14d_map: Optional[Dict[str, float]] = None,
+    wf90d: Optional[Dict[str, Any]] = None,
+    excluded_symbols: Optional[Sequence[str]] = None,
+    now_utc: Optional[int] = None,
+) -> str:
+    """毎時 Discord サマリーに添える F7 稼働・待機フィルター状況 1行サマリーを生成する."""
+    overall = str(overall_regime or "NEUTRAL").upper()
+    tier = str(strength_tier or "BALANCED").upper()
+    excl_set = {normalize_symbol(str(x)) for x in (excluded_symbols or [])}
+    s_map = {normalize_symbol(str(k)): float(v or 0.0) for k, v in (sym_ret14d_map or {}).items()}
+    eu_now = is_eu_session_jst(now_utc)
+    wf = wf90d or {}
+    wf_paused = bool(wf.get("paused", False))
+    wf_n = int(wf.get("window_trades", 0) or 0)
+    wf_net = float(wf.get("window_net", 0.0) or 0.0)
+    wf_pf = float(wf.get("window_pf", 0.0) or 0.0)
+    btc14 = float(btc_ret14d or 0.0)
+
+    total_mid = len(TRADABLE_MID_CAP_SYMBOLS)
+    long_ok_n = 0
+    short_ok_n = 0
+    for s in TRADABLE_MID_CAP_SYMBOLS:
+        ns = normalize_symbol(s)
+        if ns in excl_set:
+            continue
+        long_ok_n += 1
+        ok_ne, _ = check_f7_no_exhaustion(btc14, s_map.get(ns, 0.0))
+        if ok_ne:
+            short_ok_n += 1
+
+    if tier == "ULTRA_BUY":
+        if eu_now:
+            state_lbl = "⏸️ LONG待機 [NoEU除外 16-22JST]"
+        else:
+            state_lbl = f"🟢 LONG稼働中 (val_poc_30m: {long_ok_n}/{total_mid}銘柄)"
+    elif overall == "SELL":
+        if wf_paused and btc14 < F7_NOEXH_BTC_RET14D_MIN:
+            state_lbl = "⏸️ SHORT待機 [WF90d休止 & NoExhブロック]"
+        elif wf_paused:
+            state_lbl = "⏸️ SHORT待機 [WF90d休止中]"
+        elif short_ok_n == 0:
+            state_lbl = "⏸️ SHORT待機 [NoExh疲れ切りブロック]"
+        else:
+            state_lbl = f"🟢 SHORT稼働中 (h3b_squeeze_1h: {short_ok_n}/{total_mid}銘柄)"
+    else:
+        state_lbl = "⚪ F7待機 [条件未達: ULTRA_BUY / SELL 待ち]"
+
+    wf_tag = "PAUSED" if wf_paused else "ACTIVE"
+    return (
+        f"🏛️ F7状態: {state_lbl} | BTC14d:{btc14 * 100.0:+.1f}% | "
+        f"WF90d:{wf_tag}(n={wf_n},${wf_net:+.2f},PF={wf_pf:.2f})"
+    )

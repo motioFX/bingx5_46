@@ -335,6 +335,12 @@ USDCよりも圧倒的に出来高・流動性が厚い **USDT無期限先物ペ
 | **同時競合時の優先順位** | `(vol_ratio DESC, symbol ASC)` の決定論的ソートで空き枠（最大 `MAX_ACTIVE_POSITIONS = 2`）を配分 | `(vol_ratio DESC, symbol ASC)` の決定論的ソートで空き枠（最大 `MAX_ACTIVE_POSITIONS = 2`）を配分 |
 | **指値追随 (`pending_entry_orders`)** | `Best Bid` Post-Only 指値、最大3サイクル追随（`ULTRA_BUY` 喪失・16:00 JST突入・CB時は即時キャンセル） | `Best Ask` Post-Only 指値、最大3サイクル追随（`SELL` 喪失・`WF90d` 休止・CB時は即時キャンセル） |
 
+#### 🛡️ 3-1-1. F7 実運用堅牢化 ＆ 軽量化統一仕様
+- **取引所ネイティブ保険逆指値（`STOP_MARKET` 防護クッション）併用**: SSoT ソフト SL（`eff_sl`）による第一執行を維持しつつ、VPS 通信瞬断・API メンテナンス時の保険として約定保有後および `eff_sl` の有利方向更新時（`BE_LOCK` / `TRAIL_SL`）に `eff_sl` の `0.35%` 外側（Long: `eff_sl * 0.9965` / Short: `eff_sl * 1.0035`、現在価格から最低 `0.20%` 安全距離確保、`0.05%` 以上有利化した時のみラチェット更新）へ取引所側 `STOP_MARKET`（`workingType="MARK_PRICE"`, `positionSide="LONG"/"SHORT"`）を同期配置し、決済完了時・外部決済検知時は `active_order_cancel` で先行撤去する。
+- **`WF90d` 同一 1h 確定足キャッシュ**: `Data/h3b_wf90d_state.json` の `evaluated_at_utc == cutoff_1h` 時は SQLite 全履歴再走査を省略し、保存済みキャッシュを返却して毎時 CPU 負荷を削減する。
+- **毎時ステータスサマリーへの F7 稼働・待機理由 1 行表示**: 正時サマリーに `🏛️ F7状態:` 行を追加し、`NoExh`・`WF90d`・`NoEU`・地合いティアの現在状態を明示する。
+- **ログ世代ローテーション統一**: `check_and_restart.sh` により再起動時ログを最大5世代退避ローテーションし、`.gitattributes`（`*.sh text eol=lf`）でシェルスクリプト改行コードを LF 固定する。
+
 ---
 
 ### 🧩 3-2. 従来のセッション連動 Pure 3大戦略体系（後方互換・研究アーカイブ参照用 / 非推奨旧仕様）

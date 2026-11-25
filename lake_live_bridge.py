@@ -261,6 +261,48 @@ def _count_1h_symbols_in_lake(lake: LakeStore, cutoff_1h: int) -> int:
     return cnt
 
 
+def _load_or_eval_h3b_wf90d(
+    lake: LakeStore,
+    cutoff_1h: int,
+    wf_state_file: Optional[Path],
+    gil_yield_sec: float = 0.0,
+) -> Dict[str, Any]:
+    """同一 1h 確定足境界 (`evaluated_at_utc == cutoff_1h`) では保存済み WF90d キャッシュを再利用する。"""
+    req_keys = (
+        "paused",
+        "window_days",
+        "window_trades",
+        "window_net",
+        "window_pf",
+        "total_paper_trades",
+        "evaluated_at_utc",
+    )
+    if wf_state_file is not None and wf_state_file.exists():
+        try:
+            cached = json.loads(wf_state_file.read_text(encoding="utf-8"))
+            if (
+                isinstance(cached, dict)
+                and all(k in cached for k in req_keys)
+                and int(cached.get("evaluated_at_utc", -1)) == int(cutoff_1h)
+            ):
+                return {k: v for k, v in cached.items() if not str(k).startswith("_")}
+        except Exception:
+            pass
+
+    raw_wf = evaluate_h3b_wf90d_gate_from_lake(lake, cutoff_utc=cutoff_1h, gil_yield_sec=gil_yield_sec)
+    h3b_wf90d = {k: v for k, v in raw_wf.items() if not str(k).startswith("_")}
+    h3b_wf90d["evaluated_at_utc"] = int(cutoff_1h)
+    if wf_state_file is not None:
+        try:
+            wf_state_file.parent.mkdir(parents=True, exist_ok=True)
+            wf_tmp = wf_state_file.with_suffix(".tmp")
+            wf_tmp.write_text(json.dumps(h3b_wf90d, ensure_ascii=False, indent=2), encoding="utf-8")
+            wf_tmp.replace(wf_state_file)
+        except Exception:
+            pass
+    return h3b_wf90d
+
+
 def ensure_lake_ready_on_startup(history_days: int = 210) -> Dict[str, Any]:
     """
     ボット起動時に Data/lake/bingx_lake.db の存在および過去履歴深度を確認し、
@@ -334,15 +376,14 @@ def refresh_hourly_regime_for_bot(
 
     btc_ret14d, sym_ret14d_map = _compute_f7_ret14d_context(lake, cutoff_1h)
     h3b_wf90d = {"paused": False, "window_days": 90, "window_trades": 0, "window_net": 0.0, "window_pf": 0.0, "total_paper_trades": 0}
-    if db_path is None and _count_1h_symbols_in_lake(lake, cutoff_1h) >= 15:
+    wf_file = (
+        (Path(state_file_path).parent / "h3b_wf90d_state.json")
+        if state_file_path is not None
+        else (Path(__file__).resolve().parent / "Data" / "h3b_wf90d_state.json" if db_path is None else None)
+    )
+    if _count_1h_symbols_in_lake(lake, cutoff_1h) >= 15 and (db_path is None or state_file_path is not None):
         try:
-            raw_wf = evaluate_h3b_wf90d_gate_from_lake(lake, cutoff_utc=cutoff_1h)
-            h3b_wf90d = {k: v for k, v in raw_wf.items() if not str(k).startswith("_")}
-            wf_file = Path(__file__).resolve().parent / "Data" / "h3b_wf90d_state.json"
-            wf_file.parent.mkdir(parents=True, exist_ok=True)
-            wf_tmp = wf_file.with_suffix(".tmp")
-            wf_tmp.write_text(json.dumps(h3b_wf90d, ensure_ascii=False, indent=2), encoding="utf-8")
-            wf_tmp.replace(wf_file)
+            h3b_wf90d = _load_or_eval_h3b_wf90d(lake, cutoff_1h, wf_file)
         except Exception:
             pass
 
@@ -351,6 +392,8 @@ def refresh_hourly_regime_for_bot(
     excl_reasons = excl_raw if isinstance(excl_raw, dict) else {}
     now_iso = datetime.now(timezone.utc).isoformat()
     ms_payload = {
+        "f7_mode": True,
+        "f7_mode_name": F7_MODE_NAME,
         "overall_regime": new_regime,
         "strength_tier": new_tier,
         "regime_pattern": reg_eval.get("regime_pattern", ""),
@@ -545,22 +588,12 @@ def run_f7_screening_for_bot(
     }
 
     btc_ret14d, sym_ret14d_map = _compute_f7_ret14d_context(lake, cutoff_1h)
-    raw_wf90d = evaluate_h3b_wf90d_gate_from_lake(lake, cutoff_utc=cutoff_1h, gil_yield_sec=gil_yield_sec)
-    h3b_wf90d = {k: v for k, v in raw_wf90d.items() if not str(k).startswith("_")}
-
     wf_out_file = (
         Path(wf90d_state_path)
         if wf90d_state_path is not None
         else (Path(__file__).resolve().parent / "Data" / "h3b_wf90d_state.json" if db_path is None else None)
     )
-    if wf_out_file is not None:
-        try:
-            wf_out_file.parent.mkdir(parents=True, exist_ok=True)
-            tmp_p = wf_out_file.with_suffix(".tmp")
-            tmp_p.write_text(json.dumps(h3b_wf90d, ensure_ascii=False, indent=2), encoding="utf-8")
-            tmp_p.replace(wf_out_file)
-        except Exception:
-            pass
+    h3b_wf90d = _load_or_eval_h3b_wf90d(lake, cutoff_1h, wf_out_file, gil_yield_sec=gil_yield_sec)
 
     if db_path is None:
         try:
@@ -576,6 +609,8 @@ def run_f7_screening_for_bot(
             now_iso_ms = datetime.now(timezone.utc).isoformat()
             merged_ms = {
                 **existing_ms,
+                "f7_mode": True,
+                "f7_mode_name": F7_MODE_NAME,
                 "overall_regime": overall,
                 "strength_tier": tier,
                 "regime_pattern": cur_regime.get("regime_pattern", existing_ms.get("regime_pattern", "")),

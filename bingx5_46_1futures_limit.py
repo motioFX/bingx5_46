@@ -144,13 +144,16 @@ from strategy_f7_two_pillar import (
     calc_atr_series as _f7_calc_atr_series,
     check_f7_no_exhaustion,
     compute_h3b_squeeze_1h_entry_levels,
+    compute_insurance_stop_price,
     compute_val_poc_30m_entry_levels,
     evaluate_h3b_squeeze_1h_entry,
     evaluate_h3b_squeeze_1h_exit,
     evaluate_val_poc_30m_entry,
     evaluate_val_poc_30m_exit,
+    format_f7_hourly_status_line,
     is_eu_session_jst,
     is_f7_strategy,
+    should_update_insurance_stop,
 )
 
 # [ 3 ] ポジション・ロット設定 (PROJECT_RULES.md 準拠)
@@ -3113,10 +3116,23 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                         f"⏰ **【BingX 毎時ステータスサマリー ({now_jst.strftime('%H:00')} JST)】**",
                         f"💰 残高: ${h_balance:,.2f} ({acct_mode_str}) | {daily_badge}",
                         f"🌐 地合い: {overall_regime} {regime_strength.get('strength_desc', '')}",
+                    ]
+                    if USE_F7_TWO_PILLAR_MODE:
+                        _, wf90d_sum = _load_f7_wf90d_paused(regime_info)
+                        f7_line_h = format_f7_hourly_status_line(
+                            overall_regime=overall_regime,
+                            strength_tier=regime_info.get("strength_tier", "BALANCED"),
+                            btc_ret14d=float(regime_info.get("btc_ret14d", 0.0) or 0.0),
+                            sym_ret14d_map=regime_info.get("sym_ret14d_map") or {},
+                            wf90d=wf90d_sum,
+                            excluded_symbols=regime_info.get("excluded_symbols") or [],
+                        )
+                        summary_lines.append(f7_line_h)
+                    summary_lines.extend([
                         "```text",
                         tbl_header,
                         tbl_divider,
-                    ]
+                    ])
                     for r in hourly_summary_rows:
                         px = r["price"]
                         px_str = f"${px:,.4f}" if px < 10 else (f"${px:,.2f}" if px < 1000 else f"${px:,.1f}")
@@ -3206,7 +3222,20 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                             last_nanpin_time.pop(sym, None)
                             last_trade_time[sym] = time.time()
                             missing_position_counts.pop(sym, None)
-                            discord.print_log(f"⚠️ [{sym}] 取引所側でのポジション解消（外部決済または清算）を検知しました。", level="warning")
+                            scale_in_states.pop(sym, None)
+                            save_scale_in_states(scale_in_states)
+                            trailing_tp_states.pop(sym, None)
+                            save_trailing_tp_states(trailing_tp_states)
+                            try:
+                                await api.active_order_cancel()
+                            except Exception:
+                                pass
+                            try:
+                                from real_trade_tracker import sync_real_trades_from_bingx_api
+                                await sync_real_trades_from_bingx_api(mode=mode)
+                            except Exception:
+                                pass
+                            discord.print_log(f"⚠️ [{sym}] 取引所側でのポジション解消（外部決済または清算・ネイティブSL約定等）を検知・清掃しました。", level="warning")
                     else:
                         missing_position_counts.pop(sym, None)
 
@@ -3391,6 +3420,27 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                         pos_action = "STOP_LOSS" if exit_reason == "STOP_LOSS" else "CLOSE_ALL"
                     else:
                         pos_action = "HOLD"
+                        try:
+                            eff_sl_cur = float(f7_ex.get("eff_sl", 0.0) or scale_state_cur.get("sl_price", 0.0) or 0.0)
+                            side_str_ins = "short" if is_short_pos else "long"
+                            ins_cand_px = compute_insurance_stop_price(side_str_ins, eff_sl_cur, cur_px)
+                            cur_ins_px = float(scale_state_cur.get("protective_sl_price", 0.0) or 0.0)
+                            cur_ins_oid = scale_state_cur.get("protective_sl_order_id")
+                            fail_ts = float(scale_state_cur.get("protective_sl_fail_ts", 0.0) or 0.0)
+                            if should_update_insurance_stop(side_str_ins, cur_ins_px, ins_cand_px) and (time.time() - fail_ts) >= 120.0:
+                                new_oid = await api.sync_protective_stop_order(
+                                    side_str_ins, pos_qty, ins_cand_px, prev_order_id=cur_ins_oid
+                                )
+                                if new_oid:
+                                    scale_state_cur["protective_sl_price"] = float(api._quantize_price(ins_cand_px))
+                                    scale_state_cur["protective_sl_order_id"] = str(new_oid)
+                                    scale_state_cur.pop("protective_sl_fail_ts", None)
+                                else:
+                                    scale_state_cur["protective_sl_fail_ts"] = time.time()
+                                scale_in_states[sym] = scale_state_cur
+                                save_scale_in_states(scale_in_states)
+                        except Exception as ins_err:
+                            discord.print_log(f"⚠️ [{sym}] ネイティブ保険SL同期例外: {ins_err}", level="debug")
                 else:
                     df_eval = logic.make_logic(
                         df_eval,

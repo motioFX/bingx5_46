@@ -2,12 +2,14 @@
 """F7 Two-Pillar 戦略体系 総合検証テスト (`bingx5_46`)."""
 from __future__ import annotations
 
+import asyncio
 import json
 import sys
 import tempfile
 import unittest
 from pathlib import Path
 from typing import Tuple
+from unittest import mock
 
 import numpy as np
 import pandas as pd
@@ -17,7 +19,9 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 import bingx5_46_1futures_limit as bot_main
-from lake_live_bridge import run_f7_screening_for_bot
+import bingx5_46_2api as b2api
+import lake_live_bridge
+from lake_live_bridge import refresh_hourly_regime_for_bot, run_f7_screening_for_bot
 from lake_store import LakeStore, SUPPORTED_TIMEFRAMES, TIMEFRAME_SECONDS
 from strategy_f7_two_pillar import (
     F7_LONG_STRATEGY,
@@ -32,8 +36,13 @@ from strategy_f7_two_pillar import (
     evaluate_val_poc_30m_entry,
     evaluate_val_poc_30m_exit,
     is_eu_session_jst,
+    is_f7_strategy,
+    compute_insurance_stop_price,
+    format_f7_hourly_status_line,
     simulate_f7_portfolio,
+    should_update_insurance_stop,
 )
+from symbol_universe import TRADABLE_MID_CAP_SYMBOLS
 
 
 def _make_val_poc_30m_fixture(n_bars: int = 165, end_ts_jst_hour: int = 10) -> Tuple[pd.DataFrame, int]:
@@ -374,6 +383,133 @@ class TestF7TwoPillar(unittest.TestCase):
             self.assertIn("HYPE-USDT", res_screen["selected_symbols"])
             self.assertTrue(res_screen["symbol_params_map"]["ARB-USDT"]["is_norm_excluded"])
             self.assertTrue(wf_path.exists())
+
+    def test_insurance_stop_helpers_and_hourly_status_line(self) -> None:
+        # Short: 0.35% cushion above eff_sl, clamped at >= +0.20% above current_price
+        self.assertAlmostEqual(compute_insurance_stop_price("short", 100.0, 99.0), 100.35, places=6)
+        self.assertAlmostEqual(compute_insurance_stop_price("short", 100.0, 100.0), 100.35, places=6)
+        self.assertAlmostEqual(compute_insurance_stop_price("short", 100.0, 100.25), 100.25 * 1.0020, places=6)
+        # Long: 0.35% cushion below eff_sl, clamped at <= -0.20% below current_price
+        self.assertAlmostEqual(compute_insurance_stop_price("long", 100.0, 101.0), 99.65, places=6)
+        self.assertAlmostEqual(compute_insurance_stop_price("long", 100.0, 99.70), 99.70 * 0.9980, places=6)
+
+        # Ratchet-only tightening
+        self.assertTrue(should_update_insurance_stop("short", 0.0, 100.5))
+        self.assertFalse(should_update_insurance_stop("short", 100.5, 100.48))  # <0.05% step
+        self.assertTrue(should_update_insurance_stop("short", 100.5, 100.40))   # >0.05% tighter
+        self.assertFalse(should_update_insurance_stop("short", 100.5, 101.0))   # never widen
+        self.assertTrue(should_update_insurance_stop("long", 100.0, 100.10))    # >0.05% tighter
+        self.assertFalse(should_update_insurance_stop("long", 100.0, 99.5))     # never widen
+
+        # Hourly F7 status line across key states
+        t_jst_10 = 1_750_000_000 + ((10 - ((1_750_000_000 + 9 * 3600) // 3600) % 24) % 24) * 3600
+        t_jst_18 = t_jst_10 + 8 * 3600
+        line_long = format_f7_hourly_status_line("BUY", "ULTRA_BUY", 0.05, {}, {"paused": False}, now_utc=t_jst_10)
+        self.assertIn("LONG稼働中", line_long)
+        line_eu = format_f7_hourly_status_line("BUY", "ULTRA_BUY", 0.05, {}, {"paused": False}, now_utc=t_jst_18)
+        self.assertIn("NoEU除外", line_eu)
+        line_both = format_f7_hourly_status_line(
+            "SELL", "ULTRA_SELL", -0.174, {}, {"paused": True, "window_trades": 48, "window_net": -2.56, "window_pf": 0.66}
+        )
+        self.assertIn("WF90d休止 & NoExhブロック", line_both)
+        self.assertIn("WF90d:PAUSED(n=48,$-2.56,PF=0.66)", line_both)
+        line_short = format_f7_hourly_status_line("SELL", "SELL", -0.05, {}, {"paused": False, "window_trades": 20, "window_net": 1.50, "window_pf": 1.30})
+        self.assertIn("SHORT稼働中", line_short)
+        line_neu = format_f7_hourly_status_line("NEUTRAL", "BALANCED", 0.0, {}, {"paused": False})
+        self.assertIn("F7待機", line_neu)
+
+        # Shell script LF line-ending check
+        self.assertTrue((ROOT / ".gitattributes").exists())
+        self.assertNotIn(b"\r", (ROOT / "check_and_restart.sh").read_bytes())
+
+    def test_wf90d_1h_cache_hit_and_miss(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            td_p = Path(td)
+            db_path = td_p / "wf_cache.db"
+            ms_path = td_p / "market_state.json"
+            lake = LakeStore(db_path=db_path)
+
+            t0 = (1_750_000_000 // 3600) * 3600
+            rows_1h = [
+                {
+                    "ts_utc": t0 - (30 - k) * 3600,
+                    "open": 100.0,
+                    "high": 101.0,
+                    "low": 99.0,
+                    "close": 100.0,
+                    "volume": 50.0,
+                }
+                for k in range(30)
+            ]
+            df_1h = pd.DataFrame(rows_1h)
+            for sym in TRADABLE_MID_CAP_SYMBOLS[:18]:
+                lake.upsert_candles(sym, "1h", df_1h, cutoff_utc=t0 + 3600)
+            lake.upsert_candles("BTC-USDT", "1h", df_1h, cutoff_utc=t0 + 3600)
+
+            wf_mock_res = {
+                "paused": True,
+                "window_days": 90,
+                "window_trades": 12,
+                "window_net": -3.20,
+                "window_pf": 0.70,
+                "total_paper_trades": 20,
+                "evaluated_at_utc": t0,
+            }
+            now_box = [t0 + 120]
+            with mock.patch.object(lake_live_bridge, "utc_now_sec", side_effect=lambda: now_box[0]), \
+                 mock.patch.object(lake_live_bridge, "evaluate_h3b_wf90d_gate_from_lake", return_value=wf_mock_res) as wf_spy:
+                r1 = refresh_hourly_regime_for_bot(db_path=db_path, sync_live=False, state_file_path=ms_path)
+                self.assertEqual(wf_spy.call_count, 1)
+                self.assertTrue(r1["h3b_wf90d"]["paused"])
+
+                # Same 1h bucket -> cache hit, SQLite WF90d scan skipped
+                now_box[0] = t0 + 900
+                r2 = refresh_hourly_regime_for_bot(db_path=db_path, sync_live=False, state_file_path=ms_path)
+                self.assertEqual(wf_spy.call_count, 1)
+                self.assertEqual(r2["h3b_wf90d"]["window_trades"], 12)
+
+                # Next 1h bucket -> cache miss, recomputed once
+                now_box[0] = t0 + 3600 + 60
+                refresh_hourly_regime_for_bot(db_path=db_path, sync_live=False, state_file_path=ms_path)
+                self.assertEqual(wf_spy.call_count, 2)
+
+    def test_bingx_native_protective_stop_order_api(self) -> None:
+        spec = {"sz_decimals": 2, "min_qty": 0.01, "price_place": 4}
+        req_mock = mock.AsyncMock(
+            side_effect=[
+                {"code": 0, "data": {}},
+                {"code": 0, "data": {"order": {"orderId": 987654}}},
+            ]
+        )
+        with mock.patch.object(b2api, "_async_bingx_request", req_mock), \
+             mock.patch.object(b2api, "fetch_instrument_spec_bingx", return_value=spec), \
+             mock.patch.object(b2api, "is_air", False), \
+             mock.patch.object(b2api, "ALLOW_LIVE_TRADING", False):
+            api = b2api.api_bingx(symbol="HYPE-USDT", mode="demo", instrument_spec=spec)
+            api.bingx.api_key = "test_key"
+            api.bingx.secret_key = "test_secret"
+            oid = asyncio.run(api.sync_protective_stop_order("short", 0.25, 62.3456, prev_order_id="old111"))
+            self.assertEqual(oid, "987654")
+            self.assertEqual(req_mock.await_count, 2)
+            del_call = req_mock.await_args_list[0]
+            self.assertEqual(del_call.args[0], "DELETE")
+            self.assertEqual(del_call.kwargs["params"]["orderId"], "old111")
+            post_call = req_mock.await_args_list[1]
+            self.assertEqual(post_call.args[0], "POST")
+            p = post_call.kwargs["params"]
+            self.assertEqual(p["type"], "STOP_MARKET")
+            self.assertEqual(p["side"], "BUY")
+            self.assertEqual(p["positionSide"], "SHORT")
+            self.assertEqual(p["workingType"], "MARK_PRICE")
+            self.assertNotIn("reduceOnly", p)
+
+            # Live safety lock blocks protective stop placement and cancel
+            api_live = b2api.api_bingx(symbol="HYPE-USDT", mode="live", instrument_spec=spec)
+            api_live.bingx.api_key = "test_key"
+            api_live.bingx.secret_key = "test_secret"
+            self.assertIsNone(asyncio.run(api_live.sync_protective_stop_order("long", 0.25, 58.0)))
+            self.assertFalse(asyncio.run(api_live.cancel_order_by_id("987654")))
+            self.assertEqual(req_mock.await_count, 2)
 
 
 if __name__ == "__main__":

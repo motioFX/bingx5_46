@@ -451,6 +451,108 @@ class api_bingx_helper:
             discord.print_log(f"BingX active_order_cancel error: {e}", level="debug")
             return False
 
+    async def cancel_order_by_id(self, order_id: Any) -> bool:
+        """指定 orderId の未約定指値/逆指値注文をキャンセルする。"""
+        if not order_id or is_air:
+            return True
+        if not ALLOW_LIVE_TRADING and str(self.mode).lower() == "live":
+            discord.print_log(
+                f"🛡️ [SAFEGUARD] ALLOW_LIVE_TRADING=False のため本番注文キャンセルを遮断しました: {self.symbol}",
+                level="warning",
+            )
+            return False
+        if not self.api_key or self.api_key.startswith("YOUR_"):
+            return True
+        try:
+            res = await _async_bingx_request(
+                "DELETE",
+                self.base_url,
+                "/openApi/swap/v2/trade/order",
+                self.api_key,
+                self.secret_key,
+                params={"symbol": self.symbol, "orderId": str(order_id)},
+                timeout=10,
+            )
+            if isinstance(res, dict) and res.get("code") == 0:
+                return True
+            msg_low = str((res or {}).get("msg", "")).lower()
+            if any(k in msg_low for k in ("not exist", "closed", "filled", "canceled", "cancelled", "80014", "80016")):
+                return True
+            discord.print_log(f"[{self.symbol}] 個別注文キャンセル結果(orderId={order_id}): {res}", level="debug")
+            return False
+        except Exception as e:
+            discord.print_log(f"[{self.symbol}] cancel_order_by_id error: {e}", level="debug")
+            return False
+
+    async def sync_protective_stop_order(
+        self,
+        side: str,
+        quantity: float,
+        stop_price: float,
+        prev_order_id: Any = None,
+    ) -> Optional[str]:
+        """取引所ネイティブ STOP_MARKET (MARK_PRICE) 保険逆指値を配置・ラチェット更新する。"""
+        q = self._quantize_quantity(quantity)
+        s_px = self._quantize_price(stop_price)
+        if not (q > 0.0 and s_px and s_px > 0.0):
+            return None
+        if not ALLOW_LIVE_TRADING and str(self.mode).lower() == "live":
+            discord.print_log(
+                f"🛡️ [SAFEGUARD] ALLOW_LIVE_TRADING=False のため本番 STOP_MARKET 配置を遮断しました: {self.symbol}",
+                level="warning",
+            )
+            return None
+        if is_air:
+            oid_air = f"air_sl_{self.symbol}_{int(time.time() * 1000)}"
+            discord.print_log(
+                f"🛡️ [AIR MODE] [{self.symbol}] 仮想ネイティブ保険SL同期: side={side}, stop={s_px}, qty={q}",
+                level="debug",
+            )
+            return oid_air
+        if not self.api_key or self.api_key.startswith("YOUR_"):
+            return None
+        if prev_order_id:
+            await self.cancel_order_by_id(prev_order_id)
+
+        is_short_pos = str(side or "").lower() == "short"
+        order_params = {
+            "symbol": self.symbol,
+            "side": "BUY" if is_short_pos else "SELL",
+            "positionSide": "SHORT" if is_short_pos else "LONG",
+            "type": "STOP_MARKET",
+            "stopPrice": str(s_px),
+            "quantity": str(q),
+            "workingType": "MARK_PRICE",
+        }
+        try:
+            res = await _async_bingx_request(
+                "POST",
+                self.base_url,
+                "/openApi/swap/v2/trade/order",
+                self.api_key,
+                self.secret_key,
+                params=order_params,
+                timeout=10,
+            )
+            if isinstance(res, dict) and res.get("code") == 0:
+                data_obj = res.get("data") if isinstance(res.get("data"), dict) else {}
+                order_obj = data_obj.get("order") if isinstance(data_obj.get("order"), dict) else {}
+                new_oid = order_obj.get("orderId") or data_obj.get("orderId") or "placed"
+                discord.print_log(
+                    f"🛡️ [{self.symbol}] 取引所ネイティブ保険SL設定完了: "
+                    f"{'SHORT' if is_short_pos else 'LONG'} stopPrice=${s_px}, qty={q}, orderId={new_oid}",
+                    level="info",
+                )
+                return str(new_oid)
+            discord.print_log(
+                f"⚠️ [{self.symbol}] ネイティブ保険SL配置失敗 (stopPrice={s_px}, qty={q}): {res}",
+                level="warning",
+            )
+            return None
+        except Exception as e:
+            discord.print_log(f"⚠️ [{self.symbol}] ネイティブ保険SL配置例外: {e}", level="warning")
+            return None
+
     async def set_leverage(self, leverage: int = 10) -> bool:
         if is_air or not self.api_key or self.api_key.startswith("YOUR_"):
             return True
@@ -577,6 +679,18 @@ class api_bingx:
 
     async def get_open_orders(self, include_stop: bool = True) -> list[dict]:
         return await self.bingx.get_open_orders()
+
+    async def cancel_order_by_id(self, order_id: Any) -> bool:
+        return await self.bingx.cancel_order_by_id(order_id)
+
+    async def sync_protective_stop_order(
+        self,
+        side: str,
+        quantity: float,
+        stop_price: float,
+        prev_order_id: Any = None,
+    ) -> Optional[str]:
+        return await self.bingx.sync_protective_stop_order(side, quantity, stop_price, prev_order_id=prev_order_id)
 
     async def _place_maker_entry_limit(
         self,
