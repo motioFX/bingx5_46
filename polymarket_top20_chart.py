@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import statistics
 import sys
 import time
 from datetime import datetime, timedelta, timezone
@@ -77,6 +78,7 @@ HIGH_CONTRAST_COLORS = [
     "#8c564b", "#e377c2", "#17becf", "#bcbd22", "#34495e",
 ]
 LINE_STYLES = ["-", "--", "-.", ":"]
+VOL_ALERT_CATEGORIES = {"Econ/Fin", "Geo"}
 
 
 def configure_japanese_font() -> None:
@@ -279,10 +281,75 @@ def compute_24h_prob_delta(history: List[Tuple[datetime, float]]) -> Tuple[Optio
     return ref_p * 100.0, (latest_p - ref_p) * 100.0
 
 
+def detect_causal_vol_shocks(
+    history: List[Tuple[datetime, float]],
+    min_dp_pt: float = 3.0,
+    min_sigma: float = 3.0,
+    roll_window: int = 168,
+    cooldown_hours: float = 6.0,
+    recent_window_hours: float = 8.0,
+) -> Dict[str, Any]:
+    """完全因果的（過去窓のみ使用・先読みなし）に 1h 3σ確率急変ショックを検知する"""
+    shock_indices: List[int] = []
+    shock_details: List[Dict[str, Any]] = []
+    prev_dps: List[float] = []
+    last_shock_dt: Optional[datetime] = None
+
+    for i in range(1, len(history)):
+        prev_dt, prev_p = history[i - 1]
+        cur_dt, cur_p = history[i]
+        dt_hours = (cur_dt - prev_dt).total_seconds() / 3600.0
+        if not (0.25 <= dt_hours <= 4.0):
+            continue
+
+        dp_pt = (cur_p - prev_p) * 100.0
+        if len(prev_dps) >= 24:
+            window_vals = prev_dps[-roll_window:]
+            roll_std = statistics.stdev(window_vals)
+            if roll_std > 1e-9 and abs(dp_pt) >= min_dp_pt:
+                z_score = abs(dp_pt) / roll_std
+                cooldown_ok = (
+                    last_shock_dt is None
+                    or (cur_dt - last_shock_dt).total_seconds() >= cooldown_hours * 3600.0
+                )
+                if z_score >= min_sigma and cooldown_ok:
+                    shock_indices.append(i)
+                    shock_details.append({
+                        "idx": i,
+                        "dt": cur_dt,
+                        "dp_pt": dp_pt,
+                        "z_score": z_score,
+                        "prob_before_pct": prev_p * 100.0,
+                        "prob_after_pct": cur_p * 100.0,
+                    })
+                    last_shock_dt = cur_dt
+
+        prev_dps.append(dp_pt)
+
+    recent_shock: Optional[Dict[str, Any]] = None
+    if shock_details and history:
+        latest_dt = history[-1][0]
+        recent_cands = [
+            sh for sh in shock_details
+            if (latest_dt - sh["dt"]).total_seconds() <= recent_window_hours * 3600.0
+        ]
+        if recent_cands:
+            recent_shock = max(recent_cands, key=lambda sh: abs(float(sh["dp_pt"])))
+
+    return {
+        "shock_indices": shock_indices,
+        "shock_details": shock_details,
+        "recent_shock": recent_shock,
+    }
+
+
 def collect_top_normalized_markets(
     top_n: int = 20,
     min_days: float = 1.0,
     lookback_days: int = 30,
+    shock_window_hours: float = 8.0,
+    shock_min_pt: float = 3.0,
+    shock_min_sigma: float = 3.0,
 ) -> List[Dict[str, Any]]:
     """24h出来高順で相場センチメント条件を満たす上位 top_n 銘柄と1ヶ月推移を収集"""
     events = fetch_top_active_events(limit=150)
@@ -317,6 +384,14 @@ def collect_top_normalized_markets(
         diff_pct = last_norm - 100.0
         span_days = (times[-1] - times[0]).total_seconds() / 86400.0
         prob_24h_ago_pct, delta_24h_pt = compute_24h_prob_delta(history)
+        shock_info = detect_causal_vol_shocks(
+            history,
+            min_dp_pt=shock_min_pt,
+            min_sigma=shock_min_sigma,
+            recent_window_hours=shock_window_hours,
+        )
+        recent_shock = shock_info["recent_shock"]
+        is_vol_alert = bool(category in VOL_ALERT_CATEGORIES and recent_shock is not None)
 
         results.append({
             "rank": len(results) + 1,
@@ -335,6 +410,10 @@ def collect_top_normalized_markets(
             "span_days": span_days,
             "times": times,
             "norm_values": norm_values,
+            "shock_indices": shock_info["shock_indices"],
+            "shock_details": shock_info["shock_details"],
+            "recent_shock": recent_shock,
+            "is_vol_alert": is_vol_alert,
         })
 
         if len(results) >= top_n:
@@ -361,6 +440,9 @@ def render_normalized_chart(
     fig.patch.set_facecolor("#ffffff")
     ax.set_facecolor("#fafafa")
 
+    all_norms: List[float] = []
+    has_any_shock = False
+
     for idx, item in enumerate(items):
         color = HIGH_CONTRAST_COLORS[idx % len(HIGH_CONTRAST_COLORS)]
         linestyle = LINE_STYLES[(idx // len(HIGH_CONTRAST_COLORS)) % len(LINE_STYLES)]
@@ -374,9 +456,12 @@ def render_normalized_chart(
         )
         # matplotlib 側の naive 表示用に tz を除いた JST 時刻を使う
         naive_times = [t.replace(tzinfo=None) for t in item["times"]]
+        norms = item["norm_values"]
+        all_norms.extend(norms)
+
         ax.plot(
             naive_times,
-            item["norm_values"],
+            norms,
             label=label,
             color=color,
             linestyle=linestyle,
@@ -385,13 +470,71 @@ def render_normalized_chart(
         )
         ax.scatter(
             [naive_times[-1]],
-            [item["norm_values"][-1]],
+            [norms[-1]],
             color=color,
             s=22,
             zorder=5,
         )
 
+        shock_idxs = item.get("shock_indices") or []
+        if shock_idxs:
+            has_any_shock = True
+            recent_idx = item["recent_shock"]["idx"] if (item.get("is_vol_alert") and item.get("recent_shock")) else None
+            normal_idxs = [si for si in shock_idxs if si != recent_idx and 0 <= si < len(naive_times)]
+            if normal_idxs:
+                ax.scatter(
+                    [naive_times[si] for si in normal_idxs],
+                    [norms[si] for si in normal_idxs],
+                    marker="*",
+                    s=115,
+                    color=color,
+                    edgecolors="#111111",
+                    linewidths=0.5,
+                    zorder=7,
+                )
+            if recent_idx is not None and 0 <= recent_idx < len(naive_times):
+                ax.scatter(
+                    [naive_times[recent_idx]],
+                    [norms[recent_idx]],
+                    marker="*",
+                    s=185,
+                    color=color,
+                    edgecolors="#d62728",
+                    linewidths=1.3,
+                    zorder=8,
+                )
+
     ax.axhline(100.0, color="#555555", linestyle="--", linewidth=1.2, alpha=0.75, label="基準ライン (100%)")
+    if has_any_shock:
+        ax.scatter(
+            [], [],
+            marker="*",
+            s=115,
+            color="#444444",
+            edgecolors="#d62728",
+            linewidths=0.9,
+            label="★ = 1h 3σ急変ショック (|Δp|>=3pt & >=3σ)",
+        )
+
+    # 極端な低確率急騰スパイクで他の線が潰れないよう Y軸外れ値スマートクリップ
+    if all_norms:
+        sorted_vals = sorted(all_norms)
+        ymax_raw = sorted_vals[-1]
+        ymin_raw = sorted_vals[0]
+        p96 = sorted_vals[int(0.96 * (len(sorted_vals) - 1))]
+        if ymax_raw > max(260.0, p96 * 1.45):
+            y_cap = max(220.0, min(ymax_raw * 1.05, p96 * 1.25))
+            y_low = max(0.0, min(85.0, ymin_raw * 0.92))
+            ax.set_ylim(y_low, y_cap)
+            ax.text(
+                0.012, 0.975,
+                f"※ 一部急騰銘柄はY軸上限 ({y_cap:.0f}%, 実最大 {ymax_raw:.0f}%) 超のためクリップ表示",
+                transform=ax.transAxes,
+                ha="left", va="top",
+                fontsize=8.2,
+                color="#444444",
+                bbox={"boxstyle": "round,pad=0.3", "facecolor": "#fff8e1", "edgecolor": "#e0c070", "alpha": 0.92},
+            )
     ax.set_title(
         f"Polymarket 相場センチメント 24h出来高 {rank_label} — 直近1ヶ月推移 (開始=100%) [{generated_at_jst.strftime('%Y-%m-%d %H:%M JST')}]",
         fontsize=12.5,
@@ -435,6 +578,9 @@ def build_discord_caption(
     rank_label: str,
     generated_at_jst: datetime,
     shock_items: Optional[List[Dict[str, Any]]] = None,
+    vol_alerts: Optional[List[Dict[str, Any]]] = None,
+    show_regime_banner: bool = False,
+    shock_window_hours: float = 8.0,
 ) -> str:
     """各チャート画像に添える Discord サマリーテキスト（2000文字以内）を作成"""
     header = (
@@ -442,7 +588,31 @@ def build_discord_caption(
         f"取得時刻: `{generated_at_jst.strftime('%Y-%m-%d %H:%M JST')}` | "
         f"対象: `Crypto / 経済金融 / Tech・AI / 地政学 / 政治`"
     )
-    lines = [header, "```text"]
+    lines = [header]
+
+    if show_regime_banner:
+        if vol_alerts:
+            lines.append(
+                f"🚨 **【ボラ警戒モード】FOMC/地政学 1h 3σショック検知 (直近{shock_window_hours:g}h)**\n"
+                "┗ 今後1〜6h BTC(1.24x)/Gold(1.33x) 変動拡大注意・成行飛び乗り厳禁"
+            )
+            lines.append("```text")
+            for a_item in vol_alerts[:3]:
+                sh = a_item["recent_shock"]
+                dp = float(sh["dp_pt"])
+                sign = "+" if dp >= 0 else ""
+                ev_s = shorten_text(a_item["title"], 24)
+                dt_str = sh["dt"].strftime("%m/%d %H:%M")
+                lines.append(
+                    f"[{a_item['category']:<8}] {ev_s:<24} {sign}{dp:4.1f}pt ({sh['z_score']:3.1f}σ) @ {dt_str}"
+                )
+            lines.append("```")
+        else:
+            lines.append(
+                f"🟢 **ボラ・レジーム: 平常** (FOMC/地政学 直近{shock_window_hours:g}hに 3σショックなし)"
+            )
+
+    lines.append("```text")
     for item in items:
         ev_s = shorten_text(item["title"], 24)
         cand_s = shorten_text(item["candidate"], 13)
@@ -472,7 +642,13 @@ def build_discord_caption(
 
     text = "\n".join(lines)
     if len(text) > 1950:
-        text = text[:1940] + "\n```"
+        cut = text[:1940]
+        last_nl = cut.rfind("\n")
+        if last_nl > 0:
+            cut = cut[:last_nl]
+        if cut.count("```") % 2 == 1:
+            cut += "\n```"
+        text = cut
     return text
 
 
@@ -519,6 +695,9 @@ def main() -> int:
     parser.add_argument("--top-n", type=int, default=20, help="取得銘柄数（デフォルト: 20）")
     parser.add_argument("--days", type=int, default=30, help="集計対象日数（デフォルト: 30日）")
     parser.add_argument("--min-days", type=float, default=1.0, help="除外する超短期閾値日数（デフォルト: 1.0日）")
+    parser.add_argument("--shock-window-hours", type=float, default=8.0, help="ボラ警戒バナー判定窓(時間、デフォルト: 8.0)")
+    parser.add_argument("--shock-min-pt", type=float, default=3.0, help="1h急変ショック最小確率差(pt、デフォルト: 3.0)")
+    parser.add_argument("--shock-min-sigma", type=float, default=3.0, help="1h急変ショック最小Zスコア(σ、デフォルト: 3.0)")
     parser.add_argument("--channel", type=str, default=None, help="送信先Webhook名 (例: real1_bitbank, test4_test)")
     parser.add_argument("--test", action="store_true", help="test4_test チャンネルへ強制送信")
     parser.add_argument("--dry-run", action="store_true", help="画像生成のみ行い Discord 送信しない")
@@ -533,6 +712,9 @@ def main() -> int:
         top_n=args.top_n,
         min_days=args.min_days,
         lookback_days=args.days,
+        shock_window_hours=args.shock_window_hours,
+        shock_min_pt=args.shock_min_pt,
+        shock_min_sigma=args.shock_min_sigma,
     )
     if not items:
         print("❌ 有効なマーケットデータを取得できませんでした。")
@@ -543,13 +725,28 @@ def main() -> int:
         key=lambda it: abs(float(it["delta_24h_pt"])),
         reverse=True,
     )[:5]
+    vol_alerts = sorted(
+        [it for it in items if it.get("is_vol_alert") and it.get("recent_shock")],
+        key=lambda it: abs(float(it["recent_shock"]["dp_pt"])),
+        reverse=True,
+    )
 
-    print(f"✅ 取得完了: {len(items)} 銘柄")
+    print(f"✅ 取得完了: {len(items)} 銘柄 (3σショック延べ {sum(len(it.get('shock_indices') or []) for it in items)} 回)")
+    if vol_alerts:
+        print(f"🚨 ボラ警戒モード発動 (直近{args.shock_window_hours:g}h / {len(vol_alerts)}件):")
+        for a_it in vol_alerts:
+            sh = a_it["recent_shock"]
+            sign = "+" if sh["dp_pt"] >= 0 else ""
+            print(f"  * [{a_it['category']}] {a_it['title']} -> {sign}{sh['dp_pt']:.1f}pt ({sh['z_score']:.1f}σ) @ {sh['dt'].strftime('%m/%d %H:%M JST')}")
+    else:
+        print(f"🟢 ボラ・レジーム: 平常 (FOMC/地政学 直近{args.shock_window_hours:g}hに 3σショックなし)")
+
     for item in items:
         sign = "+" if item["diff_pct"] >= 0 else ""
         d24 = _format_24h_delta(item.get("delta_24h_pt"))
+        n_sh = len(item.get("shock_indices") or [])
         print(
-            f"  #{item['rank']:02d} [{item['category']:<8}] 24h=${item['volume24h']:>10,.0f} ({item['span_days']:4.1f}d) | "
+            f"  #{item['rank']:02d} [{item['category']:<8}] 24h=${item['volume24h']:>10,.0f} ({item['span_days']:4.1f}d, ★{n_sh}) | "
             f"{item['base_prob_pct']:5.1f}%->{item['curr_prob_pct']:5.1f}% ({sign}{item['diff_pct']:6.1f}% | {d24}) | "
             f"{item['title']} [{item['candidate']}]"
         )
@@ -582,8 +779,20 @@ def main() -> int:
 
     if args.dry_run:
         for idx, (rank_label, sub_items, _) in enumerate(generated):
-            cap = build_discord_caption(sub_items, rank_label, now_jst, shock_items=shock_items if idx == 0 else None)
+            cap = build_discord_caption(
+                sub_items,
+                rank_label,
+                now_jst,
+                shock_items=shock_items if idx == 0 else None,
+                vol_alerts=vol_alerts if idx == 0 else None,
+                show_regime_banner=(idx == 0),
+                shock_window_hours=args.shock_window_hours,
+            )
             print(f"📝 [{rank_label}] キャプション文字数: {len(cap)} 文字")
+            if idx == 0:
+                print("--- [Top 1-10 キャプションプレビュー] ---")
+                print(cap)
+                print("---------------------------------------")
         print("📌 [--dry-run] Discord 送信をスキップしました。")
         cleanup_old_charts(plots_dir)
         return 0
@@ -601,6 +810,9 @@ def main() -> int:
             rank_label,
             now_jst,
             shock_items=shock_items if idx == 0 else None,
+            vol_alerts=vol_alerts if idx == 0 else None,
+            show_regime_banner=(idx == 0),
+            shock_window_hours=args.shock_window_hours,
         )
         ok = send_chart_to_discord(webhook_url, chart_path, caption)
         if ok:
