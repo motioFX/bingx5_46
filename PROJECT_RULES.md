@@ -28,6 +28,8 @@
 | `bitbank5_46_3logic.py` | `send_discord` ロギング（ANSI バッファリング、プラットフォーム別 Webhook 振分）および既存補助ユーティリティ |
 | `config_loader.py` | `bitbank_credentials.json` 読み込み、Windows（`test4_test`）/ Linux（`real1_bitbank`）自動振り分け、`WEBHOOK_ALIASES` 管理 |
 | `polymarket_top20_chart.py` | Polymarket 相場センチメント 5 カテゴリ（`Crypto` / `Econ/Fin` / `Tech/AI` / `Geo` / `Politics`）24h出来高 Top 20 の直近1ヶ月ノーマライズ比較チャート生成（Top 1-10 / Top 11-20）＆ 24h急変Top 5付き Discord 配信（VPS cron 1日3回実行） |
+| `polymarket_buy_no_screener.py` | 多択 NegRisk（非地政学）＆ 高 IV BTC/ETH 遠方ターゲットの `Maker Buy No` 割高候補スクリーナー |
+| `polymarket_paper_trader.py` | `Maker Buy No` 24時間仮想ペーパートレードボット（初期 `$100` → 目標 `$200`, `real1_bitbank` へ cron 2時間おき実行） |
 | `check_and_restart.sh` | VPS cron（5分間隔）からのプロセス死活監視・`flock` 多重起動防止・自動復旧スクリプト |
 | `master_data_collector.py` / `download_*.py` / `data_pipeline_utils.py` | 海外・国内取引所ヒストリカル収集関連モジュール（通常監視時は停止、`--enable-history` または単体手動実行用） |
 
@@ -121,6 +123,7 @@ flowchart TD
 ```cron
 */5 * * * * /home/ubuntu/bitbank5_46/check_and_restart.sh > /dev/null 2>&1
 0 1,9,17 * * * cd /home/ubuntu/bitbank5_46 && /home/ubuntu/pybot-env310/bin/python -u /home/ubuntu/bitbank5_46/polymarket_top20_chart.py --channel real1_bitbank > /home/ubuntu/bitbank5_46/Data/polymarket_chart.log 2>&1
+15 */2 * * * cd /home/ubuntu/bitbank5_46 && /home/ubuntu/pybot-env310/bin/python -u /home/ubuntu/bitbank5_46/polymarket_paper_trader.py --initial-balance 100 --target-balance 200 --channel real1_bitbank --notify-mode smart > /home/ubuntu/bitbank5_46/Data/polymarket_paper.log 2>&1
 ```
 
 ### 4.3 ログ・ディスク容量保護
