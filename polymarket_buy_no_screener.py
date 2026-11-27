@@ -13,6 +13,7 @@ import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
 import math
+import re
 import sys
 import time
 from datetime import datetime, timedelta, timezone
@@ -31,23 +32,160 @@ if str(BASE_DIR) not in sys.path:
     sys.path.insert(0, str(BASE_DIR))
 
 from config_loader import get_webhook_url
-from polymarket_chart_latency_research import (
-    digital_above_prob,
-    one_touch_prob,
-    parse_crypto_strike,
-    solve_implied_vol,
-)
-from polymarket_leadlag_research import (
-    BINANCE_KLINES_URL,
+from polymarket_top20_chart import (
     GAMMA_EVENTS_URL,
     configure_japanese_font,
-    http_get_json,
     is_placeholder_name,
     parse_json_list,
+    send_chart_to_discord,
     shorten_text,
 )
-from polymarket_mispricing_research import fetch_book_metrics, parse_dt_utc
-from polymarket_top20_chart import send_chart_to_discord
+
+BINANCE_KLINES_URL = "https://api.binance.com/api/v3/klines"
+CLOB_BOOK_URL = "https://clob.polymarket.com/book"
+
+
+def http_get_json(url: str, params: Dict[str, Any], timeout: int = 15, retries: int = 4) -> Any:
+    for attempt in range(retries):
+        try:
+            resp = requests.get(url, params=params, timeout=timeout)
+            if resp.status_code == 429:
+                time.sleep(float(resp.headers.get("Retry-After", 1.2 * (attempt + 1))))
+                continue
+            if resp.status_code in (400, 404):
+                return None
+            resp.raise_for_status()
+            return resp.json()
+        except Exception:
+            if attempt == retries - 1:
+                return None
+            time.sleep(0.5 * (attempt + 1))
+    return None
+
+
+def parse_dt_utc(val: Any) -> Optional[datetime]:
+    if not val:
+        return None
+    s = str(val).strip()
+    if not s:
+        return None
+    try:
+        s_norm = s.replace("Z", "+00:00")
+        if re.search(r"[+-]\d{2}$", s_norm):
+            s_norm += ":00"
+        dt = datetime.fromisoformat(s_norm)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except Exception:
+        try:
+            return datetime.strptime(s[:10], "%Y-%m-%d").replace(tzinfo=timezone.utc)
+        except Exception:
+            return None
+
+
+def norm_cdf(x: float) -> float:
+    return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
+
+
+def one_touch_prob(spot: float, strike: float, sigma: float, t_years: float, direction: int, risk_neutral: bool = False) -> float:
+    if spot <= 0 or strike <= 0:
+        return float("nan")
+    if direction > 0 and spot >= strike:
+        return 1.0
+    if direction < 0 and spot <= strike:
+        return 1.0
+    if t_years <= 1e-6 or sigma <= 1e-6:
+        return 0.0
+    mu = (-0.5 * sigma * sigma) if risk_neutral else 0.0
+    sd = sigma * math.sqrt(t_years)
+    if direction > 0:
+        x = math.log(strike / spot)
+        t1 = norm_cdf((-x + mu * t_years) / sd)
+        t2 = math.exp(min(50.0, (2.0 * mu * x) / (sigma * sigma))) * norm_cdf((-x - mu * t_years) / sd)
+        return float(min(1.0, max(0.0, t1 + t2)))
+    b = math.log(spot / strike)
+    t1 = norm_cdf((-b - mu * t_years) / sd)
+    t2 = math.exp(min(50.0, (-2.0 * mu * b) / (sigma * sigma))) * norm_cdf((-b + mu * t_years) / sd)
+    return float(min(1.0, max(0.0, t1 + t2)))
+
+
+def digital_above_prob(spot: float, strike: float, sigma: float, t_years: float, risk_neutral: bool = False) -> float:
+    if spot <= 0 or strike <= 0:
+        return float("nan")
+    if t_years <= 1e-6 or sigma <= 1e-6:
+        return 1.0 if spot >= strike else 0.0
+    mu = (-0.5 * sigma * sigma) if risk_neutral else 0.0
+    d2 = (math.log(spot / strike) + mu * t_years) / (sigma * math.sqrt(t_years))
+    return float(min(1.0, max(0.0, norm_cdf(d2))))
+
+
+def solve_implied_vol(market_prob: float, spot: float, strike: float, t_years: float, kind: str, direction: int) -> float:
+    if not (0.01 <= market_prob <= 0.99) or t_years <= 1e-6:
+        return float("nan")
+
+    def obj(sig: float) -> float:
+        if kind == "hit":
+            return one_touch_prob(spot, strike, sig, t_years, direction, risk_neutral=False) - market_prob
+        return digital_above_prob(spot, strike, sig, t_years, risk_neutral=False) - market_prob
+
+    lo, hi = 0.05, 3.50
+    f_lo, f_hi = obj(lo), obj(hi)
+    if math.isnan(f_lo) or math.isnan(f_hi) or f_lo * f_hi > 0:
+        return float("nan")
+    for _ in range(45):
+        mid = 0.5 * (lo + hi)
+        f_mid = obj(mid)
+        if abs(f_mid) < 1e-5:
+            return mid
+        if f_lo * f_mid <= 0:
+            hi, f_hi = mid, f_mid
+        else:
+            lo, f_lo = mid, f_mid
+    return 0.5 * (lo + hi)
+
+
+def parse_crypto_strike(event_title: str, sub_label: str) -> Optional[Dict[str, Any]]:
+    tl = event_title.lower()
+    asset = "BTC" if "bitcoin" in tl else ("ETH" if "ethereum" in tl else None)
+    if not asset:
+        return None
+    lbl = str(sub_label or "").strip()
+    if "above" in tl:
+        m = re.search(r"([\d,]+(?:\.\d+)?)", lbl)
+        if not m:
+            return None
+        return {"asset": asset, "kind": "above", "strike": float(m.group(1).replace(",", "")), "strike_dir": 1}
+    if "hit" in tl:
+        m = re.search(r"([↑↓])\s*\$?([\d,]+(?:\.\d+)?)", lbl)
+        if not m:
+            return None
+        return {"asset": asset, "kind": "hit", "strike": float(m.group(2).replace(",", "")), "strike_dir": 1 if m.group(1) == "↑" else -1}
+    return None
+
+
+def fetch_book_metrics(token_id: str) -> Optional[Dict[str, Any]]:
+    bk = http_get_json(CLOB_BOOK_URL, {"token_id": token_id}, timeout=12)
+    if not bk or not isinstance(bk, dict):
+        return None
+    bids = sorted([(float(b["price"]), float(b["size"])) for b in (bk.get("bids") or []) if float(b.get("size", 0)) > 0], key=lambda x: x[0], reverse=True)
+    asks = sorted([(float(a["price"]), float(a["size"])) for a in (bk.get("asks") or []) if float(a.get("size", 0)) > 0], key=lambda x: x[0])
+    if not bids or not asks:
+        return None
+    best_bid, best_bid_sz = bids[0]
+    best_ask, best_ask_sz = asks[0]
+    if best_bid <= 0 or best_ask <= 0 or best_ask < best_bid:
+        return None
+    mid = 0.5 * (best_bid + best_ask)
+    return {
+        "token_id": token_id,
+        "best_bid": best_bid,
+        "best_ask": best_ask,
+        "mid": mid,
+        "spread_cents": (best_ask - best_bid) * 100.0,
+        "top_depth_usd": min(best_bid * best_bid_sz, best_ask * best_ask_sz),
+        "depth_2c_usd": sum(p * s for p, s in bids if p >= mid - 0.02) + sum(p * s for p, s in asks if p <= mid + 0.02),
+    }
 
 if hasattr(sys.stdout, "reconfigure"):
     try:
