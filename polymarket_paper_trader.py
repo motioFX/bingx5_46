@@ -453,6 +453,14 @@ def run_paper_cycle(
         "n_pending": len(state["pending_orders"]),
     }
 
+    if reset and not dry_run:
+        for old_f in (trades_csv, equity_csv):
+            if old_f.exists():
+                try:
+                    old_f.unlink()
+                except Exception:
+                    pass
+
     if not dry_run:
         atomic_write_json(state_path, state)
         append_csv_rows(
@@ -471,7 +479,7 @@ def run_paper_cycle(
         "eq_row": eq_row,
         "events_log": events_log,
         "closed_rows": closed_rows,
-        "equity_csv": equity_csv,
+        "equity_csv": None if (reset and dry_run) else equity_csv,
         "rv_map": rv_map,
     }
 
@@ -491,7 +499,7 @@ def render_paper_dashboard(
     fig.patch.set_facecolor("#ffffff")
 
     # 左パネル: 仮想口座エクイティ推移
-    if eq_csv.exists():
+    if eq_csv is not None and eq_csv.exists():
         df_eq = pd.read_csv(eq_csv, encoding="utf-8")
     else:
         df_eq = pd.DataFrame([eq_row])
