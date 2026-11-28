@@ -42,6 +42,7 @@ from lake_store import (
     sec_to_iso,
     utc_now_sec,
 )
+from strategy_f7_two_pillar import compute_norm_2d_vol_metrics_from_close_arrays
 from symbol_universe import (
     BENCHMARK_SYMBOL,
     EXCLUDED_TRADE_MEGA_CAPS,
@@ -170,12 +171,17 @@ def compute_regime_from_lake(
             },
             "recommended_symbols": [],
             "excluded_symbols": {},
+            "norm_amp_2d": None,
+            "norm_disp_2d": None,
             "whale_snapshot": {"source": "lake_empty"},
         }
 
     res = evaluate_market_regime_3window(symbol_1h_dfs)
     arr_map = {s: d["close"].to_numpy(dtype=np.float64) for s, d in symbol_1h_dfs.items()}
     res["excluded_symbols"] = compute_normalized_exclusions_from_close_arrays(arr_map, res.get("overall_regime", "NEUTRAL"))
+    vol2d = compute_norm_2d_vol_metrics_from_close_arrays(arr_map)
+    res["norm_amp_2d"] = vol2d.get("norm_amp_2d")
+    res["norm_disp_2d"] = vol2d.get("norm_disp_2d")
     res["whale_snapshot"] = {"source": "lake_offline_1h"}
     return res
 
@@ -223,6 +229,8 @@ def _snapshot_from_regime_dict(
         "recommended_symbols": list(reg.get("recommended_symbols", [])),
         "excluded_symbols": excl_dict,
         "excluded_symbols_set": frozenset(normalize_symbol(str(s)) for s in excl_dict.keys()),
+        "norm_amp_2d": reg.get("norm_amp_2d"),
+        "norm_disp_2d": reg.get("norm_disp_2d"),
         "whale_snapshot": {
             "source": source_label,
             "period_results": _compact_period_results(reg.get("period_results")),
@@ -310,6 +318,9 @@ def compute_hourly_regime_series_from_lake(
             reg_t["excluded_symbols"] = compute_normalized_exclusions_from_close_arrays(
                 hourly_arrays_at_t, reg_t.get("overall_regime", "NEUTRAL")
             )
+            vol2d_t = compute_norm_2d_vol_metrics_from_close_arrays(hourly_arrays_at_t)
+            reg_t["norm_amp_2d"] = vol2d_t.get("norm_amp_2d")
+            reg_t["norm_disp_2d"] = vol2d_t.get("norm_disp_2d")
             hourly_map[t_hr] = _snapshot_from_regime_dict(t_hr, reg_t, source_label="lake_hourly_1h")
 
         if gil_yield_sec > 0 and ((step_idx + 1) % 200) == 0:

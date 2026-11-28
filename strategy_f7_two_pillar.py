@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
 """F7 Two-Pillar 戦略体系 Single Source of Truth (SSoT).
 
-構成 (`F7_30mNoEU_S8bNoExh_WF90d`):
-  1. Pillar 1 (LONG): `val_poc_30m` (`30m`足, `ULTRA_BUY`限定, BUYノーマライズ除外なし, 欧州16-22 JST除外)
+構成 (`F7_30mNoEU_Amp2d_S8bNoExhDisp2d_WF90d`):
+  1. Pillar 1 (LONG): `val_poc_30m` (`30m`足, `ULTRA_BUY` または `BUY & norm_amp_2d>=11%`, BUYノーマライズ除外なし, 欧州16-22 JST除外)
   2. Pillar 2 (SHORT): `h3b_squeeze_1h` (`1h`足, `overall_regime == "SELL"`, SELLノーマライズ除外なし,
-                       NoExh `btc_ret14d >= -10% & sym_ret14d >= -20%`, 因果 WF90d ヒステリシスゲート)
+                       `norm_disp_2d>=5%`, NoExh `btc_ret14d >= -10% & sym_ret14d >= -20%`, 因果 WF90d ヒステリシスゲート)
 
 バックテスト (`simulate_f7_portfolio_from_lake`) とライブ運用 (`evaluate_val_poc_30m_entry/exit`,
 `evaluate_h3b_squeeze_1h_entry/exit`, `evaluate_h3b_wf90d_gate_from_lake`) の数式・閾値・決済優先順位を
@@ -29,10 +29,14 @@ from symbol_universe import (
 # ---------------------------------------------------------------------------
 # F7 検証済み固定パラメータ (Single Source of Truth)
 # ---------------------------------------------------------------------------
-F7_MODE_NAME: str = "F7_30mNoEU_S8bNoExh_WF90d"
+F7_MODE_NAME: str = "F7_30mNoEU_Amp2d_S8bNoExhDisp2d_WF90d"
 F7_LONG_STRATEGY: str = "val_poc_30m"
 F7_SHORT_STRATEGY: str = "h3b_squeeze_1h"
 F7_STRATEGIES: Tuple[str, str] = (F7_LONG_STRATEGY, F7_SHORT_STRATEGY)
+
+F7_NORM_VOL_WINDOW_HOURS: int = 48
+F7_LONG_AMP2D_UNLOCK_PCT: float = 11.0
+F7_SHORT_DISP2D_MIN_PCT: float = 5.0
 
 F7_MAX_ACTIVE_POSITIONS: int = 2
 F7_POSITION_COST_USDT: float = 15.0
@@ -214,6 +218,82 @@ def check_f7_no_exhaustion(
     return True, ""
 
 
+def compute_norm_2d_vol_metrics_from_close_arrays(
+    close_arrays_by_symbol: Dict[str, np.ndarray],
+    window_hours: int = F7_NORM_VOL_WINDOW_HOURS,
+) -> Dict[str, Optional[float]]:
+    """直近 `window_hours` 本の確定 1h 終値配列から 2d ノーマライズ振れ幅 (`norm_amp_2d`, `norm_disp_2d`) を因果算出する."""
+    w = max(2, int(window_hours))
+    unique_arrays: Dict[str, np.ndarray] = {}
+    for sym, arr in (close_arrays_by_symbol or {}).items():
+        ns = normalize_symbol(str(sym))
+        if ns in unique_arrays:
+            continue
+        unique_arrays[ns] = np.asarray(arr, dtype=np.float64)
+
+    amps: List[float] = []
+    finals: List[float] = []
+    for arr in unique_arrays.values():
+        if len(arr) < w:
+            continue
+        sl = arr[-w:]
+        if not np.all(np.isfinite(sl)) or float(sl[0]) <= 0.0:
+            continue
+        norm = sl / float(sl[0])
+        amps.append((float(np.max(norm)) - float(np.min(norm))) * 100.0)
+        finals.append(float(norm[-1]))
+
+    if len(amps) < 2:
+        return {
+            "norm_amp_2d": None,
+            "norm_disp_2d": None,
+            "valid_symbols": len(amps),
+        }
+
+    norm_amp_2d = float(np.median(amps))
+    norm_disp_2d = float((np.quantile(finals, 0.90) - np.quantile(finals, 0.10)) * 100.0)
+    return {
+        "norm_amp_2d": norm_amp_2d,
+        "norm_disp_2d": norm_disp_2d,
+        "valid_symbols": len(amps),
+    }
+
+
+def is_f7_long_regime_allowed(
+    overall_regime: str,
+    strength_tier: str,
+    norm_amp_2d: Optional[float] = None,
+) -> Tuple[bool, str]:
+    """`val_poc_30m` の地合い許可判定 (`ULTRA_BUY` または `BUY & norm_amp_2d >= 11.0%`)."""
+    tier_u = str(strength_tier or "").upper()
+    reg_u = str(overall_regime or "").upper()
+    if tier_u == "ULTRA_BUY":
+        return True, "ULTRA_BUY"
+    has_amp = norm_amp_2d is not None and np.isfinite(float(norm_amp_2d))
+    if reg_u == "BUY" and has_amp and float(norm_amp_2d) >= F7_LONG_AMP2D_UNLOCK_PCT:
+        return True, f"BUY_AMP2D({float(norm_amp_2d):.1f}%>={F7_LONG_AMP2D_UNLOCK_PCT:.0f}%)"
+    if has_amp:
+        return False, f"TIER_NOT_ULTRA_BUY({tier_u},amp2d={float(norm_amp_2d):.1f}%<{F7_LONG_AMP2D_UNLOCK_PCT:.0f}%)"
+    return False, f"TIER_NOT_ULTRA_BUY({tier_u})"
+
+
+def check_f7_short_dispersion(
+    norm_disp_2d: Optional[float],
+) -> Tuple[bool, str]:
+    """`h3b_squeeze_1h` 用の 2d 団子相場除外ゲート (`norm_disp_2d >= 5.0%`)."""
+    if norm_disp_2d is None:
+        return True, ""
+    try:
+        val = float(norm_disp_2d)
+    except (TypeError, ValueError):
+        return True, ""
+    if not np.isfinite(val):
+        return True, ""
+    if val < F7_SHORT_DISP2D_MIN_PCT:
+        return False, f"LOW_DISP2D({val:.1f}%<{F7_SHORT_DISP2D_MIN_PCT:.1f}%)"
+    return True, ""
+
+
 def _calc_profit_factor(pnls: np.ndarray) -> float:
     if len(pnls) == 0:
         return 0.0
@@ -279,6 +359,8 @@ def evaluate_val_poc_30m_entry(
     strength_tier: str,
     is_norm_excluded: bool = False,
     now_utc: Optional[int] = None,
+    overall_regime: str = "",
+    norm_amp_2d: Optional[float] = None,
 ) -> Dict[str, Any]:
     """`val_poc_30m` の最新確定 30m 足でのエントリー可否およびシグナル補助 DataFrame を返す."""
     df = _normalize_candle_df(df_30m)
@@ -346,9 +428,9 @@ def evaluate_val_poc_30m_entry(
         }
     )
 
-    tier_u = str(strength_tier or "").upper()
-    if tier_u != "ULTRA_BUY":
-        res["block_reason"] = f"TIER_NOT_ULTRA_BUY({tier_u})"
+    long_ok, long_reason = is_f7_long_regime_allowed(overall_regime, strength_tier, norm_amp_2d)
+    if not long_ok:
+        res["block_reason"] = long_reason
         return res
     if is_norm_excluded:
         res["block_reason"] = "NORM_PEAK_EXCLUDED"
@@ -357,6 +439,7 @@ def evaluate_val_poc_30m_entry(
         res["block_reason"] = "EU_SESSION_BLOCK(16-22JST)"
         return res
     res["gate_ok"] = True
+    res["long_regime_trigger"] = long_reason
 
     if not valid_va:
         res["block_reason"] = "INVALID_VA"
@@ -475,6 +558,7 @@ def evaluate_h3b_squeeze_1h_entry(
     btc_ret14d: Optional[float] = 0.0,
     sym_ret14d: Optional[float] = 0.0,
     wf90d_paused: bool = False,
+    norm_disp_2d: Optional[float] = None,
 ) -> Dict[str, Any]:
     """`h3b_squeeze_1h` の最新確定 1h 足でのエントリー可否およびシグナル補助 DataFrame を返す."""
     df = _normalize_candle_df(df_1h)
@@ -554,6 +638,10 @@ def evaluate_h3b_squeeze_1h_entry(
     noexh_ok, noexh_reason = check_f7_no_exhaustion(btc_ret14d, sym_ret14d)
     if not noexh_ok:
         res["block_reason"] = noexh_reason
+        return res
+    disp_ok, disp_reason = check_f7_short_dispersion(norm_disp_2d)
+    if not disp_ok:
+        res["block_reason"] = disp_reason
         return res
     if wf90d_paused:
         res["block_reason"] = "H3B_WF90D_PAUSED"
@@ -968,7 +1056,14 @@ def _resolve_val_poc_30m_candidates_from_arrays(
             continue
         hk = (sc // 3600) * 3600
         reg_info = hourly_regime_map.get(hk)
-        if not reg_info or str(reg_info.get("strength_tier", "")).upper() != "ULTRA_BUY":
+        if not reg_info:
+            continue
+        long_ok, _ = is_f7_long_regime_allowed(
+            str(reg_info.get("overall_regime", "")),
+            str(reg_info.get("strength_tier", "")),
+            reg_info.get("norm_amp_2d"),
+        )
+        if not long_ok:
             continue
 
         poc, val, vah = _compute_mp_levels(o, h, l, c, v_mp, end_idx=i)
@@ -1031,7 +1126,7 @@ def _resolve_val_poc_30m_candidates_from_arrays(
                 "symbol": norm_sym,
                 "strategy": F7_LONG_STRATEGY,
                 "side": "long",
-                "tier": "ULTRA_BUY",
+                "tier": str(reg_info.get("strength_tier", "")),
                 "norm_excl": norm_sym in excl_set,
                 "vr": float(vr[i]),
                 "fill_ts": int(ts_o[eb]),
@@ -1084,6 +1179,9 @@ def _resolve_h3b_1h_candidates_from_arrays(
         hk = (sc // 3600) * 3600
         reg_info = hourly_regime_map.get(hk)
         if not reg_info or str(reg_info.get("overall_regime", "")).upper() != "SELL":
+            continue
+        disp_ok, _ = check_f7_short_dispersion(reg_info.get("norm_disp_2d"))
+        if not disp_ok:
             continue
 
         # NoExh 因果チェック
@@ -1361,6 +1459,8 @@ def format_f7_hourly_status_line(
     wf90d: Optional[Dict[str, Any]] = None,
     excluded_symbols: Optional[Sequence[str]] = None,
     now_utc: Optional[int] = None,
+    norm_amp_2d: Optional[float] = None,
+    norm_disp_2d: Optional[float] = None,
 ) -> str:
     """毎時 Discord サマリーに添える F7 稼働・待機フィルター状況 1行サマリーを生成する."""
     overall = str(overall_regime or "NEUTRAL").upper()
@@ -1387,25 +1487,45 @@ def format_f7_hourly_status_line(
         if ok_ne:
             short_ok_n += 1
 
-    if tier == "ULTRA_BUY":
+    long_reg_ok, _ = is_f7_long_regime_allowed(overall, tier, norm_amp_2d)
+    disp_ok, _ = check_f7_short_dispersion(norm_disp_2d)
+
+    if long_reg_ok:
         if eu_now:
             state_lbl = "⏸️ LONG待機 [NoEU除外 16-22JST]"
         else:
-            state_lbl = f"🟢 LONG稼働中 (val_poc_30m: {long_ok_n}/{total_mid}銘柄)"
+            long_tag = "ULTRA_BUY" if tier == "ULTRA_BUY" else "BUY+Amp2d"
+            state_lbl = f"🟢 LONG稼働中 (val_poc_30m/{long_tag}: {long_ok_n}/{total_mid}銘柄)"
     elif overall == "SELL":
-        if wf_paused and btc14 < F7_NOEXH_BTC_RET14D_MIN:
+        noexh_blocked = (btc14 < F7_NOEXH_BTC_RET14D_MIN) or (short_ok_n == 0)
+        if wf_paused and noexh_blocked and disp_ok:
             state_lbl = "⏸️ SHORT待機 [WF90d休止 & NoExhブロック]"
-        elif wf_paused:
-            state_lbl = "⏸️ SHORT待機 [WF90d休止中]"
-        elif short_ok_n == 0:
-            state_lbl = "⏸️ SHORT待機 [NoExh疲れ切りブロック]"
-        else:
+        elif not (wf_paused or noexh_blocked or (not disp_ok)):
             state_lbl = f"🟢 SHORT稼働中 (h3b_squeeze_1h: {short_ok_n}/{total_mid}銘柄)"
+        else:
+            block_parts: List[str] = []
+            if wf_paused:
+                block_parts.append("WF90d休止中" if (not noexh_blocked and disp_ok) else "WF90d休止")
+            if noexh_blocked:
+                block_parts.append("NoExh疲れ切りブロック" if (not wf_paused and disp_ok) else "NoExhブロック")
+            if not disp_ok:
+                block_parts.append("Disp2d団子<5%")
+            state_lbl = f"⏸️ SHORT待機 [{' & '.join(block_parts)}]"
     else:
-        state_lbl = "⚪ F7待機 [条件未達: ULTRA_BUY / SELL 待ち]"
+        if overall == "BUY":
+            state_lbl = f"⚪ F7待機 [条件未達: ULTRA_BUY or Amp2d>={F7_LONG_AMP2D_UNLOCK_PCT:.0f}% 待ち]"
+        else:
+            state_lbl = "⚪ F7待機 [条件未達: ULTRA_BUY / SELL 待ち]"
+
+    vol_parts: List[str] = []
+    if norm_amp_2d is not None and np.isfinite(float(norm_amp_2d)):
+        vol_parts.append(f"Amp{float(norm_amp_2d):.1f}%")
+    if norm_disp_2d is not None and np.isfinite(float(norm_disp_2d)):
+        vol_parts.append(f"Disp{float(norm_disp_2d):.1f}%")
+    vol_seg = f" | 2d振れ幅:{'/'.join(vol_parts)}" if vol_parts else ""
 
     wf_tag = "PAUSED" if wf_paused else "ACTIVE"
     return (
-        f"🏛️ F7状態: {state_lbl} | BTC14d:{btc14 * 100.0:+.1f}% | "
+        f"🏛️ F7状態: {state_lbl}{vol_seg} | BTC14d:{btc14 * 100.0:+.1f}% | "
         f"WF90d:{wf_tag}(n={wf_n},${wf_net:+.2f},PF={wf_pf:.2f})"
     )

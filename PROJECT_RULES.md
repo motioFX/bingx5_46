@@ -1,7 +1,7 @@
 # bingx5_46 プロジェクト運用ルール & 開発アーキテクチャ規約 (PROJECT_RULES)
 
 本ドキュメントは、`bingx5_46`（BingX USDT無期限先物 自動売買ボット）プロジェクトの設計思想、システム起動シーケンス、データパイプライン、取引戦略、資金管理、およびサーバー運用に関する最高位の規約（Single Source of Truth）です。
-コアロジック（**F7 Two-Pillar 戦略体系**: `val_poc_30m` [30分足・ULTRA_BUY・欧州除外] ＋ `h3b_squeeze_1h` [1時間足・SELL・S8bトレーリング・NoExh・WF90d]、3期間ノーマライズ全体地合い判定）は `hype5_45` と完全同一のアルゴリズム（`strategy_f7_two_pillar.py` SSoT）を維持しつつ、取引基盤として **BingX USDT無期限先物（豊富なUSDT流動性）** および **BingX公式 VSTデモ口座（実API発注検証）** に完全特化しています。
+コアロジック（**F7 Two-Pillar 戦略体系**: `val_poc_30m` [30分足・`ULTRA_BUY` または `BUY & norm_amp_2d>=11%`・欧州除外] ＋ `h3b_squeeze_1h` [1時間足・`SELL`・`norm_disp_2d>=5%`・S8bトレーリング・NoExh・WF90d]、3期間ノーマライズ全体地合い判定）は `hype5_45` と完全同一のアルゴリズム（`strategy_f7_two_pillar.py` SSoT）を維持しつつ、取引基盤として **BingX USDT無期限先物（豊富なUSDT流動性）** および **BingX公式 VSTデモ口座（実API発注検証）** に完全特化しています。
 
 ---
 
@@ -316,29 +316,29 @@ USDCよりも圧倒的に出来高・流動性が厚い **USDT無期限先物ペ
 
 ## 3. F7 Two-Pillar 戦略体系 ＆ エグジット統一仕様 (`strategy_f7_two_pillar.py` SSoT)
 
-2021年〜2026年（約5.9年間 / 全6暦年・中堅17〜18アルト固定 `$15` 枠・往復コスト控除後）のデータ検証において全6暦年で黒字を達成した検証済み仕様として、以下の **F7 Two-Pillar（買い・売り独立2本柱）戦略体系** を本番・デモ共通の SSoT（`strategy_f7_two_pillar.py` / `USE_F7_TWO_PILLAR_MODE = True`）として採用する（後方互換テスト用に旧6戦略グリッド関連モジュールも保守維持する）。
+2021年〜2026年（約5.9年間 / 全6暦年・中堅17〜18アルト固定 `$15` 枠・往復コスト控除後）のデータ検証において全6暦年で黒字を達成した検証済み仕様（C4 拡張版: `F7_30mNoEU_Amp2d_S8bNoExhDisp2d_WF90d`）として、以下の **F7 Two-Pillar（買い・売り独立2本柱）戦略体系** を本番・デモ共通の SSoT（`strategy_f7_two_pillar.py` / `USE_F7_TWO_PILLAR_MODE = True`）として採用する（後方互換テスト用に旧6戦略グリッド関連モジュールも保守維持する）。
 
 ### 🧩 3-1. F7 Two-Pillar コア戦略対比マトリクス（単発1本固定 / ナンピン完全ゼロ）
 
 | 項目 | Pillar 1: ロング戦略 (`val_poc_30m` / `L1a_30m_VAL_TP`) | Pillar 2: ショート戦略 (`h3b_squeeze_1h` / `H3b_1h_Squeeze`) |
 | :--- | :--- | :--- |
 | **対象時間足** | **`30m`（30分確定足）** | **`1h`（1時間確定足）** |
-| **許可地合い (`Regime`)** | **`ULTRA_BUY` ティアのみ**（3窓全BUY一致 BBB） | **`overall_regime == "SELL"`**（売り優勢全体） |
+| **許可地合い (`Regime`)** | **`ULTRA_BUY`**（3窓全BUY一致 BBB）**または** **`overall_regime == "BUY"` かつ `norm_amp_2d >= 11.0%`**（2日ノーマライズチャート振幅拡大時） | **`overall_regime == "SELL"`**（売り優勢全体） |
 | **前半高安監査 (`NoNormExcl`)** | 対象銘柄が BUY ノーマライズ除外（前半ピーク半値割れ）でないこと | 対象銘柄が SELL ノーマライズ除外（前半ボトム半値超え）でないこと |
 | **時間帯フィルタ** | **欧州時間帯（16:00〜22:00 JST）新規禁止 (`NoEU`)** | 24時間許可 |
-| **追加前提フィルタ** | なし | **疲れ切り回避 (`NoExh`)**: `btc_ret14d >= -10.0%` かつ `sym_ret14d >= -20.0%`<br>**因果 WF90d ゲート**: `strategy_f7_two_pillar.evaluate_h3b_wf90d_gate_from_lake` によりポートフォリオ直近90日確定ペーパー台帳 (`n >= 10`) をヒステリシス判定（休止入り: `net90d < -3.00` かつ `pf90d < 0.85` / 休止解除: `pf90d >= 1.00` または `net90d >= 0.0`） |
+| **追加前提フィルタ** | **2日ノーマライズ振れ幅 (`norm_amp_2d`)**: 直近48本の確定1h足で各銘柄の `(max(norm)-min(norm))*100` の全銘柄中央値（`ULTRA_BUY` 未達時は `>= 11.0%` で `BUY` 全ティア解禁） | **2日団子相場除外 (`norm_disp_2d >= 5.0%`)**: 直近48本の確定1h足における全銘柄最終正規化値の `(P90 - P10)*100 >= 5.0%`（`WF90d` ペーパー台帳にも同一適用）<br>**疲れ切り回避 (`NoExh`)**: `btc_ret14d >= -10.0%` かつ `sym_ret14d >= -20.0%`<br>**因果 WF90d ゲート**: `strategy_f7_two_pillar.evaluate_h3b_wf90d_gate_from_lake` によりポートフォリオ直近90日確定ペーパー台帳 (`n >= 10`) をヒステリシス判定（休止入り: `net90d < -3.00` かつ `pf90d < 0.85` / 休止解除: `pf90d >= 1.00` または `net90d >= 0.0`） |
 | **エントリー条件** | ・`warmup >= 155`<br>・Market Profile (`period=120, half_life=60.0, bins=50, va=0.70`, `vah > val > 0`, `poc > 0`)<br>・`val * 0.965 <= close <= val * 1.002`<br>・出来高倍率 `vr = volume / rolling(20, min_periods=5).mean().shift(1) >= 1.2` | ・`warmup >= 170`<br>・BB(20, `ddof=0`) 幅 `bw = 4*std/mid` について、直前確定足 `bw.shift(1) <= bw.rolling(168, min_periods=50).quantile(0.25).shift(1)`（ボラ圧縮スクイーズ）<br>・出来高倍率 `vr >= 1.5`<br>・`close < low.rolling(48, min_periods=48).min().shift(1)`（48時間安値下方ブレイク） |
 | **初期 SL / トレーリング** | `init_sl = epx - min(2.0 * entry_atr, epx * 0.040)`（`ATR14` 連動・最大4.0%キャップ） | **S8b 段階的防衛トレール**:<br>・`init_sl = epx + 2.0 * entry_atr`<br>・約定翌足以降: `eff_sl = min(init_sl, trough + 2.0 * prev_bar_atr)`<br>・到達利益が `(epx - min_trough) >= 1.5 * entry_atr` に達した瞬間 `be_locked = True` とし、`eff_sl = min(eff_sl, epx * 0.9980)` (`BE_LOCK_SL`) をロック |
 | **目標 TP** | `tp_base = val + (vah - val) * 0.70`（未達/低値時は `poc` または `epx * 1.006`）<br>`target_tp = max(tp_base, epx * 1.006)` | 目標TP上限を設けず `S8b` トレーリング＆FlipBEで利益伸長 |
 | **地合い反転建値撤退 (`FlipBE`)** | **`overall_regime == "SELL"` の時のみ** 建値 `+0.20%` 到達で早期撤退（`NEUTRAL` では決済しない） | **`overall_regime == "BUY"` の時のみ** 建値 `-0.20%` 到達で早期撤退（`NEUTRAL` では決済しない） |
 | **タイムアウト / 最大保有** | タイムアウト強制損切りなし / **最大保有 `1440分`（24時間）で強制決済 (`MAX_HOLD_CLOSE`)** | タイムアウト強制損切りなし / **最大保有 `7200分`（120時間 = 5日間）で強制決済 (`MAX_HOLD_CLOSE`)** |
 | **同時競合時の優先順位** | `(vol_ratio DESC, symbol ASC)` の決定論的ソートで空き枠（最大 `MAX_ACTIVE_POSITIONS = 2`）を配分 | `(vol_ratio DESC, symbol ASC)` の決定論的ソートで空き枠（最大 `MAX_ACTIVE_POSITIONS = 2`）を配分 |
-| **指値追随 (`pending_entry_orders`)** | `Best Bid` Post-Only 指値、最大3サイクル追随（`ULTRA_BUY` 喪失・16:00 JST突入・CB時は即時キャンセル） | `Best Ask` Post-Only 指値、最大3サイクル追随（`SELL` 喪失・`WF90d` 休止・CB時は即時キャンセル） |
+| **指値追随 (`pending_entry_orders`)** | `Best Bid` Post-Only 指値、最大3サイクル追随（(`ULTRA_BUY` または `BUY & amp_2d >= 11%`) 喪失・16:00 JST突入・CB時は即時キャンセル） | `Best Ask` Post-Only 指値、最大3サイクル追随（`SELL` 喪失・`norm_disp_2d < 5%`・`WF90d` 休止・CB時は即時キャンセル） |
 
 #### 🛡️ 3-1-1. F7 実運用堅牢化 ＆ 軽量化統一仕様
 - **取引所ネイティブ保険逆指値（`STOP_MARKET` 防護クッション）併用**: SSoT ソフト SL（`eff_sl`）による第一執行を維持しつつ、VPS 通信瞬断・API メンテナンス時の保険として約定保有後および `eff_sl` の有利方向更新時（`BE_LOCK` / `TRAIL_SL`）に `eff_sl` の `0.35%` 外側（Long: `eff_sl * 0.9965` / Short: `eff_sl * 1.0035`、現在価格から最低 `0.20%` 安全距離確保、`0.05%` 以上有利化した時のみラチェット更新）へ取引所側 `STOP_MARKET`（`workingType="MARK_PRICE"`, `positionSide="LONG"/"SHORT"`）を同期配置し、決済完了時・外部決済検知時は `active_order_cancel` で先行撤去する。
-- **`WF90d` 同一 1h 確定足キャッシュ**: `Data/h3b_wf90d_state.json` の `evaluated_at_utc == cutoff_1h` 時は SQLite 全履歴再走査を省略し、保存済みキャッシュを返却して毎時 CPU 負荷を削減する。
-- **毎時ステータスサマリーへの F7 稼働・待機理由 1 行表示**: 正時サマリーに `🏛️ F7状態:` 行を追加し、`NoExh`・`WF90d`・`NoEU`・地合いティアの現在状態を明示する。
+- **`WF90d` 同一 1h 確定足キャッシュ**: `Data/h3b_wf90d_state.json` の `evaluated_at_utc == cutoff_1h` かつ `mode_name == F7_MODE_NAME` 時は SQLite 全履歴再走査を省略し、保存済みキャッシュを返却して毎時 CPU 負荷を削減する（モード名不一致時は自動で再評価する）。
+- **毎時ステータスサマリーへの F7 稼働・待機理由 1 行表示**: 正時サマリーに `🏛️ F7状態:` 行を追加し、`NoExh`・`WF90d`・`NoEU`・`2d振れ幅:Amp{x}%/Disp{y}%`（`BUY+Amp2d` 稼働・`Disp2d団子<5%` 待機含む）および地合いティアの現在状態を明示する。
 - **ログ世代ローテーション統一**: `check_and_restart.sh` により再起動時ログを最大5世代退避ローテーションし、`.gitattributes`（`*.sh text eol=lf`）でシェルスクリプト改行コードを LF 固定する。
 
 ---

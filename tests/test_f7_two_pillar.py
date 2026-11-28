@@ -25,17 +25,21 @@ from lake_live_bridge import refresh_hourly_regime_for_bot, run_f7_screening_for
 from lake_store import LakeStore, SUPPORTED_TIMEFRAMES, TIMEFRAME_SECONDS
 from strategy_f7_two_pillar import (
     F7_LONG_STRATEGY,
+    F7_MODE_NAME,
     F7_SHORT_STRATEGY,
     apply_causal_wf_90d_filter,
     build_causal_wf_90d_timeline,
     check_f7_no_exhaustion,
+    check_f7_short_dispersion,
     compute_h3b_squeeze_1h_entry_levels,
+    compute_norm_2d_vol_metrics_from_close_arrays,
     compute_val_poc_30m_entry_levels,
     evaluate_h3b_squeeze_1h_entry,
     evaluate_h3b_squeeze_1h_exit,
     evaluate_val_poc_30m_entry,
     evaluate_val_poc_30m_exit,
     is_eu_session_jst,
+    is_f7_long_regime_allowed,
     is_f7_strategy,
     compute_insurance_stop_price,
     format_f7_hourly_status_line,
@@ -510,6 +514,133 @@ class TestF7TwoPillar(unittest.TestCase):
             self.assertIsNone(asyncio.run(api_live.sync_protective_stop_order("long", 0.25, 58.0)))
             self.assertFalse(asyncio.run(api_live.cancel_order_by_id("987654")))
             self.assertEqual(req_mock.await_count, 2)
+
+    def test_c4_norm_2d_vol_metrics_gates_status_and_cache_invalidation(self) -> None:
+        # 1) compute_norm_2d_vol_metrics_from_close_arrays: 48h amplitude median & P90-P10 dispersion + deduplication
+        arr_a = np.full(48, 100.0, dtype=np.float64)
+        arr_a[24] = 110.0
+        arr_a[-1] = 100.0  # amp = 10%, final = 1.00
+        arr_b = np.full(48, 100.0, dtype=np.float64)
+        arr_b[24] = 120.0
+        arr_b[-1] = 110.0  # amp = 20%, final = 1.10
+        arr_c = np.full(48, 100.0, dtype=np.float64)
+        arr_c[24] = 112.0
+        arr_c[-1] = 104.0  # amp = 12%, final = 1.04
+        # Duplicate key "HYPE" vs "HYPE-USDT" should only count once
+        m = compute_norm_2d_vol_metrics_from_close_arrays({
+            "HYPE-USDT": arr_a,
+            "HYPE": arr_a * 2.0,
+            "SUI-USDT": arr_b,
+            "ENA-USDT": arr_c,
+        })
+        self.assertEqual(m["valid_symbols"], 3)
+        self.assertAlmostEqual(float(m["norm_amp_2d"]), 12.0, places=6)
+        expected_disp = (np.quantile([1.00, 1.10, 1.04], 0.90) - np.quantile([1.00, 1.10, 1.04], 0.10)) * 100.0
+        self.assertAlmostEqual(float(m["norm_disp_2d"]), float(expected_disp), places=6)
+
+        # Insufficient symbols -> None (fail-open)
+        m_small = compute_norm_2d_vol_metrics_from_close_arrays({"HYPE-USDT": arr_a})
+        self.assertIsNone(m_small["norm_amp_2d"])
+        self.assertIsNone(m_small["norm_disp_2d"])
+
+        # 2) C2 Long gate: BUY + norm_amp_2d >= 11.0% unlocks non-ULTRA_BUY, NEUTRAL stays blocked, EU stays blocked
+        df_asia, close_ts_asia = _make_val_poc_30m_fixture(end_ts_jst_hour=10)
+        ok_mod_low, _ = is_f7_long_regime_allowed("BUY", "MODERATE_BUY", 10.5)
+        self.assertFalse(ok_mod_low)
+        ok_mod_hi, trig_hi = is_f7_long_regime_allowed("BUY", "MODERATE_BUY", 11.2)
+        self.assertTrue(ok_mod_hi)
+        self.assertIn("BUY_AMP2D", trig_hi)
+        ok_neu_hi, _ = is_f7_long_regime_allowed("NEUTRAL", "LEAN_BUY", 15.0)
+        self.assertFalse(ok_neu_hi)
+
+        r_mod_low = evaluate_val_poc_30m_entry(
+            df_asia, strength_tier="MODERATE_BUY", overall_regime="BUY", norm_amp_2d=10.5, now_utc=close_ts_asia
+        )
+        self.assertFalse(r_mod_low["should_enter"])
+        r_mod_hi = evaluate_val_poc_30m_entry(
+            df_asia, strength_tier="MODERATE_BUY", overall_regime="BUY", norm_amp_2d=11.2, now_utc=close_ts_asia
+        )
+        self.assertTrue(r_mod_hi["should_enter"], r_mod_hi.get("block_reason"))
+        r_neu = evaluate_val_poc_30m_entry(
+            df_asia, strength_tier="LEAN_BUY", overall_regime="NEUTRAL", norm_amp_2d=15.0, now_utc=close_ts_asia
+        )
+        self.assertFalse(r_neu["should_enter"])
+        df_eu, close_ts_eu = _make_val_poc_30m_fixture(end_ts_jst_hour=17)
+        r_eu_amp = evaluate_val_poc_30m_entry(
+            df_eu, strength_tier="MODERATE_BUY", overall_regime="BUY", norm_amp_2d=15.0, now_utc=close_ts_eu
+        )
+        self.assertFalse(r_eu_amp["should_enter"])
+        self.assertIn("EU_SESSION_BLOCK", r_eu_amp["block_reason"])
+
+        # 3) C4 Short dispersion gate: disp_2d < 5.0% blocks, >= 5.0% or None allows
+        d_ok_none, _ = check_f7_short_dispersion(None)
+        self.assertTrue(d_ok_none)
+        d_ok_low, _ = check_f7_short_dispersion(4.9)
+        self.assertFalse(d_ok_low)
+        d_ok_pass, _ = check_f7_short_dispersion(5.0)
+        self.assertTrue(d_ok_pass)
+
+        df_1h, _ = _make_h3b_1h_fixture()
+        r_s_low = evaluate_h3b_squeeze_1h_entry(
+            df_1h, overall_regime="SELL", btc_ret14d=-0.05, sym_ret14d=-0.10, wf90d_paused=False, norm_disp_2d=4.9
+        )
+        self.assertFalse(r_s_low["should_enter"])
+        self.assertIn("LOW_DISP2D", r_s_low["block_reason"])
+        r_s_ok = evaluate_h3b_squeeze_1h_entry(
+            df_1h, overall_regime="SELL", btc_ret14d=-0.05, sym_ret14d=-0.10, wf90d_paused=False, norm_disp_2d=5.0
+        )
+        self.assertTrue(r_s_ok["should_enter"], r_s_ok.get("block_reason"))
+
+        # 4) Hourly status line displays BUY+Amp2d, Disp2d団子<5%, and 2d振れ幅 metrics
+        t_jst_10 = 1_750_000_000 + ((10 - ((1_750_000_000 + 9 * 3600) // 3600) % 24) % 24) * 3600
+        line_amp_long = format_f7_hourly_status_line(
+            "BUY", "MODERATE_BUY", -0.05, {}, {"paused": False}, now_utc=t_jst_10, norm_amp_2d=12.4, norm_disp_2d=6.8
+        )
+        self.assertIn("BUY+Amp2d", line_amp_long)
+        self.assertIn("2d振れ幅:Amp12.4%/Disp6.8%", line_amp_long)
+        line_disp_wait = format_f7_hourly_status_line(
+            "SELL", "SELL", -0.05, {}, {"paused": False}, norm_amp_2d=6.0, norm_disp_2d=4.2
+        )
+        self.assertIn("Disp2d団子<5%", line_disp_wait)
+
+        # 5) WF90d cache invalidation when mode_name mismatches
+        with tempfile.TemporaryDirectory() as td:
+            td_p = Path(td)
+            db_path = td_p / "wf_mode_cache.db"
+            wf_path = td_p / "h3b_wf90d_state.json"
+            lake = LakeStore(db_path=db_path)
+            cutoff_1h = 1_750_032_000
+            wf_path.write_text(
+                json.dumps({
+                    "paused": True,
+                    "window_days": 90,
+                    "window_trades": 48,
+                    "window_net": -2.56,
+                    "window_pf": 0.66,
+                    "total_paper_trades": 70,
+                    "evaluated_at_utc": cutoff_1h,
+                    "mode_name": "F7_30mNoEU_S8bNoExh_WF90d",
+                }),
+                encoding="utf-8",
+            )
+            fresh_wf = {
+                "paused": False,
+                "window_days": 90,
+                "window_trades": 30,
+                "window_net": 1.25,
+                "window_pf": 1.15,
+                "total_paper_trades": 45,
+                "evaluated_at_utc": cutoff_1h,
+            }
+            with mock.patch.object(lake_live_bridge, "evaluate_h3b_wf90d_gate_from_lake", return_value=fresh_wf) as spy:
+                res1 = lake_live_bridge._load_or_eval_h3b_wf90d(lake, cutoff_1h, wf_path)
+                self.assertEqual(spy.call_count, 1)
+                self.assertEqual(res1["mode_name"], F7_MODE_NAME)
+                self.assertFalse(res1["paused"])
+                # Same mode_name & same cutoff_1h -> cache hit
+                res2 = lake_live_bridge._load_or_eval_h3b_wf90d(lake, cutoff_1h, wf_path)
+                self.assertEqual(spy.call_count, 1)
+                self.assertEqual(res2["window_net"], 1.25)
 
 
 if __name__ == "__main__":

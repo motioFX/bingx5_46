@@ -41,9 +41,12 @@ from strategy_f7_two_pillar import (
     F7_SHORT_STRATEGY,
     F7_SHORT_TIMEFRAME,
     check_f7_no_exhaustion,
+    check_f7_short_dispersion,
+    compute_norm_2d_vol_metrics_from_close_arrays,
     compute_ret14d_from_1h_close,
     evaluate_h3b_wf90d_gate_from_lake,
     is_eu_session_jst,
+    is_f7_long_regime_allowed,
 )
 from symbol_universe import (
     BENCHMARK_SYMBOL,
@@ -251,6 +254,20 @@ def _compute_f7_ret14d_context(
     return float(btc_ret14d), sym_ret14d_map
 
 
+def _compute_f7_norm_2d_context(
+    lake: LakeStore,
+    cutoff_1h: int,
+) -> Dict[str, Optional[float]]:
+    """LAKE_UNIVERSE_SYMBOLS の確定 1h 足 (直近48本) から 2d ノーマライズ振れ幅指標を因果算出する."""
+    close_arrays: Dict[str, np.ndarray] = {}
+    for sym in LAKE_UNIVERSE_SYMBOLS:
+        ns = normalize_symbol(sym)
+        df_s = lake.load_candles(ns, "1h", cutoff_utc=cutoff_1h, limit=60)
+        if not df_s.empty:
+            close_arrays[ns] = df_s["close"].to_numpy(dtype=np.float64)
+    return compute_norm_2d_vol_metrics_from_close_arrays(close_arrays)
+
+
 def _count_1h_symbols_in_lake(lake: LakeStore, cutoff_1h: int) -> int:
     start_1h = int(cutoff_1h) - 20 * 86400
     cnt = 0
@@ -267,7 +284,7 @@ def _load_or_eval_h3b_wf90d(
     wf_state_file: Optional[Path],
     gil_yield_sec: float = 0.0,
 ) -> Dict[str, Any]:
-    """同一 1h 確定足境界 (`evaluated_at_utc == cutoff_1h`) では保存済み WF90d キャッシュを再利用する。"""
+    """同一 1h 確定足境界 (`evaluated_at_utc == cutoff_1h` かつ `mode_name == F7_MODE_NAME`) では保存済み WF90d キャッシュを再利用する。"""
     req_keys = (
         "paused",
         "window_days",
@@ -276,6 +293,7 @@ def _load_or_eval_h3b_wf90d(
         "window_pf",
         "total_paper_trades",
         "evaluated_at_utc",
+        "mode_name",
     )
     if wf_state_file is not None and wf_state_file.exists():
         try:
@@ -283,6 +301,7 @@ def _load_or_eval_h3b_wf90d(
             if (
                 isinstance(cached, dict)
                 and all(k in cached for k in req_keys)
+                and str(cached.get("mode_name", "")) == F7_MODE_NAME
                 and int(cached.get("evaluated_at_utc", -1)) == int(cutoff_1h)
             ):
                 return {k: v for k, v in cached.items() if not str(k).startswith("_")}
@@ -292,6 +311,7 @@ def _load_or_eval_h3b_wf90d(
     raw_wf = evaluate_h3b_wf90d_gate_from_lake(lake, cutoff_utc=cutoff_1h, gil_yield_sec=gil_yield_sec)
     h3b_wf90d = {k: v for k, v in raw_wf.items() if not str(k).startswith("_")}
     h3b_wf90d["evaluated_at_utc"] = int(cutoff_1h)
+    h3b_wf90d["mode_name"] = F7_MODE_NAME
     if wf_state_file is not None:
         try:
             wf_state_file.parent.mkdir(parents=True, exist_ok=True)
@@ -350,6 +370,7 @@ def refresh_hourly_regime_for_bot(
     ms_file = Path(state_file_path) if state_file_path is not None else (Path(__file__).resolve().parent / "Data" / "market_state.json")
     prev_regime = ""
     prev_tier = ""
+    prev_norm_amp_2d: Optional[float] = None
     if ms_file.exists():
         try:
             prev_data = json.loads(ms_file.read_text(encoding="utf-8"))
@@ -358,6 +379,8 @@ def refresh_hourly_regime_for_bot(
                 prev_tier = str(
                     (prev_data.get("regime_strength") or {}).get("tier", prev_data.get("strength_tier", ""))
                 ).upper()
+                if prev_data.get("norm_amp_2d") is not None:
+                    prev_norm_amp_2d = float(prev_data.get("norm_amp_2d"))
         except Exception:
             pass
 
@@ -374,8 +397,21 @@ def refresh_hourly_regime_for_bot(
         net_sc = float(strength_obj.get("net_score", 0.0) or 0.0)
         strength_obj["strength_desc"] = f"【{t_jp} ({net_sc * 100:+.1f}%)】"
 
+    norm_amp_2d = reg_eval.get("norm_amp_2d")
+    norm_disp_2d = reg_eval.get("norm_disp_2d")
+    if norm_amp_2d is None or norm_disp_2d is None:
+        v2d_fb = _compute_f7_norm_2d_context(lake, cutoff_1h)
+        if norm_amp_2d is None:
+            norm_amp_2d = v2d_fb.get("norm_amp_2d")
+        if norm_disp_2d is None:
+            norm_disp_2d = v2d_fb.get("norm_disp_2d")
+
+    prev_long_ok, _ = is_f7_long_regime_allowed(prev_regime, prev_tier, prev_norm_amp_2d)
+    new_long_ok, _ = is_f7_long_regime_allowed(new_regime, new_tier, norm_amp_2d)
+    long_gate_changed = bool(prev_regime and (prev_long_ok != new_long_ok))
+
     btc_ret14d, sym_ret14d_map = _compute_f7_ret14d_context(lake, cutoff_1h)
-    h3b_wf90d = {"paused": False, "window_days": 90, "window_trades": 0, "window_net": 0.0, "window_pf": 0.0, "total_paper_trades": 0}
+    h3b_wf90d = {"paused": False, "window_days": 90, "window_trades": 0, "window_net": 0.0, "window_pf": 0.0, "total_paper_trades": 0, "mode_name": F7_MODE_NAME}
     wf_file = (
         (Path(state_file_path).parent / "h3b_wf90d_state.json")
         if state_file_path is not None
@@ -403,6 +439,8 @@ def refresh_hourly_regime_for_bot(
         "recommended_symbols": reg_eval.get("recommended_symbols", []),
         "excluded_symbols": excl_list,
         "exclusion_reasons": excl_reasons,
+        "norm_amp_2d": norm_amp_2d,
+        "norm_disp_2d": norm_disp_2d,
         "btc_ret14d": btc_ret14d,
         "sym_ret14d_map": sym_ret14d_map,
         "h3b_wf90d": h3b_wf90d,
@@ -425,8 +463,11 @@ def refresh_hourly_regime_for_bot(
         "prev_strength_tier": prev_tier,
         "strength_tier": new_tier,
         "tier_changed_ultra_buy": tier_changed_ultra_buy,
+        "long_gate_changed": long_gate_changed,
         "regime_flipped": regime_flipped,
         "regime_eval": reg_eval,
+        "norm_amp_2d": norm_amp_2d,
+        "norm_disp_2d": norm_disp_2d,
         "btc_ret14d": btc_ret14d,
         "sym_ret14d_map": sym_ret14d_map,
         "h3b_wf90d": h3b_wf90d,
@@ -588,6 +629,15 @@ def run_f7_screening_for_bot(
     }
 
     btc_ret14d, sym_ret14d_map = _compute_f7_ret14d_context(lake, cutoff_1h)
+    norm_amp_2d = cur_regime.get("norm_amp_2d")
+    norm_disp_2d = cur_regime.get("norm_disp_2d")
+    if norm_amp_2d is None or norm_disp_2d is None:
+        v2d_ctx = _compute_f7_norm_2d_context(lake, cutoff_1h)
+        if norm_amp_2d is None:
+            norm_amp_2d = v2d_ctx.get("norm_amp_2d")
+        if norm_disp_2d is None:
+            norm_disp_2d = v2d_ctx.get("norm_disp_2d")
+
     wf_out_file = (
         Path(wf90d_state_path)
         if wf90d_state_path is not None
@@ -620,6 +670,8 @@ def run_f7_screening_for_bot(
                 "recommended_symbols": cur_regime.get("recommended_symbols", existing_ms.get("recommended_symbols", [])),
                 "excluded_symbols": excl_list_ms,
                 "exclusion_reasons": excl_reasons_ms,
+                "norm_amp_2d": norm_amp_2d,
+                "norm_disp_2d": norm_disp_2d,
                 "btc_ret14d": btc_ret14d,
                 "sym_ret14d_map": sym_ret14d_map,
                 "h3b_wf90d": h3b_wf90d,
@@ -637,6 +689,8 @@ def run_f7_screening_for_bot(
 
     wf90d_paused = bool(h3b_wf90d.get("paused", False))
     eu_now = is_eu_session_jst(now_sec)
+    long_reg_ok, long_reg_reason = is_f7_long_regime_allowed(overall, tier, norm_amp_2d)
+    short_disp_ok, short_disp_reason = check_f7_short_dispersion(norm_disp_2d)
     mega_cap_set = {normalize_symbol(s) for s in excluded_mega_caps}
     symbol_params_map: Dict[str, Dict[str, Any]] = {}
     selected_symbols: List[str] = []
@@ -649,8 +703,8 @@ def run_f7_screening_for_bot(
         sym_ret14d = float(sym_ret14d_map.get(ns, 0.0))
         noexh_ok, noexh_reason = check_f7_no_exhaustion(btc_ret14d, sym_ret14d)
 
-        long_eligible = (tier == "ULTRA_BUY") and (not is_norm_excl) and (not eu_now)
-        short_eligible = (overall == "SELL") and (not is_norm_excl) and noexh_ok and (not wf90d_paused)
+        long_eligible = long_reg_ok and (not is_norm_excl) and (not eu_now)
+        short_eligible = (overall == "SELL") and (not is_norm_excl) and noexh_ok and short_disp_ok and (not wf90d_paused)
 
         active_strat = F7_LONG_STRATEGY if overall == "BUY" else (F7_SHORT_STRATEGY if overall == "SELL" else F7_LONG_STRATEGY)
         active_side = "long" if active_strat == F7_LONG_STRATEGY else "short"
@@ -667,6 +721,7 @@ def run_f7_screening_for_bot(
             "is_qualified": True,
             "eval_grade": "F7_SSOT",
             "eligible_now": long_eligible,
+            "long_regime_trigger": long_reg_reason,
         }
         short_spec = {
             "strategy": F7_SHORT_STRATEGY,
@@ -678,6 +733,7 @@ def run_f7_screening_for_bot(
             "eligible_now": short_eligible,
             "wf90d_paused": wf90d_paused,
             "noexh_ok": noexh_ok,
+            "short_disp_ok": short_disp_ok,
         }
         active_spec = dict(long_spec if active_strat == F7_LONG_STRATEGY else short_spec)
 
@@ -691,10 +747,14 @@ def run_f7_screening_for_bot(
             "breakout_params": short_spec,
             "best_overall": active_spec,
             "is_norm_excluded": is_norm_excl,
+            "norm_amp_2d": norm_amp_2d,
+            "norm_disp_2d": norm_disp_2d,
             "btc_ret14d": btc_ret14d,
             "sym_ret14d": sym_ret14d,
             "noexh_ok": noexh_ok,
             "noexh_reason": noexh_reason,
+            "short_disp_ok": short_disp_ok,
+            "short_disp_reason": short_disp_reason,
             "wf90d_paused": wf90d_paused,
             "f7_long_eligible_now": long_eligible,
             "f7_short_eligible_now": short_eligible,
@@ -706,10 +766,12 @@ def run_f7_screening_for_bot(
     long_elig_cnt = sum(1 for s in selected_symbols if symbol_params_map[s].get("f7_long_eligible_now"))
     short_elig_cnt = sum(1 for s in selected_symbols if symbol_params_map[s].get("f7_short_eligible_now"))
     wf_status_lbl = "PAUSED" if wf90d_paused else "ACTIVE"
+    amp2d_lbl = f"{float(norm_amp_2d):.1f}%" if norm_amp_2d is not None else "N/A"
+    disp2d_lbl = f"{float(norm_disp_2d):.1f}%" if norm_disp_2d is not None else "N/A"
 
     summary_log = (
         f"🏛️ **【{F7_MODE_NAME} スクリーニング結果】**\n"
-        f"   ├ 地合い/強度: `{overall}` / `{tier}` (EU除外: {'YES(16-22JST)' if eu_now else 'NO'}) | BTC14d: `{btc_ret14d * 100:+.1f}%`\n"
+        f"   ├ 地合い/強度: `{overall}` / `{tier}` (EU除外: {'YES(16-22JST)' if eu_now else 'NO'}) | BTC14d: `{btc_ret14d * 100:+.1f}%` | 2d振れ幅: `Amp={amp2d_lbl} / Disp={disp2d_lbl}`\n"
         f"   ├ H3b WF90dゲート: **`{wf_status_lbl}`** (90d: n={h3b_wf90d['window_trades']}, Net=${h3b_wf90d['window_net']:+.2f}, PF={h3b_wf90d['window_pf']:.2f})\n"
         f"   └ 監視対象: **{len(selected_symbols)}中堅アルト** | 現時点稼働可: `val_poc_30m`={long_elig_cnt}銘柄 / `h3b_squeeze_1h`={short_elig_cnt}銘柄"
     )
@@ -721,6 +783,9 @@ def run_f7_screening_for_bot(
         "winner": None,
         "selection": {"selection_id": f"f7_{cutoff_1h}", "reason_text": F7_MODE_NAME},
         "regime_eval": cur_regime,
+        "norm_amp_2d": norm_amp_2d,
+        "norm_disp_2d": norm_disp_2d,
+        "short_disp_ok": short_disp_ok,
         "btc_ret14d": btc_ret14d,
         "sym_ret14d_map": sym_ret14d_map,
         "h3b_wf90d": h3b_wf90d,

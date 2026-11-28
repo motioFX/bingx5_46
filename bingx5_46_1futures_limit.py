@@ -143,6 +143,7 @@ from strategy_f7_two_pillar import (
     F7_SHORT_STRATEGY,
     calc_atr_series as _f7_calc_atr_series,
     check_f7_no_exhaustion,
+    check_f7_short_dispersion,
     compute_h3b_squeeze_1h_entry_levels,
     compute_insurance_stop_price,
     compute_val_poc_30m_entry_levels,
@@ -152,6 +153,7 @@ from strategy_f7_two_pillar import (
     evaluate_val_poc_30m_exit,
     format_f7_hourly_status_line,
     is_eu_session_jst,
+    is_f7_long_regime_allowed,
     is_f7_strategy,
     should_update_insurance_stop,
 )
@@ -631,6 +633,8 @@ def get_regime_gate_info(symbol: str) -> Dict[str, Any]:
         "action": "NORMAL",
         "overall_regime": "NEUTRAL",
         "regime_strength": {},
+        "norm_amp_2d": None,
+        "norm_disp_2d": None,
         "is_buy_regime": False,
         "is_sell_regime": False,
         "is_peak_dropped": False,
@@ -670,6 +674,8 @@ def get_regime_gate_info(symbol: str) -> Dict[str, Any]:
             "allowed_strategies": data.get("allowed_strategies", []),
             "regime_strength": data.get("regime_strength", {}),
             "excluded_symbols": list(excluded),
+            "norm_amp_2d": data.get("norm_amp_2d"),
+            "norm_disp_2d": data.get("norm_disp_2d"),
             "btc_ret14d": float(data.get("btc_ret14d", 0.0) or 0.0),
             "sym_ret14d_map": dict(data.get("sym_ret14d_map") or {}),
             "h3b_wf90d": dict(data.get("h3b_wf90d") or {}),
@@ -1860,6 +1866,8 @@ async def run_screening_and_optimization(mode: str, send_charts: bool = False, s
                 "f7_mode": bool(USE_F7_TWO_PILLAR_MODE),
                 "h3b_wf90d": lake_out.get("h3b_wf90d"),
                 "btc_ret14d": lake_out.get("btc_ret14d"),
+                "norm_amp_2d": lake_out.get("norm_amp_2d"),
+                "norm_disp_2d": lake_out.get("norm_disp_2d"),
                 "selected_symbols": selected_symbols,
                 "symbol_params_map": clean_map,
                 "evaluated_at": datetime.now(timezone.utc).isoformat()
@@ -1884,8 +1892,8 @@ async def run_screening_and_optimization(mode: str, send_charts: bool = False, s
         short_q_n = sum(1 for s in selected_symbols if symbol_params_map.get(s, {}).get("f7_short_eligible_now"))
         discord.print_log(
             f"\n★ 【{F7_MODE_NAME} 監視設定】 {len(selected_symbols)}中堅アルト | "
-            f"LONG(`val_poc_30m`/30m/ULTRA_BUY/NoEU)={long_q_n}銘柄 | "
-            f"SHORT(`h3b_squeeze_1h`/1h/SELL/S8b+NoExh+WF90d)={short_q_n}銘柄"
+            f"LONG(`val_poc_30m`/30m/ULTRA_BUY or BUY&Amp2d>=11%/NoEU)={long_q_n}銘柄 | "
+            f"SHORT(`h3b_squeeze_1h`/1h/SELL/S8b+NoExh+Disp2d>=5%+WF90d)={short_q_n}銘柄"
         )
     # 選定銘柄の個別最適化パラメータをDiscordログ表示 (旧6戦略モード)
     elif selected_symbols:
@@ -2752,7 +2760,7 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
         hours_str = ", ".join([f"{h:02d}:00" for h in sorted(ANALYSIS_HOURS)])
         cycle_str = f"毎日 {hours_str} JST ({24 // max(1, len(ANALYSIS_HOURS))}時間ごと)"
     strat_banner_label = (
-        f"{F7_MODE_NAME} (`val_poc_30m`[30m/ULTRA_BUY/NoEU] + `h3b_squeeze_1h`[1h/SELL/S8b+WF90d])"
+        f"{F7_MODE_NAME} (`val_poc_30m`[30m/ULTRA_BUY|BUY&Amp2d>=11%/NoEU] + `h3b_squeeze_1h`[1h/SELL/S8b+Disp2d>=5%+WF90d])"
         if USE_F7_TWO_PILLAR_MODE
         else "3態勢地合い連動 (BULL:買い / NEUTRAL:待機 / BEAR:売り)"
     )
@@ -2782,8 +2790,8 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
         f"  監視足種     : {candle_banner_label}\n"
         f"  銘柄選定周期 : {cycle_str}\n"
         f"  ポジション枠 : 最大 {MAX_ACTIVE_POSITIONS} 銘柄同時保有\n"
-        f"  買い (BULL)  : 単発1本固定 / 30m VAL_TP (ULTRA_BUY・欧州16-22JST除外 / SL=min(2ATR,4%))\n"
-        f"  売り (BEAR)  : 単発1本固定 / 1h H3b Squeeze (SELL・NoExh・WF90d / S8b+1.5ATR BE/2ATRトレール)\n"
+        f"  買い (BULL)  : 単発1本固定 / 30m VAL_TP (ULTRA_BUY or BUY&Amp2d>=11%・欧州16-22JST除外 / SL=min(2ATR,4%))\n"
+        f"  売り (BEAR)  : 単発1本固定 / 1h H3b Squeeze (SELL・Disp2d>=5%・NoExh・WF90d / S8b+1.5ATR BE/2ATRトレール)\n"
         f"  日次リスク管理: 回数制限なし / 損失CB -${DAILY_MAX_LOSS_USDT:.2f} (JST 09:00 リセット)\n"
         f"  銘柄＆出来高 : 中堅アルト18銘柄特化 (SOL/DOGE/XRP除外 / 競合時は vol_ratio 降順優先)\n"
         "==================================================\n"
@@ -3018,16 +3026,23 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                         overall_regime = regime_info.get("overall_regime", "NEUTRAL")
                         regime_strength = regime_info.get("regime_strength", {})
                         new_reg_up = str(reg_refresh.get("overall_regime", overall_regime)).upper()
-                        if reg_refresh.get("tier_changed_ultra_buy"):
+                        if reg_refresh.get("tier_changed_ultra_buy") or reg_refresh.get("long_gate_changed"):
+                            amp2d_ref = reg_refresh.get("norm_amp_2d")
+                            amp2d_str = f"{float(amp2d_ref):.1f}%" if amp2d_ref is not None else "N/A"
                             discord.print_log(
-                                f"🔔 [F7 Tier Shift] ULTRA_BUY 状態変化: "
-                                f"{reg_refresh.get('prev_strength_tier')} -> {reg_refresh.get('strength_tier')}",
+                                f"🔔 [F7 Long Gate Shift] 状態変化: "
+                                f"{reg_refresh.get('prev_strength_tier')} -> {reg_refresh.get('strength_tier')} (Amp2d={amp2d_str})",
                                 force_send=True,
                             )
                         wf_ref = reg_refresh.get("h3b_wf90d") or {}
                         if wf_ref:
+                            amp2d_h = reg_refresh.get("norm_amp_2d")
+                            disp2d_h = reg_refresh.get("norm_disp_2d")
+                            amp2d_hs = f"{float(amp2d_h):.1f}%" if amp2d_h is not None else "N/A"
+                            disp2d_hs = f"{float(disp2d_h):.1f}%" if disp2d_h is not None else "N/A"
                             discord.print_log(
                                 f"📊 [F7 Hourly Context] Tier={reg_refresh.get('strength_tier')} | "
+                                f"Amp2d={amp2d_hs} | Disp2d={disp2d_hs} | "
                                 f"BTC14d={float(reg_refresh.get('btc_ret14d', 0.0) or 0.0)*100:+.1f}% | "
                                 f"WF90d={'PAUSED' if wf_ref.get('paused') else 'ACTIVE'}(n={wf_ref.get('window_trades', 0)},Net=${float(wf_ref.get('window_net', 0.0)):+.2f})"
                             )
@@ -3126,6 +3141,8 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                             sym_ret14d_map=regime_info.get("sym_ret14d_map") or {},
                             wf90d=wf90d_sum,
                             excluded_symbols=regime_info.get("excluded_symbols") or [],
+                            norm_amp_2d=regime_info.get("norm_amp_2d"),
+                            norm_disp_2d=regime_info.get("norm_disp_2d"),
                         )
                         summary_lines.append(f7_line_h)
                     summary_lines.extend([
@@ -3642,16 +3659,29 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
             tier_u_f7 = str(regime_info.get("strength_tier") or (regime_strength or {}).get("tier") or "BALANCED").upper()
             wf90d_paused_f7, wf90d_diag_f7 = _load_f7_wf90d_paused(regime_info)
             eu_now_f7 = is_eu_session_jst(now_utc_f7)
-            long_active_f7 = (tier_u_f7 == "ULTRA_BUY") and (not eu_now_f7)
-            short_active_f7 = (overall_u_f7 == "SELL") and (not wf90d_paused_f7)
+            norm_amp_2d_f7 = regime_info.get("norm_amp_2d")
+            norm_disp_2d_f7 = regime_info.get("norm_disp_2d")
+            long_reg_ok_f7, long_reg_reason_f7 = is_f7_long_regime_allowed(overall_u_f7, tier_u_f7, norm_amp_2d_f7)
+            short_disp_ok_f7, short_disp_reason_f7 = check_f7_short_dispersion(norm_disp_2d_f7)
+            long_active_f7 = long_reg_ok_f7 and (not eu_now_f7)
+            short_active_f7 = (overall_u_f7 == "SELL") and (not wf90d_paused_f7) and short_disp_ok_f7
 
             if not (long_active_f7 or short_active_f7):
-                if tier_u_f7 == "ULTRA_BUY" and eu_now_f7:
-                    idle_reason_f7 = "EU時間帯除外 (16:00-22:00 JST / val_poc_30m 新規停止)"
-                elif overall_u_f7 == "SELL" and wf90d_paused_f7:
-                    idle_reason_f7 = f"H3b WF90d休止中 (n={wf90d_diag_f7.get('window_trades',0)}, Net=${float(wf90d_diag_f7.get('window_net',0.0)):+.2f})"
+                if long_reg_ok_f7 and eu_now_f7:
+                    idle_reason_f7 = f"EU時間帯除外 (16:00-22:00 JST / val_poc_30m 新規停止, {long_reg_reason_f7})"
+                elif overall_u_f7 == "SELL":
+                    s_blocks = []
+                    if wf90d_paused_f7:
+                        s_blocks.append(
+                            f"WF90d休止(n={wf90d_diag_f7.get('window_trades',0)},Net=${float(wf90d_diag_f7.get('window_net',0.0)):+.2f})"
+                        )
+                    if not short_disp_ok_f7:
+                        s_blocks.append(f"2d団子相場除外({short_disp_reason_f7})")
+                    idle_reason_f7 = f"H3b {' & '.join(s_blocks)}"
                 else:
-                    idle_reason_f7 = f"F7待機態勢 (overall={overall_u_f7}, tier={tier_u_f7})"
+                    amp_s = f"{float(norm_amp_2d_f7):.1f}%" if norm_amp_2d_f7 is not None else "N/A"
+                    disp_s = f"{float(norm_disp_2d_f7):.1f}%" if norm_disp_2d_f7 is not None else "N/A"
+                    idle_reason_f7 = f"F7待機態勢 (overall={overall_u_f7}, tier={tier_u_f7}, amp2d={amp_s}, disp2d={disp_s})"
                 if now_jst.hour != last_neutral_notice_hour:
                     last_neutral_notice_hour = now_jst.hour
                     discord.print_log(f"⚪ [F7待機] {idle_reason_f7}", level="info")
@@ -3718,6 +3748,7 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                                 btc_ret14d=btc_ret14d_f7,
                                 sym_ret14d=sr_ev,
                                 wf90d_paused=wf90d_paused_f7,
+                                norm_disp_2d=norm_disp_2d_f7,
                             )
                         else:
                             ev_r = evaluate_val_poc_30m_entry(
@@ -3725,6 +3756,8 @@ async def start(mode: str = 'demo', max_lot: float = 10.0, interval: str = '60')
                                 strength_tier=tier_u_f7,
                                 is_norm_excluded=is_nex,
                                 now_utc=now_utc_f7,
+                                overall_regime=overall_u_f7,
+                                norm_amp_2d=norm_amp_2d_f7,
                             )
                         ev_r["symbol"] = sym_ev
                         return ev_r
